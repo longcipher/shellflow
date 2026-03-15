@@ -5,28 +5,53 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/shellflow
-    permissions:
-      contents: read
-      id-token: write
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
+
+      - name: Get version from tag
+        id: tag_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Check pyproject.toml version
+        run: |
+          FILE_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          
+          echo "pyproject.toml version: $FILE_VERSION"
+          echo "Tag version: ${{ env.VERSION }}"
+          
+          if [ "$FILE_VERSION" != "${{ env.VERSION }}" ]; then
+            echo "Error: pyproject.toml version ($FILE_VERSION) does not match tag version (${{ env.VERSION }})"
+            exit 1
+          fi
+
+      - name: Generate Changelog
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          config: cliff.toml
+          args: --verbose --latest --strip header
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.git-cliff.outputs.content }}
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
 
       - name: Install dependencies
         run: uv sync --all-groups
@@ -39,8 +64,10 @@ jobs:
           uv run pytest -q
           uv run behave features
 
-      - name: Build distributions
+      - name: Build Package
         run: uv build
 
       - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: uv publish
