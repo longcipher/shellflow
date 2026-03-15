@@ -37,6 +37,14 @@ uv tool install shellflow
 shellflow --version
 ```
 
+### Install Skill
+
+```bash
+npx skills add longcipher/shellflow
+```
+
+This installs the agent skill from this repository for writing and reviewing Shellflow playbooks.
+
 To upgrade to the latest version:
 
 ```bash
