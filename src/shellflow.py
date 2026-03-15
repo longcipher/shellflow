@@ -23,6 +23,8 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as distribution_version
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +122,10 @@ class ExecutionError(ShellflowError):
     """Exception raised when execution fails."""
 
 
+PACKAGE_NAME = "shellflow"
+DEFAULT_VERSION = "0.1.0"
+
+
 # =============================================================================
 # SSH Config Parser
 # =============================================================================
@@ -148,6 +154,9 @@ def read_ssh_config(host: str) -> SSHConfig | None:
         with ssh_config_path.open() as handle:
             ssh_config.parse(handle)
 
+        if not _ssh_config_matches_host(ssh_config, host):
+            return None
+
         lookup = ssh_config.lookup(host)
         if not lookup:
             return None
@@ -164,6 +173,16 @@ def read_ssh_config(host: str) -> SSHConfig | None:
     except (AttributeError, ImportError):
         # Fall back to basic parsing
         return _parse_ssh_config_basic(ssh_config_path, host)
+
+
+def _ssh_config_matches_host(ssh_config: Any, host: str) -> bool:
+    """Check whether a host matches any explicit Host rule in the SSH config."""
+    get_hostnames = getattr(ssh_config, "get_hostnames", None)
+    if not callable(get_hostnames):
+        return True
+
+    patterns = {pattern for pattern in get_hostnames() if pattern}
+    return any(fnmatch.fnmatch(host, pattern) for pattern in patterns)
 
 
 def _get_ssh_config_path() -> Path:
@@ -389,12 +408,7 @@ def _is_valid_env_name(name: str) -> bool:
 
 def _quote_shell_value(value: str) -> str:
     """Quote a value for use in a shell export statement."""
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("$", "\\$")
-        .replace("`", "\\`")
-    )
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
     return f'"{escaped}"'
 
 
@@ -407,7 +421,34 @@ def _combine_output(stdout: str, stderr: str) -> str:
     return output or error_output
 
 
-def execute_local(block: Block, context: ExecutionContext) -> ExecutionResult:
+def _iter_display_commands(commands: list[str]) -> list[str]:
+    """Return non-empty, non-comment commands suitable for verbose display."""
+    return [command for command in commands if command.strip() and not command.lstrip().startswith("#")]
+
+
+def _format_env_value(value: str) -> str:
+    """Format an environment variable value for readable verbose output."""
+    escaped = (
+        value.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t").replace('"', '\\"')
+    )
+    return f'"{escaped}"'
+
+
+def _iter_display_context(context: ExecutionContext) -> list[str]:
+    """Return explicit shellflow context values suitable for verbose display."""
+    lines: list[str] = []
+    if context.last_output:
+        lines.append(f"SHELLFLOW_LAST_OUTPUT={_format_env_value(context.last_output)}")
+    for key, value in context.env.items():
+        if _is_valid_env_name(key):
+            lines.append(f"{key}={_format_env_value(value)}")
+    return lines
+
+
+def execute_local(
+    block: Block,
+    context: ExecutionContext,
+) -> ExecutionResult:
     """Execute a local block.
 
     Runs the block's commands in a local subprocess with the given context.
@@ -422,7 +463,11 @@ def execute_local(block: Block, context: ExecutionContext) -> ExecutionResult:
     if not block.commands:
         return ExecutionResult(success=True, output="")
 
-    script = _build_executable_script(block.commands, context, include_context_exports=False)
+    script = _build_executable_script(
+        block.commands,
+        context,
+        include_context_exports=False,
+    )
     env = context.to_shell_env()
 
     try:
@@ -478,31 +523,37 @@ def execute_remote(
             error_message="No host specified for remote block",
         )
 
+    if ssh_config is None:
+        ssh_config = read_ssh_config(host)
+
+    if ssh_config is None:
+        ssh_config_path = _get_ssh_config_path()
+        return ExecutionResult(
+            success=False,
+            output="",
+            exit_code=-1,
+            error_message=(f"Remote host '{host}' was not found in SSH config: {ssh_config_path}"),
+        )
+
     ssh_args = ["ssh"]
 
-    if ssh_config:
-        if ssh_config.port and ssh_config.port != 22:
-            ssh_args.extend(["-p", str(ssh_config.port)])
-        if ssh_config.user:
-            ssh_args.extend(["-l", ssh_config.user])
-        if ssh_config.identity_file:
-            ssh_args.extend(["-i", str(Path(ssh_config.identity_file).expanduser())])
-    else:
-        manual_config = read_ssh_config(host)
-        if manual_config:
-            if manual_config.port and manual_config.port != 22:
-                ssh_args.extend(["-p", str(manual_config.port)])
-            if manual_config.user:
-                ssh_args.extend(["-l", manual_config.user])
-            if manual_config.identity_file:
-                ssh_args.extend(["-i", str(Path(manual_config.identity_file).expanduser())])
+    if ssh_config.port and ssh_config.port != 22:
+        ssh_args.extend(["-p", str(ssh_config.port)])
+    if ssh_config.user:
+        ssh_args.extend(["-l", ssh_config.user])
+    if ssh_config.identity_file:
+        ssh_args.extend(["-i", str(Path(ssh_config.identity_file).expanduser())])
 
     ssh_config_path = _get_ssh_config_path()
     if ssh_config_path.exists():
         ssh_args.extend(["-F", str(ssh_config_path)])
 
     ssh_args.extend(["-o", "BatchMode=yes", host, "bash", "-se"])
-    remote_script = _build_executable_script(block.commands, context, include_context_exports=True)
+    remote_script = _build_executable_script(
+        block.commands,
+        context,
+        include_context_exports=True,
+    )
 
     try:
         result = subprocess.run(
@@ -554,6 +605,7 @@ def run_script(blocks: list[Block], verbose: bool = False) -> RunResult:
     RED = "\033[91m"
     BLUE = "\033[94m"
     YELLOW = "\033[93m"
+    DIM = "\033[90m"
     RESET = "\033[0m"
 
     for i, block in enumerate(blocks, 1):
@@ -564,6 +616,10 @@ def run_script(blocks: list[Block], verbose: bool = False) -> RunResult:
             else:
                 host = block.host or "unknown"
                 print(f"{YELLOW}[{i}/{len(blocks)}] REMOTE: {host}{RESET}")
+            for env_line in _iter_display_context(context):
+                print(f"{DIM}@env {env_line}{RESET}")
+            for command in _iter_display_commands(block.commands):
+                print(f"{DIM}$ {command}{RESET}")
 
         # Execute the block
         if block.is_local:
@@ -636,7 +692,7 @@ Examples:
     parser.add_argument(
         "--version",
         action="version",
-        version="%(prog)s 0.1.0",
+        version=f"%(prog)s {_get_version()}",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -732,6 +788,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"\nCompleted: {result.blocks_executed} block(s) executed successfully.")
 
     return 0
+
+
+def _get_version() -> str:
+    """Resolve the installed package version, falling back to the source default."""
+    try:
+        return distribution_version(PACKAGE_NAME)
+    except PackageNotFoundError:
+        return DEFAULT_VERSION
 
 
 if __name__ == "__main__":

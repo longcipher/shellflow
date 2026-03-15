@@ -5,7 +5,24 @@ description = "A minimal shell script orchestrator with SSH support"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
+authors = [{ name = "Bob Liu" }]
+keywords = ["shell", "ssh", "orchestration", "automation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = ["paramiko>=3.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/longcipher/shellflow"
+Repository = "https://github.com/longcipher/shellflow"
+Issues = "https://github.com/longcipher/shellflow/issues"
 
 [project.scripts]
 shellflow = "shellflow:main"
@@ -15,7 +32,9 @@ requires = ["hatchling>=1.18.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/shellflow"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/shellflow.py" = "shellflow.py"
 
 [dependency-groups]
 dev = [
@@ -27,6 +46,7 @@ dev = [
     "ty>=0.0.21",
     "behave>=1.3.3",
     "hypothesis>=6.151.9",
+    "shellflow",
 ]
 
 [tool.pytest.ini_options]
@@ -42,3 +62,11 @@ markers = [
     "benchmark: marks benchmark tests",
 ]
 asyncio_mode = "auto"
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+shellflow = { workspace = true, editable = true }

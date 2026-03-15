@@ -1,161 +1,229 @@
-# Shellflow
+# ShellFlow
 
-A minimal shell script orchestrator with SSH support. Shellflow allows you to write shell scripts that execute across local and remote environments using simple comment markers.
+[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/longcipher/shellflow)
+[![Context7](https://img.shields.io/badge/Website-context7.com-blue)](https://context7.com/longcipher/shellflow)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/shellflow.svg)](https://pypi.org/project/shellflow/)
 
-## Features
+![shellflow](https://socialify.git.ci/longcipher/shellflow/image?font=Source+Code+Pro&language=1&name=1&owner=1&pattern=Circuit+Board&theme=Auto)
 
-- **Block-based execution**: Use comment markers to define local and remote execution blocks
-- **SSH support**: Automatically reads SSH configuration from `~/.ssh/config`
-- **Fail-fast execution**: Stops on first error with clear error reporting
-- **Context passing**: The previous block output is passed via `SHELLFLOW_LAST_OUTPUT`
-- **CLI interface**: Simple command-line tool for running scripts
+ShellFlow is a minimal shell script orchestrator for mixed local and remote execution. You write one shell script, mark execution boundaries with comments, and ShellFlow runs each block in order while resolving remote targets from your SSH configuration.
+
+![shellflow-run](assets/shellflow-run.png)
+
+## What It Does
+
+- Split a shell script into `@LOCAL` and `@REMOTE` execution blocks.
+- Run each block fail-fast, in order.
+- Reuse the shared prelude before the first marker for every block.
+- Pass the previous block output forward as `SHELLFLOW_LAST_OUTPUT`.
+- Resolve remote targets from `~/.ssh/config` or a custom SSH config path.
+
+## Quick Start
+
+```bash
+git clone https://github.com/longcipher/shellflow.git
+cd shellflow
+uv sync --all-groups # uv sync --refresh --reinstall --no-cache
+uv tool install --force --reinstall --refresh --no-cache .
+
+shellflow run playbooks/hello.sh
+```
+
+If you do not want a global tool install, use `uv run shellflow run playbooks/hello.sh`.
 
 ## Installation
 
-```bash
-# Install the package and dependencies
-uv sync --all-groups
+### Development checkout
 
-# Install in development mode
+```bash
+git clone https://github.com/longcipher/shellflow.git
+cd shellflow
+uv sync --all-groups # uv sync --refresh --reinstall --no-cache
+```
+
+### Install as a local tool
+
+```bash
+uv tool install --force .
+shellflow --version
+```
+
+### Install into the active environment
+
+```bash
 uv pip install -e .
+shellflow --version
 ```
 
-## Usage
+## Script Format
 
-### Writing Scripts
+Shellflow recognizes two markers:
 
-Shellflow scripts use comment markers to define execution blocks:
+- `# @LOCAL`
+- `# @REMOTE <ssh-host>`
 
-```bash
-# @LOCAL
-echo "Running locally"
+`<ssh-host>` must match a `Host` entry in your SSH config. Shellflow then connects using that SSH host definition, which means the actual machine can be resolved through the configured `HostName`, `User`, `Port`, and `IdentityFile` values.
 
-# @REMOTE myserver
-echo "Running on myserver"
-
-# @LOCAL
-echo "Back to local"
-```
-
-### Running Scripts
-
-```bash
-# Run a script
-shellflow run script.sh
-
-# Run with verbose output
-shellflow run script.sh --verbose
-shellflow run script.sh -v
-
-# Use a non-default SSH config file
-shellflow run script.sh --ssh-config ./ssh_config
-```
-
-### SSH Configuration
-
-Shellflow reads SSH configuration from `~/.ssh/config`. The following options are supported:
-
-```ssh
-Host myserver
-    HostName 192.168.1.100
-    User admin
-    Port 2222
-    IdentityFile ~/.ssh/myserver_key
-```
-
-If `paramiko` is installed, it will be used for parsing. Otherwise, a basic parser is used as fallback.
-
-### Execution Model
-
-Blocks are intentionally stateless. Shell state such as `cd`, shell variables, and `export` commands do not persist into the next block. If you need to pass data forward, use the previous block output via `SHELLFLOW_LAST_OUTPUT`:
-
-```bash
-# @LOCAL
-echo "Step 1 output"
-
-# @LOCAL
-echo "Previous output was: $SHELLFLOW_LAST_OUTPUT"
-```
-
-Lines before the first marker, such as a shebang or shared shell options, are prepended to every block. That lets you define common guardrails once:
+Example:
 
 ```bash
 #!/bin/bash
 set -euo pipefail
 
 # @LOCAL
-echo "runs with the shared prelude"
+echo "runs locally"
 
-# @REMOTE myserver
-echo "remote block gets the same prelude"
+# @REMOTE sui
+uname -a
+
+# @LOCAL
+echo "remote output: $SHELLFLOW_LAST_OUTPUT"
 ```
 
-## Testing
+## SSH Configuration
 
-### Unit Tests (pytest)
+Example `~/.ssh/config` entry:
 
-Run unit tests with pytest:
+```sshconfig
+Host sui
+    HostName 192.168.1.100
+    User deploy
+    Port 22
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+With that config, this block is valid:
 
 ```bash
-# Run all tests
+# @REMOTE sui
+hostname
+```
+
+This is intentional:
+
+- Shellflow accepts configured SSH host names, not arbitrary free-form targets.
+- Unknown remote targets fail early with a clear error before spawning `ssh`.
+- You can override the default config path with `--ssh-config`.
+
+## Execution Model
+
+Each block runs in a fresh shell.
+
+- Shell options from the prelude are copied into every block.
+- Shell state like `cd`, shell variables, aliases, and `export` commands does not persist across blocks.
+- Explicit context values are passed forward through environment variables.
+
+Example:
+
+```bash
+# @LOCAL
+echo "build-123"
+
+# @LOCAL
+echo "last output = $SHELLFLOW_LAST_OUTPUT"
+```
+
+Lines before the first marker are treated as a shared prelude and prepended to every executable block:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# @LOCAL
+echo "prelude is active"
+
+# @REMOTE sui
+echo "prelude is also active here"
+```
+
+## CLI
+
+```text
+shellflow run <script>
+shellflow run <script> --verbose
+shellflow run <script> --ssh-config ./ssh_config
+shellflow --version
+```
+
+Examples:
+
+```bash
+shellflow run playbooks/hello.sh
+shellflow run playbooks/hello.sh -v
+shellflow run playbooks/hello.sh --ssh-config ~/.ssh/config.work
+```
+
+## Development
+
+Useful commands:
+
+```bash
+just sync
 just test
-
-# Run specific test file
-uv run pytest tests/test_shellflow.py
-
-# Run with coverage
-uv run pytest --cov=shellflow --cov-report=term-missing
-```
-
-### BDD Tests (behave)
-
-Run acceptance tests with behave:
-
-```bash
-# Run BDD tests
 just bdd
-
-# Or directly
-uv run behave
-```
-
-### Running All Tests
-
-```bash
-# Run format, lint, test, and BDD
 just test-all
+just typecheck
+just build
+just publish
 ```
 
-## Development Commands
+Direct verification commands:
 
 ```bash
-just format      # Format code with ruff
-just lint        # Lint with ruff
-just test        # Run pytest
-just bdd         # Run behave BDD tests
-just test-all   # Run format, lint, test, and bdd
-just typecheck  # Type check with ty
+uv run pytest -q
+uv run behave features
+uv run ruff check .
+uv run ty check src tests
+uv build
 ```
 
-## Project Structure
+## Release Process
+
+Shellflow supports both local publishing and GitHub Actions release publishing.
+
+### Local publish
+
+```bash
+just publish
+```
+
+`uv publish` uses standard `uv` authentication mechanisms such as `UV_PUBLISH_TOKEN`, or PyPI trusted publishing when supported by the environment.
+
+### GitHub Actions publish on tag push
+
+The repository includes:
+
+- `.github/workflows/ci.yml` for lint, type-check, test, and build verification.
+- `.github/workflows/release.yml` for publishing to PyPI when a tag like `v0.1.0` is pushed.
+
+Recommended release flow:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+To use trusted publishing with PyPI:
+
+1. Create a `pypi` environment in GitHub repository settings.
+2. Add this repository as a trusted publisher in the PyPI project settings.
+3. Push a `v*` tag.
+
+The release workflow then runs verification, builds distributions with `uv build`, and uploads them with `uv publish`.
+
+## Project Layout
 
 ```text
 shellflow/
-├── src/shellflow.py    # Main module
-├── tests/              # Unit tests
-├── features/           # BDD feature files
-│   ├── parser.feature
-│   └── runner.feature
-├── pyproject.toml      # Project configuration
+├── src/shellflow.py
+├── tests/
+├── features/
+├── playbooks/
+├── pyproject.toml
+├── Justfile
 └── README.md
-```
-
-## CLI Reference
-
-```text
-shellflow run <script>    # Run a shellflow script
-shellflow run <script> -v # Run with verbose output
-shellflow --version       # Show version
 ```
 
 ## License

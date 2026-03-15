@@ -551,6 +551,7 @@ dev = [
     { name = "pytest-benchmark" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "shellflow" },
     { name = "ty" },
 ]
 
@@ -566,6 +567,7 @@ dev = [
     { name = "pytest-benchmark", specifier = ">=5.2.3" },
     { name = "pytest-cov", specifier = ">=7.0.0" },
     { name = "ruff", specifier = ">=0.15.5" },
+    { name = "shellflow", editable = "." },
     { name = "ty", specifier = ">=0.0.21" },
 ]
 

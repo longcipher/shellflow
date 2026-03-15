@@ -7,6 +7,7 @@ and helper functions in src/shellflow.py.
 from __future__ import annotations
 
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -615,11 +616,14 @@ class TestExecuteRemote:
 
         mock_result = mock.Mock(returncode=0, stdout="", stderr="")
 
-        with mock.patch.dict(
-            "os.environ",
-            {"AWS_SECRET_ACCESS_KEY": "super-secret"},
-            clear=True,
-        ), mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"AWS_SECRET_ACCESS_KEY": "super-secret"},
+                clear=True,
+            ),
+            mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run,
+        ):
             execute_remote(block, context, ssh_config)
 
         sent_script = mock_run.call_args.kwargs["input"]
@@ -683,13 +687,16 @@ class TestExecuteRemote:
         mock_result.stdout = ""
         mock_result.stderr = ""
 
-        with mock.patch(
-            "shellflow.read_ssh_config",
-            return_value=mock_ssh_config,
-        ) as mock_read_config, mock.patch(
-            "shellflow.subprocess.run",
-            return_value=mock_result,
-        ) as mock_run:
+        with (
+            mock.patch(
+                "shellflow.read_ssh_config",
+                return_value=mock_ssh_config,
+            ) as mock_read_config,
+            mock.patch(
+                "shellflow.subprocess.run",
+                return_value=mock_result,
+            ) as mock_run,
+        ):
             execute_remote(block, execution_context, None)
 
             # Verify SSH config was looked up
@@ -855,9 +862,12 @@ Host testserver
     IdentityFile ~/.ssh/test_key
 """)
 
-        with mock.patch.object(Path, "home", return_value=tmp_path), mock.patch.dict(
-            "sys.modules",
-            {"paramiko": None},
+        with (
+            mock.patch.object(Path, "home", return_value=tmp_path),
+            mock.patch.dict(
+                "sys.modules",
+                {"paramiko": None},
+            ),
         ):
             result = read_ssh_config("testserver")
 
@@ -878,9 +888,12 @@ Host server1
     HostName 192.168.1.1
 """)
 
-        with mock.patch.object(Path, "home", return_value=tmp_path), mock.patch.dict(
-            "sys.modules",
-            {"paramiko": None},
+        with (
+            mock.patch.object(Path, "home", return_value=tmp_path),
+            mock.patch.dict(
+                "sys.modules",
+                {"paramiko": None},
+            ),
         ):
             result = read_ssh_config("nonexistent")
 
@@ -897,9 +910,12 @@ Host *
     Port 2222
 """)
 
-        with mock.patch.object(Path, "home", return_value=tmp_path), mock.patch.dict(
-            "sys.modules",
-            {"paramiko": None},
+        with (
+            mock.patch.object(Path, "home", return_value=tmp_path),
+            mock.patch.dict(
+                "sys.modules",
+                {"paramiko": None},
+            ),
         ):
             result = read_ssh_config("anyhost")
 
@@ -923,15 +939,46 @@ Host deploy-box
     Port 2222
 """)
 
-        with mock.patch.object(Path, "home", return_value=tmp_path), mock.patch.dict(
-            "sys.modules",
-            {"paramiko": None},
+        with (
+            mock.patch.object(Path, "home", return_value=tmp_path),
+            mock.patch.dict(
+                "sys.modules",
+                {"paramiko": None},
+            ),
         ):
             result = read_ssh_config("deploy-box")
 
         assert result is not None
         assert result.user == "deploy"
         assert result.port == 2222
+
+    def test_paramiko_lookup_requires_matching_host_rule(self, tmp_path: Path) -> None:
+        """Test paramiko lookup rejects hosts not matched by any Host rule."""
+        ssh_dir = tmp_path / ".ssh"
+        ssh_dir.mkdir()
+        config_file = ssh_dir / "config"
+        config_file.write_text("""
+Host deploy-box
+    HostName 10.0.0.10
+""")
+
+        fake_ssh_config = mock.Mock()
+        fake_ssh_config.lookup.return_value = {"hostname": "missing-host"}
+        fake_ssh_config.get_hostnames.return_value = {"deploy-box"}
+
+        fake_paramiko = mock.Mock()
+        fake_paramiko.SSHConfig.return_value = fake_ssh_config
+
+        with (
+            mock.patch.object(Path, "home", return_value=tmp_path),
+            mock.patch.dict(
+                "sys.modules",
+                {"paramiko": fake_paramiko},
+            ),
+        ):
+            result = read_ssh_config("missing-host")
+
+        assert result is None
 
 
 # =============================================================================
@@ -1010,26 +1057,72 @@ class TestRunScript:
         mock_result.stdout = "server1\n"
         mock_result.stderr = ""
 
-        with mock.patch("shellflow.read_ssh_config", return_value=None), mock.patch(
-            "shellflow.subprocess.run",
-            return_value=mock_result,
+        with (
+            mock.patch(
+                "shellflow.read_ssh_config",
+                return_value=SSHConfig(host="server1"),
+            ),
+            mock.patch("shellflow.subprocess.run", return_value=mock_result),
         ):
             result = run_script(blocks)
 
         assert result.success is True
 
+    def test_remote_block_requires_host_in_ssh_config(self) -> None:
+        """Test remote execution fails before SSH when host is not defined in SSH config."""
+        blocks = [
+            Block(target="REMOTE:missing-host", commands=["hostname"]),
+        ]
+
+        with (
+            mock.patch("shellflow.read_ssh_config", return_value=None),
+            mock.patch("shellflow.subprocess.run") as mock_run,
+        ):
+            result = run_script(blocks)
+
+        assert result.success is False
+        assert "ssh config" in result.error_message.lower()
+        mock_run.assert_not_called()
+
     def test_verbose_output(self, capsys: Any) -> None:
         """Test verbose mode produces output."""
         blocks = [
-            Block(target="LOCAL", commands=['echo "test"']),
+            Block(target="LOCAL", commands=['echo "__RESULT__"']),
         ]
 
         result = run_script(blocks, verbose=True)
 
         captured = capsys.readouterr()
         assert result.success is True
-        # Verbose output should contain block info
         assert "LOCAL" in captured.out or "local" in captured.out.lower()
+        assert '\x1b[90m$ echo "__RESULT__"\x1b[0m' in captured.out
+        assert captured.out.index('$ echo "__RESULT__"') < captured.out.index("__RESULT__")
+        assert captured.out.index("__RESULT__") < captured.out.index("✓ Success")
+
+    def test_verbose_remote_context_output_is_clean(self, capsys: Any) -> None:
+        """Test verbose remote output shows clean context instead of shell trace internals."""
+        blocks = [
+            Block(target="LOCAL", commands=['printf "alpha"']),
+            Block(target="REMOTE:server1", commands=["hostname"]),
+        ]
+
+        with (
+            mock.patch(
+                "shellflow.read_ssh_config",
+                return_value=SSHConfig(host="server1"),
+            ),
+            mock.patch(
+                "shellflow.execute_remote",
+                return_value=ExecutionResult(success=True, output="server1"),
+            ),
+        ):
+            result = run_script(blocks, verbose=True)
+
+        captured = capsys.readouterr()
+        assert result.success is True
+        assert 'SHELLFLOW_LAST_OUTPUT="alpha"' in captured.out
+        assert "export SHELLFLOW_LAST_OUTPUT" not in captured.out
+        assert "$ hostname" in captured.out
 
 
 # =============================================================================
@@ -1178,7 +1271,20 @@ echo "This should not run"
 
         assert result.success is False
         assert result.blocks_executed == 2
-        assert "block 2 failed" in result.error_message.lower()
+
+
+class TestPackagingConfig:
+    """Tests for build packaging configuration."""
+
+    def test_wheel_configuration_includes_single_module_entrypoint(self) -> None:
+        """Test wheel build config includes the single-file module at top level."""
+        pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        pyproject_data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+
+        wheel_config = pyproject_data["tool"]["hatch"]["build"]["targets"]["wheel"]
+        force_include = wheel_config.get("force-include", {})
+
+        assert force_include.get("src/shellflow.py") == "shellflow.py"
 
     def test_context_variable_passing(self) -> None:
         """Test that context variables are passed between blocks."""

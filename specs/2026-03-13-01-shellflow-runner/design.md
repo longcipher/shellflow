@@ -26,6 +26,7 @@
 ### 2.1 Problem Statement
 
 Current pain points in DevOps script management:
+
 - Fragmented script files: Separate scripts for local and remote operations
 - Manual sequencing: No built-in way to define execution order across environments
 - Poor error handling: Scripts continue executing after failures or provide minimal error context
@@ -98,7 +99,7 @@ The following features are explicitly deferred to future versions to maintain si
 
 Shellflow operates as a CLI tool that processes user script files and coordinates execution across local and remote environments.
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        User Workflow                                  │
 │                                                                     │
@@ -111,7 +112,7 @@ Shellflow operates as a CLI tool that processes user script files and coordinate
 
 System Components (Simplified):
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │              Shellflow Architecture (Simplified)            │
 │                                                             │
@@ -172,6 +173,7 @@ No existing components identified for reuse. The current codebase contains a tem
 | AD-07 | Simplified | **No Protocol Classes** | No `typing.Protocol` for Block or Executor. Simple dataclasses and functions. |
 
 **Key Principles:**
+
 1. **YAGNI**: If a feature isn't needed for v1, it's out
 2. **Explicit over Implicit**: No magic registries or dependency injection
 3. **Flat over Nested**: Single file over deep module hierarchy
@@ -227,10 +229,12 @@ No existing components identified for reuse. The current codebase contains a tem
 - **Step Definition Location:** `features/steps/shellflow_steps.py`
 
 **Property Testing Strategy:**
+
 - Parser property tests: Generate random script content with markers, verify valid parsing
 - Configuration property tests: Generate random config structures, verify validation
 
 **Benchmark Strategy:**
+
 - SSH connection establishment benchmark (when connection pooling implemented)
 - Script parsing benchmark for large files
 
@@ -282,6 +286,7 @@ src/
 ```
 
 **Design rationale:**
+
 - A single Python file can comfortably hold ~500 lines of well-organized code
 - Fewer files = less cognitive load when navigating the codebase
 - No import cycles or complex dependency graphs to manage
@@ -448,7 +453,7 @@ class ConfigManagerInterface(Protocol):
 
 **Main Execution Flow:**
 
-```
+```text
 1. CLI receives command with script path
    |
    v
@@ -482,7 +487,7 @@ class ConfigManagerInterface(Protocol):
 
 **Parser Logic:**
 
-```
+```text
 Input: .sh file content
 Output: List of Block objects
 
@@ -638,6 +643,7 @@ results = await asyncio.gather(*tasks, return_exceptions=True)
 ```
 
 This approach:
+
 - Spawns separate `ssh` processes for each concurrent operation
 - Uses `asyncio` to manage multiple subprocesses without blocking
 - Naturally handles I/O streaming from multiple hosts in parallel
@@ -647,7 +653,7 @@ This approach:
 
 With system SSH, connection multiplexing is handled natively by OpenSSH's `ControlMaster` feature:
 
-```
+```text
 1. SSH Executor initialization:
    a. Create temp directory for ControlPath sockets
    b. Set SSH_OPTIONS: ControlMaster=auto, ControlPath=/tmp/shellflow-xxx/%h-%p-%r
@@ -670,6 +676,7 @@ With system SSH, connection multiplexing is handled natively by OpenSSH's `Contr
 ```
 
 **Key Benefits:**
+
 - **Zero code complexity**: OpenSSH handles all multiplexing logic
 - **Transparent**: Works with any SSH config in ~/.ssh/config
 - **Efficient**: Single TCP connection per host regardless of concurrency
@@ -677,7 +684,7 @@ With system SSH, connection multiplexing is handled natively by OpenSSH's `Contr
 
 **Concurrent Group Execution (Fan-Out/Fan-In):**
 
-```
+```text
 1. Parse # @REMOTE @groupname marker
 2. Resolve group to list of hosts via ConfigManager
 3. Create RemoteGroupBlock with group reference
@@ -786,6 +793,7 @@ echo "Deployment complete on all hosts!"
 ```
 
 **Environment Variables:**
+
 - `SHELLFLOW_CONFIG`: Path to config file (default: `~/.config/shellflow/config.toml`)
 - `SHELLFLOW_SSH_KEY`: Default SSH key path
 - `SHELLFLOW_LOG_LEVEL`: Override log level
@@ -836,7 +844,7 @@ class SSHError(ExecutionError):
 
 **Error Reporting Format:**
 
-```
+```text
 ERROR: Execution failed at block 3 (remote:production-web)
 
 Command:
@@ -904,6 +912,7 @@ Integration tests verify component interactions:
 | CLI end-to-end | `tests/integration/test_cli.py` | Full CLI invocation with various arguments |
 
 Mock Strategy:
+
 - SSH connections mocked using `paramiko` mocks or test containers
 - Filesystem operations use temporary directories
 - Subprocess calls mocked to capture commands without execution
@@ -969,6 +978,7 @@ Mock Strategy:
 ## 7. Cross-Functional Concerns
 
 ### Security
+
 - No hardcoded credentials; SSH keys and agent-only authentication
 - Config files should have restrictive permissions (0o600) checked at load
 - **Variable Injection via Environment Variables**: Context variables are passed to blocks via environment variables using `subprocess.run(env=...)` for local and dynamically generated `export VAR=value` (with `shlex.quote()`) for remote. This prevents shell injection attacks that could occur with string templating.
@@ -976,22 +986,26 @@ Mock Strategy:
 - Note: Since bash scripts with pipes/redirections must be executed as strings via shell interpreter, the security boundary is at the variable injection layer, not the command structure itself
 
 ### Backward Compatibility
+
 - Initial release - no backward compatibility concerns
 - Future versions: maintain comment marker compatibility
 
 ### Documentation
+
 - README with quickstart guide
 - Example scripts in `examples/` directory
 - Full CLI help text
 - Configuration reference
 
 ### Monitoring/Logging
+
 - Structured logging (JSON) for machine parsing
 - Human-readable text format option
 - Execution timing per block
 - Connection metrics for SSH
 
 ### Rollback Strategy
+
 - Fail-fast by default ensures partial deployments don't continue
 - No automatic rollback (user handles via script logic)
 - Dry-run mode available for testing

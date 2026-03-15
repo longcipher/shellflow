@@ -50,6 +50,11 @@ bench:
 build:
   uv build
 
+# Publish the package to PyPI
+publish:
+  uv build
+  uv publish
+
 # Type check with ty
 typecheck:
   uv run ty check src tests

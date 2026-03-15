@@ -82,10 +82,13 @@ def when_run_the_script(context: Context) -> None:
 
     blocks = parse_script(script_content)
 
-    with mock.patch(
-        "shellflow.read_ssh_config",
-        side_effect=lambda host: SSHConfig(host=host),
-    ), mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote):
+    with (
+        mock.patch(
+            "shellflow.read_ssh_config",
+            side_effect=lambda host: SSHConfig(host=host),
+        ),
+        mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote),
+    ):
         result = run_script(blocks, verbose=getattr(context, "verbose", False))
 
     context.run_result = result
@@ -130,8 +133,7 @@ def then_output_should_contain(context: Context, text: str) -> None:
     combined_output = getattr(context, "stdout", "") + getattr(context, "stderr", "")
     if text not in combined_output:
         raise AssertionError(
-            f"Expected output to contain {text!r}, but it did not.\n"
-            f"Combined output: {combined_output}"
+            f"Expected output to contain {text!r}, but it did not.\nCombined output: {combined_output}"
         )
 
 
@@ -140,8 +142,7 @@ def then_output_should_not_contain(context: Context, text: str) -> None:
     combined_output = getattr(context, "stdout", "") + getattr(context, "stderr", "")
     if text in combined_output:
         raise AssertionError(
-            f"Expected output not to contain {text!r}, but it did.\n"
-            f"Combined output: {combined_output}"
+            f"Expected output not to contain {text!r}, but it did.\nCombined output: {combined_output}"
         )
 
 

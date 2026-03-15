@@ -11,6 +11,7 @@
 ## Summary
 
 Implementation of the **simplified** Shellflow bash script runner. This is a minimal, single-file implementation (~500 lines) that:
+
 - Parses `.sh` files with comment markers (`# @LOCAL`, `# @REMOTE <host>`)
 - Executes blocks sequentially (local subprocess or SSH)
 - Provides fail-fast behavior with clear error reporting
