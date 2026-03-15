@@ -1,0 +1,110 @@
+# Ruff configuration — strict, performance-oriented Python
+# https://docs.astral.sh/ruff/configuration/
+
+target-version = "py313"
+line-length = 120
+extend-exclude = ["specs"]
+
+[lint]
+select = [
+    "F",      # Pyflakes
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "YTT",    # flake8-2020
+    "ANN",    # flake8-annotations
+    "ASYNC",  # flake8-async
+    "S",      # flake8-bandit
+    "BLE",    # flake8-blind-except
+    "FBT",    # flake8-boolean-trap
+    "B",      # flake8-bugbear
+    "A",      # flake8-builtins
+    "COM",    # flake8-commas
+    "C4",     # flake8-comprehensions
+    "DTZ",    # flake8-datetimez
+    "T10",    # flake8-debugger
+    "EM",     # flake8-errmsg
+    "FA",     # flake8-future-annotations
+    "ISC",    # flake8-implicit-str-concat
+    "ICN",    # flake8-import-conventions
+    "LOG",    # flake8-logging
+    "G",      # flake8-logging-format
+    "INP",    # flake8-no-pep420
+    "PIE",    # flake8-pie
+    "T20",    # flake8-print
+    "PYI",    # flake8-pyi
+    "PT",     # flake8-pytest-style
+    "Q",      # flake8-quotes
+    "RSE",    # flake8-raise
+    "RET",    # flake8-return
+    "SLF",    # flake8-self
+    "SLOT",   # flake8-slots
+    "SIM",    # flake8-simplify
+    "TID",    # flake8-tidy-imports
+    "TCH",    # flake8-type-checking
+    "INT",    # flake8-gettext
+    "ARG",    # flake8-unused-arguments
+    "PTH",    # flake8-use-pathlib
+    "ERA",    # eradicate
+    "PD",     # pandas-vet
+    "PGH",    # pygrep-hooks
+    "PL",     # Pylint
+    "TRY",    # tryceratops
+    "FLY",    # flynt
+    "PERF",   # Perflint
+    "FURB",   # refurb
+    "RUF",    # Ruff-specific rules
+]
+ignore = [
+    "ANN401",  # Dynamically typed expressions (typing.Any) are disallowed
+    "COM812",  # Trailing comma missing (conflicts with formatter)
+    "ISC001",  # Implicitly concatenated string literals (conflicts with formatter)
+    "TRY003",  # Avoid specifying long messages outside the exception class
+    "EM101",   # Exception must not use a string literal
+    "EM102",   # Exception must not use an f-string literal
+    "S101",    # Use of assert detected (needed for tests)
+    "T20",     # Allow print statements in CLI tool
+    "S602",    # Allow subprocess with shell=True (required for shell scripts)
+    "S603",    # Allow subprocess with untrusted input (SSH commands)
+    "PLR0912", # Allow complex functions with many branches
+    "FBT001",  # Allow boolean positional args (verbose flag)
+    "FBT002",  # Allow boolean default args
+    "PLR2004", # Allow magic values in comparisons
+    "N806",    # Allow uppercase constants in functions (colors)
+    "PLW1510", # Allow subprocess without explicit check
+    "PLC0415", # Allow imports in try blocks (optional dependency handling)
+    "PTH123",  # Allow open() instead of Path.open()
+    "B034",    # Allow re.split with positional args
+    "PLW2901", # Allow loop variable reuse
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",    # assert is fine in tests
+    "S603",    # subprocess calls are fine in tests
+    "ANN",     # Annotations not required in tests
+    "ARG",     # Unused arguments are common in fixtures
+    "PLR2004", # Magic value comparisons in tests
+    "T20",     # print is fine in tests
+]
+
+[lint.isort]
+known-first-party = ["uv_app"]
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.pylint]
+max-args = 8
+max-branches = 12
+max-returns = 6
+max-statements = 50
+
+[format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = true
