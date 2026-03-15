@@ -6,6 +6,7 @@ and helper functions in src/shellflow.py.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tomllib
 from pathlib import Path
@@ -13,8 +14,11 @@ from typing import Any
 from unittest import mock
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from shellflow import (
+    VALID_EXPORT_SOURCES,
     Block,
     ExecutionContext,
     ExecutionError,
@@ -24,6 +28,7 @@ from shellflow import (
     ShellflowError,
     SSHConfig,
     _clean_commands,
+    _is_valid_env_name,
     create_parser,
     execute_local,
     execute_remote,
@@ -31,6 +36,21 @@ from shellflow import (
     parse_script,
     read_ssh_config,
     run_script,
+)
+
+VALID_EXPORT_NAME_STRATEGY = st.from_regex(r"[A-Za-z_][A-Za-z0-9_]*", fullmatch=True)
+INVALID_EXPORT_NAME_STRATEGY = st.one_of(
+    st.from_regex(r"[0-9][A-Za-z0-9_]*", fullmatch=True),
+    st.from_regex(r"[A-Za-z_][A-Za-z0-9_]*-[A-Za-z0-9_]+", fullmatch=True),
+    st.from_regex(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z0-9_]+", fullmatch=True),
+).filter(lambda name: not _is_valid_env_name(name))
+VALID_EXPORT_SOURCE_STRATEGY = st.sampled_from(sorted(VALID_EXPORT_SOURCES))
+MALFORMED_DIRECTIVE_LINE_STRATEGY = st.one_of(
+    st.integers(min_value=1, max_value=1000).map(lambda value: f"# @TIMEOUT {value} extra"),
+    st.integers(min_value=0, max_value=10).map(lambda value: f"# @RETRY {value} extra"),
+    st.tuples(VALID_EXPORT_NAME_STRATEGY, VALID_EXPORT_SOURCE_STRATEGY).map(
+        lambda parts: f"# @EXPORT {parts[0]}={parts[1]} extra"
+    ),
 )
 
 # =============================================================================
@@ -429,6 +449,37 @@ class TestCleanCommands:
 class TestExecuteLocal:
     """Tests for execute_local function."""
 
+    def test_timeout_directive_passes_timeout_to_subprocess(
+        self,
+        execution_context: ExecutionContext,
+    ) -> None:
+        """Test local execution applies the block timeout policy to subprocess.run."""
+        block = Block(target="LOCAL", commands=['echo "hello"'], timeout_seconds=7)
+
+        mock_result = mock.Mock(returncode=0, stdout="hello\n", stderr="")
+
+        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+            result = execute_local(block, execution_context)
+
+        assert result.success is True
+        assert mock_run.call_args.kwargs["timeout"] == 7
+
+    def test_no_input_uses_devnull_stdin(
+        self,
+        execution_context: ExecutionContext,
+    ) -> None:
+        """Test no-input mode redirects stdin away from the terminal."""
+        block = Block(target="LOCAL", commands=['echo "hello"'])
+
+        mock_result = mock.Mock(returncode=0, stdout="hello\n", stderr="")
+
+        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+            result = execute_local(block, execution_context, no_input=True)
+
+        assert result.success is True
+        assert mock_run.call_args.kwargs["stdin"] is subprocess.DEVNULL
+        assert "input" not in mock_run.call_args.kwargs
+
     def test_block_stops_on_first_failing_command(
         self,
         execution_context: ExecutionContext,
@@ -529,6 +580,39 @@ class TestExecuteLocal:
 
 class TestExecuteRemote:
     """Tests for execute_remote function."""
+
+    def test_timeout_directive_passes_timeout_to_remote_subprocess(
+        self,
+        execution_context: ExecutionContext,
+    ) -> None:
+        """Test remote execution applies the block timeout policy to subprocess.run."""
+        block = Block(target="REMOTE:server1", commands=["hostname"], timeout_seconds=11)
+        ssh_config = SSHConfig(host="server1")
+
+        mock_result = mock.Mock(returncode=0, stdout="server1\n", stderr="")
+
+        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+            result = execute_remote(block, execution_context, ssh_config)
+
+        assert result.success is True
+        assert mock_run.call_args.kwargs["timeout"] == 11
+
+    def test_no_input_adds_stdin_null_flag(
+        self,
+        execution_context: ExecutionContext,
+    ) -> None:
+        """Test no-input mode prevents SSH from reading caller stdin."""
+        block = Block(target="REMOTE:server1", commands=["hostname"])
+        ssh_config = SSHConfig(host="server1")
+
+        mock_result = mock.Mock(returncode=0, stdout="server1\n", stderr="")
+
+        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+            result = execute_remote(block, execution_context, ssh_config, no_input=True)
+
+        assert result.success is True
+        call_args = mock_run.call_args[0][0]
+        assert "-n" in call_args
 
     def test_empty_block(self, execution_context: ExecutionContext) -> None:
         """Test executing empty remote block returns success."""
@@ -715,6 +799,62 @@ class TestExecuteRemote:
 
 class TestParseScriptAdvanced:
     """Advanced tests for parse_script function."""
+
+    def test_parse_timeout_and_retry_directives(self) -> None:
+        """Test timeout and retry directives become block-local policy metadata."""
+        script = """# @LOCAL
+# @TIMEOUT 15
+# @RETRY 2
+echo \"hello\"
+"""
+
+        blocks = parse_script(script)
+
+        assert len(blocks) == 1
+        assert blocks[0].timeout_seconds == 15
+        assert blocks[0].retry_count == 2
+        assert blocks[0].commands == ['echo "hello"']
+
+    def test_parse_export_directives(self) -> None:
+        """Test export directives become block-local export mappings."""
+        script = """# @LOCAL
+# @EXPORT VERSION=stdout
+# @EXPORT STATUS=exit_code
+echo \"hello\"
+"""
+
+        blocks = parse_script(script)
+
+        assert len(blocks) == 1
+        assert blocks[0].exports == {"VERSION": "stdout", "STATUS": "exit_code"}
+        assert blocks[0].commands == ['echo "hello"']
+
+    @pytest.mark.parametrize(
+        ("directive", "value", "message"),
+        [
+            ("TIMEOUT", "0", "positive integer"),
+            ("TIMEOUT", "abc", "positive integer"),
+            ("RETRY", "-1", "non-negative integer"),
+            ("RETRY", "abc", "non-negative integer"),
+            ("EXPORT", "VERSION", "NAME=source format"),
+            ("EXPORT", "1VERSION=stdout", "valid environment variable name"),
+            ("EXPORT", "VERSION=stream", "Valid sources"),
+        ],
+    )
+    def test_invalid_directive_values_raise_parse_error(
+        self,
+        directive: str,
+        value: str,
+        message: str,
+    ) -> None:
+        """Test invalid timeout and retry directives fail parsing."""
+        script = f"""# @LOCAL
+# @{directive} {value}
+echo \"hello\"
+"""
+
+        with pytest.raises(ParseError, match=message):
+            parse_script(script)
 
     def test_prelude_is_prepended_to_each_block(self) -> None:
         """Test that lines before the first marker are applied to each block."""
@@ -989,6 +1129,268 @@ Host deploy-box
 class TestRunScript:
     """Tests for run_script function."""
 
+    def test_dry_run_skips_execution_and_emits_plan_events(self) -> None:
+        """Test dry-run mode emits a plan without executing any block commands."""
+        blocks = [
+            Block(target="LOCAL", commands=['echo "first"'], source_line=2),
+            Block(target="REMOTE:staging", commands=["hostname"], source_line=6),
+        ]
+
+        with (
+            mock.patch("shellflow.execute_local") as mock_execute_local,
+            mock.patch("shellflow.execute_remote") as mock_execute_remote,
+        ):
+            result = run_script(blocks, dry_run=True)
+
+        assert result.success is True
+        assert result.blocks_executed == 0
+        assert [event.event for event in result.events] == [
+            "dry_run_started",
+            "dry_run_block",
+            "dry_run_block",
+            "dry_run_finished",
+        ]
+        assert result.events[1].target == "LOCAL"
+        assert result.events[2].target == "REMOTE:staging"
+        mock_execute_local.assert_not_called()
+        mock_execute_remote.assert_not_called()
+
+    def test_named_exports_propagate_to_later_blocks(self) -> None:
+        """Test explicit exports are added to later block environments."""
+        blocks = [
+            Block(target="LOCAL", commands=['echo "1.2.3"'], source_line=2, exports={"VERSION": "stdout"}),
+            Block(target="LOCAL", commands=['printf "%s" "$VERSION"'], source_line=6),
+        ]
+
+        def fake_execute_local(block: Block, context: ExecutionContext, no_input: bool = False) -> ExecutionResult:
+            del no_input
+            if block.source_line == 2:
+                assert context.env == {}
+                assert context.last_output == ""
+                return ExecutionResult(
+                    success=True,
+                    output="1.2.3",
+                    exit_code=0,
+                    stdout="1.2.3",
+                )
+
+            assert context.env["VERSION"] == "1.2.3"
+            assert context.last_output == "1.2.3"
+            return ExecutionResult(
+                success=True,
+                output="VERSION=1.2.3",
+                exit_code=0,
+                stdout="VERSION=1.2.3",
+            )
+
+        with mock.patch("shellflow.execute_local", side_effect=fake_execute_local):
+            result = run_script(blocks)
+
+        assert result.success is True
+        assert result.block_results[0].exported_env == {"VERSION": "1.2.3"}
+        assert result.block_results[1].output == "VERSION=1.2.3"
+
+    def test_block_report_can_redact_secret_like_exports(self) -> None:
+        """Test structured block serialization can redact obvious secret-like exports."""
+        result = ExecutionResult(
+            success=True,
+            output="ok",
+            stdout="ok",
+            exported_env={
+                "VERSION": "1.2.3",
+                "API_TOKEN": "super-secret-token",
+            },
+        )
+
+        payload = result.to_dict(redact_secret_exports=True)
+
+        assert payload["exported_env"] == {
+            "VERSION": "1.2.3",
+            "API_TOKEN": "[REDACTED]",
+        }
+
+    def test_event_payload_can_redact_secret_like_export_values_for_audit(self) -> None:
+        """Test audit serialization redacts secret-like exported values across the event payload."""
+        secret_export_name = "API" + "_TOKEN"
+        block_result = ExecutionResult(
+            success=True,
+            output="super-secret-token",
+            stdout="super-secret-token",
+            exported_env={secret_export_name: "super-secret-token"},
+        )
+        event = block_result
+
+        payload = event.to_dict(redact_secret_exports=True)
+
+        assert payload["output"] == "[REDACTED]"
+        assert payload["stdout"] == "[REDACTED]"
+        assert payload["exported_env"][secret_export_name] == "[REDACTED]"
+
+    def test_retry_directive_reruns_failed_block_and_emits_retry_event(self) -> None:
+        """Test retry policy reruns a transiently failing block and records retry metadata."""
+        blocks = [
+            Block(target="LOCAL", commands=['echo "retry"'], retry_count=1, source_line=4),
+        ]
+
+        attempt_results = [
+            ExecutionResult(
+                success=False,
+                output="",
+                exit_code=1,
+                error_message="Exit code: 1",
+                failure_kind="runtime",
+            ),
+            ExecutionResult(
+                success=True,
+                output="recovered",
+                exit_code=0,
+                stdout="recovered",
+            ),
+        ]
+
+        with mock.patch("shellflow.execute_local", side_effect=attempt_results) as mock_execute:
+            result = run_script(blocks)
+
+        assert result.success is True
+        assert result.block_results[0].attempts == 2
+        assert [event.event for event in result.events] == [
+            "run_started",
+            "block_started",
+            "block_retrying",
+            "block_finished",
+            "run_finished",
+        ]
+        assert mock_execute.call_count == 2
+
+    def test_timeout_directive_stops_retry_and_records_timeout_policy(self) -> None:
+        """Test timeout failures stay bounded and preserve timeout metadata in reports."""
+        blocks = [
+            Block(target="LOCAL", commands=["sleep 5"], timeout_seconds=3, retry_count=2, source_line=9),
+        ]
+
+        timed_out_result = ExecutionResult(
+            success=False,
+            output="",
+            exit_code=-1,
+            error_message="Timed out after 3 second(s)",
+            timed_out=True,
+            failure_kind="timeout",
+        )
+
+        with mock.patch("shellflow.execute_local", return_value=timed_out_result) as mock_execute:
+            result = run_script(blocks)
+
+        assert result.success is False
+        assert result.exit_code == 4
+        assert result.block_results[0].timed_out is True
+        assert result.block_results[0].attempts == 1
+        assert result.block_results[0].timeout_seconds == 3
+        assert mock_execute.call_count == 1
+
+    def test_block_report_keeps_split_output_and_metadata(self) -> None:
+        """Test run results retain structured block metadata for reporting."""
+        blocks = [
+            Block(target="LOCAL", commands=['printf "out"', 'printf "err" >&2'], source_line=3),
+        ]
+
+        result = run_script(blocks)
+
+        assert result.success is True
+        assert result.run_id
+        assert result.schema_version
+        assert result.block_results[0].block_id == "block-1"
+        assert result.block_results[0].block_index == 1
+        assert result.block_results[0].source_line == 3
+        assert result.block_results[0].stdout == "out"
+        assert result.block_results[0].stderr == "err"
+        assert result.block_results[0].duration_ms >= 0
+        assert result.block_results[0].attempts == 1
+        assert result.block_results[0].timed_out is False
+
+    def test_run_script_records_ordered_events(self) -> None:
+        """Test run results expose ordered events for JSONL output."""
+        blocks = [
+            Block(target="LOCAL", commands=['echo "first"'], source_line=1),
+            Block(target="LOCAL", commands=['echo "second"'], source_line=4),
+        ]
+
+        result = run_script(blocks)
+
+        assert [event.event for event in result.events] == [
+            "run_started",
+            "block_started",
+            "block_finished",
+            "block_started",
+            "block_finished",
+            "run_finished",
+        ]
+        assert result.events[1].block_id == "block-1"
+        assert result.events[3].block_id == "block-2"
+
+    @given(stdout=st.text(), stderr=st.text())
+    def test_hypothesis_report_serialization_keeps_required_fields(self, stdout: str, stderr: str) -> None:
+        """Test serialized reports always expose the required top-level and block fields."""
+        result = RunResult(
+            success=not stderr,
+            blocks_executed=1,
+            run_id="run-test",
+            schema_version="1.0",
+            block_results=[
+                ExecutionResult(
+                    success=not stderr,
+                    output="\n".join(part for part in (stdout, stderr) if part),
+                    stdout=stdout,
+                    stderr=stderr,
+                    block_id="block-1",
+                    block_index=1,
+                    source_line=7,
+                )
+            ],
+        )
+
+        payload = result.to_dict()
+
+        assert payload["run_id"] == "run-test"
+        assert payload["schema_version"] == "1.0"
+        assert payload["blocks"][0]["block_id"] == "block-1"
+        assert "stdout" in payload["blocks"][0]
+        assert "stderr" in payload["blocks"][0]
+
+    @given(name=VALID_EXPORT_NAME_STRATEGY, source=VALID_EXPORT_SOURCE_STRATEGY)
+    def test_hypothesis_valid_export_directives_round_trip(self, name: str, source: str) -> None:
+        """Test valid export directives always parse into block export mappings."""
+        script = f"""# @LOCAL
+# @EXPORT {name}={source}
+echo \"hello\"
+"""
+
+        blocks = parse_script(script)
+
+        assert len(blocks) == 1
+        assert blocks[0].exports == {name: source}
+
+    @given(name=INVALID_EXPORT_NAME_STRATEGY, source=VALID_EXPORT_SOURCE_STRATEGY)
+    def test_hypothesis_invalid_export_names_are_rejected(self, name: str, source: str) -> None:
+        """Test invalid export names are always rejected by the parser."""
+        script = f"""# @LOCAL
+# @EXPORT {name}={source}
+echo \"hello\"
+"""
+
+        with pytest.raises(ParseError, match="valid environment variable name"):
+            parse_script(script)
+
+    @given(line=MALFORMED_DIRECTIVE_LINE_STRATEGY)
+    def test_hypothesis_malformed_directive_lines_fail_parsing(self, line: str) -> None:
+        """Test malformed directive-like comment lines fail instead of being treated as ordinary comments."""
+        script = f"""# @LOCAL
+{line}
+echo \"hello\"
+"""
+
+        with pytest.raises(ParseError):
+            parse_script(script)
+
     def test_empty_blocks(self) -> None:
         """Test running empty block list."""
         result = run_script([])
@@ -1159,6 +1561,39 @@ class TestCreateParser:
         args = parser.parse_args(["run", "script.sh", "--verbose"])
         assert args.verbose is True
 
+    def test_run_command_json(self) -> None:
+        """Test run command with JSON flag."""
+        parser = create_parser()
+        args = parser.parse_args(["run", "script.sh", "--json"])
+        assert args.json is True
+        assert args.jsonl is False
+
+    def test_run_command_jsonl(self) -> None:
+        """Test run command with JSONL flag."""
+        parser = create_parser()
+        args = parser.parse_args(["run", "script.sh", "--jsonl"])
+        assert args.jsonl is True
+        assert args.json is False
+
+    def test_run_command_no_input(self) -> None:
+        """Test run command with no-input flag."""
+        parser = create_parser()
+        args = parser.parse_args(["run", "script.sh", "--no-input"])
+        assert args.no_input is True
+
+    def test_run_command_dry_run(self) -> None:
+        """Test run command with dry-run flag."""
+        parser = create_parser()
+        args = parser.parse_args(["run", "script.sh", "--dry-run"])
+        assert args.dry_run is True
+
+    def test_run_command_audit_log(self, tmp_path: Path) -> None:
+        """Test run command with audit-log path."""
+        parser = create_parser()
+        audit_log_path = tmp_path / "audit.jsonl"
+        args = parser.parse_args(["run", "script.sh", "--audit-log", str(audit_log_path)])
+        assert args.audit_log == str(audit_log_path)
+
 
 class TestMain:
     """Tests for main function."""
@@ -1206,6 +1641,123 @@ exit 1
 
         assert result == 1
 
+    def test_run_script_parse_failure_uses_parse_exit_code(self, tmp_path: Path) -> None:
+        """Test parse failures use the dedicated exit code."""
+        script_path = tmp_path / "test.sh"
+        script_path.write_text("""# @BROKEN
+echo \"hello\"
+""")
+
+        result = main(["run", str(script_path)])
+
+        assert result == 2
+
+    def test_run_script_no_input_json_marks_interactive_input_unavailable(self, tmp_path: Path, capsys: Any) -> None:
+        """Test no-input mode advertises non-interactive execution in structured output."""
+        script_path = tmp_path / "stdin.sh"
+        script_path.write_text("""# @LOCAL
+read -r reply
+printf 'reply=%s\n' "$reply"
+""")
+
+        result = main(["run", str(script_path), "--no-input", "--json"])
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+
+        assert result == 1
+        assert payload["no_input"] is True
+        assert "input" in json.dumps(payload).lower()
+
+    def test_run_script_json_output(self, tmp_path: Path, capsys: Any) -> None:
+        """Test JSON mode emits a machine-readable run report."""
+        script_path = tmp_path / "test.sh"
+        script_path.write_text("""# @LOCAL
+echo "hello"
+""")
+
+        result = main(["run", str(script_path), "--json"])
+
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+
+        assert result == 0
+        assert payload["run_id"]
+        assert payload["schema_version"]
+        assert payload["blocks"][0]["stdout"] == "hello"
+
+    def test_run_script_jsonl_output(self, tmp_path: Path, capsys: Any) -> None:
+        """Test JSONL mode emits ordered execution events."""
+        script_path = tmp_path / "test.sh"
+        script_path.write_text("""# @LOCAL
+echo "hello"
+""")
+
+        result = main(["run", str(script_path), "--jsonl"])
+
+        captured = capsys.readouterr()
+        events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+
+        assert result == 0
+        assert [event["event"] for event in events] == [
+            "run_started",
+            "block_started",
+            "block_finished",
+            "run_finished",
+        ]
+
+    def test_run_script_dry_run_jsonl_output(self, tmp_path: Path, capsys: Any) -> None:
+        """Test dry-run mode emits structured plan events instead of executing blocks."""
+        marker_path = tmp_path / "should-not-exist.marker"
+        script_path = tmp_path / "dry-run.sh"
+        script_path.write_text(
+            f"""# @LOCAL
+printf 'executed' > \"{marker_path}\"
+
+# @REMOTE staging
+echo "remote preview"
+"""
+        )
+
+        result = main(["run", str(script_path), "--dry-run", "--jsonl"])
+
+        captured = capsys.readouterr()
+        events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+
+        assert result == 0
+        assert marker_path.exists() is False
+        assert [event["event"] for event in events] == [
+            "dry_run_started",
+            "dry_run_block",
+            "dry_run_block",
+            "dry_run_finished",
+        ]
+        assert [event.get("target") for event in events[1:3]] == ["LOCAL", "REMOTE:staging"]
+
+    def test_run_script_audit_log_writes_redacted_jsonl(self, tmp_path: Path, capsys: Any) -> None:
+        """Test audit-log mode mirrors redacted structured events to disk."""
+        audit_log_path = tmp_path / "audit.jsonl"
+        script_path = tmp_path / "audit.sh"
+        script_path.write_text(
+            """# @LOCAL
+# @EXPORT API_TOKEN=stdout
+echo "super-secret-token"
+"""
+        )
+
+        result = main(["run", str(script_path), "--audit-log", str(audit_log_path), "--jsonl"])
+
+        captured = capsys.readouterr()
+        stdout_events = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+        audit_log_text = audit_log_path.read_text()
+        audit_events = [json.loads(line) for line in audit_log_text.splitlines() if line.strip()]
+
+        assert result == 0
+        assert stdout_events
+        assert audit_events
+        assert "super-secret-token" not in audit_log_text
+        assert "[REDACTED]" in audit_log_text
+
 
 class TestCmdRun:
     """Tests for cmd_run function."""
@@ -1232,6 +1784,46 @@ class TestCmdRun:
 
         result = main(["run", str(script_path)])
         assert result == 0  # Empty script is not an error
+
+    def test_missing_ssh_host_uses_ssh_config_exit_code(self, tmp_path: Path) -> None:
+        """Test missing SSH config maps to the SSH-config exit code."""
+        script_path = tmp_path / "remote.sh"
+        script_path.write_text("""# @REMOTE missing-host
+echo "hello"
+""")
+
+        with mock.patch("shellflow.read_ssh_config", return_value=None):
+            result = main(["run", str(script_path)])
+
+        assert result == 3
+
+    def test_timeout_failure_uses_timeout_exit_code(self, tmp_path: Path) -> None:
+        """Test timeout failures map to the timeout-specific exit code."""
+        script_path = tmp_path / "timeout.sh"
+        script_path.write_text("""# @LOCAL
+echo "hello"
+""")
+
+        timed_out_result = RunResult(
+            success=False,
+            blocks_executed=1,
+            error_message="Block 1 timed out",
+            exit_code=4,
+            block_results=[
+                ExecutionResult(
+                    success=False,
+                    output="",
+                    exit_code=-1,
+                    error_message="timed out",
+                    timed_out=True,
+                )
+            ],
+        )
+
+        with mock.patch("shellflow.run_script", return_value=timed_out_result):
+            result = main(["run", str(script_path), "--json"])
+
+        assert result == 4
 
 
 # =============================================================================

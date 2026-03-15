@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 import re
 import subprocess
 import sys
+import time
+import uuid
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
@@ -39,6 +42,10 @@ class Block:
 
     target: str  # "LOCAL" or "REMOTE:<host>"
     commands: list[str] = field(default_factory=list)
+    source_line: int = 0
+    timeout_seconds: int | None = None
+    retry_count: int = 0
+    exports: dict[str, str] = field(default_factory=dict)
 
     @property
     def is_local(self) -> bool:
@@ -82,6 +89,102 @@ class ExecutionResult:
     output: str
     exit_code: int = 0
     error_message: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    duration_ms: int = 0
+    attempts: int = 1
+    timed_out: bool = False
+    timeout_seconds: int | None = None
+    failure_kind: str | None = None
+    no_input: bool = False
+    block_id: str = ""
+    block_index: int = 0
+    source_line: int = 0
+    exported_env: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self, *, redact_secret_exports: bool = False) -> dict[str, Any]:
+        """Serialize the block result for machine-readable output."""
+        payload = {
+            "block_id": self.block_id,
+            "index": self.block_index,
+            "source_line": self.source_line,
+            "success": self.success,
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "output": self.output,
+            "duration_ms": self.duration_ms,
+            "attempts": self.attempts,
+            "timed_out": self.timed_out,
+            "timeout_seconds": self.timeout_seconds,
+            "failure_kind": self.failure_kind,
+            "no_input": self.no_input,
+            "error_message": self.error_message,
+            "exported_env": _serialize_exported_env(self.exported_env, redact_secret_exports=redact_secret_exports),
+        }
+        if redact_secret_exports:
+            return _redact_payload_strings(payload, _collect_secret_values(self.exported_env))
+        return payload
+
+
+@dataclass
+class ReportEvent:
+    """Structured execution event emitted during a run."""
+
+    event: str
+    run_id: str
+    schema_version: str
+    success: bool | None = None
+    exit_code: int | None = None
+    block_id: str | None = None
+    block_index: int | None = None
+    target: str | None = None
+    host: str | None = None
+    source_line: int | None = None
+    blocks_executed: int | None = None
+    total_blocks: int | None = None
+    attempts: int | None = None
+    timeout_seconds: int | None = None
+    failure_kind: str | None = None
+    no_input: bool | None = None
+    block: ExecutionResult | None = None
+
+    def to_dict(self, *, redact_secret_exports: bool = False) -> dict[str, Any]:
+        """Serialize the event for JSON Lines output."""
+        payload: dict[str, Any] = {
+            "event": self.event,
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+        }
+        if self.success is not None:
+            payload["success"] = self.success
+        if self.exit_code is not None:
+            payload["exit_code"] = self.exit_code
+        if self.block_id is not None:
+            payload["block_id"] = self.block_id
+        if self.block_index is not None:
+            payload["index"] = self.block_index
+        if self.target is not None:
+            payload["target"] = self.target
+        if self.host is not None:
+            payload["host"] = self.host
+        if self.source_line is not None:
+            payload["source_line"] = self.source_line
+        if self.blocks_executed is not None:
+            payload["blocks_executed"] = self.blocks_executed
+        if self.total_blocks is not None:
+            payload["total_blocks"] = self.total_blocks
+        if self.attempts is not None:
+            payload["attempts"] = self.attempts
+        if self.timeout_seconds is not None:
+            payload["timeout_seconds"] = self.timeout_seconds
+        if self.failure_kind is not None:
+            payload["failure_kind"] = self.failure_kind
+        if self.no_input is not None:
+            payload["no_input"] = self.no_input
+        if self.block is not None:
+            payload["block"] = self.block.to_dict(redact_secret_exports=redact_secret_exports)
+        return payload
 
 
 @dataclass
@@ -92,6 +195,28 @@ class RunResult:
     blocks_executed: int = 0
     error_message: str = ""
     block_results: list[ExecutionResult] = field(default_factory=list)
+    run_id: str = ""
+    schema_version: str = "1.0"
+    exit_code: int = 0
+    failure_kind: str | None = None
+    no_input: bool = False
+    events: list[ReportEvent] = field(default_factory=list)
+
+    def to_dict(self, *, redact_secret_exports: bool = False) -> dict[str, Any]:
+        """Serialize the run report for machine-readable output."""
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "success": self.success,
+            "exit_code": self.exit_code,
+            "failure_kind": self.failure_kind,
+            "no_input": self.no_input,
+            "blocks_executed": self.blocks_executed,
+            "error_message": self.error_message,
+            "blocks": [
+                block_result.to_dict(redact_secret_exports=redact_secret_exports) for block_result in self.block_results
+            ],
+        }
 
 
 @dataclass
@@ -124,6 +249,51 @@ class ExecutionError(ShellflowError):
 
 PACKAGE_NAME = "shellflow"
 DEFAULT_VERSION = "0.1.0"
+SCHEMA_VERSION = "1.0"
+EXIT_SUCCESS = 0
+EXIT_EXECUTION_FAILURE = 1
+EXIT_PARSE_FAILURE = 2
+EXIT_SSH_CONFIG_FAILURE = 3
+EXIT_TIMEOUT_FAILURE = 4
+
+FAILURE_PARSE = "parse"
+FAILURE_RUNTIME = "runtime"
+FAILURE_SSH_CONFIG = "ssh_config"
+FAILURE_TIMEOUT = "timeout"
+VALID_EXPORT_SOURCES = {"stdout", "stderr", "output", "exit_code"}
+SECRET_LIKE_ENV_PATTERNS = ("TOKEN", "SECRET", "PASSWORD")
+
+
+def _exit_code_for_failure(failure_kind: str | None) -> int:
+    """Map a failure category to the stable CLI exit code."""
+    mapping = {
+        None: EXIT_SUCCESS,
+        FAILURE_RUNTIME: EXIT_EXECUTION_FAILURE,
+        FAILURE_PARSE: EXIT_PARSE_FAILURE,
+        FAILURE_SSH_CONFIG: EXIT_SSH_CONFIG_FAILURE,
+        FAILURE_TIMEOUT: EXIT_TIMEOUT_FAILURE,
+    }
+    return mapping.get(failure_kind, EXIT_EXECUTION_FAILURE)
+
+
+def _failure_kind_for_result(result: ExecutionResult) -> str | None:
+    """Infer the top-level failure category for a block result."""
+    if result.success:
+        return None
+    if result.timed_out:
+        return FAILURE_TIMEOUT
+    if result.failure_kind is not None:
+        return result.failure_kind
+    return FAILURE_RUNTIME
+
+
+def _stringify_subprocess_stream(value: Any) -> str:
+    """Convert subprocess output values to text for reporting."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
 
 
 # =============================================================================
@@ -267,6 +437,7 @@ def _parse_ssh_config_basic(config_path: Path, host: str) -> SSHConfig | None:
 
 
 BLOCK_MARKER_RE = re.compile(r"^\s*#\s*@(?P<marker>[A-Z]+)(?:\s+(?P<argument>\S+))?\s*$")
+MARKER_PREFIX_RE = re.compile(r"^\s*#\s*@")
 
 
 def _parse_block_marker(line: str) -> tuple[str, str | None] | None:
@@ -283,6 +454,54 @@ def _build_block_commands(prelude: list[str], body: list[str]) -> list[str]:
     if not cleaned_body:
         return []
     return [*prelude, *cleaned_body]
+
+
+def _parse_positive_int(argument: str | None, *, directive: str, line_no: int) -> int:
+    """Parse a positive integer directive argument."""
+    if argument is None or not argument.isdigit() or int(argument) <= 0:
+        raise ParseError(f"Line {line_no}: @{directive} expects a positive integer")
+    return int(argument)
+
+
+def _parse_non_negative_int(argument: str | None, *, directive: str, line_no: int) -> int:
+    """Parse a non-negative integer directive argument."""
+    if argument is None or not argument.isdigit():
+        raise ParseError(f"Line {line_no}: @{directive} expects a non-negative integer")
+    return int(argument)
+
+
+def _parse_export_directive(argument: str | None, *, line_no: int) -> tuple[str, str]:
+    """Parse an @EXPORT NAME=source directive."""
+    if not argument or "=" not in argument:
+        raise ParseError(f"Line {line_no}: @EXPORT expects NAME=source format")
+
+    name, source = argument.split("=", 1)
+    name = name.strip()
+    source = source.strip()
+
+    if not _is_valid_env_name(name):
+        raise ParseError(f"Line {line_no}: @EXPORT expects a valid environment variable name")
+
+    if source not in VALID_EXPORT_SOURCES:
+        valid_sources = ", ".join(sorted(VALID_EXPORT_SOURCES))
+        raise ParseError(f"Line {line_no}: @EXPORT source is invalid. Valid sources: {valid_sources}")
+
+    return name, source
+
+
+def _apply_block_directive(block: Block, marker_name: str, marker_argument: str | None, line_no: int) -> None:
+    """Apply block-local directive metadata to a block."""
+    if marker_name == "TIMEOUT":
+        block.timeout_seconds = _parse_positive_int(marker_argument, directive=marker_name, line_no=line_no)
+        return
+    if marker_name == "RETRY":
+        block.retry_count = _parse_non_negative_int(marker_argument, directive=marker_name, line_no=line_no)
+        return
+    if marker_name == "EXPORT":
+        export_name, export_source = _parse_export_directive(marker_argument, line_no=line_no)
+        block.exports[export_name] = export_source
+        return
+    raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
 
 
 def parse_script(content: str) -> list[Block]:
@@ -305,32 +524,43 @@ def parse_script(content: str) -> list[Block]:
     current_block: Block | None = None
     accumulated_lines: list[str] = []
     prelude_lines: list[str] = []
+    directive_phase = False
 
     for line_no, line in enumerate(content.splitlines(), 1):
         marker = _parse_block_marker(line)
         if marker:
             marker_name, marker_argument = marker
-            if marker_name not in {"LOCAL", "REMOTE"}:
-                raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
+            if marker_name in {"LOCAL", "REMOTE"}:
+                if current_block is None:
+                    prelude_lines = _clean_commands(accumulated_lines)
+                else:
+                    current_block.commands = _build_block_commands(prelude_lines, accumulated_lines)
+                    if current_block.commands:
+                        blocks.append(current_block)
 
-            if current_block is None:
-                prelude_lines = _clean_commands(accumulated_lines)
-            else:
-                current_block.commands = _build_block_commands(prelude_lines, accumulated_lines)
-                if current_block.commands:
-                    blocks.append(current_block)
+                accumulated_lines = []
+                directive_phase = True
 
-            accumulated_lines = []
+                if marker_name == "LOCAL":
+                    current_block = Block(target="LOCAL", source_line=line_no)
+                else:
+                    if not marker_argument:
+                        raise ParseError(f"Line {line_no}: @REMOTE marker missing host")
+                    current_block = Block(target=f"REMOTE:{marker_argument}", source_line=line_no)
+                continue
 
-            if marker_name == "LOCAL":
-                current_block = Block(target="LOCAL")
-            else:
-                if not marker_argument:
-                    raise ParseError(f"Line {line_no}: @REMOTE marker missing host")
-                current_block = Block(target=f"REMOTE:{marker_argument}")
-            continue
+            if current_block is not None and directive_phase:
+                _apply_block_directive(current_block, marker_name, marker_argument, line_no)
+                continue
+
+            raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
+
+        if current_block is not None and directive_phase and MARKER_PREFIX_RE.match(line):
+            raise ParseError(f"Line {line_no}: Malformed marker syntax")
 
         accumulated_lines.append(line)
+        if current_block is not None and line.strip():
+            directive_phase = False
 
     # Don't forget the last block
     if current_block:
@@ -401,6 +631,68 @@ def _build_context_exports(context: ExecutionContext) -> list[str]:
     return exports
 
 
+def _extract_export_value(result: ExecutionResult, source: str) -> str:
+    """Extract an exportable scalar value from a block result."""
+    if source == "stdout":
+        return result.stdout
+    if source == "stderr":
+        return result.stderr
+    if source == "output":
+        return result.output
+    if source == "exit_code":
+        return str(result.exit_code)
+    return ""
+
+
+def _is_secret_like_env_name(name: str) -> bool:
+    """Return whether an export name is likely to contain a secret."""
+    upper_name = name.upper()
+    return any(pattern in upper_name for pattern in SECRET_LIKE_ENV_PATTERNS)
+
+
+def _serialize_exported_env(exported_env: dict[str, str], *, redact_secret_exports: bool) -> dict[str, str]:
+    """Serialize exported values, optionally redacting obvious secrets."""
+    if not redact_secret_exports:
+        return dict(exported_env)
+    return {key: "[REDACTED]" if _is_secret_like_env_name(key) else value for key, value in exported_env.items()}
+
+
+def _collect_secret_values(exported_env: dict[str, str]) -> set[str]:
+    """Collect secret-like export values that should be redacted from audit sinks."""
+    return {value for key, value in exported_env.items() if _is_secret_like_env_name(key) and value}
+
+
+def _redact_text_value(value: str, secret_values: set[str]) -> str:
+    """Redact known secret values from a string payload."""
+    redacted = value
+    for secret_value in secret_values:
+        redacted = redacted.replace(secret_value, "[REDACTED]")
+    return redacted
+
+
+def _redact_payload_strings(payload: Any, secret_values: set[str]) -> Any:
+    """Recursively redact secret values from a serialized payload."""
+    if not secret_values:
+        return payload
+    if isinstance(payload, dict):
+        return {key: _redact_payload_strings(value, secret_values) for key, value in payload.items()}
+    if isinstance(payload, list):
+        return [_redact_payload_strings(value, secret_values) for value in payload]
+    if isinstance(payload, str):
+        return _redact_text_value(payload, secret_values)
+    return payload
+
+
+def _apply_block_exports(block: Block, result: ExecutionResult, context: ExecutionContext) -> dict[str, str]:
+    """Apply explicit block exports to the shared execution context."""
+    exported_env: dict[str, str] = {}
+    for name, source in block.exports.items():
+        value = _extract_export_value(result, source)
+        context.env[name] = value
+        exported_env[name] = value
+    return exported_env
+
+
 def _is_valid_env_name(name: str) -> bool:
     """Check whether a string is a valid shell environment variable name."""
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
@@ -448,6 +740,7 @@ def _iter_display_context(context: ExecutionContext) -> list[str]:
 def execute_local(
     block: Block,
     context: ExecutionContext,
+    no_input: bool = False,
 ) -> ExecutionResult:
     """Execute a local block.
 
@@ -469,21 +762,54 @@ def execute_local(
         include_context_exports=False,
     )
     env = context.to_shell_env()
+    run_kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "env": env,
+    }
+    if block.timeout_seconds is not None:
+        run_kwargs["timeout"] = block.timeout_seconds
 
     try:
-        result = subprocess.run(
-            ["/bin/bash", "-se"],
-            input=script,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        if no_input:
+            result = subprocess.run(
+                ["/bin/bash", "-se", "-c", script],
+                stdin=subprocess.DEVNULL,
+                **run_kwargs,
+            )
+        else:
+            result = subprocess.run(
+                ["/bin/bash", "-se"],
+                input=script,
+                **run_kwargs,
+            )
 
         return ExecutionResult(
             success=result.returncode == 0,
             output=_combine_output(result.stdout, result.stderr),
             exit_code=result.returncode,
             error_message="" if result.returncode == 0 else f"Exit code: {result.returncode}",
+            stdout=result.stdout.strip(),
+            stderr=result.stderr.strip(),
+            timeout_seconds=block.timeout_seconds,
+            failure_kind=None if result.returncode == 0 else FAILURE_RUNTIME,
+            no_input=no_input,
+        )
+    except subprocess.TimeoutExpired as e:
+        stdout = _stringify_subprocess_stream(e.output).strip()
+        stderr = _stringify_subprocess_stream(e.stderr).strip()
+        timeout_value = int(e.timeout) if isinstance(e.timeout, int | float) else e.timeout
+        return ExecutionResult(
+            success=False,
+            output=_combine_output(stdout, stderr),
+            exit_code=-1,
+            error_message=f"Timed out after {timeout_value} second(s)",
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=True,
+            timeout_seconds=block.timeout_seconds,
+            failure_kind=FAILURE_TIMEOUT,
+            no_input=no_input,
         )
     except (OSError, subprocess.SubprocessError) as e:
         return ExecutionResult(
@@ -491,6 +817,11 @@ def execute_local(
             output="",
             exit_code=-1,
             error_message=str(e),
+            stdout="",
+            stderr="",
+            timeout_seconds=block.timeout_seconds,
+            failure_kind=FAILURE_RUNTIME,
+            no_input=no_input,
         )
 
 
@@ -498,6 +829,7 @@ def execute_remote(
     block: Block,
     context: ExecutionContext,
     ssh_config: SSHConfig | None,
+    no_input: bool = False,
 ) -> ExecutionResult:
     """Execute a remote block via SSH.
 
@@ -521,6 +853,10 @@ def execute_remote(
             output="",
             exit_code=-1,
             error_message="No host specified for remote block",
+            stdout="",
+            stderr="",
+            failure_kind=FAILURE_SSH_CONFIG,
+            no_input=no_input,
         )
 
     if ssh_config is None:
@@ -533,9 +869,15 @@ def execute_remote(
             output="",
             exit_code=-1,
             error_message=(f"Remote host '{host}' was not found in SSH config: {ssh_config_path}"),
+            stdout="",
+            stderr="",
+            failure_kind=FAILURE_SSH_CONFIG,
+            no_input=no_input,
         )
 
     ssh_args = ["ssh"]
+    if no_input:
+        ssh_args.append("-n")
 
     if ssh_config.port and ssh_config.port != 22:
         ssh_args.extend(["-p", str(ssh_config.port)])
@@ -554,13 +896,18 @@ def execute_remote(
         context,
         include_context_exports=True,
     )
+    run_kwargs: dict[str, Any] = {
+        "input": remote_script,
+        "capture_output": True,
+        "text": True,
+    }
+    if block.timeout_seconds is not None:
+        run_kwargs["timeout"] = block.timeout_seconds
 
     try:
         result = subprocess.run(
             ssh_args,
-            input=remote_script,
-            capture_output=True,
-            text=True,
+            **run_kwargs,
         )
 
         return ExecutionResult(
@@ -568,6 +915,27 @@ def execute_remote(
             output=_combine_output(result.stdout, result.stderr),
             exit_code=result.returncode,
             error_message="" if result.returncode == 0 else f"SSH exit code: {result.returncode}",
+            stdout=result.stdout.strip(),
+            stderr=result.stderr.strip(),
+            timeout_seconds=block.timeout_seconds,
+            failure_kind=None if result.returncode == 0 else FAILURE_RUNTIME,
+            no_input=no_input,
+        )
+    except subprocess.TimeoutExpired as e:
+        stdout = _stringify_subprocess_stream(e.output).strip()
+        stderr = _stringify_subprocess_stream(e.stderr).strip()
+        timeout_value = int(e.timeout) if isinstance(e.timeout, int | float) else e.timeout
+        return ExecutionResult(
+            success=False,
+            output=_combine_output(stdout, stderr),
+            exit_code=-1,
+            error_message=f"Timed out after {timeout_value} second(s)",
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=True,
+            timeout_seconds=block.timeout_seconds,
+            failure_kind=FAILURE_TIMEOUT,
+            no_input=no_input,
         )
     except (OSError, subprocess.SubprocessError) as e:
         return ExecutionResult(
@@ -575,7 +943,215 @@ def execute_remote(
             output="",
             exit_code=-1,
             error_message=str(e),
+            stdout="",
+            stderr="",
+            timeout_seconds=block.timeout_seconds,
+            failure_kind=FAILURE_RUNTIME,
+            no_input=no_input,
         )
+
+
+def _new_run_id() -> str:
+    """Create a stable run identifier for structured output."""
+    return f"run-{uuid.uuid4().hex}"
+
+
+def _make_block_id(index: int) -> str:
+    """Create a stable block identifier within a run."""
+    return f"block-{index}"
+
+
+def _make_run_started_event(run_id: str, total_blocks: int, *, no_input: bool = False) -> ReportEvent:
+    """Build the run-start event."""
+    return ReportEvent(
+        event="run_started",
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        total_blocks=total_blocks,
+        no_input=no_input,
+    )
+
+
+def _make_block_started_event(run_id: str, block_id: str, index: int, block: Block, total_blocks: int) -> ReportEvent:
+    """Build the block-start event."""
+    return ReportEvent(
+        event="block_started",
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        block_id=block_id,
+        block_index=index,
+        target=block.target,
+        host=block.host,
+        source_line=block.source_line,
+        total_blocks=total_blocks,
+    )
+
+
+def _make_block_finished_event(run_id: str, result: ExecutionResult, block: Block, total_blocks: int) -> ReportEvent:
+    """Build the block-finished event."""
+    return ReportEvent(
+        event="block_finished",
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        success=result.success,
+        exit_code=result.exit_code,
+        block_id=result.block_id,
+        block_index=result.block_index,
+        target=block.target,
+        host=block.host,
+        source_line=result.source_line,
+        total_blocks=total_blocks,
+        attempts=result.attempts,
+        timeout_seconds=result.timeout_seconds,
+        failure_kind=_failure_kind_for_result(result),
+        no_input=result.no_input,
+        block=result,
+    )
+
+
+def _make_block_retrying_event(
+    run_id: str,
+    block_id: str,
+    index: int,
+    block: Block,
+    total_blocks: int,
+    *,
+    attempts: int,
+    failure_kind: str | None,
+) -> ReportEvent:
+    """Build the block-retrying event."""
+    return ReportEvent(
+        event="block_retrying",
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        block_id=block_id,
+        block_index=index,
+        target=block.target,
+        host=block.host,
+        source_line=block.source_line,
+        total_blocks=total_blocks,
+        attempts=attempts,
+        timeout_seconds=block.timeout_seconds,
+        failure_kind=failure_kind,
+        no_input=False,
+    )
+
+
+def _make_run_finished_event(
+    run_id: str,
+    success: bool,
+    exit_code: int,
+    blocks_executed: int,
+    total_blocks: int,
+    *,
+    failure_kind: str | None = None,
+    no_input: bool = False,
+) -> ReportEvent:
+    """Build the run-finished event."""
+    return ReportEvent(
+        event="run_finished",
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        success=success,
+        exit_code=exit_code,
+        blocks_executed=blocks_executed,
+        total_blocks=total_blocks,
+        failure_kind=failure_kind,
+        no_input=no_input,
+    )
+
+
+def _make_dry_run_started_event(run_id: str, total_blocks: int, *, no_input: bool = False) -> ReportEvent:
+    """Build the dry-run start event."""
+    return ReportEvent(
+        event="dry_run_started",
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        total_blocks=total_blocks,
+        no_input=no_input,
+    )
+
+
+def _make_dry_run_block_event(run_id: str, block_id: str, index: int, block: Block, total_blocks: int) -> ReportEvent:
+    """Build a dry-run block-plan event."""
+    return ReportEvent(
+        event="dry_run_block",
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        block_id=block_id,
+        block_index=index,
+        target=block.target,
+        host=block.host,
+        source_line=block.source_line,
+        total_blocks=total_blocks,
+    )
+
+
+def _make_dry_run_finished_event(run_id: str, total_blocks: int, *, no_input: bool = False) -> ReportEvent:
+    """Build the dry-run finished event."""
+    return ReportEvent(
+        event="dry_run_finished",
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        success=True,
+        exit_code=EXIT_SUCCESS,
+        blocks_executed=0,
+        total_blocks=total_blocks,
+        no_input=no_input,
+    )
+
+
+def _finalize_block_result(result: ExecutionResult, block: Block, index: int, started_at: float) -> ExecutionResult:
+    """Attach reporting metadata to a block result."""
+    result.block_id = _make_block_id(index)
+    result.block_index = index
+    result.source_line = block.source_line
+    result.timeout_seconds = block.timeout_seconds
+    result.duration_ms = max(int((time.perf_counter() - started_at) * 1000), 0)
+    return result
+
+
+def _execute_block_once(block: Block, context: ExecutionContext, *, no_input: bool) -> ExecutionResult:
+    """Execute one block attempt using the existing local and remote seams."""
+    if block.is_local:
+        if no_input:
+            return execute_local(block, context, no_input=True)
+        return execute_local(block, context)
+
+    host = block.host
+    if not host:
+        return ExecutionResult(
+            success=False,
+            output="",
+            exit_code=-1,
+            error_message="No host specified for remote block",
+            failure_kind=FAILURE_SSH_CONFIG,
+            no_input=no_input,
+            timeout_seconds=block.timeout_seconds,
+        )
+
+    ssh_config = read_ssh_config(host)
+    if no_input:
+        return execute_remote(block, context, ssh_config, no_input=True)
+    return execute_remote(block, context, ssh_config)
+
+
+def _emit_structured_output_json(run_result: RunResult) -> None:
+    """Print a JSON run report."""
+    print(json.dumps(run_result.to_dict()))
+
+
+def _emit_structured_output_jsonl(run_result: RunResult, *, redact_secret_exports: bool = False) -> None:
+    """Print JSON Lines events for a run."""
+    for event in run_result.events:
+        print(json.dumps(event.to_dict(redact_secret_exports=redact_secret_exports)))
+
+
+def _write_audit_log(path: Path, run_result: RunResult) -> None:
+    """Mirror structured JSONL events to an audit log with redaction applied."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(event.to_dict(redact_secret_exports=True)) for event in run_result.events]
+    path.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
 # =============================================================================
@@ -583,7 +1159,12 @@ def execute_remote(
 # =============================================================================
 
 
-def run_script(blocks: list[Block], verbose: bool = False) -> RunResult:
+def run_script(  # noqa: PLR0915
+    blocks: list[Block],
+    verbose: bool = False,
+    no_input: bool = False,
+    dry_run: bool = False,
+) -> RunResult:
     """Run a list of blocks sequentially.
 
     Executes each block in order, updating the execution context between
@@ -599,6 +1180,12 @@ def run_script(blocks: list[Block], verbose: bool = False) -> RunResult:
     context = ExecutionContext()
     blocks_executed = 0
     block_results: list[ExecutionResult] = []
+    run_id = _new_run_id()
+    total_blocks = len(blocks)
+    if dry_run:
+        events = [_make_dry_run_started_event(run_id, total_blocks, no_input=no_input)]
+    else:
+        events = [_make_run_started_event(run_id, total_blocks, no_input=no_input)]
 
     # ANSI color codes for verbose output
     GREEN = "\033[92m"
@@ -608,7 +1195,35 @@ def run_script(blocks: list[Block], verbose: bool = False) -> RunResult:
     DIM = "\033[90m"
     RESET = "\033[0m"
 
+    if dry_run:
+        for i, block in enumerate(blocks, 1):
+            block_id = _make_block_id(i)
+            events.append(_make_dry_run_block_event(run_id, block_id, i, block, total_blocks))
+            if verbose:
+                if block.is_local:
+                    print(f"{BLUE}[plan {i}/{len(blocks)}] LOCAL{RESET}")
+                else:
+                    host = block.host or "unknown"
+                    print(f"{YELLOW}[plan {i}/{len(blocks)}] REMOTE: {host}{RESET}")
+                for command in _iter_display_commands(block.commands):
+                    print(f"{DIM}$ {command}{RESET}")
+
+        events.append(_make_dry_run_finished_event(run_id, total_blocks, no_input=no_input))
+        return RunResult(
+            success=True,
+            blocks_executed=0,
+            block_results=[],
+            run_id=run_id,
+            schema_version=SCHEMA_VERSION,
+            exit_code=EXIT_SUCCESS,
+            no_input=no_input,
+            events=events,
+        )
+
     for i, block in enumerate(blocks, 1):
+        block_id = _make_block_id(i)
+        events.append(_make_block_started_event(run_id, block_id, i, block, total_blocks))
+
         # Print block info if verbose
         if verbose:
             if block.is_local:
@@ -621,24 +1236,39 @@ def run_script(blocks: list[Block], verbose: bool = False) -> RunResult:
             for command in _iter_display_commands(block.commands):
                 print(f"{DIM}$ {command}{RESET}")
 
-        # Execute the block
-        if block.is_local:
-            result = execute_local(block, context)
-        else:
-            host = block.host
-            if not host:
-                return RunResult(
-                    success=False,
-                    blocks_executed=blocks_executed,
-                    error_message=f"Block {i}: No host specified for remote block",
+        # Execute the block, retrying only bounded runtime failures.
+        attempt_count = 0
+        max_attempts = block.retry_count + 1
+        while True:
+            attempt_count += 1
+            started_at = time.perf_counter()
+            result = _execute_block_once(block, context, no_input=no_input)
+            result = _finalize_block_result(result, block, i, started_at)
+            result.attempts = attempt_count
+
+            if result.success or result.timed_out or attempt_count >= max_attempts:
+                break
+
+            events.append(
+                _make_block_retrying_event(
+                    run_id,
+                    block_id,
+                    i,
+                    block,
+                    total_blocks,
+                    attempts=attempt_count,
+                    failure_kind=_failure_kind_for_result(result),
                 )
-            ssh_config = read_ssh_config(host)
-            result = execute_remote(block, context, ssh_config)
+            )
+            if verbose:
+                print(f"{YELLOW}↻ Retrying attempt {attempt_count + 1}/{max_attempts}{RESET}")
 
         # Update context
         context.last_output = result.output
         context.success = result.success
+        result.exported_env = _apply_block_exports(block, result, context)
         block_results.append(result)
+        events.append(_make_block_finished_event(run_id, result, block, total_blocks))
 
         if verbose:
             if result.output:
@@ -652,17 +1282,51 @@ def run_script(blocks: list[Block], verbose: bool = False) -> RunResult:
 
         # Fail fast on error
         if not result.success:
+            failure_kind = _failure_kind_for_result(result)
+            exit_code = _exit_code_for_failure(failure_kind)
+            events.append(
+                _make_run_finished_event(
+                    run_id,
+                    success=False,
+                    exit_code=exit_code,
+                    blocks_executed=blocks_executed,
+                    total_blocks=total_blocks,
+                    failure_kind=failure_kind,
+                    no_input=no_input,
+                )
+            )
             return RunResult(
                 success=False,
                 blocks_executed=blocks_executed,
                 error_message=f"Block {i} failed: {result.error_message}",
                 block_results=block_results,
+                run_id=run_id,
+                schema_version=SCHEMA_VERSION,
+                exit_code=exit_code,
+                failure_kind=failure_kind,
+                no_input=no_input,
+                events=events,
             )
 
+    events.append(
+        _make_run_finished_event(
+            run_id,
+            success=True,
+            exit_code=EXIT_SUCCESS,
+            blocks_executed=blocks_executed,
+            total_blocks=total_blocks,
+            no_input=no_input,
+        )
+    )
     return RunResult(
         success=True,
         blocks_executed=blocks_executed,
         block_results=block_results,
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        exit_code=EXIT_SUCCESS,
+        no_input=no_input,
+        events=events,
     )
 
 
@@ -685,6 +1349,12 @@ def create_parser() -> argparse.ArgumentParser:
 Examples:
   shellflow run script.sh              # Run a script
   shellflow run script.sh --verbose    # Run with verbose output
+    shellflow run script.sh --json       # Emit one machine-readable JSON report
+    shellflow run script.sh --jsonl      # Emit streaming JSON Lines events
+    shellflow run script.sh --no-input   # Disable interactive stdin consumption
+    shellflow run script.sh --dry-run    # Preview the execution plan only
+    shellflow run script.sh --audit-log audit.jsonl --jsonl
+                                                                            # Mirror redacted events to an audit file
   shellflow --version                  # Show version
         """,
     )
@@ -717,6 +1387,34 @@ Examples:
         "--ssh-config",
         help="Path to an SSH config file to use instead of ~/.ssh/config",
     )
+    run_parser.add_argument(
+        "--no-input",
+        action="store_true",
+        dest="no_input",
+        help="Run without interactive stdin and report non-interactive mode in structured output",
+    )
+    run_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Preview the execution plan without running any block commands",
+    )
+    run_parser.add_argument(
+        "--audit-log",
+        dest="audit_log",
+        help="Write a redacted JSON Lines audit log to the given path",
+    )
+    output_group = run_parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable JSON run report",
+    )
+    output_group.add_argument(
+        "--jsonl",
+        action="store_true",
+        help="Emit machine-readable JSON Lines events",
+    )
 
     return parser
 
@@ -735,7 +1433,7 @@ def main(args: list[str] | None = None) -> int:
 
     if not parsed_args.command:
         parser.print_help()
-        return 1
+        return EXIT_EXECUTION_FAILURE
 
     if parsed_args.command == "run":
         return cmd_run(parsed_args)
@@ -759,35 +1457,59 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if not script_path.exists():
         sys.stderr.write(f"Error: Script not found: {script_path}\n")
-        return 1
+        return EXIT_EXECUTION_FAILURE
 
     try:
         content = script_path.read_text()
     except OSError as e:
         sys.stderr.write(f"Error: Cannot read script: {e}\n")
-        return 1
+        return EXIT_EXECUTION_FAILURE
 
     try:
         blocks = parse_script(content)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
-        return 1
+        return _exit_code_for_failure(FAILURE_PARSE)
 
     if not blocks:
+        empty_result = run_script([], no_input=args.no_input, dry_run=args.dry_run)
+        if args.json or args.jsonl:
+            if args.json:
+                _emit_structured_output_json(empty_result)
+            else:
+                _emit_structured_output_jsonl(empty_result)
+        if args.audit_log:
+            _write_audit_log(Path(args.audit_log), empty_result)
         if args.verbose:
             print("No executable blocks found in script.")
-        return 0
+        return EXIT_SUCCESS
 
-    result = run_script(blocks, verbose=args.verbose)
+    machine_mode = args.json or args.jsonl
+    result = run_script(
+        blocks,
+        verbose=args.verbose and not machine_mode,
+        no_input=args.no_input,
+        dry_run=args.dry_run,
+    )
+
+    if args.audit_log:
+        _write_audit_log(Path(args.audit_log), result)
+
+    if args.json:
+        _emit_structured_output_json(result)
+    elif args.jsonl:
+        _emit_structured_output_jsonl(result)
 
     if not result.success:
-        sys.stderr.write(f"Execution failed: {result.error_message}\n")
-        return 1
+        exit_code = result.exit_code if result.exit_code != EXIT_SUCCESS else EXIT_EXECUTION_FAILURE
+        if not machine_mode:
+            sys.stderr.write(f"Execution failed: {result.error_message}\n")
+        return exit_code
 
-    if args.verbose:
+    if args.verbose and not machine_mode:
         print(f"\nCompleted: {result.blocks_executed} block(s) executed successfully.")
 
-    return 0
+    return EXIT_SUCCESS
 
 
 def _get_version() -> str:

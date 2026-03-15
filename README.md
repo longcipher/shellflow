@@ -1,5 +1,7 @@
 # ShellFlow
 
+> AI agent native DevOps bash script orchestrator.
+
 [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/longcipher/shellflow)
 [![Context7](https://img.shields.io/badge/Website-context7.com-blue)](https://context7.com/longcipher/shellflow)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
@@ -18,6 +20,10 @@ ShellFlow is a minimal shell script orchestrator for mixed local and remote exec
 - Run each block fail-fast, in order.
 - Reuse the shared prelude before the first marker for every block.
 - Pass the previous block output forward as `SHELLFLOW_LAST_OUTPUT`.
+- Export named scalar values from a block into later block environments.
+- Emit either a final JSON report or streaming JSON Lines events for agents.
+- Support bounded `@TIMEOUT` and `@RETRY` directives without embedding workflow logic.
+- Provide non-interactive, dry-run, and audit-log modes for automated execution.
 - Resolve remote targets from `~/.ssh/config` or a custom SSH config path.
 
 ## Quick Start
@@ -80,6 +86,12 @@ Shellflow recognizes two markers:
 - `# @LOCAL`
 - `# @REMOTE <ssh-host>`
 
+Shellflow also recognizes bounded block directives at the top of a block body:
+
+- `# @TIMEOUT <seconds>`
+- `# @RETRY <count>`
+- `# @EXPORT NAME=stdout|stderr|output|exit_code`
+
 `<ssh-host>` must match a `Host` entry in your SSH config. Shellflow then connects using that SSH host definition, which means the actual machine can be resolved through the configured `HostName`, `User`, `Port`, and `IdentityFile` values.
 
 Example:
@@ -89,6 +101,7 @@ Example:
 set -euo pipefail
 
 # @LOCAL
+# @EXPORT VERSION=stdout
 echo "runs locally"
 
 # @REMOTE sui
@@ -96,6 +109,7 @@ uname -a
 
 # @LOCAL
 echo "remote output: $SHELLFLOW_LAST_OUTPUT"
+echo "version = $VERSION"
 ```
 
 ## SSH Configuration
@@ -141,6 +155,18 @@ echo "build-123"
 echo "last output = $SHELLFLOW_LAST_OUTPUT"
 ```
 
+Named exports are additive to `SHELLFLOW_LAST_OUTPUT`:
+
+```bash
+# @LOCAL
+# @EXPORT VERSION=stdout
+echo "2026.03.15"
+
+# @REMOTE sui
+echo "deploying $VERSION"
+echo "last output = $SHELLFLOW_LAST_OUTPUT"
+```
+
 Lines before the first marker are treated as a shared prelude and prepended to every executable block:
 
 ```bash
@@ -154,11 +180,41 @@ echo "prelude is active"
 echo "prelude is also active here"
 ```
 
+## Agent-Native Usage
+
+Shellflow is designed to be the execution substrate for an outer agent, not an embedded planner.
+
+- Use `--json` when you want one final machine-readable run report.
+- Use `--jsonl` when you want ordered event records while the script runs.
+- Use `--no-input` for CI or agent runs where interactive prompts must fail deterministically.
+- Use `--dry-run` to preview planned execution without running commands.
+- Use `--audit-log <path>` to mirror the structured event stream into a redacted JSONL file.
+
+Recommended agent flow:
+
+1. Generate or select a plain shell script with `@LOCAL` and `@REMOTE` markers.
+2. Add bounded directives only where needed: `@TIMEOUT`, `@RETRY`, and `@EXPORT`.
+3. Run with `--json` or `--jsonl`.
+4. Let the outer agent decide whether to retry, branch, or stop based on Shellflow's structured result.
+
+Shellflow intentionally does not provide:
+
+- Conditional directives such as `@IF stdout_contains=...`
+- A workflow DSL or embedded ReAct loop
+- Heuristic destructive-command detection
+
+Those decisions belong in the outer agent or automation layer.
+
 ## CLI
 
 ```text
 shellflow run <script>
 shellflow run <script> --verbose
+shellflow run <script> --json
+shellflow run <script> --jsonl
+shellflow run <script> --no-input
+shellflow run <script> --dry-run
+shellflow run <script> --audit-log ./audit.jsonl --jsonl
 shellflow run <script> --ssh-config ./ssh_config
 shellflow --version
 ```
@@ -168,6 +224,10 @@ Examples:
 ```bash
 shellflow run playbooks/hello.sh
 shellflow run playbooks/hello.sh -v
+shellflow run playbooks/hello.sh --json
+shellflow run playbooks/hello.sh --jsonl --no-input
+shellflow run playbooks/hello.sh --dry-run --jsonl
+shellflow run playbooks/hello.sh --audit-log ./audit.jsonl --jsonl
 shellflow run playbooks/hello.sh --ssh-config ~/.ssh/config.work
 ```
 
