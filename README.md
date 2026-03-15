@@ -23,17 +23,25 @@ ShellFlow is a minimal shell script orchestrator for mixed local and remote exec
 ## Quick Start
 
 ```bash
-git clone https://github.com/longcipher/shellflow.git
-cd shellflow
-uv sync --all-groups # uv sync --refresh --reinstall --no-cache
-uv tool install --force --reinstall --refresh --no-cache .
+uv tool install shellflow
 
 shellflow run playbooks/hello.sh
 ```
 
-If you do not want a global tool install, use `uv run shellflow run playbooks/hello.sh`.
-
 ## Installation
+
+### User installation (from PyPI)
+
+```bash
+uv tool install shellflow
+shellflow --version
+```
+
+To upgrade to the latest version:
+
+```bash
+uv tool upgrade shellflow
+```
 
 ### Development checkout
 
@@ -43,14 +51,14 @@ cd shellflow
 uv sync --all-groups # uv sync --refresh --reinstall --no-cache
 ```
 
-### Install as a local tool
+### Install as a local tool (from source)
 
 ```bash
 uv tool install --force .
 shellflow --version
 ```
 
-### Install into the active environment
+### Install into the active environment (from source)
 
 ```bash
 uv pip install -e .
