@@ -13,12 +13,9 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-import os
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
-
-ZSH_AVAILABLE = os.path.exists("/bin/zsh")
 
 from shellflow import (
     VALID_EXPORT_SOURCES,
@@ -41,6 +38,8 @@ from shellflow import (
     read_ssh_config,
     run_script,
 )
+
+ZSH_AVAILABLE = Path("/bin/zsh").exists()
 
 VALID_EXPORT_NAME_STRATEGY = st.from_regex(r"[A-Za-z_][A-Za-z0-9_]*", fullmatch=True)
 INVALID_EXPORT_NAME_STRATEGY = st.one_of(
