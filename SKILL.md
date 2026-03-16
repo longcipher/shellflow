@@ -167,6 +167,22 @@ You can use multiple exports in a single block:
 curl -s -w "%{http_code}" -o response.txt https://api.example.com
 ```
 
+### Shell Directive
+
+`# @SHELL <shell>` - Specify the shell to use for executing this block.
+
+Use this when targeting remote hosts that use a non-bash default shell (e.g., zsh).
+
+```bash
+# @REMOTE zsh-server
+# @SHELL zsh
+# zsh-specific commands now work
+reload
+compdef
+```
+
+Without `@SHELL`, Shellflow defaults to `bash` for all remote blocks.
+
 ## 5. Assume every block runs in a fresh shell
 
 Each block is isolated.
@@ -351,7 +367,7 @@ Shellflow returns distinct exit codes for different failure types:
 Before returning a Shellflow playbook, verify that:
 
 - The script is valid bash without custom DSL syntax.
-- Only `# @LOCAL`, `# @REMOTE <host>`, and block directives (`# @TIMEOUT`, `# @RETRY`, `# @EXPORT`) are used.
+- Only `# @LOCAL`, `# @REMOTE <host>`, and block directives (`# @TIMEOUT`, `# @RETRY`, `# @EXPORT`, `# @SHELL`) are used.
 - Block directives appear immediately after the block marker, before any commands.
 - Anything before the first marker is safe to repeat for every block.
 - Every block can run independently in a fresh shell.
@@ -399,6 +415,7 @@ log "build $BUILD_ID complete"
 - Using an undefined remote host alias.
 - Placing block directives after commands instead of immediately after the marker.
 - Using invalid export sources (not stdout, stderr, output, or exit_code).
+- Forgetting that `@SHELL` must be specified before any commands in the block.
 - Forgetting that `@RETRY 0` means no retry attempts.
 - Using `@TIMEOUT` with values too small for normal operation.
 - Printing extra debug output from a block whose output is consumed by the next block via `@EXPORT`.

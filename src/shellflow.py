@@ -46,6 +46,7 @@ class Block:
     timeout_seconds: int | None = None
     retry_count: int = 0
     exports: dict[str, str] = field(default_factory=dict)
+    shell: str | None = None  # Shell to use for execution (e.g., "zsh", "bash")
 
     @property
     def is_local(self) -> bool:
@@ -501,6 +502,11 @@ def _apply_block_directive(block: Block, marker_name: str, marker_argument: str 
         export_name, export_source = _parse_export_directive(marker_argument, line_no=line_no)
         block.exports[export_name] = export_source
         return
+    if marker_name == "SHELL":
+        if not marker_argument:
+            raise ParseError(f"Line {line_no}: @SHELL requires a shell name (e.g., zsh, bash)")
+        block.shell = marker_argument
+        return
     raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
 
 
@@ -890,7 +896,8 @@ def execute_remote(
     if ssh_config_path.exists():
         ssh_args.extend(["-F", str(ssh_config_path)])
 
-    ssh_args.extend(["-o", "BatchMode=yes", host, "bash", "-se"])
+    shell = block.shell or "bash"
+    ssh_args.extend(["-o", "BatchMode=yes", host, shell, "-se"])
     remote_script = _build_executable_script(
         block.commands,
         context,

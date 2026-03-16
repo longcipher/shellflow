@@ -91,6 +91,7 @@ Shellflow also recognizes bounded block directives at the top of a block body:
 - `# @TIMEOUT <seconds>`
 - `# @RETRY <count>`
 - `# @EXPORT NAME=stdout|stderr|output|exit_code`
+- `# @SHELL <shell>` - Specify the shell to use (e.g., `zsh`, `bash`)
 
 `<ssh-host>` must match a `Host` entry in your SSH config. Shellflow then connects using that SSH host definition, which means the actual machine can be resolved through the configured `HostName`, `User`, `Port`, and `IdentityFile` values.
 
@@ -110,6 +111,22 @@ uname -a
 # @LOCAL
 echo "remote output: $SHELLFLOW_LAST_OUTPUT"
 echo "version = $VERSION"
+```
+
+Using `@SHELL` for remote servers with non-bash default shells:
+
+```bash
+#!/bin/bash
+
+# @REMOTE zsh-server
+# @SHELL zsh
+# zsh-specific commands work here
+reload
+compdef
+
+# @REMOTE bash-server
+# Default bash shell is used
+ls -la
 ```
 
 ## SSH Configuration
