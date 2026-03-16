@@ -13,9 +13,12 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+import os
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+
+ZSH_AVAILABLE = os.path.exists("/bin/zsh")
 
 from shellflow import (
     VALID_EXPORT_SOURCES,
@@ -833,6 +836,7 @@ class TestExecuteRemote:
 class TestShellBootstrapIntegration:
     """Integration-style tests for non-interactive shell bootstrap behavior."""
 
+    @pytest.mark.skipif(not ZSH_AVAILABLE, reason="zsh not available")
     def test_zsh_bootstrap_ignores_nonzero_zshrc_and_keeps_path_customizations(self, tmp_path: Path) -> None:
         """Test guarded zshrc bootstrap still exposes commands after a non-zero rc return."""
         bin_dir = tmp_path / "bin"
