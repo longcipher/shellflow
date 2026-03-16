@@ -115,6 +115,8 @@ echo "version = $VERSION"
 
 Using `@SHELL` for remote servers with non-bash default shells:
 
+Shellflow starts remote shells in login mode. For remote `zsh` and `bash` blocks, Shellflow also bootstraps `~/.zshrc` or `~/.bashrc` quietly before running your commands so tools initialized there, such as `mise`, remain available in non-interactive automation even if the rc file exits non-zero.
+
 ```bash
 #!/bin/bash
 

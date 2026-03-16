@@ -721,6 +721,18 @@ def step_given_script_file_with_secret_like_export(context: Context) -> None:
     )
 
 
+@given('a script file with a remote "{shell_name}" block')
+def step_given_script_file_with_remote_shell_block(context: Context, shell_name: str) -> None:
+    given_script_file_with_content(
+        context,
+        f"""
+        # @REMOTE testhost
+        # @SHELL {shell_name}
+        echo "bootstrap-check"
+        """,
+    )
+
+
 @given("a script with content:")
 def step_given_script_with_content(context: Context) -> None:
     given_script_with_content(context, context.text)
@@ -734,6 +746,33 @@ def step_given_host_configured_in_ssh_config(context: Context, host: str) -> Non
 @when("I run the script")
 def step_when_run_the_script(context: Context) -> None:
     when_run_the_script(context)
+
+
+@when("I inspect the generated remote script payload")
+def step_when_inspect_generated_remote_script_payload(context: Context) -> None:
+    script_content = getattr(context, "script_content", None)
+    if not script_content:
+        raise ValueError("No script content set. Did you call the Given step first?")
+
+    blocks = parse_script(script_content)
+    if len(blocks) != 1 or not blocks[0].is_remote:
+        raise AssertionError(f"Expected exactly one remote block, got: {blocks}")
+
+    block = blocks[0]
+    ssh_config = _read_ssh_config_for_context(context, block.host or "")
+    if ssh_config is None:
+        raise AssertionError(f"Remote host not configured for test: {block.host}")
+
+    mock_result = mock.Mock(returncode=0, stdout="", stderr="")
+    with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+        result = execute_remote(block, ExecutionContext(), ssh_config)
+
+    if not result.success:
+        raise AssertionError(f"Expected execute_remote to succeed, got: {result}")
+
+    context.stdout = mock_run.call_args.kwargs["input"]
+    context.stderr = ""
+    context.exit_code = 0
 
 
 @when("I run the script with JSON output enabled")

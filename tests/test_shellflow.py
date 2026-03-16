@@ -27,6 +27,7 @@ from shellflow import (
     RunResult,
     ShellflowError,
     SSHConfig,
+    _build_executable_script,
     _clean_commands,
     _is_valid_env_name,
     create_parser,
@@ -688,6 +689,43 @@ class TestExecuteRemote:
             assert "-i" in call_args
             assert "/path/to/key" in call_args
 
+    def test_custom_remote_shell_runs_as_login_shell(
+        self,
+        execution_context: ExecutionContext,
+    ) -> None:
+        """Test custom remote shells run in login mode so host PATH initialization is loaded."""
+        block = Block(target="REMOTE:myhost", commands=["mise --version"], shell="zsh")  # noqa: S604
+        ssh_config = SSHConfig(host="myhost")
+
+        mock_result = mock.Mock(returncode=0, stdout="2026.1.0\n", stderr="")
+
+        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+            result = execute_remote(block, execution_context, ssh_config)
+
+        assert result.success is True
+        call_args = mock_run.call_args[0][0]
+        assert call_args[-4:] == ["zsh", "-l", "-s", "-e"]
+
+    def test_remote_zsh_bootstraps_zshrc_before_commands(
+        self,
+        execution_context: ExecutionContext,
+    ) -> None:
+        """Test remote zsh execution sources ~/.zshrc so non-login PATH customizations are available."""
+        block = Block(target="REMOTE:myhost", commands=["mise --version"], shell="zsh")  # noqa: S604
+        ssh_config = SSHConfig(host="myhost")
+
+        mock_result = mock.Mock(returncode=0, stdout="2026.1.0\n", stderr="")
+
+        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+            result = execute_remote(block, execution_context, ssh_config)
+
+        assert result.success is True
+        sent_script = mock_run.call_args.kwargs["input"]
+        assert "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }" in sent_script
+        assert sent_script.index(
+            "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }"
+        ) < sent_script.index("mise --version")
+
     def test_remote_execution_only_exports_explicit_context(
         self,
         execution_context: ExecutionContext,
@@ -790,6 +828,68 @@ class TestExecuteRemote:
             call_args = mock_run.call_args[0][0]
             assert "-p" in call_args
             assert "2222" in call_args
+
+
+class TestShellBootstrapIntegration:
+    """Integration-style tests for non-interactive shell bootstrap behavior."""
+
+    def test_zsh_bootstrap_ignores_nonzero_zshrc_and_keeps_path_customizations(self, tmp_path: Path) -> None:
+        """Test guarded zshrc bootstrap still exposes commands after a non-zero rc return."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_mise = bin_dir / "mise"
+        fake_mise.write_text("#!/bin/sh\necho fake-mise\n")
+        fake_mise.chmod(0o755)
+
+        (tmp_path / ".zshrc").write_text(f'export PATH="{bin_dir}:$PATH"\nfalse\n')
+
+        script = _build_executable_script(  # noqa: S604
+            ["command -v mise"],
+            ExecutionContext(),
+            include_context_exports=False,
+            shell="zsh",
+        )
+
+        result = subprocess.run(
+            ["/bin/zsh", "-l", "-s", "-e"],
+            input=script,
+            capture_output=True,
+            text=True,
+            env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert str(fake_mise) in result.stdout
+
+    def test_bash_bootstrap_ignores_nonzero_bashrc_and_keeps_path_customizations(self, tmp_path: Path) -> None:
+        """Test guarded bashrc bootstrap still exposes commands after a non-zero rc return."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_tool = bin_dir / "tool-from-bashrc"
+        fake_tool.write_text("#!/bin/sh\necho fake-bash-tool\n")
+        fake_tool.chmod(0o755)
+
+        (tmp_path / ".bashrc").write_text(f'export PATH="{bin_dir}:$PATH"\nfalse\n')
+
+        script = _build_executable_script(  # noqa: S604
+            ["command -v tool-from-bashrc"],
+            ExecutionContext(),
+            include_context_exports=False,
+            shell="bash",
+        )
+
+        result = subprocess.run(
+            ["/bin/bash", "-l", "-s", "-e"],
+            input=script,
+            capture_output=True,
+            text=True,
+            env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert str(fake_tool) in result.stdout
 
 
 # =============================================================================

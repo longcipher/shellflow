@@ -619,13 +619,28 @@ def _build_executable_script(
     context: ExecutionContext,
     *,
     include_context_exports: bool,
+    shell: str | None = None,
 ) -> str:
     """Build a shell script payload for local or remote execution."""
     script_lines = ["set -e"]
     if include_context_exports:
         script_lines.extend(_build_context_exports(context))
+    script_lines.extend(_build_shell_bootstrap(shell))
     script_lines.extend(commands)
     return "\n".join(script_lines)
+
+
+def _build_shell_bootstrap(shell: str | None) -> list[str]:
+    """Build shell-specific bootstrap lines needed for non-interactive automation."""
+    if not shell:
+        return []
+
+    shell_name = Path(shell).name
+    if shell_name == "zsh":
+        return ["test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }"]
+    if shell_name == "bash":
+        return ["test -f ~/.bashrc && { set +e; . ~/.bashrc >/dev/null 2>&1; set -e; }"]
+    return []
 
 
 def _build_context_exports(context: ExecutionContext) -> list[str]:
@@ -897,11 +912,12 @@ def execute_remote(
         ssh_args.extend(["-F", str(ssh_config_path)])
 
     shell = block.shell or "bash"
-    ssh_args.extend(["-o", "BatchMode=yes", host, shell, "-se"])
+    ssh_args.extend(["-o", "BatchMode=yes", host, shell, "-l", "-s", "-e"])
     remote_script = _build_executable_script(
         block.commands,
         context,
         include_context_exports=True,
+        shell=shell,
     )
     run_kwargs: dict[str, Any] = {
         "input": remote_script,

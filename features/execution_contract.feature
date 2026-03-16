@@ -27,3 +27,17 @@ Feature: Agent-facing execution contract
     And the missing SSH host failure should exit with code 3
     And the block execution failure should exit with code 1
     And the timeout failure should exit with code 4
+
+  Scenario: Remote zsh payload bootstraps zshrc before user commands
+    Given host "testhost" is configured in SSH config
+    And a script file with a remote "zsh" block
+    When I inspect the generated remote script payload
+    Then the output should contain "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }"
+    And the output should contain "bootstrap-check"
+
+  Scenario: Remote bash payload bootstraps bashrc before user commands
+    Given host "testhost" is configured in SSH config
+    And a script file with a remote "bash" block
+    When I inspect the generated remote script payload
+    Then the output should contain "test -f ~/.bashrc && { set +e; . ~/.bashrc >/dev/null 2>&1; set -e; }"
+    And the output should contain "bootstrap-check"
