@@ -257,6 +257,9 @@ EXIT_PARSE_FAILURE = 2
 EXIT_SSH_CONFIG_FAILURE = 3
 EXIT_TIMEOUT_FAILURE = 4
 
+# Maximum output lines per command for verbose mode
+MAX_OUTPUT_LINES = 20
+
 FAILURE_PARSE = "parse"
 FAILURE_RUNTIME = "runtime"
 FAILURE_SSH_CONFIG = "ssh_config"
@@ -758,6 +761,105 @@ def _iter_display_context(context: ExecutionContext) -> list[str]:
     return lines
 
 
+def _truncate_output_lines(output: str, max_lines: int = MAX_OUTPUT_LINES) -> str:
+    """Truncate output to maximum number of lines."""
+    lines = output.splitlines()
+    if len(lines) <= max_lines:
+        return output
+    truncated = lines[:max_lines]
+    remaining = len(lines) - max_lines
+    truncated.append(f"... ({remaining} more line{'s' if remaining > 1 else ''} truncated)")
+    return "\n".join(truncated)
+
+
+def _execute_single_command(
+    command: str,
+    context: ExecutionContext,
+    shell: str | None,
+    no_input: bool,
+    is_remote: bool = False,
+    host: str | None = None,
+    ssh_config: SSHConfig | None = None,
+) -> tuple[str, int, str, str]:
+    """Execute a single command and return output, exit code, stdout, stderr.
+
+    Returns:
+        Tuple of (combined_output, exit_code, stdout, stderr)
+    """
+    env = context.to_shell_env()
+    script_lines = ["set -e"]
+
+    # Add shell bootstrap for non-interactive shells
+    if shell:
+        script_lines.extend(_build_shell_bootstrap(shell))
+
+    # Add the single command
+    script_lines.append(command)
+
+    script = "\n".join(script_lines)
+
+    run_kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "env": env,
+    }
+
+    try:
+        if is_remote and host:
+            # Remote execution via SSH
+            ssh_args = ["ssh"]
+            if no_input:
+                ssh_args.append("-n")
+
+            if ssh_config:
+                if ssh_config.port and ssh_config.port != 22:
+                    ssh_args.extend(["-p", str(ssh_config.port)])
+                if ssh_config.user:
+                    ssh_args.extend(["-l", ssh_config.user])
+                if ssh_config.identity_file:
+                    ssh_args.extend(["-i", str(Path(ssh_config.identity_file).expanduser())])
+
+            ssh_config_path = _get_ssh_config_path()
+            if ssh_config_path.exists():
+                ssh_args.extend(["-F", str(ssh_config_path)])
+
+            exec_shell = shell or "bash"
+            ssh_args.extend(["-o", "BatchMode=yes", host, exec_shell, "-l", "-s", "-e"])
+
+            result = subprocess.run(
+                ssh_args,
+                input=script,
+                capture_output=True,
+                text=True,
+            )
+        # Local execution
+        elif no_input:
+            result = subprocess.run(
+                ["/bin/bash", "-se", "-c", script],
+                stdin=subprocess.DEVNULL,
+                **run_kwargs,
+            )
+        else:
+            result = subprocess.run(
+                ["/bin/bash", "-se"],
+                input=script,
+                **run_kwargs,
+            )
+
+        stdout = result.stdout.strip() if result.stdout else ""
+        stderr = result.stderr.strip() if result.stderr else ""
+        combined = _combine_output(stdout, stderr)
+        return combined, result.returncode, stdout, stderr
+
+    except subprocess.TimeoutExpired as e:
+        stdout = _stringify_subprocess_stream(e.output).strip()
+        stderr = _stringify_subprocess_stream(e.stderr).strip()
+        combined = _combine_output(stdout, stderr)
+        return combined, -1, stdout, stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return str(e), -1, "", str(e)
+
+
 def execute_local(
     block: Block,
     context: ExecutionContext,
@@ -1182,11 +1284,99 @@ def _write_audit_log(path: Path, run_result: RunResult) -> None:
 # =============================================================================
 
 
+def _execute_block_commands_sequential(
+    block: Block,
+    context: ExecutionContext,
+    no_input: bool,
+    verbose: bool,
+    _block_index: int,  # Unused but kept for API consistency
+    _total_blocks: int,  # Unused but kept for API consistency
+) -> ExecutionResult:
+    """Execute block commands sequentially, printing output after each command.
+
+    Returns:
+        ExecutionResult combining all command outputs.
+    """
+    # ANSI color codes
+    RED = "\033[91m"
+    DIM = "\033[90m"
+    RESET = "\033[0m"
+
+    all_outputs: list[str] = []
+    all_stdout: list[str] = []
+    all_stderr: list[str] = []
+    final_exit_code = 0
+    success = True
+
+    commands_to_execute = _iter_display_commands(block.commands)
+    ssh_config = None
+    if block.is_remote:
+        host = block.host
+        if host:
+            ssh_config = read_ssh_config(host)
+
+    for cmd in commands_to_execute:
+        # Print the command being executed
+        if verbose:
+            print(f"{DIM}$ {cmd}{RESET}")
+
+        # Execute single command
+        output, exit_code, stdout, stderr = _execute_single_command(
+            command=cmd,
+            context=context,
+            shell=block.shell,
+            no_input=no_input,
+            is_remote=block.is_remote,
+            host=block.host,
+            ssh_config=ssh_config,
+        )
+
+        # Store outputs
+        all_outputs.append(output)
+        if stdout:
+            all_stdout.append(stdout)
+        if stderr:
+            all_stderr.append(stderr)
+
+        # Print output immediately with truncation
+        if verbose and output:
+            truncated = _truncate_output_lines(output, MAX_OUTPUT_LINES)
+            print(truncated)
+
+        # Check for failure
+        if exit_code != 0:
+            final_exit_code = exit_code
+            success = False
+            if verbose:
+                print(f"{RED}✗ Command failed with exit code {exit_code}{RESET}\n")
+            break
+
+    combined_output = "\n".join(filter(None, all_outputs))
+    combined_stdout = "\n".join(filter(None, all_stdout))
+    combined_stderr = "\n".join(filter(None, all_stderr))
+
+    # Update context
+    context.last_output = combined_output
+    context.success = success
+
+    return ExecutionResult(
+        success=success,
+        output=combined_output,
+        exit_code=final_exit_code,
+        error_message="" if success else f"Exit code: {final_exit_code}",
+        stdout=combined_stdout,
+        stderr=combined_stderr,
+        failure_kind=None if success else FAILURE_RUNTIME,
+        no_input=no_input,
+    )
+
+
 def run_script(  # noqa: PLR0915
     blocks: list[Block],
     verbose: bool = False,
     no_input: bool = False,
     dry_run: bool = False,
+    sequential_output: bool = True,  # New parameter for sequential output
 ) -> RunResult:
     """Run a list of blocks sequentially.
 
@@ -1196,6 +1386,7 @@ def run_script(  # noqa: PLR0915
     Args:
         blocks: List of blocks to execute.
         verbose: Whether to print progress information.
+        sequential_output: Whether to print command output sequentially after each command.
 
     Returns:
         RunResult with success status and execution info.
@@ -1247,7 +1438,60 @@ def run_script(  # noqa: PLR0915
         block_id = _make_block_id(i)
         events.append(_make_block_started_event(run_id, block_id, i, block, total_blocks))
 
-        # Print block info if verbose
+        # Execute the block
+        if sequential_output and verbose:
+            # Use sequential execution with per-command output
+            attempt_count = 0
+            max_attempts = block.retry_count + 1
+            while True:
+                attempt_count += 1
+                started_at = time.perf_counter()
+
+                result = _execute_block_commands_sequential(block, context, no_input, verbose, i, len(blocks))
+                result = _finalize_block_result(result, block, i, started_at)
+                result.attempts = attempt_count
+
+                if result.success or result.timed_out or attempt_count >= max_attempts:
+                    break
+
+                if verbose:
+                    print(f"{YELLOW}↻ Retrying attempt {attempt_count + 1}/{max_attempts}{RESET}")
+
+            block_results.append(result)
+            events.append(_make_block_finished_event(run_id, result, block, total_blocks))
+            blocks_executed += 1
+
+            # Fail fast on error
+            if not result.success:
+                failure_kind = _failure_kind_for_result(result)
+                exit_code = _exit_code_for_failure(failure_kind)
+                events.append(
+                    _make_run_finished_event(
+                        run_id,
+                        success=False,
+                        exit_code=exit_code,
+                        blocks_executed=blocks_executed,
+                        total_blocks=total_blocks,
+                        failure_kind=failure_kind,
+                        no_input=no_input,
+                    )
+                )
+                return RunResult(
+                    success=False,
+                    blocks_executed=blocks_executed,
+                    error_message=f"Block {i} failed: {result.error_message}",
+                    block_results=block_results,
+                    run_id=run_id,
+                    schema_version=SCHEMA_VERSION,
+                    exit_code=exit_code,
+                    failure_kind=failure_kind,
+                    no_input=no_input,
+                    events=events,
+                )
+
+            continue  # Skip the old execution path
+
+        # Print block info if verbose (old path - for non-sequential mode or when not verbose)
         if verbose:
             if block.is_local:
                 print(f"{BLUE}[{i}/{len(blocks)}] LOCAL{RESET}")
@@ -1295,7 +1539,8 @@ def run_script(  # noqa: PLR0915
 
         if verbose:
             if result.output:
-                print(result.output)
+                truncated = _truncate_output_lines(result.output, MAX_OUTPUT_LINES)
+                print(truncated)
             if result.success:
                 print(f"{GREEN}✓ Success{RESET}\n")
             else:
