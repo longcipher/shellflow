@@ -1294,23 +1294,79 @@ def _execute_block_commands_sequential(
 ) -> ExecutionResult:
     """Execute block commands sequentially, printing output after each command.
 
+    For local blocks, commands are executed one at a time for verbose output.
+    For remote blocks, all commands are executed in a single SSH connection
+    to preserve execution state (e.g., working directory) between commands.
+
     Returns:
         ExecutionResult combining all command outputs.
     """
-    # ANSI color codes
-    RED = "\033[91m"
-    DIM = "\033[90m"
+    if verbose:
+        _print_block_header(block, block_index, total_blocks)
+
+    commands_to_execute = _iter_display_commands(block.commands)
+
+    if block.is_remote:
+        return _execute_remote_block_sequential(block, context, no_input, verbose, commands_to_execute)
+
+    return _execute_local_block_sequential(block, context, no_input, verbose, commands_to_execute)
+
+
+def _print_block_header(block: Block, block_index: int, total_blocks: int) -> None:
+    """Print block header for verbose output."""
     BLUE = "\033[94m"
     YELLOW = "\033[93m"
     RESET = "\033[0m"
 
-    # Print block header if verbose
+    if block.is_local:
+        print(f"{BLUE}[{block_index}/{total_blocks}] LOCAL{RESET}")
+    else:
+        host = block.host or "unknown"
+        print(f"{YELLOW}[{block_index}/{total_blocks}] REMOTE: {host}{RESET}")
+
+
+def _execute_remote_block_sequential(
+    block: Block,
+    context: ExecutionContext,
+    no_input: bool,
+    verbose: bool,
+    commands_to_execute: list[str],
+) -> ExecutionResult:
+    """Execute remote block commands in a single SSH connection."""
+    RED = "\033[91m"
+    DIM = "\033[90m"
+    RESET = "\033[0m"
+
     if verbose:
-        if block.is_local:
-            print(f"{BLUE}[{block_index}/{total_blocks}] LOCAL{RESET}")
-        else:
-            host = block.host or "unknown"
-            print(f"{YELLOW}[{block_index}/{total_blocks}] REMOTE: {host}{RESET}")
+        for cmd in commands_to_execute:
+            print(f"{DIM}$ {cmd}{RESET}")
+
+    result = _execute_block_once(block, context, no_input=no_input)
+
+    if verbose and result.output:
+        truncated = _truncate_output_lines(result.output, MAX_OUTPUT_LINES)
+        print(truncated)
+
+    context.last_output = result.output
+    context.success = result.success
+
+    if not result.success and verbose:
+        print(f"{RED}✗ Command failed with exit code {result.exit_code}{RESET}\n")
+
+    return result
+
+
+def _execute_local_block_sequential(
+    block: Block,
+    context: ExecutionContext,
+    no_input: bool,
+    verbose: bool,
+    commands_to_execute: list[str],
+) -> ExecutionResult:
+    """Execute local block commands one at a time for verbose output."""
+    RED = "\033[91m"
+    DIM = "\033[90m"
+    RESET = "\033[0m"
 
     all_outputs: list[str] = []
     all_stdout: list[str] = []
@@ -1318,14 +1374,10 @@ def _execute_block_commands_sequential(
     final_exit_code = 0
     success = True
 
-    commands_to_execute = _iter_display_commands(block.commands)
-
     for cmd in commands_to_execute:
-        # Print the command being executed
         if verbose:
             print(f"{DIM}$ {cmd}{RESET}")
 
-        # Execute single command using a single-command block
         single_block = Block(
             target=block.target,
             commands=[cmd],
@@ -1334,19 +1386,16 @@ def _execute_block_commands_sequential(
         )
         result = _execute_block_once(single_block, context, no_input=no_input)
 
-        # Store outputs
         all_outputs.append(result.output)
         if result.stdout:
             all_stdout.append(result.stdout)
         if result.stderr:
             all_stderr.append(result.stderr)
 
-        # Print output immediately with truncation
         if verbose and result.output:
             truncated = _truncate_output_lines(result.output, MAX_OUTPUT_LINES)
             print(truncated)
 
-        # Check for failure
         if not result.success:
             final_exit_code = result.exit_code
             success = False
@@ -1358,7 +1407,6 @@ def _execute_block_commands_sequential(
     combined_stdout = "\n".join(filter(None, all_stdout))
     combined_stderr = "\n".join(filter(None, all_stderr))
 
-    # Update context
     context.last_output = combined_output
     context.success = success
 
