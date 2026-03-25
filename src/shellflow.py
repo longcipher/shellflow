@@ -21,6 +21,7 @@ import fnmatch
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -83,6 +84,25 @@ class ExecutionContext:
 
 
 @dataclass
+class CommandLog:
+    """Structured verbose log for one executed command."""
+
+    command: str
+    output: str = ""
+    exit_code: int | None = None
+    status: str = "completed"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize one command log for structured output."""
+        return {
+            "command": self.command,
+            "output": self.output,
+            "exit_code": self.exit_code,
+            "status": self.status,
+        }
+
+
+@dataclass
 class ExecutionResult:
     """Result of executing a single block."""
 
@@ -102,6 +122,7 @@ class ExecutionResult:
     block_index: int = 0
     source_line: int = 0
     exported_env: dict[str, str] = field(default_factory=dict)
+    command_logs: list[CommandLog] = field(default_factory=list)
 
     def to_dict(self, *, redact_secret_exports: bool = False) -> dict[str, Any]:
         """Serialize the block result for machine-readable output."""
@@ -122,6 +143,7 @@ class ExecutionResult:
             "no_input": self.no_input,
             "error_message": self.error_message,
             "exported_env": _serialize_exported_env(self.exported_env, redact_secret_exports=redact_secret_exports),
+            "command_logs": [command_log.to_dict() for command_log in self.command_logs],
         }
         if redact_secret_exports:
             return _redact_payload_strings(payload, _collect_secret_values(self.exported_env))
@@ -259,6 +281,7 @@ EXIT_TIMEOUT_FAILURE = 4
 
 # Maximum output lines per command for verbose mode
 MAX_OUTPUT_LINES = 20
+TRACE_MARKER = "__SHELLFLOW_CMD__:"
 
 FAILURE_PARSE = "parse"
 FAILURE_RUNTIME = "runtime"
@@ -737,6 +760,16 @@ def _combine_output(stdout: str, stderr: str) -> str:
     return output or error_output
 
 
+def _strip_trace_markers(output: str) -> str:
+    """Remove shellflow trace marker lines from captured output."""
+    cleaned_lines: list[str] = []
+    for line in output.splitlines():
+        if TRACE_MARKER in line:
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
 def _iter_display_commands(commands: list[str]) -> list[str]:
     """Return non-empty, non-comment commands suitable for verbose display."""
     return [command for command in commands if command.strip() and not command.lstrip().startswith("#")]
@@ -762,14 +795,151 @@ def _iter_display_context(context: ExecutionContext) -> list[str]:
 
 
 def _truncate_output_lines(output: str, max_lines: int = MAX_OUTPUT_LINES) -> str:
-    """Truncate output to maximum number of lines."""
+    """Keep only the last maximum number of lines from output."""
     lines = output.splitlines()
     if len(lines) <= max_lines:
         return output
-    truncated = lines[:max_lines]
+    truncated = lines[-max_lines:]
     remaining = len(lines) - max_lines
-    truncated.append(f"... ({remaining} more line{'s' if remaining > 1 else ''} truncated)")
+    truncated.insert(0, f"... ({remaining} earlier line{'s' if remaining > 1 else ''} truncated)")
     return "\n".join(truncated)
+
+
+def _parse_remote_command_logs(
+    output: str,
+    *,
+    success: bool,
+    exit_code: int,
+    interrupted: bool = False,
+    trailing_error_output: str = "",
+) -> list[CommandLog]:
+    """Parse traced remote output into one journal entry per command."""
+    command_logs: list[CommandLog] = []
+    current_command: str | None = None
+    current_output: list[str] = []
+
+    def flush_current() -> None:
+        nonlocal current_command, current_output
+        if current_command is None:
+            current_output = []
+            return
+        command_logs.append(CommandLog(command=current_command, output="\n".join(current_output).strip()))
+        current_command = None
+        current_output = []
+
+    for line in output.splitlines():
+        marker_index = line.find(TRACE_MARKER)
+        if marker_index >= 0:
+            flush_current()
+            current_command = line[marker_index + len(TRACE_MARKER) :].strip()
+            continue
+        if current_command is not None:
+            current_output.append(line)
+
+    flush_current()
+
+    if trailing_error_output.strip():
+        if command_logs:
+            last_output = command_logs[-1].output
+            command_logs[-1].output = _combine_output(last_output, trailing_error_output)
+        else:
+            command_logs.append(CommandLog(command="<remote-command>", output=trailing_error_output.strip()))
+
+    if not command_logs:
+        return command_logs
+
+    for command_log in command_logs[:-1]:
+        command_log.exit_code = 0
+        command_log.status = "completed"
+
+    last_command = command_logs[-1]
+    if success:
+        last_command.exit_code = 0
+        last_command.status = "completed"
+    elif interrupted:
+        last_command.exit_code = exit_code
+        last_command.status = "interrupted"
+    else:
+        last_command.exit_code = exit_code
+        last_command.status = "failed"
+
+    return command_logs
+
+
+def _build_remote_trace_script(block: Block, context: ExecutionContext, shell: str) -> str:
+    """Build a traced remote script that preserves shell state while journaling commands."""
+    script_lines = ["set -e"]
+    script_lines.extend(_build_context_exports(context))
+    script_lines.extend(_build_shell_bootstrap(shell))
+    script_lines.extend(
+        [
+            "exec 3>&1",
+            f"export PS4={_quote_shell_value(TRACE_MARKER)}",
+            "export BASH_XTRACEFD=3",
+            "export XTRACEFD=3",
+            "set -x",
+        ]
+    )
+    script_lines.extend(block.commands)
+    return "\n".join(script_lines)
+
+
+def _run_remote_subprocess(
+    ssh_args: list[str],
+    remote_script: str,
+    *,
+    timeout_seconds: int | None,
+) -> tuple[str, str, int, bool, bool]:
+    """Run an SSH subprocess and preserve partial output on timeout or interruption."""
+    process = subprocess.Popen(
+        ssh_args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    interrupted = False
+    timed_out = False
+
+    try:
+        stdout, stderr = process.communicate(remote_script, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        stdout, stderr = process.communicate()
+    except KeyboardInterrupt:
+        interrupted = True
+        process.send_signal(signal.SIGINT)
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+
+    return (
+        stdout or "",
+        stderr or "",
+        process.returncode if process.returncode is not None else -1,
+        interrupted,
+        timed_out,
+    )
+
+
+def _print_command_logs(command_logs: list[CommandLog], output_tail_lines: int) -> None:
+    """Print grouped verbose logs for each command in execution order."""
+    DIM = "\033[90m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    RESET = "\033[0m"
+
+    for command_log in command_logs:
+        print(f"{DIM}$ {command_log.command}{RESET}")
+        if command_log.output:
+            print(_truncate_output_lines(command_log.output, output_tail_lines))
+        if command_log.status == "failed":
+            print(f"{RED}exit {command_log.exit_code}{RESET}")
+        elif command_log.status == "interrupted":
+            print(f"{YELLOW}! Interrupted while running this command{RESET}")
 
 
 def _execute_single_command(
@@ -1015,52 +1185,47 @@ def execute_remote(
 
     shell = block.shell or "bash"
     ssh_args.extend(["-o", "BatchMode=yes", host, shell, "-l", "-s", "-e"])
-    remote_script = _build_executable_script(
-        block.commands,
-        context,
-        include_context_exports=True,
-        shell=shell,
-    )
-    run_kwargs: dict[str, Any] = {
-        "input": remote_script,
-        "capture_output": True,
-        "text": True,
-    }
-    if block.timeout_seconds is not None:
-        run_kwargs["timeout"] = block.timeout_seconds
+    remote_script = _build_remote_trace_script(block, context, shell)
 
     try:
-        result = subprocess.run(
+        stdout, stderr, exit_code, interrupted, timed_out = _run_remote_subprocess(
             ssh_args,
-            **run_kwargs,
+            remote_script,
+            timeout_seconds=block.timeout_seconds,
+        )
+        cleaned_stdout = _strip_trace_markers(stdout)
+        command_logs = _parse_remote_command_logs(
+            stdout,
+            success=exit_code == 0 and not interrupted and not timed_out,
+            exit_code=exit_code,
+            interrupted=interrupted,
+            trailing_error_output=stderr,
         )
 
+        success = exit_code == 0 and not interrupted and not timed_out
+        failure_kind = None if success else FAILURE_RUNTIME
+        result_exit_code = exit_code
+        error_message = "" if success else f"SSH exit code: {exit_code}"
+
+        if timed_out:
+            result_exit_code = -1
+            error_message = f"Timed out after {block.timeout_seconds} second(s)"
+            failure_kind = FAILURE_TIMEOUT
+        elif interrupted:
+            error_message = "Interrupted by user"
+
         return ExecutionResult(
-            success=result.returncode == 0,
-            output=_combine_output(result.stdout, result.stderr),
-            exit_code=result.returncode,
-            error_message="" if result.returncode == 0 else f"SSH exit code: {result.returncode}",
-            stdout=result.stdout.strip(),
-            stderr=result.stderr.strip(),
+            success=success,
+            output=_combine_output(cleaned_stdout, stderr),
+            exit_code=result_exit_code,
+            error_message=error_message,
+            stdout=cleaned_stdout,
+            stderr=stderr.strip(),
+            timed_out=timed_out,
             timeout_seconds=block.timeout_seconds,
-            failure_kind=None if result.returncode == 0 else FAILURE_RUNTIME,
+            failure_kind=failure_kind,
             no_input=no_input,
-        )
-    except subprocess.TimeoutExpired as e:
-        stdout = _stringify_subprocess_stream(e.output).strip()
-        stderr = _stringify_subprocess_stream(e.stderr).strip()
-        timeout_value = int(e.timeout) if isinstance(e.timeout, int | float) else e.timeout
-        return ExecutionResult(
-            success=False,
-            output=_combine_output(stdout, stderr),
-            exit_code=-1,
-            error_message=f"Timed out after {timeout_value} second(s)",
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=True,
-            timeout_seconds=block.timeout_seconds,
-            failure_kind=FAILURE_TIMEOUT,
-            no_input=no_input,
+            command_logs=command_logs,
         )
     except (OSError, subprocess.SubprocessError) as e:
         return ExecutionResult(
@@ -1291,6 +1456,7 @@ def _execute_block_commands_sequential(
     verbose: bool,
     block_index: int,
     total_blocks: int,
+    output_tail_lines: int,
 ) -> ExecutionResult:
     """Execute block commands sequentially, printing output after each command.
 
@@ -1307,9 +1473,16 @@ def _execute_block_commands_sequential(
     commands_to_execute = _iter_display_commands(block.commands)
 
     if block.is_remote:
-        return _execute_remote_block_sequential(block, context, no_input, verbose, commands_to_execute)
+        return _execute_remote_block_sequential(
+            block,
+            context,
+            no_input,
+            verbose,
+            commands_to_execute,
+            output_tail_lines,
+        )
 
-    return _execute_local_block_sequential(block, context, no_input, verbose, commands_to_execute)
+    return _execute_local_block_sequential(block, context, no_input, verbose, commands_to_execute, output_tail_lines)
 
 
 def _print_block_header(block: Block, block_index: int, total_blocks: int) -> None:
@@ -1331,21 +1504,23 @@ def _execute_remote_block_sequential(
     no_input: bool,
     verbose: bool,
     commands_to_execute: list[str],
+    output_tail_lines: int,
 ) -> ExecutionResult:
     """Execute remote block commands in a single SSH connection."""
     RED = "\033[91m"
     DIM = "\033[90m"
     RESET = "\033[0m"
 
-    if verbose:
-        for cmd in commands_to_execute:
-            print(f"{DIM}$ {cmd}{RESET}")
-
     result = _execute_block_once(block, context, no_input=no_input)
 
-    if verbose and result.output:
-        truncated = _truncate_output_lines(result.output, MAX_OUTPUT_LINES)
-        print(truncated)
+    if verbose:
+        if result.command_logs:
+            _print_command_logs(result.command_logs, output_tail_lines)
+        elif result.output:
+            for cmd in commands_to_execute:
+                print(f"{DIM}$ {cmd}{RESET}")
+            truncated = _truncate_output_lines(result.output, output_tail_lines)
+            print(truncated)
 
     context.last_output = result.output
     context.success = result.success
@@ -1362,6 +1537,7 @@ def _execute_local_block_sequential(
     no_input: bool,
     verbose: bool,
     commands_to_execute: list[str],
+    output_tail_lines: int,
 ) -> ExecutionResult:
     """Execute local block commands one at a time for verbose output."""
     RED = "\033[91m"
@@ -1393,7 +1569,7 @@ def _execute_local_block_sequential(
             all_stderr.append(result.stderr)
 
         if verbose and result.output:
-            truncated = _truncate_output_lines(result.output, MAX_OUTPUT_LINES)
+            truncated = _truncate_output_lines(result.output, output_tail_lines)
             print(truncated)
 
         if not result.success:
@@ -1428,6 +1604,7 @@ def run_script(  # noqa: PLR0915
     no_input: bool = False,
     dry_run: bool = False,
     sequential_output: bool = True,  # New parameter for sequential output
+    output_tail_lines: int = MAX_OUTPUT_LINES,
 ) -> RunResult:
     """Run a list of blocks sequentially.
 
@@ -1502,7 +1679,15 @@ def run_script(  # noqa: PLR0915
                 attempt_count += 1
                 started_at = time.perf_counter()
 
-                result = _execute_block_commands_sequential(block, context, no_input, verbose, i, len(blocks))
+                result = _execute_block_commands_sequential(
+                    block,
+                    context,
+                    no_input,
+                    verbose,
+                    i,
+                    len(blocks),
+                    output_tail_lines,
+                )
                 result = _finalize_block_result(result, block, i, started_at)
                 result.attempts = attempt_count
 
@@ -1600,7 +1785,7 @@ def run_script(  # noqa: PLR0915
 
         if verbose:
             if result.output:
-                truncated = _truncate_output_lines(result.output, MAX_OUTPUT_LINES)
+                truncated = _truncate_output_lines(result.output, output_tail_lines)
                 print(truncated)
             if result.success:
                 print(f"{GREEN}✓ Success{RESET}\n")
@@ -1713,6 +1898,12 @@ Examples:
         help="Enable verbose output with colored progress",
     )
     run_parser.add_argument(
+        "--output-lines",
+        type=int,
+        default=MAX_OUTPUT_LINES,
+        help="Maximum number of trailing log lines to print per command in verbose mode",
+    )
+    run_parser.add_argument(
         "--ssh-config",
         help="Path to an SSH config file to use instead of ~/.ssh/config",
     )
@@ -1819,6 +2010,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         verbose=args.verbose and not machine_mode,
         no_input=args.no_input,
         dry_run=args.dry_run,
+        output_tail_lines=args.output_lines,
     )
 
     if args.audit_log:

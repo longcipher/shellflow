@@ -18,8 +18,10 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from shellflow import (
+    TRACE_MARKER,
     VALID_EXPORT_SOURCES,
     Block,
+    CommandLog,
     ExecutionContext,
     ExecutionError,
     ExecutionResult,
@@ -30,6 +32,7 @@ from shellflow import (
     _build_executable_script,
     _clean_commands,
     _is_valid_env_name,
+    _parse_remote_command_logs,
     create_parser,
     execute_local,
     execute_remote,
@@ -584,6 +587,46 @@ class TestExecuteLocal:
 class TestExecuteRemote:
     """Tests for execute_remote function."""
 
+    def test_parse_remote_command_logs_groups_output_by_command(self) -> None:
+        """Test remote traced output is grouped into per-command logs."""
+        output = """__SHELLFLOW_CMD__:cd /srv/app
+__SHELLFLOW_CMD__:git pull
+Already up to date.
+__SHELLFLOW_CMD__:cargo build --release
+Finished release build
+"""
+
+        logs = _parse_remote_command_logs(output, success=True, exit_code=0)
+
+        assert logs == [
+            CommandLog(command="cd /srv/app", output="", exit_code=0, status="completed"),
+            CommandLog(command="git pull", output="Already up to date.", exit_code=0, status="completed"),
+            CommandLog(
+                command="cargo build --release",
+                output="Finished release build",
+                exit_code=0,
+                status="completed",
+            ),
+        ]
+
+    def test_parse_remote_command_logs_marks_last_command_failed(self) -> None:
+        """Test failed remote execution attributes the failure to the last started command."""
+        output = """__SHELLFLOW_CMD__:git pull
+Already up to date.
+__SHELLFLOW_CMD__:cargo build --release
+error: build failed
+"""
+
+        logs = _parse_remote_command_logs(output, success=False, exit_code=101)
+
+        assert logs[0] == CommandLog(command="git pull", output="Already up to date.", exit_code=0, status="completed")
+        assert logs[1] == CommandLog(
+            command="cargo build --release",
+            output="error: build failed",
+            exit_code=101,
+            status="failed",
+        )
+
     def test_timeout_directive_passes_timeout_to_remote_subprocess(
         self,
         execution_context: ExecutionContext,
@@ -592,13 +635,14 @@ class TestExecuteRemote:
         block = Block(target="REMOTE:server1", commands=["hostname"], timeout_seconds=11)
         ssh_config = SSHConfig(host="server1")
 
-        mock_result = mock.Mock(returncode=0, stdout="server1\n", stderr="")
-
-        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+        with mock.patch(
+            "shellflow._run_remote_subprocess",
+            return_value=(f"{TRACE_MARKER}hostname\nserver1\n", "", 0, False, False),
+        ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config)
 
         assert result.success is True
-        assert mock_run.call_args.kwargs["timeout"] == 11
+        assert mock_run.call_args.kwargs["timeout_seconds"] == 11
 
     def test_no_input_adds_stdin_null_flag(
         self,
@@ -608,13 +652,14 @@ class TestExecuteRemote:
         block = Block(target="REMOTE:server1", commands=["hostname"])
         ssh_config = SSHConfig(host="server1")
 
-        mock_result = mock.Mock(returncode=0, stdout="server1\n", stderr="")
-
-        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+        with mock.patch(
+            "shellflow._run_remote_subprocess",
+            return_value=(f"{TRACE_MARKER}hostname\nserver1\n", "", 0, False, False),
+        ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config, no_input=True)
 
         assert result.success is True
-        call_args = mock_run.call_args[0][0]
+        call_args = mock_run.call_args.args[0]
         assert "-n" in call_args
 
     def test_empty_block(self, execution_context: ExecutionContext) -> None:
@@ -647,12 +692,10 @@ class TestExecuteRemote:
             identity_file="~/.ssh/key",
         )
 
-        mock_result = mock.Mock()
-        mock_result.returncode = 0
-        mock_result.stdout = "server1\n"
-        mock_result.stderr = ""
-
-        with mock.patch("shellflow.subprocess.run", return_value=mock_result):
+        with mock.patch(
+            "shellflow._run_remote_subprocess",
+            return_value=(f"{TRACE_MARKER}hostname\nserver1\n", "", 0, False, False),
+        ):
             result = execute_remote(block, execution_context, ssh_config)
 
         assert result.success is True
@@ -673,16 +716,14 @@ class TestExecuteRemote:
             identity_file="/path/to/key",
         )
 
-        mock_result = mock.Mock()
-        mock_result.returncode = 0
-        mock_result.stdout = ""
-        mock_result.stderr = ""
-
-        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+        with mock.patch(
+            "shellflow._run_remote_subprocess",
+            return_value=(f"{TRACE_MARKER}uptime\n", "", 0, False, False),
+        ) as mock_run:
             execute_remote(block, execution_context, ssh_config)
 
             # Check that SSH command was called with correct args
-            call_args = mock_run.call_args[0][0]
+            call_args = mock_run.call_args.args[0]
             assert "ssh" in call_args[0]
             assert "-p" in call_args
             assert "2222" in call_args
@@ -699,13 +740,14 @@ class TestExecuteRemote:
         block = Block(target="REMOTE:myhost", commands=["mise --version"], shell="zsh")  # noqa: S604
         ssh_config = SSHConfig(host="myhost")
 
-        mock_result = mock.Mock(returncode=0, stdout="2026.1.0\n", stderr="")
-
-        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+        with mock.patch(
+            "shellflow._run_remote_subprocess",
+            return_value=(f"{TRACE_MARKER}mise --version\n2026.1.0\n", "", 0, False, False),
+        ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config)
 
         assert result.success is True
-        call_args = mock_run.call_args[0][0]
+        call_args = mock_run.call_args.args[0]
         assert call_args[-4:] == ["zsh", "-l", "-s", "-e"]
 
     def test_remote_zsh_bootstraps_zshrc_before_commands(
@@ -716,13 +758,14 @@ class TestExecuteRemote:
         block = Block(target="REMOTE:myhost", commands=["mise --version"], shell="zsh")  # noqa: S604
         ssh_config = SSHConfig(host="myhost")
 
-        mock_result = mock.Mock(returncode=0, stdout="2026.1.0\n", stderr="")
-
-        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+        with mock.patch(
+            "shellflow._run_remote_subprocess",
+            return_value=(f"{TRACE_MARKER}mise --version\n2026.1.0\n", "", 0, False, False),
+        ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config)
 
         assert result.success is True
-        sent_script = mock_run.call_args.kwargs["input"]
+        sent_script = mock_run.call_args.args[1]
         assert "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }" in sent_script
         assert sent_script.index(
             "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }"
@@ -738,19 +781,20 @@ class TestExecuteRemote:
         context = ExecutionContext(env={"DEPLOY_ENV": "prod"}, last_output="done")
         ssh_config = SSHConfig(host="server1")
 
-        mock_result = mock.Mock(returncode=0, stdout="", stderr="")
-
         with (
             mock.patch.dict(
                 "os.environ",
                 {"AWS_SECRET_ACCESS_KEY": "super-secret"},
                 clear=True,
             ),
-            mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run,
+            mock.patch(
+                "shellflow._run_remote_subprocess",
+                return_value=(f"{TRACE_MARKER}env\n", "", 0, False, False),
+            ) as mock_run,
         ):
             execute_remote(block, context, ssh_config)
 
-        sent_script = mock_run.call_args.kwargs["input"]
+        sent_script = mock_run.call_args.args[1]
         assert 'export DEPLOY_ENV="prod"' in sent_script
         assert 'export SHELLFLOW_LAST_OUTPUT="done"' in sent_script
         assert "AWS_SECRET_ACCESS_KEY" not in sent_script
@@ -763,17 +807,32 @@ class TestExecuteRemote:
         block = Block(target="REMOTE:server1", commands=["false"])
         ssh_config = SSHConfig(host="server1")
 
-        mock_result = mock.Mock()
-        mock_result.returncode = 1
-        mock_result.stdout = ""
-        mock_result.stderr = "Permission denied"
-
-        with mock.patch("shellflow.subprocess.run", return_value=mock_result):
+        with mock.patch(
+            "shellflow._run_remote_subprocess",
+            return_value=(f"{TRACE_MARKER}false\n", "Permission denied", 1, False, False),
+        ):
             result = execute_remote(block, execution_context, ssh_config)
 
         assert result.success is False
         assert result.exit_code == 1
         assert "permission denied" in result.output.lower()
+
+    def test_remote_execution_interruption_marks_current_command(self, execution_context: ExecutionContext) -> None:
+        """Test interrupted remote execution marks the last started command as interrupted."""
+        block = Block(target="REMOTE:server1", commands=["sleep 30"])
+        ssh_config = SSHConfig(host="server1")
+
+        with mock.patch(
+            "shellflow._run_remote_subprocess",
+            return_value=(f"{TRACE_MARKER}sleep 30\npartial output\n", "", 130, True, False),
+        ):
+            result = execute_remote(block, execution_context, ssh_config)
+
+        assert result.success is False
+        assert "interrupted" in result.error_message.lower()
+        assert result.command_logs == [
+            CommandLog(command="sleep 30", output="partial output", exit_code=130, status="interrupted")
+        ]
 
     def test_subprocess_error_handling(
         self,
@@ -784,7 +843,7 @@ class TestExecuteRemote:
         ssh_config = SSHConfig(host="server1")
 
         with mock.patch(
-            "shellflow.subprocess.run",
+            "shellflow._run_remote_subprocess",
             side_effect=subprocess.SubprocessError("SSH failed"),
         ):
             result = execute_remote(block, execution_context, ssh_config)
@@ -806,19 +865,14 @@ class TestExecuteRemote:
             port=2222,
         )
 
-        mock_result = mock.Mock()
-        mock_result.returncode = 0
-        mock_result.stdout = ""
-        mock_result.stderr = ""
-
         with (
             mock.patch(
                 "shellflow.read_ssh_config",
                 return_value=mock_ssh_config,
             ) as mock_read_config,
             mock.patch(
-                "shellflow.subprocess.run",
-                return_value=mock_result,
+                "shellflow._run_remote_subprocess",
+                return_value=(f"{TRACE_MARKER}hostname\n", "", 0, False, False),
             ) as mock_run,
         ):
             execute_remote(block, execution_context, None)
@@ -827,7 +881,7 @@ class TestExecuteRemote:
             mock_read_config.assert_called_once_with("myhost")
 
             # Verify the port from looked-up config was used
-            call_args = mock_run.call_args[0][0]
+            call_args = mock_run.call_args.args[0]
             assert "-p" in call_args
             assert "2222" in call_args
 
@@ -1557,17 +1611,15 @@ echo \"hello\"
             Block(target="REMOTE:server1", commands=["hostname"]),
         ]
 
-        mock_result = mock.Mock()
-        mock_result.returncode = 0
-        mock_result.stdout = "server1\n"
-        mock_result.stderr = ""
-
         with (
             mock.patch(
                 "shellflow.read_ssh_config",
                 return_value=SSHConfig(host="server1"),
             ),
-            mock.patch("shellflow.subprocess.run", return_value=mock_result),
+            mock.patch(
+                "shellflow._run_remote_subprocess",
+                return_value=(f"{TRACE_MARKER}hostname\nserver1\n", "", 0, False, False),
+            ),
         ):
             result = run_script(blocks)
 
@@ -1581,7 +1633,7 @@ echo \"hello\"
 
         with (
             mock.patch("shellflow.read_ssh_config", return_value=None),
-            mock.patch("shellflow.subprocess.run") as mock_run,
+            mock.patch("shellflow._run_remote_subprocess") as mock_run,
         ):
             result = run_script(blocks)
 
@@ -1629,6 +1681,42 @@ echo \"hello\"
         assert "export SHELLFLOW_LAST_OUTPUT" not in captured.out
         assert "$ hostname" in captured.out
 
+    def test_verbose_remote_output_prints_grouped_command_logs(self, capsys: Any) -> None:
+        """Test verbose remote output prints each command with its own truncated logs."""
+        blocks = [
+            Block(target="REMOTE:server1", commands=["cd /srv/app", "git pull"]),
+        ]
+
+        with (
+            mock.patch("shellflow.read_ssh_config", return_value=SSHConfig(host="server1")),
+            mock.patch(
+                "shellflow.execute_remote",
+                return_value=ExecutionResult(
+                    success=True,
+                    output="ignored combined output",
+                    exit_code=0,
+                    command_logs=[
+                        CommandLog(command="cd /srv/app", output="", exit_code=0, status="completed"),
+                        CommandLog(
+                            command="git pull",
+                            output="line 1\nline 2\nline 3",
+                            exit_code=0,
+                            status="completed",
+                        ),
+                    ],
+                ),
+            ),
+        ):
+            result = run_script(blocks, verbose=True, output_tail_lines=2)
+
+        captured = capsys.readouterr()
+        assert result.success is True
+        assert "$ cd /srv/app" in captured.out
+        assert "$ git pull" in captured.out
+        assert "line 2" in captured.out
+        assert "line 3" in captured.out
+        assert "line 1" not in captured.out
+
 
 # =============================================================================
 # CLI Tests
@@ -1663,6 +1751,18 @@ class TestCreateParser:
         parser = create_parser()
         args = parser.parse_args(["run", "script.sh", "--verbose"])
         assert args.verbose is True
+
+    def test_run_command_output_lines_default(self) -> None:
+        """Test run command uses the default command output tail line count."""
+        parser = create_parser()
+        args = parser.parse_args(["run", "script.sh"])
+        assert args.output_lines == 20
+
+    def test_run_command_output_lines_override(self) -> None:
+        """Test run command accepts a custom command output tail line count."""
+        parser = create_parser()
+        args = parser.parse_args(["run", "script.sh", "--output-lines", "7"])
+        assert args.output_lines == 7
 
     def test_run_command_json(self) -> None:
         """Test run command with JSON flag."""

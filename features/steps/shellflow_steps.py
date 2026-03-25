@@ -763,14 +763,16 @@ def step_when_inspect_generated_remote_script_payload(context: Context) -> None:
     if ssh_config is None:
         raise AssertionError(f"Remote host not configured for test: {block.host}")
 
-    mock_result = mock.Mock(returncode=0, stdout="", stderr="")
-    with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+    with mock.patch(
+        "shellflow._run_remote_subprocess",
+        return_value=("", "", 0, False, False),
+    ) as mock_run:
         result = execute_remote(block, ExecutionContext(), ssh_config)
 
     if not result.success:
         raise AssertionError(f"Expected execute_remote to succeed, got: {result}")
 
-    context.stdout = mock_run.call_args.kwargs["input"]
+    context.stdout = mock_run.call_args.args[1]
     context.stderr = ""
     context.exit_code = 0
 
