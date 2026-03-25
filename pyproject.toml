@@ -1,6 +1,6 @@
 [project]
 name = "shellflow"
-version = "0.2.2"
+version = "0.2.3"
 description = "A minimal shell script orchestrator with SSH support"
 readme = "README.md"
 license = "Apache-2.0"
@@ -39,11 +39,11 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "pytest>=9.0.1",
-    "pytest-cov>=7.0.0",
+    "pytest-cov>=7.1.0",
     "pytest-asyncio>=1.3.0",
     "pytest-benchmark>=5.2.3",
-    "ruff>=0.15.5",
-    "ty>=0.0.21",
+    "ruff>=0.15.7",
+    "ty>=0.0.25",
     "behave>=1.3.3",
     "hypothesis>=6.151.9",
     "shellflow",
