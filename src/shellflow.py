@@ -849,8 +849,6 @@ def _execute_single_command(
         stdout = result.stdout.strip() if result.stdout else ""
         stderr = result.stderr.strip() if result.stderr else ""
         combined = _combine_output(stdout, stderr)
-        return combined, result.returncode, stdout, stderr
-
     except subprocess.TimeoutExpired as e:
         stdout = _stringify_subprocess_stream(e.output).strip()
         stderr = _stringify_subprocess_stream(e.stderr).strip()
@@ -858,6 +856,8 @@ def _execute_single_command(
         return combined, -1, stdout, stderr
     except (OSError, subprocess.SubprocessError) as e:
         return str(e), -1, "", str(e)
+    else:
+        return combined, result.returncode, stdout, stderr
 
 
 def execute_local(
@@ -1289,8 +1289,8 @@ def _execute_block_commands_sequential(
     context: ExecutionContext,
     no_input: bool,
     verbose: bool,
-    _block_index: int,  # Unused but kept for API consistency
-    _total_blocks: int,  # Unused but kept for API consistency
+    block_index: int,
+    total_blocks: int,
 ) -> ExecutionResult:
     """Execute block commands sequentially, printing output after each command.
 
@@ -1300,7 +1300,17 @@ def _execute_block_commands_sequential(
     # ANSI color codes
     RED = "\033[91m"
     DIM = "\033[90m"
+    BLUE = "\033[94m"
+    YELLOW = "\033[93m"
     RESET = "\033[0m"
+
+    # Print block header if verbose
+    if verbose:
+        if block.is_local:
+            print(f"{BLUE}[{block_index}/{total_blocks}] LOCAL{RESET}")
+        else:
+            host = block.host or "unknown"
+            print(f"{YELLOW}[{block_index}/{total_blocks}] REMOTE: {host}{RESET}")
 
     all_outputs: list[str] = []
     all_stdout: list[str] = []
@@ -1309,46 +1319,39 @@ def _execute_block_commands_sequential(
     success = True
 
     commands_to_execute = _iter_display_commands(block.commands)
-    ssh_config = None
-    if block.is_remote:
-        host = block.host
-        if host:
-            ssh_config = read_ssh_config(host)
 
     for cmd in commands_to_execute:
         # Print the command being executed
         if verbose:
             print(f"{DIM}$ {cmd}{RESET}")
 
-        # Execute single command
-        output, exit_code, stdout, stderr = _execute_single_command(
-            command=cmd,
-            context=context,
+        # Execute single command using a single-command block
+        single_block = Block(
+            target=block.target,
+            commands=[cmd],
             shell=block.shell,
-            no_input=no_input,
-            is_remote=block.is_remote,
-            host=block.host,
-            ssh_config=ssh_config,
+            timeout_seconds=block.timeout_seconds,
         )
+        result = _execute_block_once(single_block, context, no_input=no_input)
 
         # Store outputs
-        all_outputs.append(output)
-        if stdout:
-            all_stdout.append(stdout)
-        if stderr:
-            all_stderr.append(stderr)
+        all_outputs.append(result.output)
+        if result.stdout:
+            all_stdout.append(result.stdout)
+        if result.stderr:
+            all_stderr.append(result.stderr)
 
         # Print output immediately with truncation
-        if verbose and output:
-            truncated = _truncate_output_lines(output, MAX_OUTPUT_LINES)
+        if verbose and result.output:
+            truncated = _truncate_output_lines(result.output, MAX_OUTPUT_LINES)
             print(truncated)
 
         # Check for failure
-        if exit_code != 0:
-            final_exit_code = exit_code
+        if not result.success:
+            final_exit_code = result.exit_code
             success = False
             if verbose:
-                print(f"{RED}✗ Command failed with exit code {exit_code}{RESET}\n")
+                print(f"{RED}✗ Command failed with exit code {result.exit_code}{RESET}\n")
             break
 
     combined_output = "\n".join(filter(None, all_outputs))
@@ -1440,6 +1443,10 @@ def run_script(  # noqa: PLR0915
 
         # Execute the block
         if sequential_output and verbose:
+            # Print context before executing
+            for env_line in _iter_display_context(context):
+                print(f"{DIM}@env {env_line}{RESET}")
+
             # Use sequential execution with per-command output
             attempt_count = 0
             max_attempts = block.retry_count + 1
@@ -1456,6 +1463,12 @@ def run_script(  # noqa: PLR0915
 
                 if verbose:
                     print(f"{YELLOW}↻ Retrying attempt {attempt_count + 1}/{max_attempts}{RESET}")
+
+            # Print success/failure status
+            if result.success:
+                print(f"{GREEN}✓ Success{RESET}\n")
+            else:
+                print(f"{RED}✗ Failed: {result.error_message}{RESET}\n")
 
             block_results.append(result)
             events.append(_make_block_finished_event(run_id, result, block, total_blocks))
