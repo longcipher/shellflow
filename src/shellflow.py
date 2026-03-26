@@ -663,10 +663,16 @@ def _build_shell_bootstrap(shell: str | None) -> list[str]:
 
     shell_name = Path(shell).name
     if shell_name == "zsh":
-        return ["test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }"]
+        return [
+            "set +x 2>/dev/null || true",
+            "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }",
+        ]
     if shell_name == "bash":
-        return ["test -f ~/.bashrc && { set +e; . ~/.bashrc >/dev/null 2>&1; set -e; }"]
-    return []
+        return [
+            "set +x 2>/dev/null || true",
+            "test -f ~/.bashrc && { set +e; . ~/.bashrc >/dev/null 2>&1; set -e; }",
+        ]
+    return ["set +x 2>/dev/null || true"]
 
 
 def _build_context_exports(context: ExecutionContext) -> list[str]:
@@ -805,7 +811,7 @@ def _truncate_output_lines(output: str, max_lines: int = MAX_OUTPUT_LINES) -> st
     return "\n".join(truncated)
 
 
-def _parse_remote_command_logs(
+def _parse_remote_command_logs(  # noqa: PLR0915
     output: str,
     *,
     success: bool,
@@ -813,74 +819,136 @@ def _parse_remote_command_logs(
     interrupted: bool = False,
     trailing_error_output: str = "",
 ) -> list[CommandLog]:
-    """Parse traced remote output into one journal entry per command."""
+    """Parse delimiter-separated remote output into one journal entry per command."""
     command_logs: list[CommandLog] = []
-    current_command: str | None = None
-    current_output: list[str] = []
 
-    def flush_current() -> None:
-        nonlocal current_command, current_output
-        if current_command is None:
-            current_output = []
-            return
-        command_logs.append(CommandLog(command=current_command, output="\n".join(current_output).strip()))
-        current_command = None
-        current_output = []
-
+    # Find the delimiter from the output
+    delim = None
     for line in output.splitlines():
-        marker_index = line.find(TRACE_MARKER)
-        if marker_index >= 0:
-            flush_current()
-            current_command = line[marker_index + len(TRACE_MARKER) :].strip()
-            continue
-        if current_command is not None:
-            current_output.append(line)
+        if line.startswith("__SHELLFLOW_START_") and line.endswith("__"):
+            candidate = line[len("__SHELLFLOW_START_") : -2]
+            if candidate:
+                delim = candidate
+                break
 
-    flush_current()
-
-    if trailing_error_output.strip():
-        if command_logs:
-            last_output = command_logs[-1].output
-            command_logs[-1].output = _combine_output(last_output, trailing_error_output)
-        else:
-            command_logs.append(CommandLog(command="<remote-command>", output=trailing_error_output.strip()))
-
-    if not command_logs:
+    if delim is None:
+        # Fallback: no delimiters found, treat entire output as one command
+        cleaned = _strip_trace_markers(output)
+        combined = _combine_output(cleaned, trailing_error_output) if trailing_error_output else cleaned
+        if combined:
+            command_logs.append(
+                CommandLog(
+                    command="<remote-command>",
+                    output=combined,
+                    exit_code=exit_code,
+                    status="completed" if success else "failed",
+                )
+            )
         return command_logs
 
-    for command_log in command_logs[:-1]:
-        command_log.exit_code = 0
-        command_log.status = "completed"
+    start_marker = f"__SHELLFLOW_START_{delim}__"
+    end_marker = f"__SHELLFLOW_END_{delim}__"
 
-    last_command = command_logs[-1]
-    if success:
-        last_command.exit_code = 0
-        last_command.status = "completed"
-    elif interrupted:
-        last_command.exit_code = exit_code
-        last_command.status = "interrupted"
-    else:
-        last_command.exit_code = exit_code
-        last_command.status = "failed"
+    # Split output by start markers
+    parts = output.split(start_marker)
+
+    for part in parts[1:]:  # Skip text before the first start marker
+        ec = None
+        lines = part.split("\n")
+
+        # Find end marker and exit code
+        output_lines: list[str] = []
+        for line in lines:
+            if line.strip() == end_marker.strip():
+                continue
+            if line.startswith("__SHELLFLOW_EXITCODE__"):
+                try:
+                    ec = int(line[len("__SHELLFLOW_EXITCODE__") :].strip())
+                except ValueError:
+                    ec = None
+                continue
+            if line.startswith("__SHELLFLOW_"):
+                continue
+            output_lines.append(line)
+
+        cleaned_output = "\n".join(output_lines).strip()
+        cleaned_output = _strip_trace_markers(cleaned_output)
+
+        command_logs.append(
+            CommandLog(
+                command="<remote-command>",
+                output=cleaned_output,
+                exit_code=ec,
+                status="completed",
+            )
+        )
+
+    # Assign proper commands from the block
+    # (callers should set command names after parsing)
+
+    # Set status based on overall result
+    if command_logs:
+        for cl in command_logs[:-1]:
+            if cl.exit_code is None:
+                cl.exit_code = 0
+            cl.status = "completed" if cl.exit_code == 0 else "failed"
+
+        last = command_logs[-1]
+        if success:
+            last.status = "completed"
+            if last.exit_code is None:
+                last.exit_code = 0
+        elif interrupted:
+            last.status = "interrupted"
+            if last.exit_code is None:
+                last.exit_code = exit_code
+        else:
+            last.status = "failed"
+            if last.exit_code is None:
+                last.exit_code = exit_code
+
+    # Append SSH-level stderr to the last command
+    if trailing_error_output.strip():
+        if command_logs:
+            last = command_logs[-1]
+            last.output = _combine_output(last.output, trailing_error_output)
+        else:
+            command_logs.append(
+                CommandLog(
+                    command="<remote-command>",
+                    output=trailing_error_output.strip(),
+                    exit_code=exit_code,
+                    status="failed",
+                )
+            )
 
     return command_logs
 
 
 def _build_remote_trace_script(block: Block, context: ExecutionContext, shell: str) -> str:
-    """Build a traced remote script that preserves shell state while journaling commands."""
-    script_lines = ["set -e"]
+    """Build a remote script with delimiter-based output separation.
+
+    Each command's combined stdout/stderr is wrapped between unique delimiters
+    so that the Python caller can cleanly associate output with commands even
+    when shell init files produce xtrace noise.
+    """
+    delimiter = uuid.uuid4().hex[:16]
+    script_lines: list[str] = [
+        "set +x 2>/dev/null || true",
+        f"__SHELLFLOW_DELIM__={delimiter}",
+    ]
     script_lines.extend(_build_context_exports(context))
     script_lines.extend(_build_shell_bootstrap(shell))
-    script_lines.extend(
-        [
-            "exec 3>&1",
-            f"export PS4={_quote_shell_value(TRACE_MARKER)}",
-            "export BASH_XTRACEFD=3",
-            "export XTRACEFD=3",
-            "set -x",
-        ]
-    )
-    script_lines.extend(block.commands)
+
+    for command in block.commands:
+        if not command.strip() or command.lstrip().startswith("#"):
+            continue
+        script_lines.append('echo "__SHELLFLOW_START_${__SHELLFLOW_DELIM__}__"')
+        script_lines.append(f"{{ {command} ; }} 2>&1")
+        script_lines.append("__SHELLFLOW_EC__=$?")
+        script_lines.append('echo "__SHELLFLOW_END_${__SHELLFLOW_DELIM__}__"')
+        script_lines.append('echo "__SHELLFLOW_EXITCODE__${__SHELLFLOW_EC__}"')
+
     return "\n".join(script_lines)
 
 
@@ -1184,7 +1252,11 @@ def execute_remote(
         ssh_args.extend(["-F", str(ssh_config_path)])
 
     shell = block.shell or "bash"
-    ssh_args.extend(["-o", "BatchMode=yes", host, shell, "-l", "-s", "-e"])
+    # Use --no-rcs for zsh or --norc for bash to prevent sourcing initialization files
+    if "zsh" in shell:
+        ssh_args.extend(["-o", "BatchMode=yes", host, shell, "--no-rcs", "-s", "-e"])
+    else:
+        ssh_args.extend(["-o", "BatchMode=yes", host, shell, "--norc", "-s", "-e"])
     remote_script = _build_remote_trace_script(block, context, shell)
 
     try:
@@ -1194,12 +1266,13 @@ def execute_remote(
             timeout_seconds=block.timeout_seconds,
         )
         cleaned_stdout = _strip_trace_markers(stdout)
+        cleaned_stderr = _strip_trace_markers(stderr)
         command_logs = _parse_remote_command_logs(
             stdout,
             success=exit_code == 0 and not interrupted and not timed_out,
             exit_code=exit_code,
             interrupted=interrupted,
-            trailing_error_output=stderr,
+            trailing_error_output=cleaned_stderr,
         )
 
         success = exit_code == 0 and not interrupted and not timed_out
@@ -1216,11 +1289,11 @@ def execute_remote(
 
         return ExecutionResult(
             success=success,
-            output=_combine_output(cleaned_stdout, stderr),
+            output=_combine_output(cleaned_stdout, cleaned_stderr),
             exit_code=result_exit_code,
             error_message=error_message,
             stdout=cleaned_stdout,
-            stderr=stderr.strip(),
+            stderr=cleaned_stderr,
             timed_out=timed_out,
             timeout_seconds=block.timeout_seconds,
             failure_kind=failure_kind,
@@ -1514,13 +1587,22 @@ def _execute_remote_block_sequential(
     result = _execute_block_once(block, context, no_input=no_input)
 
     if verbose:
+        # Assign actual command names to parsed logs
+        if result.command_logs:
+            for i, cl in enumerate(result.command_logs):
+                if i < len(commands_to_execute):
+                    cl.command = commands_to_execute[i]
+
+        # Print each command with its output
         if result.command_logs:
             _print_command_logs(result.command_logs, output_tail_lines)
-        elif result.output:
+        else:
+            # Fallback: no command logs, just show commands
             for cmd in commands_to_execute:
                 print(f"{DIM}$ {cmd}{RESET}")
-            truncated = _truncate_output_lines(result.output, output_tail_lines)
-            print(truncated)
+            if result.output:
+                truncated = _truncate_output_lines(result.output, output_tail_lines)
+                print(truncated)
 
     context.last_output = result.output
     context.success = result.success
@@ -1531,6 +1613,27 @@ def _execute_remote_block_sequential(
     return result
 
 
+def _build_local_trace_script(block: Block, context: ExecutionContext, shell: str | None) -> str:
+    """Build a local script without tracing for clean output.
+
+    For local execution, we execute all commands in a single script without
+    tracing to ensure clean output interleaving. Each command's output
+    (stdout and stderr) will be shown in order.
+    """
+    script_lines = ["set -e"]
+    script_lines.extend(_build_context_exports(context))
+    script_lines.extend(_build_shell_bootstrap(shell))
+
+    # Add all user commands without tracing
+    for command in block.commands:
+        if command.strip() and not command.lstrip().startswith("#"):
+            script_lines.append(command)
+        else:
+            script_lines.append(command)
+
+    return "\n".join(script_lines)
+
+
 def _execute_local_block_sequential(
     block: Block,
     context: ExecutionContext,
@@ -1539,63 +1642,33 @@ def _execute_local_block_sequential(
     commands_to_execute: list[str],
     output_tail_lines: int,
 ) -> ExecutionResult:
-    """Execute local block commands one at a time for verbose output."""
+    """Execute local block as a single script for proper multi-line command handling."""
     RED = "\033[91m"
     DIM = "\033[90m"
     RESET = "\033[0m"
 
-    all_outputs: list[str] = []
-    all_stdout: list[str] = []
-    all_stderr: list[str] = []
-    final_exit_code = 0
-    success = True
-
-    for cmd in commands_to_execute:
-        if verbose:
+    # Print all commands before executing (for verbose mode)
+    if verbose:
+        for cmd in commands_to_execute:
             print(f"{DIM}$ {cmd}{RESET}")
 
-        single_block = Block(
-            target=block.target,
-            commands=[cmd],
-            shell=block.shell,
-            timeout_seconds=block.timeout_seconds,
-        )
-        result = _execute_block_once(single_block, context, no_input=no_input)
+    # Execute the entire block as a single script
+    result = _execute_block_once(block, context, no_input=no_input)
 
-        all_outputs.append(result.output)
-        if result.stdout:
-            all_stdout.append(result.stdout)
-        if result.stderr:
-            all_stderr.append(result.stderr)
+    # Print output if verbose
+    if verbose and result.output:
+        truncated = _truncate_output_lines(result.output, output_tail_lines)
+        print(truncated)
 
-        if verbose and result.output:
-            truncated = _truncate_output_lines(result.output, output_tail_lines)
-            print(truncated)
+    # Print exit code if failed
+    if not result.success and verbose:
+        print(f"{RED}exit {result.exit_code}{RESET}")
 
-        if not result.success:
-            final_exit_code = result.exit_code
-            success = False
-            if verbose:
-                print(f"{RED}✗ Command failed with exit code {result.exit_code}{RESET}\n")
-            break
+    # Update context
+    context.last_output = result.output
+    context.success = result.success
 
-    combined_output = "\n".join(filter(None, all_outputs))
-    combined_stdout = "\n".join(filter(None, all_stdout))
-    combined_stderr = "\n".join(filter(None, all_stderr))
-
-    context.last_output = combined_output
-    context.success = success
-
-    return ExecutionResult(
-        success=success,
-        output=combined_output,
-        exit_code=final_exit_code,
-        error_message="" if success else f"Exit code: {final_exit_code}",
-        stdout=combined_stdout,
-        stderr=combined_stderr,
-        failure_kind=None if success else FAILURE_RUNTIME,
-        no_input=no_input,
-    )
+    return result
 
 
 def run_script(  # noqa: PLR0915
@@ -1702,6 +1775,9 @@ def run_script(  # noqa: PLR0915
                 print(f"{GREEN}✓ Success{RESET}\n")
             else:
                 print(f"{RED}✗ Failed: {result.error_message}{RESET}\n")
+
+            # Apply block exports to context
+            result.exported_env = _apply_block_exports(block, result, context)
 
             block_results.append(result)
             events.append(_make_block_finished_event(run_id, result, block, total_blocks))

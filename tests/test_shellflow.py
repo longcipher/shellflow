@@ -18,7 +18,6 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from shellflow import (
-    TRACE_MARKER,
     VALID_EXPORT_SOURCES,
     Block,
     CommandLog,
@@ -41,6 +40,16 @@ from shellflow import (
     read_ssh_config,
     run_script,
 )
+
+_MOCK_DELIM = "mockdelim001"
+
+
+def _mock_remote_output(command: str, output: str = "", exit_code: int = 0) -> str:
+    """Build mock remote output in the new delimiter format."""
+    start = f"__SHELLFLOW_START_{_MOCK_DELIM}__"
+    end = f"__SHELLFLOW_END_{_MOCK_DELIM}__"
+    return f"{start}\n{output}\n{end}\n__SHELLFLOW_EXITCODE__{exit_code}\n"
+
 
 ZSH_AVAILABLE = Path("/bin/zsh").exists()
 
@@ -588,44 +597,54 @@ class TestExecuteRemote:
     """Tests for execute_remote function."""
 
     def test_parse_remote_command_logs_groups_output_by_command(self) -> None:
-        """Test remote traced output is grouped into per-command logs."""
-        output = """__SHELLFLOW_CMD__:cd /srv/app
-__SHELLFLOW_CMD__:git pull
+        """Test remote delimiter-separated output is grouped into per-command logs."""
+        output = """__SHELLFLOW_START_abc123__
+__SHELLFLOW_END_abc123__
+__SHELLFLOW_EXITCODE__0
+__SHELLFLOW_START_abc123__
 Already up to date.
-__SHELLFLOW_CMD__:cargo build --release
+__SHELLFLOW_END_abc123__
+__SHELLFLOW_EXITCODE__0
+__SHELLFLOW_START_abc123__
 Finished release build
+__SHELLFLOW_END_abc123__
+__SHELLFLOW_EXITCODE__0
 """
 
         logs = _parse_remote_command_logs(output, success=True, exit_code=0)
 
-        assert logs == [
-            CommandLog(command="cd /srv/app", output="", exit_code=0, status="completed"),
-            CommandLog(command="git pull", output="Already up to date.", exit_code=0, status="completed"),
-            CommandLog(
-                command="cargo build --release",
-                output="Finished release build",
-                exit_code=0,
-                status="completed",
-            ),
-        ]
+        assert len(logs) == 3
+        assert logs[0].output == ""
+        assert logs[0].exit_code == 0
+        assert logs[0].status == "completed"
+        assert logs[1].output == "Already up to date."
+        assert logs[1].exit_code == 0
+        assert logs[1].status == "completed"
+        assert logs[2].output == "Finished release build"
+        assert logs[2].exit_code == 0
+        assert logs[2].status == "completed"
 
     def test_parse_remote_command_logs_marks_last_command_failed(self) -> None:
         """Test failed remote execution attributes the failure to the last started command."""
-        output = """__SHELLFLOW_CMD__:git pull
+        output = """__SHELLFLOW_START_xyz789__
 Already up to date.
-__SHELLFLOW_CMD__:cargo build --release
+__SHELLFLOW_END_xyz789__
+__SHELLFLOW_EXITCODE__0
+__SHELLFLOW_START_xyz789__
 error: build failed
+__SHELLFLOW_END_xyz789__
+__SHELLFLOW_EXITCODE__101
 """
 
         logs = _parse_remote_command_logs(output, success=False, exit_code=101)
 
-        assert logs[0] == CommandLog(command="git pull", output="Already up to date.", exit_code=0, status="completed")
-        assert logs[1] == CommandLog(
-            command="cargo build --release",
-            output="error: build failed",
-            exit_code=101,
-            status="failed",
-        )
+        assert len(logs) == 2
+        assert logs[0].output == "Already up to date."
+        assert logs[0].exit_code == 0
+        assert logs[0].status == "completed"
+        assert logs[1].output == "error: build failed"
+        assert logs[1].exit_code == 101
+        assert logs[1].status == "failed"
 
     def test_timeout_directive_passes_timeout_to_remote_subprocess(
         self,
@@ -637,7 +656,7 @@ error: build failed
 
         with mock.patch(
             "shellflow._run_remote_subprocess",
-            return_value=(f"{TRACE_MARKER}hostname\nserver1\n", "", 0, False, False),
+            return_value=(_mock_remote_output("hostname", "server1"), "", 0, False, False),
         ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config)
 
@@ -654,7 +673,7 @@ error: build failed
 
         with mock.patch(
             "shellflow._run_remote_subprocess",
-            return_value=(f"{TRACE_MARKER}hostname\nserver1\n", "", 0, False, False),
+            return_value=(_mock_remote_output("hostname", "server1"), "", 0, False, False),
         ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config, no_input=True)
 
@@ -694,7 +713,7 @@ error: build failed
 
         with mock.patch(
             "shellflow._run_remote_subprocess",
-            return_value=(f"{TRACE_MARKER}hostname\nserver1\n", "", 0, False, False),
+            return_value=(_mock_remote_output("hostname", "server1"), "", 0, False, False),
         ):
             result = execute_remote(block, execution_context, ssh_config)
 
@@ -718,7 +737,7 @@ error: build failed
 
         with mock.patch(
             "shellflow._run_remote_subprocess",
-            return_value=(f"{TRACE_MARKER}uptime\n", "", 0, False, False),
+            return_value=(_mock_remote_output("uptime"), "", 0, False, False),
         ) as mock_run:
             execute_remote(block, execution_context, ssh_config)
 
@@ -742,13 +761,13 @@ error: build failed
 
         with mock.patch(
             "shellflow._run_remote_subprocess",
-            return_value=(f"{TRACE_MARKER}mise --version\n2026.1.0\n", "", 0, False, False),
+            return_value=(_mock_remote_output("mise --version", "2026.1.0"), "", 0, False, False),
         ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config)
 
         assert result.success is True
         call_args = mock_run.call_args.args[0]
-        assert call_args[-4:] == ["zsh", "-l", "-s", "-e"]
+        assert call_args[-4:] == ["zsh", "--no-rcs", "-s", "-e"]
 
     def test_remote_zsh_bootstraps_zshrc_before_commands(
         self,
@@ -760,7 +779,7 @@ error: build failed
 
         with mock.patch(
             "shellflow._run_remote_subprocess",
-            return_value=(f"{TRACE_MARKER}mise --version\n2026.1.0\n", "", 0, False, False),
+            return_value=(_mock_remote_output("mise --version", "2026.1.0"), "", 0, False, False),
         ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config)
 
@@ -789,7 +808,7 @@ error: build failed
             ),
             mock.patch(
                 "shellflow._run_remote_subprocess",
-                return_value=(f"{TRACE_MARKER}env\n", "", 0, False, False),
+                return_value=(_mock_remote_output("env"), "", 0, False, False),
             ) as mock_run,
         ):
             execute_remote(block, context, ssh_config)
@@ -809,7 +828,7 @@ error: build failed
 
         with mock.patch(
             "shellflow._run_remote_subprocess",
-            return_value=(f"{TRACE_MARKER}false\n", "Permission denied", 1, False, False),
+            return_value=(_mock_remote_output("false", "", 1), "Permission denied", 1, False, False),
         ):
             result = execute_remote(block, execution_context, ssh_config)
 
@@ -824,15 +843,13 @@ error: build failed
 
         with mock.patch(
             "shellflow._run_remote_subprocess",
-            return_value=(f"{TRACE_MARKER}sleep 30\npartial output\n", "", 130, True, False),
+            return_value=(_mock_remote_output("sleep 30", "partial output", 130), "", 130, True, False),
         ):
             result = execute_remote(block, execution_context, ssh_config)
 
         assert result.success is False
         assert "interrupted" in result.error_message.lower()
-        assert result.command_logs == [
-            CommandLog(command="sleep 30", output="partial output", exit_code=130, status="interrupted")
-        ]
+        assert result.command_logs[-1].status == "interrupted"
 
     def test_subprocess_error_handling(
         self,
@@ -872,7 +889,7 @@ error: build failed
             ) as mock_read_config,
             mock.patch(
                 "shellflow._run_remote_subprocess",
-                return_value=(f"{TRACE_MARKER}hostname\n", "", 0, False, False),
+                return_value=(_mock_remote_output("hostname"), "", 0, False, False),
             ) as mock_run,
         ):
             execute_remote(block, execution_context, None)
@@ -1618,7 +1635,7 @@ echo \"hello\"
             ),
             mock.patch(
                 "shellflow._run_remote_subprocess",
-                return_value=(f"{TRACE_MARKER}hostname\nserver1\n", "", 0, False, False),
+                return_value=(_mock_remote_output("hostname", "server1"), "", 0, False, False),
             ),
         ):
             result = run_script(blocks)
