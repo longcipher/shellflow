@@ -290,6 +290,14 @@ FAILURE_TIMEOUT = "timeout"
 VALID_EXPORT_SOURCES = {"stdout", "stderr", "output", "exit_code"}
 SECRET_LIKE_ENV_PATTERNS = ("TOKEN", "SECRET", "PASSWORD")
 
+# ANSI color codes
+ANSI_RESET = "\033[0m"
+ANSI_RED = "\033[91m"
+ANSI_GREEN = "\033[92m"
+ANSI_YELLOW = "\033[93m"
+ANSI_BLUE = "\033[94m"
+ANSI_DIM = "\033[90m"
+
 
 def _exit_code_for_failure(failure_kind: str | None) -> int:
     """Map a failure category to the stable CLI exit code."""
@@ -1625,11 +1633,7 @@ def _build_local_trace_script(block: Block, context: ExecutionContext, shell: st
     script_lines.extend(_build_shell_bootstrap(shell))
 
     # Add all user commands without tracing
-    for command in block.commands:
-        if command.strip() and not command.lstrip().startswith("#"):
-            script_lines.append(command)
-        else:
-            script_lines.append(command)
+    script_lines.extend(block.commands)
 
     return "\n".join(script_lines)
 
