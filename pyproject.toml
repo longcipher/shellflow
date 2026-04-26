@@ -1,6 +1,6 @@
 [project]
 name = "shellflow"
-version = "0.3.0"
+version = "0.4.0"
 description = "A minimal shell script orchestrator with SSH support"
 readme = "README.md"
 license = "Apache-2.0"

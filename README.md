@@ -224,6 +224,20 @@ Shellflow intentionally does not provide:
 
 Those decisions belong in the outer agent or automation layer.
 
+### Agent-Native Logging Optimizations
+
+Shellflow includes several logging optimizations specifically designed for LLM agent consumption:
+
+- **ANSI Escape Sequence Stripping**: Automatically removes color codes, cursor movements, and other terminal control sequences that would consume unnecessary tokens in LLM context windows.
+
+- **Command-Level Granularity**: Uses `set -x` with custom `PS4` prompts to provide per-command execution traces, allowing agents to pinpoint exactly which command failed in a multi-command block.
+
+- **Stream Debouncing**: Implements intelligent buffering for progress bars and streaming output, preventing token waste from rapid `\r` updates while ensuring important output isn't lost.
+
+- **Semantic Pipeline**: Transforms raw terminal output into structured, agent-friendly data with clean text and preserved timing information.
+
+These optimizations ensure that when agents process Shellflow's JSONL output, they receive clean, actionable data without the visual formatting artifacts that make terminal output human-friendly but LLM-confusing.
+
 ## CLI
 
 ```text
