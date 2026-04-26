@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 # =============================================================================
 # Data Classes
@@ -336,10 +336,13 @@ def _stringify_subprocess_stream(value: Any) -> str:
 # =============================================================================
 
 
+# Global SSH config resolver
+
+
 def read_ssh_config(host: str) -> SSHConfig | None:
     """Read SSH configuration for a host from ~/.ssh/config.
 
-    Uses paramiko.SSHConfig if available, otherwise falls back to basic parsing.
+    Uses SSHConfigResolver with multiple providers (paramiko, basic parsing).
 
     Args:
         host: The host alias to look up.
@@ -347,37 +350,7 @@ def read_ssh_config(host: str) -> SSHConfig | None:
     Returns:
         SSHConfig object if found, None otherwise.
     """
-    ssh_config_path = _get_ssh_config_path()
-    if not ssh_config_path.exists():
-        return None
-
-    try:
-        # Try to use paramiko if available
-        import paramiko
-
-        ssh_config = paramiko.SSHConfig()
-        with ssh_config_path.open() as handle:
-            ssh_config.parse(handle)
-
-        if not _ssh_config_matches_host(ssh_config, host):
-            return None
-
-        lookup = ssh_config.lookup(host)
-        if not lookup:
-            return None
-
-        return SSHConfig(
-            host=host,
-            hostname=lookup.get("hostname"),
-            user=lookup.get("user"),
-            port=int(lookup.get("port", 22)),
-            identity_file=lookup.get("identityfile", [None])[0]
-            if isinstance(lookup.get("identityfile"), list)
-            else lookup.get("identityfile"),
-        )
-    except (AttributeError, ImportError):
-        # Fall back to basic parsing
-        return _parse_ssh_config_basic(ssh_config_path, host)
+    return _ssh_config_resolver.resolve(host)
 
 
 def _ssh_config_matches_host(ssh_config: Any, host: str) -> bool:
@@ -1180,18 +1153,10 @@ def execute_local(
             failure_kind=FAILURE_TIMEOUT,
             no_input=no_input,
         )
-    except (OSError, subprocess.SubprocessError) as e:
-        return ExecutionResult(
-            success=False,
-            output="",
-            exit_code=-1,
-            error_message=str(e),
-            stdout="",
-            stderr="",
-            timeout_seconds=block.timeout_seconds,
-            failure_kind=FAILURE_RUNTIME,
-            no_input=no_input,
-        )
+    except subprocess.SubprocessError as e:
+        return ShellflowExceptionHandler.handle_subprocess_error(e, block, no_input)
+    except OSError as e:
+        return ShellflowExceptionHandler.handle_os_error(e, block, no_input)
 
 
 def execute_remote(
@@ -1308,18 +1273,10 @@ def execute_remote(
             no_input=no_input,
             command_logs=command_logs,
         )
-    except (OSError, subprocess.SubprocessError) as e:
-        return ExecutionResult(
-            success=False,
-            output="",
-            exit_code=-1,
-            error_message=str(e),
-            stdout="",
-            stderr="",
-            timeout_seconds=block.timeout_seconds,
-            failure_kind=FAILURE_RUNTIME,
-            no_input=no_input,
-        )
+    except subprocess.SubprocessError as e:
+        return ShellflowExceptionHandler.handle_subprocess_error(e, block, no_input)
+    except OSError as e:
+        return ShellflowExceptionHandler.handle_os_error(e, block, no_input)
 
 
 def _new_run_id() -> str:
@@ -1482,29 +1439,13 @@ def _finalize_block_result(result: ExecutionResult, block: Block, index: int, st
     return result
 
 
+# Global executor factory instance
+
+
 def _execute_block_once(block: Block, context: ExecutionContext, *, no_input: bool) -> ExecutionResult:
-    """Execute one block attempt using the existing local and remote seams."""
-    if block.is_local:
-        if no_input:
-            return execute_local(block, context, no_input=True)
-        return execute_local(block, context)
-
-    host = block.host
-    if not host:
-        return ExecutionResult(
-            success=False,
-            output="",
-            exit_code=-1,
-            error_message="No host specified for remote block",
-            failure_kind=FAILURE_SSH_CONFIG,
-            no_input=no_input,
-            timeout_seconds=block.timeout_seconds,
-        )
-
-    ssh_config = read_ssh_config(host)
-    if no_input:
-        return execute_remote(block, context, ssh_config, no_input=True)
-    return execute_remote(block, context, ssh_config)
+    """Execute one block attempt using the executor abstraction."""
+    executor = _executor_factory.get_executor(block)
+    return executor.execute(block, context, no_input)
 
 
 def _emit_structured_output_json(run_result: RunResult) -> None:
@@ -1526,8 +1467,259 @@ def _write_audit_log(path: Path, run_result: RunResult) -> None:
 
 
 # =============================================================================
+# SSH Configuration Abstraction
+# =============================================================================
+
+
+class SSHConfigProvider(Protocol):
+    """Protocol for SSH configuration providers."""
+    
+    def get_config(self, host: str) -> SSHConfig | None:
+        """Get SSH configuration for a host."""
+        ...
+
+
+class ParamikoSSHConfigProvider:
+    """SSH config provider using paramiko."""
+    
+    def get_config(self, host: str) -> SSHConfig | None:
+        """Get SSH config using paramiko."""
+        ssh_config_path = _get_ssh_config_path()
+        if not ssh_config_path.exists():
+            return None
+        
+        try:
+            import paramiko
+            
+            ssh_config = paramiko.SSHConfig()
+            with ssh_config_path.open() as handle:
+                ssh_config.parse(handle)
+            
+            if not _ssh_config_matches_host(ssh_config, host):
+                return None
+            
+            lookup = ssh_config.lookup(host)
+            if not lookup:
+                return None
+            
+            return SSHConfig(
+                host=host,
+                hostname=lookup.get("hostname"),
+                user=lookup.get("user"),
+                port=int(lookup.get("port", 22)),
+                identity_file=lookup.get("identityfile", [None])[0]
+                if isinstance(lookup.get("identityfile"), list)
+                else lookup.get("identityfile"),
+            )
+        except (AttributeError, ImportError):
+            return None
+
+
+class BasicSSHConfigProvider:
+    """Basic SSH config provider without paramiko."""
+    
+    def get_config(self, host: str) -> SSHConfig | None:
+        """Get SSH config using basic parsing."""
+        ssh_config_path = _get_ssh_config_path()
+        if not ssh_config_path.exists():
+            return None
+        
+        return _parse_ssh_config_basic(ssh_config_path, host)
+
+
+class SSHConfigResolver:
+    """Resolves SSH configuration using multiple providers."""
+    
+    def __init__(self, providers: list[SSHConfigProvider] | None = None):
+        """Initialize resolver with optional providers."""
+        self.providers = providers or [
+            ParamikoSSHConfigProvider(),
+            BasicSSHConfigProvider(),
+        ]
+    
+    def resolve(self, host: str) -> SSHConfig | None:
+        """Resolve SSH config for a host using available providers."""
+        for provider in self.providers:
+            try:
+                config = provider.get_config(host)
+                if config:
+                    return config
+            except Exception:
+                continue
+        return None
+
+
+_ssh_config_resolver = SSHConfigResolver()
+
+
+# =============================================================================
+# Unified Exception Handling
+# =============================================================================
+
+
+class ShellflowExceptionHandler:
+    """Centralized exception handling for Shellflow operations."""
+    
+    @staticmethod
+    def handle_subprocess_error(error: subprocess.SubprocessError, block: Block, no_input: bool) -> ExecutionResult:
+        """Handle subprocess execution errors."""
+        return ExecutionResult(
+            success=False,
+            output="",
+            exit_code=-1,
+            error_message=str(error),
+            stdout="",
+            stderr="",
+            timeout_seconds=block.timeout_seconds,
+            failure_kind=FAILURE_RUNTIME,
+            no_input=no_input,
+        )
+    
+    @staticmethod
+    def handle_os_error(error: OSError, block: Block, no_input: bool) -> ExecutionResult:
+        """Handle OS-level errors."""
+        return ExecutionResult(
+            success=False,
+            output="",
+            exit_code=-1,
+            error_message=str(error),
+            stdout="",
+            stderr="",
+            timeout_seconds=block.timeout_seconds,
+            failure_kind=FAILURE_RUNTIME,
+            no_input=no_input,
+        )
+    
+    @staticmethod
+    def handle_timeout(block: Block, no_input: bool) -> ExecutionResult:
+        """Handle timeout errors."""
+        return ExecutionResult(
+            success=False,
+            output="",
+            exit_code=-1,
+            error_message=f"Timed out after {block.timeout_seconds} second(s)",
+            stdout="",
+            stderr="",
+            timed_out=True,
+            timeout_seconds=block.timeout_seconds,
+            failure_kind=FAILURE_TIMEOUT,
+            no_input=no_input,
+        )
+    
+    @staticmethod
+    def handle_ssh_config_error(host: str, block: Block, no_input: bool) -> ExecutionResult:
+        """Handle SSH configuration errors."""
+        ssh_config_path = _get_ssh_config_path()
+        return ExecutionResult(
+            success=False,
+            output="",
+            exit_code=-1,
+            error_message=(f"Remote host '{host}' was not found in SSH config: {ssh_config_path}"),
+            stdout="",
+            stderr="",
+            failure_kind=FAILURE_SSH_CONFIG,
+            no_input=no_input,
+            timeout_seconds=block.timeout_seconds,
+        )
+
+
+# =============================================================================
+# Execution Abstraction
+# =============================================================================
+
+
+class BlockExecutor(Protocol):
+    """Protocol for block execution strategies."""
+    
+    def execute(
+        self,
+        block: Block,
+        context: ExecutionContext,
+        no_input: bool = False,
+    ) -> ExecutionResult:
+        """Execute a block and return the result."""
+        ...
+
+
+class LocalExecutor:
+    """Executor for local block execution."""
+    
+    def execute(
+        self,
+        block: Block,
+        context: ExecutionContext,
+        no_input: bool = False,
+    ) -> ExecutionResult:
+        """Execute a local block."""
+        if no_input:
+            return execute_local(block, context, no_input=True)
+        return execute_local(block, context)
+
+
+class RemoteExecutor:
+    """Executor for remote block execution via SSH."""
+    
+    def execute(
+        self,
+        block: Block,
+        context: ExecutionContext,
+        no_input: bool = False,
+    ) -> ExecutionResult:
+        """Execute a remote block."""
+        host = block.host
+        if not host:
+            return ExecutionResult(
+                success=False,
+                output="",
+                exit_code=-1,
+                error_message="No host specified for remote block",
+                stdout="",
+                stderr="",
+                failure_kind=FAILURE_SSH_CONFIG,
+                no_input=no_input,
+                timeout_seconds=block.timeout_seconds,
+            )
+        
+        ssh_config = read_ssh_config(host)
+        if ssh_config is None:
+            ssh_config_path = _get_ssh_config_path()
+            return ExecutionResult(
+                success=False,
+                output="",
+                exit_code=-1,
+                error_message=(f"Remote host '{host}' was not found in SSH config: {ssh_config_path}"),
+                stdout="",
+                stderr="",
+                failure_kind=FAILURE_SSH_CONFIG,
+                no_input=no_input,
+                timeout_seconds=block.timeout_seconds,
+            )
+        
+        return execute_remote(block, context, ssh_config, no_input)
+
+
+class ExecutorFactory:
+    """Factory for creating appropriate executors for blocks."""
+    
+    def __init__(self):
+        """Initialize factory."""
+        self.remote_executor = RemoteExecutor()
+        self.local_executor = LocalExecutor()
+    
+    def get_executor(self, block):
+        """Get appropriate executor for a block."""
+        if block.is_local:
+            return self.local_executor
+        return self.remote_executor
+
+
+_executor_factory = ExecutorFactory()
+
+
+# =============================================================================
 # Script Runner
 # =============================================================================
+
 
 
 def _execute_block_commands_sequential(
@@ -1675,6 +1867,191 @@ def _execute_local_block_sequential(
     return result
 
 
+def _get_verbose_colors() -> dict[str, str]:
+    """Get ANSI color codes for verbose output."""
+    return {
+        "GREEN": "\033[92m",
+        "RED": "\033[91m",
+        "BLUE": "\033[94m",
+        "YELLOW": "\033[93m",
+        "DIM": "\033[90m",
+        "RESET": "\033[0m",
+    }
+
+
+def _execute_dry_run(
+    blocks: list[Block],
+    run_id: str,
+    total_blocks: int,
+    no_input: bool,
+    verbose: bool,
+    colors: dict[str, str],
+) -> RunResult:
+    """Execute dry run - preview execution plan without running commands."""
+    events = [_make_dry_run_started_event(run_id, total_blocks, no_input=no_input)]
+    
+    for i, block in enumerate(blocks, 1):
+        block_id = _make_block_id(i)
+        events.append(_make_dry_run_block_event(run_id, block_id, i, block, total_blocks))
+        if verbose:
+            if block.is_local:
+                print(f"{colors['BLUE']}[plan {i}/{len(blocks)}] LOCAL{colors['RESET']}")
+            else:
+                host = block.host or "unknown"
+                print(f"{colors['YELLOW']}[plan {i}/{len(blocks)}] REMOTE: {host}{colors['RESET']}")
+            for command in _iter_display_commands(block.commands):
+                print(f"{colors['DIM']}$ {command}{colors['RESET']}")
+    
+    events.append(_make_dry_run_finished_event(run_id, total_blocks, no_input=no_input))
+    return RunResult(
+        success=True,
+        blocks_executed=0,
+        block_results=[],
+        run_id=run_id,
+        schema_version=SCHEMA_VERSION,
+        exit_code=EXIT_SUCCESS,
+        no_input=no_input,
+        events=events,
+    )
+
+
+def _execute_block_with_sequential_output(
+    block: Block,
+    context: ExecutionContext,
+    no_input: bool,
+    verbose: bool,
+    block_index: int,
+    total_blocks: int,
+    output_tail_lines: int,
+    colors: dict[str, str],
+    events: list[ReportEvent] | None = None,
+    run_id: str | None = None,
+) -> ExecutionResult:
+    """Execute block with sequential per-command output (verbose mode)."""
+    # Print context before executing
+    for env_line in _iter_display_context(context):
+        print(f"{colors['DIM']}@env {env_line}{colors['RESET']}")
+    
+    # Use sequential execution with per-command output
+    attempt_count = 0
+    max_attempts = block.retry_count + 1
+    result: ExecutionResult | None = None
+    
+    while True:
+        attempt_count += 1
+        started_at = time.perf_counter()
+        
+        result = _execute_block_commands_sequential(
+            block,
+            context,
+            no_input,
+            verbose,
+            block_index,
+            total_blocks,
+            output_tail_lines,
+        )
+        result = _finalize_block_result(result, block, block_index, started_at)
+        result.attempts = attempt_count
+        
+        if result.success or result.timed_out or attempt_count >= max_attempts:
+            break
+        
+        # Emit retry event
+        if events is not None and run_id is not None:
+            from shellflow import _failure_kind_for_result
+            events.append(
+                _make_block_retrying_event(
+                    run_id,
+                    _make_block_id(block_index),
+                    block_index,
+                    block,
+                    total_blocks,
+                    attempts=attempt_count,
+                    failure_kind=_failure_kind_for_result(result),
+                )
+            )
+        
+        if verbose:
+            print(f"{colors['YELLOW']}↻ Retrying attempt {attempt_count + 1}/{max_attempts}{colors['RESET']}")
+    
+    # Print success/failure status
+    if result and result.success:
+        print(f"{colors['GREEN']}✓ Success{colors['RESET']}\n")
+    elif result:
+        print(f"{colors['RED']}✗ Failed: {result.error_message}{colors['RESET']}\n")
+    
+    return result
+
+
+def _execute_block_standard(
+    block: Block,
+    context: ExecutionContext,
+    no_input: bool,
+    verbose: bool,
+    block_index: int,
+    total_blocks: int,
+    output_tail_lines: int,
+    colors: dict[str, str],
+    events: list[ReportEvent],
+    run_id: str,
+) -> ExecutionResult:
+    """Execute block using standard execution path."""
+    # Print block info if verbose
+    if verbose:
+        if block.is_local:
+            print(f"{colors['BLUE']}[{block_index}/{total_blocks}] LOCAL{colors['RESET']}")
+        else:
+            host = block.host or "unknown"
+            print(f"{colors['YELLOW']}[{block_index}/{total_blocks}] REMOTE: {host}{colors['RESET']}")
+        for env_line in _iter_display_context(context):
+            print(f"{colors['DIM']}@env {env_line}{colors['RESET']}")
+        for command in _iter_display_commands(block.commands):
+            print(f"{colors['DIM']}$ {command}{colors['RESET']}")
+    
+    # Execute the block, retrying only bounded runtime failures
+    attempt_count = 0
+    max_attempts = block.retry_count + 1
+    result: ExecutionResult | None = None
+    
+    while True:
+        attempt_count += 1
+        started_at = time.perf_counter()
+        result = _execute_block_once(block, context, no_input=no_input)
+        result = _finalize_block_result(result, block, block_index, started_at)
+        result.attempts = attempt_count
+        
+        if result.success or result.timed_out or attempt_count >= max_attempts:
+            break
+        
+        # Emit retry event
+        events.append(
+            _make_block_retrying_event(
+                run_id,
+                _make_block_id(block_index),
+                block_index,
+                block,
+                total_blocks,
+                attempts=attempt_count,
+                failure_kind=_failure_kind_for_result(result),
+            )
+        )
+        
+        if verbose:
+            print(f"{colors['YELLOW']}↻ Retrying attempt {attempt_count + 1}/{max_attempts}{colors['RESET']}")
+    
+    # Print output if verbose
+    if verbose:
+        if result and result.output:
+            truncated = _truncate_output_lines(result.output, output_tail_lines)
+            print(truncated)
+        if result and result.success:
+            print(f"{colors['GREEN']}✓ Success{colors['RESET']}\n")
+        elif result:
+            print(f"{colors['RED']}✗ Failed: {result.error_message}{colors['RESET']}\n")
+    
+    return result
+
+
 def run_script(  # noqa: PLR0915
     blocks: list[Block],
     verbose: bool = False,
@@ -1701,179 +2078,43 @@ def run_script(  # noqa: PLR0915
     block_results: list[ExecutionResult] = []
     run_id = _new_run_id()
     total_blocks = len(blocks)
-    if dry_run:
-        events = [_make_dry_run_started_event(run_id, total_blocks, no_input=no_input)]
-    else:
-        events = [_make_run_started_event(run_id, total_blocks, no_input=no_input)]
-
+    
     # ANSI color codes for verbose output
-    GREEN = "\033[92m"
-    RED = "\033[91m"
-    BLUE = "\033[94m"
-    YELLOW = "\033[93m"
-    DIM = "\033[90m"
-    RESET = "\033[0m"
-
+    colors = _get_verbose_colors()
+    
     if dry_run:
-        for i, block in enumerate(blocks, 1):
-            block_id = _make_block_id(i)
-            events.append(_make_dry_run_block_event(run_id, block_id, i, block, total_blocks))
-            if verbose:
-                if block.is_local:
-                    print(f"{BLUE}[plan {i}/{len(blocks)}] LOCAL{RESET}")
-                else:
-                    host = block.host or "unknown"
-                    print(f"{YELLOW}[plan {i}/{len(blocks)}] REMOTE: {host}{RESET}")
-                for command in _iter_display_commands(block.commands):
-                    print(f"{DIM}$ {command}{RESET}")
-
-        events.append(_make_dry_run_finished_event(run_id, total_blocks, no_input=no_input))
-        return RunResult(
-            success=True,
-            blocks_executed=0,
-            block_results=[],
-            run_id=run_id,
-            schema_version=SCHEMA_VERSION,
-            exit_code=EXIT_SUCCESS,
-            no_input=no_input,
-            events=events,
+        return _execute_dry_run(
+            blocks, run_id, total_blocks, no_input, verbose, colors
         )
-
+    
+    events = [_make_run_started_event(run_id, total_blocks, no_input=no_input)]
+    
     for i, block in enumerate(blocks, 1):
         block_id = _make_block_id(i)
         events.append(_make_block_started_event(run_id, block_id, i, block, total_blocks))
-
+        
         # Execute the block
         if sequential_output and verbose:
-            # Print context before executing
-            for env_line in _iter_display_context(context):
-                print(f"{DIM}@env {env_line}{RESET}")
-
-            # Use sequential execution with per-command output
-            attempt_count = 0
-            max_attempts = block.retry_count + 1
-            while True:
-                attempt_count += 1
-                started_at = time.perf_counter()
-
-                result = _execute_block_commands_sequential(
-                    block,
-                    context,
-                    no_input,
-                    verbose,
-                    i,
-                    len(blocks),
-                    output_tail_lines,
-                )
-                result = _finalize_block_result(result, block, i, started_at)
-                result.attempts = attempt_count
-
-                if result.success or result.timed_out or attempt_count >= max_attempts:
-                    break
-
-                if verbose:
-                    print(f"{YELLOW}↻ Retrying attempt {attempt_count + 1}/{max_attempts}{RESET}")
-
-            # Print success/failure status
-            if result.success:
-                print(f"{GREEN}✓ Success{RESET}\n")
-            else:
-                print(f"{RED}✗ Failed: {result.error_message}{RESET}\n")
-
-            # Apply block exports to context
-            result.exported_env = _apply_block_exports(block, result, context)
-
-            block_results.append(result)
-            events.append(_make_block_finished_event(run_id, result, block, total_blocks))
-            blocks_executed += 1
-
-            # Fail fast on error
-            if not result.success:
-                failure_kind = _failure_kind_for_result(result)
-                exit_code = _exit_code_for_failure(failure_kind)
-                events.append(
-                    _make_run_finished_event(
-                        run_id,
-                        success=False,
-                        exit_code=exit_code,
-                        blocks_executed=blocks_executed,
-                        total_blocks=total_blocks,
-                        failure_kind=failure_kind,
-                        no_input=no_input,
-                    )
-                )
-                return RunResult(
-                    success=False,
-                    blocks_executed=blocks_executed,
-                    error_message=f"Block {i} failed: {result.error_message}",
-                    block_results=block_results,
-                    run_id=run_id,
-                    schema_version=SCHEMA_VERSION,
-                    exit_code=exit_code,
-                    failure_kind=failure_kind,
-                    no_input=no_input,
-                    events=events,
-                )
-
-            continue  # Skip the old execution path
-
-        # Print block info if verbose (old path - for non-sequential mode or when not verbose)
-        if verbose:
-            if block.is_local:
-                print(f"{BLUE}[{i}/{len(blocks)}] LOCAL{RESET}")
-            else:
-                host = block.host or "unknown"
-                print(f"{YELLOW}[{i}/{len(blocks)}] REMOTE: {host}{RESET}")
-            for env_line in _iter_display_context(context):
-                print(f"{DIM}@env {env_line}{RESET}")
-            for command in _iter_display_commands(block.commands):
-                print(f"{DIM}$ {command}{RESET}")
-
-        # Execute the block, retrying only bounded runtime failures.
-        attempt_count = 0
-        max_attempts = block.retry_count + 1
-        while True:
-            attempt_count += 1
-            started_at = time.perf_counter()
-            result = _execute_block_once(block, context, no_input=no_input)
-            result = _finalize_block_result(result, block, i, started_at)
-            result.attempts = attempt_count
-
-            if result.success or result.timed_out or attempt_count >= max_attempts:
-                break
-
-            events.append(
-                _make_block_retrying_event(
-                    run_id,
-                    block_id,
-                    i,
-                    block,
-                    total_blocks,
-                    attempts=attempt_count,
-                    failure_kind=_failure_kind_for_result(result),
-                )
+            result = _execute_block_with_sequential_output(
+                block, context, no_input, verbose, i, len(blocks), 
+                output_tail_lines, colors, events, run_id
             )
-            if verbose:
-                print(f"{YELLOW}↻ Retrying attempt {attempt_count + 1}/{max_attempts}{RESET}")
-
+        else:
+            result = _execute_block_standard(
+                block, context, no_input, verbose, i, len(blocks),
+                output_tail_lines, colors, events, run_id
+            )
+        
+        result = _finalize_block_result(result, block, i, time.perf_counter())
+        blocks_executed += 1
+        block_results.append(result)
+        events.append(_make_block_finished_event(run_id, result, block, total_blocks))
+        
         # Update context
         context.last_output = result.output
         context.success = result.success
         result.exported_env = _apply_block_exports(block, result, context)
-        block_results.append(result)
-        events.append(_make_block_finished_event(run_id, result, block, total_blocks))
-
-        if verbose:
-            if result.output:
-                truncated = _truncate_output_lines(result.output, output_tail_lines)
-                print(truncated)
-            if result.success:
-                print(f"{GREEN}✓ Success{RESET}\n")
-            else:
-                print(f"{RED}✗ Failed: {result.error_message}{RESET}\n")
-
-        blocks_executed += 1
-
+        
         # Fail fast on error
         if not result.success:
             failure_kind = _failure_kind_for_result(result)
@@ -1901,7 +2142,7 @@ def run_script(  # noqa: PLR0915
                 no_input=no_input,
                 events=events,
             )
-
+    
     events.append(
         _make_run_finished_event(
             run_id,
@@ -1923,10 +2164,6 @@ def run_script(  # noqa: PLR0915
         events=events,
     )
 
-
-# =============================================================================
-# CLI
-# =============================================================================
 
 
 def create_parser() -> argparse.ArgumentParser:
