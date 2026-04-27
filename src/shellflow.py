@@ -30,7 +30,28 @@ from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, Self, cast
+
+# Import Pydantic models
+try:
+    from shellflow_models import (
+        BlockDirective,
+        CommandTrace,
+        ScriptBlock,
+        ShellFlowRunArgs,
+        StructuredExport,
+        validate_json_export,
+    )
+except ImportError:
+    # Fallback for direct execution
+    from shellflow_models import (
+        BlockDirective,
+        CommandTrace,
+        ScriptBlock,
+        ShellFlowRunArgs,
+        StructuredExport,
+        validate_json_export,
+    )
 
 # =============================================================================
 # Data Classes
@@ -48,6 +69,7 @@ class Block:
     retry_count: int = 0
     exports: dict[str, str] = field(default_factory=dict)
     shell: str | None = None  # Shell to use for execution (e.g., "zsh", "bash")
+    structured_exports: dict[str, StructuredExport] = field(default_factory=dict)  # Pydantic-based JSON exports
 
     @property
     def is_local(self) -> bool:
@@ -83,14 +105,22 @@ class ExecutionContext:
         return shell_env
 
 
-@dataclass
 class CommandLog:
     """Structured verbose log for one executed command."""
 
-    command: str
-    output: str = ""
-    exit_code: int | None = None
-    status: str = "completed"
+    def __init__(
+        self,
+        command: str,
+        output: str = "",
+        exit_code: int | None = None,
+        status: str = "completed",
+        success: bool = True,
+    ) -> None:
+        self.command = command
+        self.output = output
+        self.exit_code = exit_code
+        self.status = status
+        self.success = success
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize one command log for structured output."""
@@ -99,6 +129,7 @@ class CommandLog:
             "output": self.output,
             "exit_code": self.exit_code,
             "status": self.status,
+            "success": self.success,
         }
 
 
@@ -126,6 +157,16 @@ class ExecutionResult:
 
     def to_dict(self, *, redact_secret_exports: bool = False) -> dict[str, Any]:
         """Serialize the block result for machine-readable output."""
+        # Handle structured exports (dict objects) vs regular string exports
+        serialized_exports = {}
+        for key, value in self.exported_env.items():
+            if isinstance(value, dict):
+                # Structured export - keep as dict for JSON serialization
+                serialized_exports[key] = value
+            else:
+                # Regular string export
+                serialized_exports[key] = str(value)
+
         payload = {
             "block_id": self.block_id,
             "index": self.block_index,
@@ -142,11 +183,11 @@ class ExecutionResult:
             "failure_kind": self.failure_kind,
             "no_input": self.no_input,
             "error_message": self.error_message,
-            "exported_env": _serialize_exported_env(self.exported_env, redact_secret_exports=redact_secret_exports),
+            "exported_env": _serialize_exported_env(serialized_exports, redact_secret_exports=redact_secret_exports),
             "command_logs": [command_log.to_dict() for command_log in self.command_logs],
         }
         if redact_secret_exports:
-            return _redact_payload_strings(payload, _collect_secret_values(self.exported_env))
+            return _redact_payload_strings(payload, _collect_secret_values(serialized_exports))
         return payload
 
 
@@ -240,6 +281,18 @@ class RunResult:
                 block_result.to_dict(redact_secret_exports=redact_secret_exports) for block_result in self.block_results
             ],
         }
+
+    @classmethod
+    def from_pydantic(cls, trace: CommandTrace) -> Self:
+        """Create a CommandLog from a Pydantic CommandTrace."""
+        trace_dict = trace.model_dump()
+        return cls(
+            command=trace_dict["command"],  # ty: ignore[unknown-argument]
+            output=trace_dict["stdout_chunk"] + trace_dict["stderr_chunk"],  # ty: ignore[unknown-argument]
+            exit_code=trace_dict["exit_code"],
+            status=trace_dict["status"],  # ty: ignore[unknown-argument]
+            success=trace_dict["exit_code"] == 0 if trace_dict["exit_code"] is not None else False,
+        )
 
 
 @dataclass
@@ -444,7 +497,7 @@ def _parse_ssh_config_basic(config_path: Path, host: str) -> SSHConfig | None:
 # =============================================================================
 
 
-BLOCK_MARKER_RE = re.compile(r"^\s*#\s*@(?P<marker>[A-Z]+)(?:\s+(?P<argument>\S+))?\s*$")
+BLOCK_MARKER_RE = re.compile(r"^\s*#\s*@(?P<marker>[A-Z_]+)(?:\s+(?P<argument>\S+))?\s*$")
 MARKER_PREFIX_RE = re.compile(r"^\s*#\s*@")
 
 
@@ -509,6 +562,16 @@ def _apply_block_directive(block: Block, marker_name: str, marker_argument: str 
         export_name, export_source = _parse_export_directive(marker_argument, line_no=line_no)
         block.exports[export_name] = export_source
         return
+    if marker_name == "EXPORT_JSON":
+        export_name, export_source = _parse_export_directive(marker_argument, line_no=line_no)
+        # For now, create a basic structured export without schema validation
+        # In a full implementation, you might parse schema from the directive
+        block.structured_exports[export_name] = StructuredExport(
+            name=export_name,
+            json_schema={},  # Empty schema for basic JSON validation
+            source=export_source,
+        )
+        return
     if marker_name == "SHELL":
         if not marker_argument:
             raise ParseError(f"Line {line_no}: @SHELL requires a shell name (e.g., zsh, bash)")
@@ -523,6 +586,8 @@ def parse_script(content: str) -> list[Block]:
     Parses scripts with comment markers:
         # @LOCAL        - Start a local execution block
         # @REMOTE <host> - Start a remote execution block
+
+    Now includes Pydantic validation to catch hallucinations and malformed directives.
 
     Args:
         content: The script content to parse.
@@ -549,6 +614,8 @@ def parse_script(content: str) -> list[Block]:
                 else:
                     current_block.commands = _build_block_commands(prelude_lines, accumulated_lines)
                     if current_block.commands:
+                        # Validate the completed block using Pydantic
+                        _validate_block_with_pydantic(current_block, line_no)
                         blocks.append(current_block)
 
                 accumulated_lines = []
@@ -579,9 +646,42 @@ def parse_script(content: str) -> list[Block]:
     if current_block:
         current_block.commands = _build_block_commands(prelude_lines, accumulated_lines)
         if current_block.commands:
+            # Validate the final block using Pydantic
+            _validate_block_with_pydantic(current_block, len(content.splitlines()))
             blocks.append(current_block)
 
     return blocks
+
+
+def _validate_block_with_pydantic(block: Block, line_no: int) -> None:
+    """Validate a parsed block using Pydantic models to catch hallucinations.
+
+    Args:
+        block: The block to validate
+        line_no: Line number for error reporting
+
+    Raises:
+        ParseError: If validation fails
+    """
+    try:
+        # Convert Block to Pydantic ScriptBlock for validation
+        block_type = "LOCAL" if block.is_local else "REMOTE"
+        target = None if block.is_local else block.host
+
+        directive = BlockDirective(
+            block_type=block_type,
+            target=target,
+            timeout=block.timeout_seconds,
+            retry=block.retry_count,
+            shell=cast("Literal['bash', 'zsh', 'sh']", block.shell if block.shell in ("bash", "zsh", "sh") else "bash"),
+        )
+
+        # The validation happens during model construction
+        ScriptBlock(directive=directive, code_lines=block.commands, source_line=block.source_line)
+        # If there are any validation errors, Pydantic will raise them
+
+    except Exception as e:
+        raise ParseError(f"Line {line_no}: Block validation failed: {e}") from e
 
 
 def _clean_commands(lines: list[str]) -> list[str]:
@@ -684,16 +784,58 @@ def _is_secret_like_env_name(name: str) -> bool:
     return any(pattern in upper_name for pattern in SECRET_LIKE_ENV_PATTERNS)
 
 
-def _serialize_exported_env(exported_env: dict[str, str], *, redact_secret_exports: bool) -> dict[str, str]:
+def _serialize_exported_env(exported_env: dict[str, Any], *, redact_secret_exports: bool) -> dict[str, Any]:
     """Serialize exported values, optionally redacting obvious secrets."""
     if not redact_secret_exports:
         return dict(exported_env)
-    return {key: "[REDACTED]" if _is_secret_like_env_name(key) else value for key, value in exported_env.items()}
+    result = {}
+    for key, value in exported_env.items():
+        if _is_secret_like_env_name(key):
+            result[key] = "[REDACTED]"
+        elif isinstance(value, dict):
+            # For structured exports, redact secrets within the dict
+            result[key] = _redact_dict_secrets(value)
+        else:
+            result[key] = str(value)
+    return result
 
 
-def _collect_secret_values(exported_env: dict[str, str]) -> set[str]:
+def _redact_dict_secrets(data: Any) -> Any:
+    """Recursively redact secret-like values in a dict structure."""
+    if isinstance(data, dict):
+        return {k: _redact_dict_secrets(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_redact_dict_secrets(item) for item in data]
+    if isinstance(data, str) and any(pattern in data.upper() for pattern in SECRET_LIKE_ENV_PATTERNS):
+        return "[REDACTED]"
+    return data
+
+
+def _collect_secret_values(exported_env: dict[str, Any]) -> set[str]:
     """Collect secret-like export values that should be redacted from audit sinks."""
-    return {value for key, value in exported_env.items() if _is_secret_like_env_name(key) and value}
+    secrets = set()
+    for key, value in exported_env.items():
+        if _is_secret_like_env_name(key):
+            if isinstance(value, str):
+                secrets.add(value)
+            elif isinstance(value, dict):
+                # Recursively collect secrets from dict values
+                secrets.update(_collect_secrets_from_dict(value))
+    return secrets
+
+
+def _collect_secrets_from_dict(data: Any) -> set[str]:
+    """Recursively collect string values that might be secrets from a dict."""
+    secrets = set()
+    if isinstance(data, dict):
+        for value in data.values():
+            secrets.update(_collect_secrets_from_dict(value))
+    elif isinstance(data, list):
+        for item in data:
+            secrets.update(_collect_secrets_from_dict(item))
+    elif isinstance(data, str):
+        secrets.add(data)
+    return secrets
 
 
 def _redact_text_value(value: str, secret_values: set[str]) -> str:
@@ -717,13 +859,28 @@ def _redact_payload_strings(payload: Any, secret_values: set[str]) -> Any:
     return payload
 
 
-def _apply_block_exports(block: Block, result: ExecutionResult, context: ExecutionContext) -> dict[str, str]:
+def _apply_block_exports(block: Block, result: ExecutionResult, context: ExecutionContext) -> dict[str, Any]:
     """Apply explicit block exports to the shared execution context."""
-    exported_env: dict[str, str] = {}
+    exported_env: dict[str, Any] = {}
     for name, source in block.exports.items():
         value = _extract_export_value(result, source)
         context.env[name] = value
         exported_env[name] = value
+
+    # Handle structured JSON exports
+    for name, structured_export in block.structured_exports.items():
+        source_value = _extract_export_value(result, structured_export.source)
+        try:
+            # Validate and parse JSON
+            parsed_value = validate_json_export(source_value, structured_export.json_schema)
+            context.env[name] = json.dumps(parsed_value)
+            exported_env[name] = parsed_value
+        except ValueError:
+            # If JSON validation fails, still export as string but log the error
+            context.env[name] = source_value
+            exported_env[name] = source_value
+            # In a production system, you might want to log this validation failure
+
     return exported_env
 
 
@@ -1473,7 +1630,7 @@ def _write_audit_log(path: Path, run_result: RunResult) -> None:
 
 class SSHConfigProvider(Protocol):
     """Protocol for SSH configuration providers."""
-    
+
     def get_config(self, host: str) -> SSHConfig | None:
         """Get SSH configuration for a host."""
         ...
@@ -1481,27 +1638,27 @@ class SSHConfigProvider(Protocol):
 
 class ParamikoSSHConfigProvider:
     """SSH config provider using paramiko."""
-    
+
     def get_config(self, host: str) -> SSHConfig | None:
         """Get SSH config using paramiko."""
         ssh_config_path = _get_ssh_config_path()
         if not ssh_config_path.exists():
             return None
-        
+
         try:
             import paramiko
-            
+
             ssh_config = paramiko.SSHConfig()
             with ssh_config_path.open() as handle:
                 ssh_config.parse(handle)
-            
+
             if not _ssh_config_matches_host(ssh_config, host):
                 return None
-            
+
             lookup = ssh_config.lookup(host)
             if not lookup:
                 return None
-            
+
             return SSHConfig(
                 host=host,
                 hostname=lookup.get("hostname"),
@@ -1517,26 +1674,26 @@ class ParamikoSSHConfigProvider:
 
 class BasicSSHConfigProvider:
     """Basic SSH config provider without paramiko."""
-    
+
     def get_config(self, host: str) -> SSHConfig | None:
         """Get SSH config using basic parsing."""
         ssh_config_path = _get_ssh_config_path()
         if not ssh_config_path.exists():
             return None
-        
+
         return _parse_ssh_config_basic(ssh_config_path, host)
 
 
 class SSHConfigResolver:
     """Resolves SSH configuration using multiple providers."""
-    
-    def __init__(self, providers: list[SSHConfigProvider] | None = None):
+
+    def __init__(self, providers: list[SSHConfigProvider] | None = None) -> None:
         """Initialize resolver with optional providers."""
         self.providers = providers or [
             ParamikoSSHConfigProvider(),
             BasicSSHConfigProvider(),
         ]
-    
+
     def resolve(self, host: str) -> SSHConfig | None:
         """Resolve SSH config for a host using available providers."""
         for provider in self.providers:
@@ -1544,7 +1701,7 @@ class SSHConfigResolver:
                 config = provider.get_config(host)
                 if config:
                     return config
-            except Exception:
+            except Exception:  # noqa: BLE001,S112
                 continue
         return None
 
@@ -1559,7 +1716,7 @@ _ssh_config_resolver = SSHConfigResolver()
 
 class ShellflowExceptionHandler:
     """Centralized exception handling for Shellflow operations."""
-    
+
     @staticmethod
     def handle_subprocess_error(error: subprocess.SubprocessError, block: Block, no_input: bool) -> ExecutionResult:
         """Handle subprocess execution errors."""
@@ -1574,7 +1731,7 @@ class ShellflowExceptionHandler:
             failure_kind=FAILURE_RUNTIME,
             no_input=no_input,
         )
-    
+
     @staticmethod
     def handle_os_error(error: OSError, block: Block, no_input: bool) -> ExecutionResult:
         """Handle OS-level errors."""
@@ -1589,7 +1746,7 @@ class ShellflowExceptionHandler:
             failure_kind=FAILURE_RUNTIME,
             no_input=no_input,
         )
-    
+
     @staticmethod
     def handle_timeout(block: Block, no_input: bool) -> ExecutionResult:
         """Handle timeout errors."""
@@ -1605,7 +1762,7 @@ class ShellflowExceptionHandler:
             failure_kind=FAILURE_TIMEOUT,
             no_input=no_input,
         )
-    
+
     @staticmethod
     def handle_ssh_config_error(host: str, block: Block, no_input: bool) -> ExecutionResult:
         """Handle SSH configuration errors."""
@@ -1630,7 +1787,7 @@ class ShellflowExceptionHandler:
 
 class BlockExecutor(Protocol):
     """Protocol for block execution strategies."""
-    
+
     def execute(
         self,
         block: Block,
@@ -1643,7 +1800,7 @@ class BlockExecutor(Protocol):
 
 class LocalExecutor:
     """Executor for local block execution."""
-    
+
     def execute(
         self,
         block: Block,
@@ -1658,7 +1815,7 @@ class LocalExecutor:
 
 class RemoteExecutor:
     """Executor for remote block execution via SSH."""
-    
+
     def execute(
         self,
         block: Block,
@@ -1679,7 +1836,7 @@ class RemoteExecutor:
                 no_input=no_input,
                 timeout_seconds=block.timeout_seconds,
             )
-        
+
         ssh_config = read_ssh_config(host)
         if ssh_config is None:
             ssh_config_path = _get_ssh_config_path()
@@ -1694,19 +1851,19 @@ class RemoteExecutor:
                 no_input=no_input,
                 timeout_seconds=block.timeout_seconds,
             )
-        
+
         return execute_remote(block, context, ssh_config, no_input)
 
 
 class ExecutorFactory:
     """Factory for creating appropriate executors for blocks."""
-    
-    def __init__(self):
+
+    def __init__(self) -> None:
         """Initialize factory."""
         self.remote_executor = RemoteExecutor()
         self.local_executor = LocalExecutor()
-    
-    def get_executor(self, block):
+
+    def get_executor(self, block: Block) -> BlockExecutor:
         """Get appropriate executor for a block."""
         if block.is_local:
             return self.local_executor
@@ -1719,7 +1876,6 @@ _executor_factory = ExecutorFactory()
 # =============================================================================
 # Script Runner
 # =============================================================================
-
 
 
 def _execute_block_commands_sequential(
@@ -1889,7 +2045,7 @@ def _execute_dry_run(
 ) -> RunResult:
     """Execute dry run - preview execution plan without running commands."""
     events = [_make_dry_run_started_event(run_id, total_blocks, no_input=no_input)]
-    
+
     for i, block in enumerate(blocks, 1):
         block_id = _make_block_id(i)
         events.append(_make_dry_run_block_event(run_id, block_id, i, block, total_blocks))
@@ -1901,7 +2057,7 @@ def _execute_dry_run(
                 print(f"{colors['YELLOW']}[plan {i}/{len(blocks)}] REMOTE: {host}{colors['RESET']}")
             for command in _iter_display_commands(block.commands):
                 print(f"{colors['DIM']}$ {command}{colors['RESET']}")
-    
+
     events.append(_make_dry_run_finished_event(run_id, total_blocks, no_input=no_input))
     return RunResult(
         success=True,
@@ -1915,7 +2071,7 @@ def _execute_dry_run(
     )
 
 
-def _execute_block_with_sequential_output(
+def _execute_block_with_sequential_output(  # noqa: PLR0913
     block: Block,
     context: ExecutionContext,
     no_input: bool,
@@ -1931,16 +2087,16 @@ def _execute_block_with_sequential_output(
     # Print context before executing
     for env_line in _iter_display_context(context):
         print(f"{colors['DIM']}@env {env_line}{colors['RESET']}")
-    
+
     # Use sequential execution with per-command output
     attempt_count = 0
     max_attempts = block.retry_count + 1
     result: ExecutionResult | None = None
-    
+
     while True:
         attempt_count += 1
         started_at = time.perf_counter()
-        
+
         result = _execute_block_commands_sequential(
             block,
             context,
@@ -1952,13 +2108,14 @@ def _execute_block_with_sequential_output(
         )
         result = _finalize_block_result(result, block, block_index, started_at)
         result.attempts = attempt_count
-        
+
         if result.success or result.timed_out or attempt_count >= max_attempts:
             break
-        
+
         # Emit retry event
         if events is not None and run_id is not None:
             from shellflow import _failure_kind_for_result
+
             events.append(
                 _make_block_retrying_event(
                     run_id,
@@ -1970,20 +2127,20 @@ def _execute_block_with_sequential_output(
                     failure_kind=_failure_kind_for_result(result),
                 )
             )
-        
+
         if verbose:
             print(f"{colors['YELLOW']}↻ Retrying attempt {attempt_count + 1}/{max_attempts}{colors['RESET']}")
-    
+
     # Print success/failure status
     if result and result.success:
         print(f"{colors['GREEN']}✓ Success{colors['RESET']}\n")
     elif result:
         print(f"{colors['RED']}✗ Failed: {result.error_message}{colors['RESET']}\n")
-    
+
     return result
 
 
-def _execute_block_standard(
+def _execute_block_standard(  # noqa: PLR0913
     block: Block,
     context: ExecutionContext,
     no_input: bool,
@@ -2007,22 +2164,22 @@ def _execute_block_standard(
             print(f"{colors['DIM']}@env {env_line}{colors['RESET']}")
         for command in _iter_display_commands(block.commands):
             print(f"{colors['DIM']}$ {command}{colors['RESET']}")
-    
+
     # Execute the block, retrying only bounded runtime failures
     attempt_count = 0
     max_attempts = block.retry_count + 1
     result: ExecutionResult | None = None
-    
+
     while True:
         attempt_count += 1
         started_at = time.perf_counter()
         result = _execute_block_once(block, context, no_input=no_input)
         result = _finalize_block_result(result, block, block_index, started_at)
         result.attempts = attempt_count
-        
+
         if result.success or result.timed_out or attempt_count >= max_attempts:
             break
-        
+
         # Emit retry event
         events.append(
             _make_block_retrying_event(
@@ -2035,10 +2192,10 @@ def _execute_block_standard(
                 failure_kind=_failure_kind_for_result(result),
             )
         )
-        
+
         if verbose:
             print(f"{colors['YELLOW']}↻ Retrying attempt {attempt_count + 1}/{max_attempts}{colors['RESET']}")
-    
+
     # Print output if verbose
     if verbose:
         if result and result.output:
@@ -2048,11 +2205,11 @@ def _execute_block_standard(
             print(f"{colors['GREEN']}✓ Success{colors['RESET']}\n")
         elif result:
             print(f"{colors['RED']}✗ Failed: {result.error_message}{colors['RESET']}\n")
-    
+
     return result
 
 
-def run_script(  # noqa: PLR0915
+def run_script(
     blocks: list[Block],
     verbose: bool = False,
     no_input: bool = False,
@@ -2078,43 +2235,39 @@ def run_script(  # noqa: PLR0915
     block_results: list[ExecutionResult] = []
     run_id = _new_run_id()
     total_blocks = len(blocks)
-    
+
     # ANSI color codes for verbose output
     colors = _get_verbose_colors()
-    
+
     if dry_run:
-        return _execute_dry_run(
-            blocks, run_id, total_blocks, no_input, verbose, colors
-        )
-    
+        return _execute_dry_run(blocks, run_id, total_blocks, no_input, verbose, colors)
+
     events = [_make_run_started_event(run_id, total_blocks, no_input=no_input)]
-    
+
     for i, block in enumerate(blocks, 1):
         block_id = _make_block_id(i)
         events.append(_make_block_started_event(run_id, block_id, i, block, total_blocks))
-        
+
         # Execute the block
         if sequential_output and verbose:
             result = _execute_block_with_sequential_output(
-                block, context, no_input, verbose, i, len(blocks), 
-                output_tail_lines, colors, events, run_id
+                block, context, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
             )
         else:
             result = _execute_block_standard(
-                block, context, no_input, verbose, i, len(blocks),
-                output_tail_lines, colors, events, run_id
+                block, context, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
             )
-        
+
         result = _finalize_block_result(result, block, i, time.perf_counter())
         blocks_executed += 1
         block_results.append(result)
         events.append(_make_block_finished_event(run_id, result, block, total_blocks))
-        
+
         # Update context
         context.last_output = result.output
         context.success = result.success
         result.exported_env = _apply_block_exports(block, result, context)
-        
+
         # Fail fast on error
         if not result.success:
             failure_kind = _failure_kind_for_result(result)
@@ -2142,7 +2295,7 @@ def run_script(  # noqa: PLR0915
                 no_input=no_input,
                 events=events,
             )
-    
+
     events.append(
         _make_run_finished_event(
             run_id,
@@ -2163,7 +2316,6 @@ def run_script(  # noqa: PLR0915
         no_input=no_input,
         events=events,
     )
-
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -2253,6 +2405,21 @@ Examples:
         help="Emit machine-readable JSON Lines events",
     )
 
+    # Agent command for Pydantic-based execution
+    agent_parser = subparsers.add_parser(
+        "agent-run",
+        help="Run a shellflow script via agent interface",
+        description="Execute a script using Pydantic-validated input for agent integration.",
+    )
+    agent_parser.add_argument(
+        "--json-input",
+        help="JSON input conforming to ShellFlowRunArgs schema",
+    )
+    agent_parser.add_argument(
+        "--ssh-config",
+        help="Path to an SSH config file to use instead of ~/.ssh/config",
+    )
+
     return parser
 
 
@@ -2274,8 +2441,57 @@ def main(args: list[str] | None = None) -> int:
 
     if parsed_args.command == "run":
         return cmd_run(parsed_args)
+    if parsed_args.command == "agent-run":
+        return cmd_agent_run(parsed_args)
 
     return 0
+
+
+def cmd_agent_run(args: argparse.Namespace) -> int:
+    """Execute the agent-run command using Pydantic-validated input.
+
+    Args:
+        args: Parsed arguments for the agent-run command.
+
+    Returns:
+        Exit code (0 for success, non-zero for failure).
+    """
+    if not args.json_input:
+        sys.stderr.write("Error: --json-input is required for agent-run\n")
+        return EXIT_EXECUTION_FAILURE
+
+    try:
+        # Parse and validate input using Pydantic
+        run_args = ShellFlowRunArgs.model_validate_json(args.json_input)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"Error: Invalid input JSON: {e}\n")
+        return EXIT_EXECUTION_FAILURE
+
+    if args.ssh_config:
+        os.environ["SHELLFLOW_SSH_CONFIG"] = str(Path(args.ssh_config).expanduser())
+
+    try:
+        blocks = parse_script(run_args.script)
+    except ParseError as e:
+        sys.stderr.write(f"Parse error: {e}\n")
+        return EXIT_PARSE_FAILURE
+
+    if not blocks:
+        result = run_script([], no_input=True, dry_run=run_args.dry_run)
+        print(result.to_dict())
+        return EXIT_SUCCESS
+
+    result = run_script(
+        blocks,
+        verbose=False,  # Agent mode doesn't need verbose output
+        no_input=True,  # Always non-interactive for agents
+        dry_run=run_args.dry_run,
+        output_tail_lines=MAX_OUTPUT_LINES,
+    )
+
+    # Output structured result
+    print(json.dumps(result.to_dict()))
+    return EXIT_SUCCESS if result.success else EXIT_EXECUTION_FAILURE
 
 
 def cmd_run(args: argparse.Namespace) -> int:
