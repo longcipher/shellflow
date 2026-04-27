@@ -1985,17 +1985,15 @@ class TestCmdRun:
     def test_parse_error_handling(self, tmp_path: Path) -> None:
         """Test handling of parse errors.
 
-        Note: The current implementation doesn't raise ParseError for missing
-        @REMOTE host, it just parses it with empty host.
+        Note: The current implementation raises ParseError for invalid markers.
         """
         script_path = tmp_path / "test.sh"
         script_path.write_text("""# @INVALID_MARKER
 """)  # Invalid marker
 
-        # Current implementation handles this gracefully
+        # Invalid markers should cause parse errors
         result = main(["run", str(script_path)])
-        # Empty script or script with invalid markers returns 0
-        assert result == 0
+        assert result == 2  # EXIT_EXECUTION_FAILURE
 
     def test_empty_script(self, tmp_path: Path) -> None:
         """Test handling of empty script (no blocks)."""
