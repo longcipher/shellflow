@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 # Import macros module
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "shellflow"))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from macros import parse_macros
 
 from shellflow import (
