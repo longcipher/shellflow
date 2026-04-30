@@ -28,6 +28,7 @@ from shellflow import (
     execute_remote,
     main,
     parse_script,
+    parse_server_config,
     run_script,
 )
 
@@ -180,7 +181,7 @@ def _run_cli_script(
     with (
         mock.patch(
             "shellflow.read_ssh_config",
-            side_effect=lambda host: SSHConfig(host=host) if host in configured else None,
+            side_effect=lambda host, servers=None: SSHConfig(host=host) if host in configured else None,
         ),
         mock.patch("shellflow.execute_remote", side_effect=fake_or_real_remote),
         redirect_stdout(stdout_buffer),
@@ -217,7 +218,8 @@ def when_run_the_script(context: Context) -> None:
         raise ValueError("No script content set. Did you call the Given step first?")
 
     try:
-        servers, blocks = parse_script(script_content)
+        blocks = parse_script(script_content)
+        servers = parse_server_config(script_content)
     except ParseError as error:
         context.run_result = None
         context.block_results = []
@@ -229,7 +231,7 @@ def when_run_the_script(context: Context) -> None:
     with (
         mock.patch(
             "shellflow.read_ssh_config",
-            side_effect=lambda host: _read_ssh_config_for_context(context, host),
+            side_effect=lambda host, servers=None: _read_ssh_config_for_context(context, host),
         ),
         mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote),
     ):
@@ -262,11 +264,14 @@ def when_the_script_is_parsed(context: Context) -> None:
         raise ValueError("No script content set. Did you call the Given step first?")
 
     try:
-        servers, blocks = parse_script(script_content)
+        blocks = parse_script(script_content)
+        servers = parse_server_config(script_content)
         context.parsed_blocks = blocks
+        context.parsed_servers = servers
         context.parse_error = None
     except ParseError as error:
         context.parsed_blocks = None
+        context.parsed_servers = None
         context.parse_error = error
 
 
@@ -741,6 +746,11 @@ def step_given_script_with_content(context: Context) -> None:
     given_script_with_content(context, context.text)
 
 
+@given("a script with task annotations:")
+def step_given_script_with_task_annotations(context: Context) -> None:
+    given_script_with_content(context, context.text)
+
+
 @given("a script with server definitions:")
 def step_given_script_with_server_definitions(context: Context) -> None:
     given_script_with_content(context, context.text)
@@ -1014,6 +1024,26 @@ def step_then_the_block_type_should_be(context: Context, block_type: str) -> Non
 @then('the block host should be "{host}"')
 def step_then_the_block_host_should_be(context: Context, host: str) -> None:
     then_the_block_host_should_be(context, host)
+
+
+@then("the block should have annotations")
+def step_then_the_block_should_have_annotations(context: Context) -> None:
+    blocks = getattr(context, "parsed_blocks", None)
+    if not blocks:
+        raise AssertionError("No parsed blocks found.")
+    if not blocks[0].annotations:
+        raise AssertionError("Block should have annotations but has none.")
+
+
+@then('the block annotation "{key}" should be "{value}"')
+def step_then_the_block_annotation_should_be(context: Context, key: str, value: str) -> None:
+    blocks = getattr(context, "parsed_blocks", None)
+    if not blocks:
+        raise AssertionError("No parsed blocks found.")
+    if key not in blocks[0].annotations:
+        raise AssertionError(f"Block annotation '{key}' not found. Available: {list(blocks[0].annotations.keys())}")
+    if blocks[0].annotations[key] != value:
+        raise AssertionError(f"Block annotation '{key}' is '{blocks[0].annotations[key]}', expected '{value}'")
 
 
 @then("servers are extracted correctly")
