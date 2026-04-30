@@ -56,6 +56,9 @@ except ImportError:
 # Import config utilities
 from config import parse_server_config
 
+# Import macro utilities
+from macros import parse_macros
+
 # =============================================================================
 # Data Classes
 # =============================================================================
@@ -100,6 +103,7 @@ class ExecutionContext:
     env: dict[str, str] = field(default_factory=dict)
     last_output: str = ""
     success: bool = True
+    macros: dict[str, list[str]] = field(default_factory=dict)
 
     def to_shell_env(self) -> dict[str, str]:
         """Convert context to environment variables for shell execution."""
@@ -538,12 +542,59 @@ def _parse_block_marker(line: str) -> tuple[str, str | None] | None:
     return match.group("marker"), match.group("argument")
 
 
-def _build_block_commands(prelude: list[str], body: list[str]) -> list[str]:
+def _expand_macros_in_commands(commands: list[str], macros: dict[str, list[str]] | None, line_no: int) -> list[str]:
+    """Expand macro calls in a list of commands."""
+    if not macros:
+        return commands
+
+    # Common shell builtins and commands that shouldn't be treated as undefined macros
+    shell_builtins = {
+        'echo', 'cd', 'pwd', 'ls', 'cat', 'grep', 'sed', 'awk', 'find', 'xargs',
+        'sort', 'uniq', 'head', 'tail', 'wc', 'cut', 'tr', 'rev', 'tac', 'nl',
+        'mkdir', 'rmdir', 'rm', 'cp', 'mv', 'touch', 'chmod', 'chown', 'ln',
+        'tar', 'gzip', 'gunzip', 'bzip2', 'bunzip2', 'zip', 'unzip',
+        'ssh', 'scp', 'rsync', 'curl', 'wget', 'ping', 'traceroute',
+        'ps', 'top', 'kill', 'killall', 'pkill', 'pgrep',
+        'sudo', 'su', 'whoami', 'id', 'groups', 'passwd',
+        'date', 'cal', 'uptime', 'df', 'du', 'free', 'vmstat', 'iostat',
+        'which', 'whereis', 'locate', 'find', 'updatedb',
+        'make', 'gcc', 'g++', 'javac', 'java', 'python', 'python3', 'pip',
+        'npm', 'yarn', 'node', 'ruby', 'perl', 'php',
+        'git', 'svn', 'hg', 'bzr',
+        'docker', 'docker-compose', 'kubectl', 'helm',
+        'systemctl', 'service', 'chkconfig', 'update-rc.d',
+        'apt', 'yum', 'dnf', 'pacman', 'brew',
+        'if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'do', 'done',
+        'case', 'esac', 'select', 'function', 'return', 'exit', 'break', 'continue'
+    }
+
+    expanded_commands: list[str] = []
+    for command in commands:
+        stripped = command.strip()
+        if stripped:
+            # Check if this entire line is a macro name
+            if stripped in macros:
+                # Expand the macro
+                expanded_commands.extend(macros[stripped])
+            elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', stripped) and stripped not in shell_builtins:
+                # Single identifier that looks like a macro but isn't defined and not a builtin
+                raise ParseError(f"Line {line_no}: Undefined macro '{stripped}'")
+            else:
+                # Regular command
+                expanded_commands.append(command)
+        else:
+            # Empty line
+            expanded_commands.append(command)
+    return expanded_commands
+
+
+def _build_block_commands(prelude: list[str], body: list[str], macros: dict[str, list[str]] | None = None, line_no: int = 0) -> list[str]:
     """Combine shared prelude with block-specific commands."""
     cleaned_body = _clean_commands(body)
     if not cleaned_body:
         return []
-    return [*prelude, *cleaned_body]
+    combined = [*prelude, *cleaned_body]
+    return _expand_macros_in_commands(combined, macros, line_no)
 
 
 def _parse_positive_int(argument: str | None, *, directive: str, line_no: int) -> int:
@@ -689,7 +740,7 @@ def _apply_block_directive(block: Block, marker_name: str, marker_argument: str 
     raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
 
 
-def parse_script(content: str) -> list[Block]:
+def parse_script(content: str, macros: dict[str, list[str]] | None = None) -> list[Block]:
     """Parse a shell script into execution blocks.
 
     Parses scripts with comment markers:
@@ -739,7 +790,7 @@ def parse_script(content: str) -> list[Block]:
                 if current_block is None:
                     prelude_lines = _clean_commands(accumulated_lines)
                 else:
-                    current_block.commands = _build_block_commands(prelude_lines, accumulated_lines)
+                    current_block.commands = _build_block_commands(prelude_lines, accumulated_lines, macros, line_no)
                     if current_block.commands:
                         # Validate the completed block using Pydantic
                         _validate_block_with_pydantic(current_block, line_no)
@@ -775,7 +826,7 @@ def parse_script(content: str) -> list[Block]:
 
     # Don't forget the last block
     if current_block:
-        current_block.commands = _build_block_commands(prelude_lines, accumulated_lines)
+        current_block.commands = _build_block_commands(prelude_lines, accumulated_lines, macros, len(lines))
         if current_block.commands:
             # Validate the final block using Pydantic
             _validate_block_with_pydantic(current_block, len(lines))
@@ -2359,6 +2410,7 @@ def run_script(
     dry_run: bool = False,
     sequential_output: bool = True,  # New parameter for sequential output
     output_tail_lines: int = MAX_OUTPUT_LINES,
+    macros: dict[str, list[str]] | None = None,
 ) -> RunResult:
     """Run a list of blocks sequentially.
 
@@ -2373,7 +2425,7 @@ def run_script(
     Returns:
         RunResult with success status and execution info.
     """
-    context = ExecutionContext()
+    context = ExecutionContext(macros=macros or {})
     blocks_executed = 0
     block_results: list[ExecutionResult] = []
     run_id = _new_run_id()
@@ -2614,14 +2666,15 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         os.environ["SHELLFLOW_SSH_CONFIG"] = str(Path(args.ssh_config).expanduser())
 
     try:
-        blocks = parse_script(run_args.script)
+        macros = parse_macros(run_args.script)
+        blocks = parse_script(run_args.script, macros)
         servers = parse_server_config(run_args.script)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return EXIT_PARSE_FAILURE
 
     if not blocks:
-        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run)
+        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, macros=macros)
         print(result.to_dict())
         return EXIT_SUCCESS
 
@@ -2632,6 +2685,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         no_input=True,  # Always non-interactive for agents
         dry_run=run_args.dry_run,
         output_tail_lines=MAX_OUTPUT_LINES,
+        macros=macros,
     )
 
     # Output structured result
@@ -2664,14 +2718,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         return EXIT_EXECUTION_FAILURE
 
     try:
-        blocks = parse_script(content)
+        macros = parse_macros(content)
+        blocks = parse_script(content, macros)
         servers = parse_server_config(content)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return _exit_code_for_failure(FAILURE_PARSE)
 
     if not blocks:
-        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run)
+        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, macros=macros)
         if args.json or args.jsonl:
             if args.json:
                 _emit_structured_output_json(empty_result)
@@ -2691,6 +2746,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         no_input=args.no_input,
         dry_run=args.dry_run,
         output_tail_lines=args.output_lines,
+        macros=macros,
     )
 
     if args.audit_log:
