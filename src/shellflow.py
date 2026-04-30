@@ -65,6 +65,9 @@ from helpers import parse_helpers
 # Import variable utilities
 from variables import parse_variables
 
+# Import hook utilities
+from hooks import execute_hook, parse_hooks
+
 # =============================================================================
 # Data Classes
 # =============================================================================
@@ -112,6 +115,7 @@ class ExecutionContext:
     macros: dict[str, list[str]] = field(default_factory=dict)
     helpers: dict[str, list[str]] = field(default_factory=dict)
     variables: dict[str, str] = field(default_factory=dict)
+    hooks: dict[str, list[str]] = field(default_factory=dict)
 
     def to_shell_env(self) -> dict[str, str]:
         """Convert context to environment variables for shell execution."""
@@ -691,6 +695,27 @@ def _skip_helper_definition(lines: list[str], start_index: int) -> int:
     return len(lines)
 
 
+def _skip_hook_definition(lines: list[str], start_index: int) -> int:
+    """Skip a hook definition block from @HOOK to @ENDHOOK.
+
+    Args:
+        lines: All lines of the script
+        start_index: Index of the @HOOK line
+
+    Returns:
+        The index after the @ENDHOOK line
+    """
+    i = start_index + 1  # Start from the line after @HOOK
+    while i < len(lines):
+        line = lines[i]
+        marker = _parse_block_marker(line)
+        if marker and marker[0] == "ENDHOOK":
+            return i + 1  # Return index after @ENDHOOK
+        i += 1
+    # If we reach the end without finding @ENDHOOK, return the end index
+    return len(lines)
+
+
 def _parse_annotation_block(lines: list[str], start_index: int) -> tuple[dict[str, str], int]:
     """Parse an annotation block starting from the given line index.
 
@@ -783,7 +808,7 @@ def _apply_block_directive(block: Block, marker_name: str, marker_argument: str 
 
 
 
-def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpers: dict[str, list[str]] | None = None) -> list[Block]:
+def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpers: dict[str, list[str]] | None = None, hooks: dict[str, list[str]] | None = None) -> list[Block]:
     """Parse a shell script into execution blocks.
 
     Parses scripts with comment markers:
@@ -836,6 +861,10 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpe
             if marker_name == "VAR":
                 # Skip variable definitions - they don't create execution blocks
                 i += 1
+                continue
+            if marker_name == "HOOK":
+                # Skip hook definitions - they don't create execution blocks
+                i = _skip_hook_definition(lines, i)
                 continue
             if marker_name in {"LOCAL", "REMOTE"}:
                 if current_block is None:
@@ -2466,6 +2495,7 @@ def run_script(
     macros: dict[str, list[str]] | None = None,
     helpers: dict[str, list[str]] | None = None,
     variables: dict[str, str] | None = None,
+    hooks: dict[str, list[str]] | None = None,
 ) -> RunResult:
     """Run a list of blocks sequentially.
 
@@ -2480,7 +2510,7 @@ def run_script(
     Returns:
         RunResult with success status and execution info.
     """
-    context = ExecutionContext(macros=macros or {}, helpers=helpers or {}, variables=variables or {})
+    context = ExecutionContext(macros=macros or {}, helpers=helpers or {}, variables=variables or {}, hooks=hooks or {})
     blocks_executed = 0
     block_results: list[ExecutionResult] = []
     run_id = _new_run_id()
@@ -2493,6 +2523,29 @@ def run_script(
         return _execute_dry_run(blocks, run_id, total_blocks, no_input, verbose, colors)
 
     events = [_make_run_started_event(run_id, total_blocks, no_input=no_input)]
+
+    # Execute PRE hooks before main blocks
+    if "PRE" in context.hooks:
+        hook_result = execute_hook("PRE", context.hooks, context)
+        if hook_result and not hook_result.success:
+            # PRE hook failed, fail the entire run
+            events.append(_make_run_finished_event(
+                run_id, success=False, exit_code=hook_result.exit_code,
+                blocks_executed=0, total_blocks=total_blocks,
+                failure_kind="hook_pre"
+            ))
+            return RunResult(
+                success=False,
+                blocks_executed=0,
+                error_message=f"PRE hook failed: {hook_result.error_message}",
+                block_results=[],
+                run_id=run_id,
+                schema_version=SCHEMA_VERSION,
+                exit_code=hook_result.exit_code,
+                failure_kind="hook_pre",
+                no_input=no_input,
+                events=events,
+            )
 
     for i, block in enumerate(blocks, 1):
         block_id = _make_block_id(i)
@@ -2731,7 +2784,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         return EXIT_PARSE_FAILURE
 
     if not blocks:
-        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, macros=macros, helpers=helpers, variables=variables)
+        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, macros=macros, helpers=helpers, variables=variables, hooks=hooks)
         print(result.to_dict())
         return EXIT_SUCCESS
 
@@ -2745,6 +2798,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         macros=macros,
         helpers=helpers,
         variables=variables,
+        hooks=hooks,
     )
 
     # Output structured result
@@ -2780,14 +2834,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         macros = parse_macros(content)
         helpers = parse_helpers(content)
         variables = parse_variables(content)
-        blocks = parse_script(content, macros, helpers)
+        hooks = parse_hooks(content)
+        blocks = parse_script(content, macros, helpers, hooks)
         servers = parse_server_config(content)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return _exit_code_for_failure(FAILURE_PARSE)
 
     if not blocks:
-        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, macros=macros, helpers=helpers, variables=variables)
+        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, macros=macros, helpers=helpers, variables=variables, hooks=hooks)
         if args.json or args.jsonl:
             if args.json:
                 _emit_structured_output_json(empty_result)
@@ -2810,6 +2865,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         macros=macros,
         helpers=helpers,
         variables=variables,
+        hooks=hooks,
     )
 
     if args.audit_log:
