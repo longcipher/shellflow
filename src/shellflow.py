@@ -392,17 +392,29 @@ def _stringify_subprocess_stream(value: Any) -> str:
 # Global SSH config resolver
 
 
-def read_ssh_config(host: str) -> SSHConfig | None:
-    """Read SSH configuration for a host from ~/.ssh/config.
+def read_ssh_config(host: str, servers: dict[str, dict[str, str]] | None = None) -> SSHConfig | None:
+    """Read SSH configuration for a host from ~/.ssh/config or server definitions.
 
     Uses SSHConfigResolver with multiple providers (paramiko, basic parsing).
 
     Args:
         host: The host alias to look up.
+        servers: Optional server definitions from script.
 
     Returns:
         SSHConfig object if found, None otherwise.
     """
+    # First check server definitions
+    if servers and host in servers:
+        server_config = servers[host]
+        return SSHConfig(
+            host=host,
+            hostname=server_config.get("host"),
+            user=server_config.get("user"),
+            port=int(server_config.get("port", 22)),
+            identity_file=server_config.get("key"),
+        )
+
     return _ssh_config_resolver.resolve(host)
 
 
@@ -580,11 +592,12 @@ def _apply_block_directive(block: Block, marker_name: str, marker_argument: str 
     raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
 
 
-def parse_script(content: str) -> list[Block]:
-    """Parse a shell script into execution blocks.
+def parse_script(content: str) -> tuple[dict[str, dict[str, str]], list[Block]]:
+    """Parse a shell script into server configs and execution blocks.
 
     Parses scripts with comment markers:
-        # @LOCAL        - Start a local execution block
+        # @SERVER <name> - Define a server configuration
+        # @LOCAL         - Start a local execution block
         # @REMOTE <host> - Start a remote execution block
 
     Now includes Pydantic validation to catch hallucinations and malformed directives.
@@ -593,11 +606,14 @@ def parse_script(content: str) -> list[Block]:
         content: The script content to parse.
 
     Returns:
-        List of Block objects.
+        Tuple of (server_configs, blocks).
 
     Raises:
         ParseError: If the script cannot be parsed.
     """
+    from src.config import parse_server_config
+
+    servers = parse_server_config(content)
     blocks: list[Block] = []
     current_block: Block | None = None
     accumulated_lines: list[str] = []
@@ -1321,6 +1337,7 @@ def execute_remote(
     context: ExecutionContext,
     ssh_config: SSHConfig | None,
     no_input: bool = False,
+    servers: dict[str, dict[str, str]] | None = None,
 ) -> ExecutionResult:
     """Execute a remote block via SSH.
 
@@ -1351,7 +1368,7 @@ def execute_remote(
         )
 
     if ssh_config is None:
-        ssh_config = read_ssh_config(host)
+        ssh_config = read_ssh_config(host, servers)
 
     if ssh_config is None:
         ssh_config_path = _get_ssh_config_path()
@@ -1852,7 +1869,7 @@ class RemoteExecutor:
                 timeout_seconds=block.timeout_seconds,
             )
 
-        return execute_remote(block, context, ssh_config, no_input)
+        return execute_remote(block, context, ssh_config, no_input, servers)
 
 
 class ExecutorFactory:
@@ -1881,6 +1898,7 @@ _executor_factory = ExecutorFactory()
 def _execute_block_commands_sequential(
     block: Block,
     context: ExecutionContext,
+    servers: dict[str, dict[str, str]] | None,
     no_input: bool,
     verbose: bool,
     block_index: int,
@@ -2100,6 +2118,7 @@ def _execute_block_with_sequential_output(  # noqa: PLR0913
         result = _execute_block_commands_sequential(
             block,
             context,
+            servers,
             no_input,
             verbose,
             block_index,
@@ -2211,6 +2230,7 @@ def _execute_block_standard(  # noqa: PLR0913
 
 def run_script(
     blocks: list[Block],
+    servers: dict[str, dict[str, str]] | None = None,
     verbose: bool = False,
     no_input: bool = False,
     dry_run: bool = False,
@@ -2471,18 +2491,19 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         os.environ["SHELLFLOW_SSH_CONFIG"] = str(Path(args.ssh_config).expanduser())
 
     try:
-        blocks = parse_script(run_args.script)
+        servers, blocks = parse_script(run_args.script)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return EXIT_PARSE_FAILURE
 
     if not blocks:
-        result = run_script([], no_input=True, dry_run=run_args.dry_run)
+        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run)
         print(result.to_dict())
         return EXIT_SUCCESS
 
     result = run_script(
         blocks,
+        servers,
         verbose=False,  # Agent mode doesn't need verbose output
         no_input=True,  # Always non-interactive for agents
         dry_run=run_args.dry_run,
@@ -2519,13 +2540,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         return EXIT_EXECUTION_FAILURE
 
     try:
-        blocks = parse_script(content)
+        servers, blocks = parse_script(content)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return _exit_code_for_failure(FAILURE_PARSE)
 
     if not blocks:
-        empty_result = run_script([], no_input=args.no_input, dry_run=args.dry_run)
+        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run)
         if args.json or args.jsonl:
             if args.json:
                 _emit_structured_output_json(empty_result)
@@ -2540,6 +2561,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     machine_mode = args.json or args.jsonl
     result = run_script(
         blocks,
+        servers,
         verbose=args.verbose and not machine_mode,
         no_input=args.no_input,
         dry_run=args.dry_run,

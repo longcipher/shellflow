@@ -71,6 +71,7 @@ def _fake_execute_remote(
     context_state: ExecutionContext,
     ssh_config: SSHConfig | None,
     no_input: bool = False,
+    servers: dict[str, dict[str, str]] | None = None,
 ) -> ExecutionResult:
     """Execute remote blocks in tests without requiring a real SSH server."""
     del context_state
@@ -170,10 +171,11 @@ def _run_cli_script(
         context_state: ExecutionContext,
         ssh_config: SSHConfig | None,
         no_input: bool = False,
+        servers: dict[str, dict[str, str]] | None = None,
     ) -> ExecutionResult:
         if ssh_config is None:
-            return execute_remote(block, context_state, ssh_config, no_input=no_input)
-        return _fake_execute_remote(block, context_state, ssh_config, no_input=no_input)
+            return execute_remote(block, context_state, ssh_config, no_input=no_input, servers=servers)
+        return _fake_execute_remote(block, context_state, ssh_config, no_input=no_input, servers=servers)
 
     with (
         mock.patch(
@@ -215,7 +217,7 @@ def when_run_the_script(context: Context) -> None:
         raise ValueError("No script content set. Did you call the Given step first?")
 
     try:
-        blocks = parse_script(script_content)
+        servers, blocks = parse_script(script_content)
     except ParseError as error:
         context.run_result = None
         context.block_results = []
@@ -231,7 +233,7 @@ def when_run_the_script(context: Context) -> None:
         ),
         mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote),
     ):
-        result = run_script(blocks, verbose=getattr(context, "verbose", False))
+        result = run_script(blocks, servers, verbose=getattr(context, "verbose", False))
 
     context.run_result = result
     context.block_results = result.block_results
@@ -260,7 +262,8 @@ def when_the_script_is_parsed(context: Context) -> None:
         raise ValueError("No script content set. Did you call the Given step first?")
 
     try:
-        context.parsed_blocks = parse_script(script_content)
+        servers, blocks = parse_script(script_content)
+        context.parsed_blocks = blocks
         context.parse_error = None
     except ParseError as error:
         context.parsed_blocks = None
@@ -738,6 +741,11 @@ def step_given_script_with_content(context: Context) -> None:
     given_script_with_content(context, context.text)
 
 
+@given("a script with server definitions:")
+def step_given_script_with_server_definitions(context: Context) -> None:
+    given_script_with_content(context, context.text)
+
+
 @given('host "{host}" is configured in SSH config')
 def step_given_host_configured_in_ssh_config(context: Context, host: str) -> None:
     given_host_configured_in_ssh_config(context, host)
@@ -832,6 +840,15 @@ def step_when_run_the_script_with_audit_log_path(context: Context) -> None:
 @when("the script is parsed")
 def step_when_the_script_is_parsed(context: Context) -> None:
     when_the_script_is_parsed(context)
+
+
+@when("parsed")
+def step_when_parsed(context: Context) -> None:
+    from src.config import parse_server_config
+    script_content = getattr(context, "script_content", None)
+    if script_content is None:
+        raise ValueError("No script content set. Did you call the Given step first?")
+    context.parsed_servers = parse_server_config(script_content)
 
 
 @then("the execution should succeed")
@@ -997,3 +1014,16 @@ def step_then_the_block_type_should_be(context: Context, block_type: str) -> Non
 @then('the block host should be "{host}"')
 def step_then_the_block_host_should_be(context: Context, host: str) -> None:
     then_the_block_host_should_be(context, host)
+
+
+@then("servers are extracted correctly")
+def step_then_servers_are_extracted_correctly(context: Context) -> None:
+    servers = getattr(context, "parsed_servers", None)
+    if servers is None:
+        raise AssertionError("No parsed servers found.")
+    if "web-server" not in servers:
+        raise AssertionError("Expected 'web-server' to be parsed.")
+    if servers["web-server"]["host"] != "example.com":
+        raise AssertionError(f"Expected host 'example.com', got {servers['web-server']['host']!r}.")
+    if servers["web-server"]["user"] != "deploy":
+        raise AssertionError(f"Expected user 'deploy', got {servers['web-server']['user']!r}.")
