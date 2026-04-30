@@ -59,6 +59,12 @@ from config import parse_server_config
 # Import macro utilities
 from macros import parse_macros
 
+# Import helper utilities
+from helpers import parse_helpers
+
+# Import variable utilities
+from variables import parse_variables
+
 # =============================================================================
 # Data Classes
 # =============================================================================
@@ -104,6 +110,7 @@ class ExecutionContext:
     last_output: str = ""
     success: bool = True
     macros: dict[str, list[str]] = field(default_factory=dict)
+    helpers: dict[str, list[str]] = field(default_factory=dict)
     variables: dict[str, str] = field(default_factory=dict)
 
     def to_shell_env(self) -> dict[str, str]:
@@ -550,12 +557,12 @@ def _parse_block_marker(line: str) -> tuple[str, str | None] | None:
     return match.group("marker"), match.group("argument")
 
 
-def _expand_macros_in_commands(commands: list[str], macros: dict[str, list[str]] | None, line_no: int) -> list[str]:
-    """Expand macro calls in a list of commands."""
-    if not macros:
+def _expand_macros_and_helpers_in_commands(commands: list[str], macros: dict[str, list[str]] | None, helpers: dict[str, list[str]] | None, line_no: int) -> list[str]:
+    """Expand macro and helper calls in a list of commands."""
+    if not macros and not helpers:
         return commands
 
-    # Common shell builtins and commands that shouldn't be treated as undefined macros
+    # Common shell builtins and commands that shouldn't be treated as undefined macros/helpers
     shell_builtins = {
         'echo', 'cd', 'pwd', 'ls', 'cat', 'grep', 'sed', 'awk', 'find', 'xargs',
         'sort', 'uniq', 'head', 'tail', 'wc', 'cut', 'tr', 'rev', 'tac', 'nl',
@@ -580,13 +587,17 @@ def _expand_macros_in_commands(commands: list[str], macros: dict[str, list[str]]
     for command in commands:
         stripped = command.strip()
         if stripped:
+            # Check if this entire line is a helper name first (helpers take precedence)
+            if helpers and stripped in helpers:
+                # Expand the helper
+                expanded_commands.extend(helpers[stripped])
             # Check if this entire line is a macro name
-            if stripped in macros:
+            elif macros and stripped in macros:
                 # Expand the macro
                 expanded_commands.extend(macros[stripped])
             elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', stripped) and stripped not in shell_builtins:
-                # Single identifier that looks like a macro but isn't defined and not a builtin
-                raise ParseError(f"Line {line_no}: Undefined macro '{stripped}'")
+                # Single identifier that looks like a macro/helper but isn't defined and not a builtin
+                raise ParseError(f"Line {line_no}: Undefined macro or helper '{stripped}'")
             else:
                 # Regular command
                 expanded_commands.append(command)
@@ -596,13 +607,13 @@ def _expand_macros_in_commands(commands: list[str], macros: dict[str, list[str]]
     return expanded_commands
 
 
-def _build_block_commands(prelude: list[str], body: list[str], macros: dict[str, list[str]] | None = None, line_no: int = 0) -> list[str]:
+def _build_block_commands(prelude: list[str], body: list[str], macros: dict[str, list[str]] | None = None, helpers: dict[str, list[str]] | None = None, line_no: int = 0) -> list[str]:
     """Combine shared prelude with block-specific commands."""
     cleaned_body = _clean_commands(body)
     if not cleaned_body:
         return []
     combined = [*prelude, *cleaned_body]
-    return _expand_macros_in_commands(combined, macros, line_no)
+    return _expand_macros_and_helpers_in_commands(combined, macros, helpers, line_no)
 
 
 def _parse_positive_int(argument: str | None, *, directive: str, line_no: int) -> int:
@@ -656,6 +667,27 @@ def _skip_macro_definition(lines: list[str], start_index: int) -> int:
             return i + 1  # Return index after @ENDMACRO
         i += 1
     # If we reach the end without finding @ENDMACRO, return the end index
+    return len(lines)
+
+
+def _skip_helper_definition(lines: list[str], start_index: int) -> int:
+    """Skip a helper definition block from @HELPER to @ENDHELPER.
+
+    Args:
+        lines: All lines of the script
+        start_index: Index of the @HELPER line
+
+    Returns:
+        The index after the @ENDHELPER line
+    """
+    i = start_index + 1  # Start from the line after @HELPER
+    while i < len(lines):
+        line = lines[i]
+        marker = _parse_block_marker(line)
+        if marker and marker[0] == "ENDHELPER":
+            return i + 1  # Return index after @ENDHELPER
+        i += 1
+    # If we reach the end without finding @ENDHELPER, return the end index
     return len(lines)
 
 
@@ -748,35 +780,10 @@ def _apply_block_directive(block: Block, marker_name: str, marker_argument: str 
     raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
 
 
-def parse_variables(content: str) -> dict[str, str]:
-    """Parse script-level variables from content.
-
-    Args:
-        content: The script content to parse.
-
-    Returns:
-        Dict of variable name to value.
-
-    Raises:
-        ParseError: If variable parsing fails.
-    """
-    variables: dict[str, str] = {}
-    lines = content.splitlines()
-    for line_no, line in enumerate(lines, 1):
-        marker = _parse_block_marker(line)
-        if marker and marker[0] == "VAR":
-            if not marker[1] or "=" not in marker[1]:
-                raise ParseError(f"Line {line_no}: @VAR expects NAME=value format")
-            name, value = marker[1].split("=", 1)
-            name = name.strip()
-            value = value.strip()
-            if not _is_valid_env_name(name):
-                raise ParseError(f"Line {line_no}: @VAR expects a valid variable name")
-            variables[name] = value
-    return variables
 
 
-def parse_script(content: str, macros: dict[str, list[str]] | None = None) -> list[Block]:
+
+def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpers: dict[str, list[str]] | None = None) -> list[Block]:
     """Parse a shell script into execution blocks.
 
     Parses scripts with comment markers:
@@ -822,6 +829,10 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None) -> li
                 # Skip macro definitions - they don't create execution blocks
                 i = _skip_macro_definition(lines, i)
                 continue
+            if marker_name == "HELPER":
+                # Skip helper definitions - they don't create execution blocks
+                i = _skip_helper_definition(lines, i)
+                continue
             if marker_name == "VAR":
                 # Skip variable definitions - they don't create execution blocks
                 i += 1
@@ -830,7 +841,7 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None) -> li
                 if current_block is None:
                     prelude_lines = _clean_commands(accumulated_lines)
                 else:
-                    current_block.commands = _build_block_commands(prelude_lines, accumulated_lines, macros, line_no)
+                    current_block.commands = _build_block_commands(prelude_lines, accumulated_lines, macros, helpers, line_no)
                     if current_block.commands:
                         # Validate the completed block using Pydantic
                         _validate_block_with_pydantic(current_block, line_no)
@@ -866,7 +877,7 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None) -> li
 
     # Don't forget the last block
     if current_block:
-        current_block.commands = _build_block_commands(prelude_lines, accumulated_lines, macros, len(lines))
+        current_block.commands = _build_block_commands(prelude_lines, accumulated_lines, macros, helpers, len(lines))
         if current_block.commands:
             # Validate the final block using Pydantic
             _validate_block_with_pydantic(current_block, len(lines))
@@ -2453,6 +2464,7 @@ def run_script(
     sequential_output: bool = True,  # New parameter for sequential output
     output_tail_lines: int = MAX_OUTPUT_LINES,
     macros: dict[str, list[str]] | None = None,
+    helpers: dict[str, list[str]] | None = None,
     variables: dict[str, str] | None = None,
 ) -> RunResult:
     """Run a list of blocks sequentially.
@@ -2468,7 +2480,7 @@ def run_script(
     Returns:
         RunResult with success status and execution info.
     """
-    context = ExecutionContext(macros=macros or {}, variables=variables or {})
+    context = ExecutionContext(macros=macros or {}, helpers=helpers or {}, variables=variables or {})
     blocks_executed = 0
     block_results: list[ExecutionResult] = []
     run_id = _new_run_id()
@@ -2710,15 +2722,16 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
 
     try:
         macros = parse_macros(run_args.script)
+        helpers = parse_helpers(run_args.script)
         variables = parse_variables(run_args.script)
-        blocks = parse_script(run_args.script, macros)
+        blocks = parse_script(run_args.script, macros, helpers)
         servers = parse_server_config(run_args.script)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return EXIT_PARSE_FAILURE
 
     if not blocks:
-        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, macros=macros, variables=variables)
+        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, macros=macros, helpers=helpers, variables=variables)
         print(result.to_dict())
         return EXIT_SUCCESS
 
@@ -2730,6 +2743,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         dry_run=run_args.dry_run,
         output_tail_lines=MAX_OUTPUT_LINES,
         macros=macros,
+        helpers=helpers,
         variables=variables,
     )
 
@@ -2764,15 +2778,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         macros = parse_macros(content)
+        helpers = parse_helpers(content)
         variables = parse_variables(content)
-        blocks = parse_script(content, macros)
+        blocks = parse_script(content, macros, helpers)
         servers = parse_server_config(content)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return _exit_code_for_failure(FAILURE_PARSE)
 
     if not blocks:
-        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, macros=macros, variables=variables)
+        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, macros=macros, helpers=helpers, variables=variables)
         if args.json or args.jsonl:
             if args.json:
                 _emit_structured_output_json(empty_result)
@@ -2793,6 +2808,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         output_tail_lines=args.output_lines,
         macros=macros,
+        helpers=helpers,
         variables=variables,
     )
 
