@@ -270,7 +270,10 @@ def when_the_script_is_parsed(context: Context) -> None:
         raise ValueError("No script content set. Did you call the Given step first?")
 
     try:
-        blocks = parse_script(script_content)
+        from helpers import parse_helpers
+        macros = parse_macros(script_content)
+        helpers = parse_helpers(script_content)
+        blocks = parse_script(script_content, macros, helpers)
         servers = parse_server_config(script_content)
         context.parsed_blocks = blocks
         context.parsed_servers = servers
@@ -1084,6 +1087,46 @@ def step_then_the_macro_should_contain_commands(context: Context, macro_name: st
             raise AssertionError(f"Macro '{macro_name}' has {len(macros[macro_name])} commands, expected {count}")
     except Exception as error:
         raise AssertionError(f"Failed to parse macros: {error}") from error
+
+
+@then('the block should contain {count:d} commands')
+def step_then_the_block_should_contain_commands(context: Context, count: int) -> None:
+    """Check that the first parsed block contains the expected number of commands."""
+    blocks = getattr(context, "parsed_blocks", None)
+    if blocks is None:
+        raise AssertionError("No blocks parsed. Did you call 'When the script is parsed' first?")
+
+    if not blocks:
+        raise AssertionError("No blocks found")
+
+    block = blocks[0]  # Check the first block
+    if len(block.commands) != count:
+        raise AssertionError(f"Block has {len(block.commands)} commands, expected {count}. Commands: {block.commands}")
+
+
+@then('the block should contain {count:d} command')
+def step_then_the_block_should_contain_command(context: Context, count: int) -> None:
+    """Check that the first parsed block contains the expected number of commands (singular form)."""
+    step_then_the_block_should_contain_commands(context, count)
+
+
+@then('the command should be "{expected_command}"')
+def step_then_the_command_should_be(context: Context, expected_command: str) -> None:
+    """Check that the first command in the first block matches the expected command."""
+    blocks = getattr(context, "parsed_blocks", None)
+    if blocks is None:
+        raise AssertionError("No blocks parsed. Did you call 'When the script is parsed' first?")
+
+    if not blocks:
+        raise AssertionError("No blocks found")
+
+    block = blocks[0]  # Check the first block
+    if not block.commands:
+        raise AssertionError("Block has no commands")
+
+    actual_command = block.commands[0]  # Check the first command
+    if actual_command != expected_command:
+        raise AssertionError(f"Command is '{actual_command}', expected '{expected_command}'")
 
 
 @then("variables should be substituted in commands")
