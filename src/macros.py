@@ -76,7 +76,7 @@ def _parse_macro_marker(line: str) -> tuple[str, str] | None:
 
 
 def _clean_macro_commands(lines: list[str]) -> list[str]:
-    """Clean macro command lines by removing leading whitespace."""
+    """Clean macro command lines by removing leading # and whitespace."""
     # Remove empty lines from start and end
     while lines and not lines[0].strip():
         lines = lines[1:]
@@ -86,15 +86,21 @@ def _clean_macro_commands(lines: list[str]) -> list[str]:
     if not lines:
         return []
 
-    # Find common leading whitespace
-    non_empty_lines = [line for line in lines if line.strip()]
-    if not non_empty_lines:
-        return []
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Remove leading # and any whitespace after it
+        if stripped.startswith('#'):
+            content = stripped[1:].strip()
+            if content:  # Only keep non-empty content
+                cleaned_lines.append(content)
+        else:
+            # Line doesn't start with #, keep as-is (shouldn't happen in well-formed macros)
+            cleaned_lines.append(stripped)
 
-    common_indent = min(len(line) - len(line.lstrip()) for line in non_empty_lines)
-
-    # Remove common leading whitespace
-    return [line[common_indent:] for line in lines]
+    return cleaned_lines
 
 
 class ParseError(Exception):
