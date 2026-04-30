@@ -39,6 +39,9 @@ from shellflow import (
     run_script,
 )
 
+# Import doctor module
+from doctor import run_doctor
+
 
 def create_temp_script(content: str) -> Path:
     """Create a temporary script file with the given content."""
@@ -1240,3 +1243,26 @@ def then_execution_stops_with_hook_failure(context: Context) -> None:
     assert not result.success, "Expected script execution to fail due to hook failure"
     # Check that it failed early (no blocks executed)
     assert result.blocks_executed == 0, f"Expected 0 blocks executed, got {result.blocks_executed}"
+
+
+@when("I run the doctor command")
+def when_run_doctor_command(context: Context) -> None:
+    """Run the doctor command and capture output."""
+    # Capture stdout
+    captured_output = io.StringIO()
+    with redirect_stdout(captured_output):
+        exit_code = main(["doctor"])
+    context.doctor_output = captured_output.getvalue()
+    context.doctor_exit_code = exit_code
+
+
+@then("the output should contain SSH connections status")
+def then_output_contains_ssh_connections_status(context: Context) -> None:
+    """Verify that the doctor output contains SSH connections status."""
+    assert "SSH connections" in context.doctor_output, f"Expected 'SSH connections' in output, got: {context.doctor_output}"
+
+
+@then("the output should contain configuration status")
+def then_output_contains_configuration_status(context: Context) -> None:
+    """Verify that the doctor output contains configuration status."""
+    assert "Configuration" in context.doctor_output, f"Expected 'Configuration' in output, got: {context.doctor_output}"

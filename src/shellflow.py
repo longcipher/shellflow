@@ -68,6 +68,9 @@ from variables import parse_variables
 # Import hook utilities
 from hooks import execute_hook, parse_hooks
 
+# Import doctor utilities
+from doctor import run_doctor
+
 # =============================================================================
 # Data Classes
 # =============================================================================
@@ -2723,6 +2726,17 @@ Examples:
         help="Path to an SSH config file to use instead of ~/.ssh/config",
     )
 
+    # Doctor command for configuration diagnostics
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check configuration and SSH connections",
+        description="Run diagnostics to verify Shellflow configuration and SSH connectivity.",
+    )
+    doctor_parser.add_argument(
+        "--ssh-config",
+        help="Path to an SSH config file to use instead of ~/.ssh/config",
+    )
+
     return parser
 
 
@@ -2746,6 +2760,8 @@ def main(args: list[str] | None = None) -> int:
         return cmd_run(parsed_args)
     if parsed_args.command == "agent-run":
         return cmd_agent_run(parsed_args)
+    if parsed_args.command == "doctor":
+        return cmd_doctor(parsed_args)
 
     return 0
 
@@ -2886,6 +2902,27 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"\nCompleted: {result.blocks_executed} block(s) executed successfully.")
 
     return EXIT_SUCCESS
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Execute the doctor command.
+
+    Args:
+        args: Parsed arguments for the doctor command.
+
+    Returns:
+        Exit code (0 for success, non-zero for failure).
+    """
+    if args.ssh_config:
+        os.environ["SHELLFLOW_SSH_CONFIG"] = str(Path(args.ssh_config).expanduser())
+
+    try:
+        result = run_doctor()
+        print(result)
+        return EXIT_SUCCESS
+    except Exception as e:
+        sys.stderr.write(f"Doctor check failed: {e}\n")
+        return EXIT_EXECUTION_FAILURE
 
 
 def _get_version() -> str:
