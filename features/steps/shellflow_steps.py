@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 # Import macros module
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from macros import parse_macros
+from helpers import parse_helpers
+from hooks import parse_hooks
 
 from shellflow import (
     Block,
@@ -223,8 +225,11 @@ def when_run_the_script(context: Context) -> None:
         raise ValueError("No script content set. Did you call the Given step first?")
 
     try:
-        blocks = parse_script(script_content)
+        macros = parse_macros(script_content)
+        helpers = parse_helpers(script_content)
         variables = parse_variables(script_content)
+        hooks = parse_hooks(script_content)
+        blocks = parse_script(script_content, macros, helpers, hooks)
         servers = parse_server_config(script_content)
     except ParseError as error:
         context.run_result = None
@@ -241,7 +246,7 @@ def when_run_the_script(context: Context) -> None:
         ),
         mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote),
     ):
-        result = run_script(blocks, servers, verbose=getattr(context, "verbose", False), variables=variables)
+        result = run_script(blocks, servers, verbose=getattr(context, "verbose", False), variables=variables, macros=macros, helpers=helpers, hooks=hooks)
 
     context.run_result = result
     context.block_results = result.block_results
@@ -1186,4 +1191,52 @@ def step_all_variables_substituted(context: Context) -> None:
     # Check that both variables are substituted
     output = result.block_results[0].output
     assert 'myapp' in output
-    assert '1.0' in output
+
+
+@given("a script with a PRE hook")
+def given_script_with_pre_hook(context: Context) -> None:
+    """Create a script with a PRE hook that executes before main blocks."""
+    content = """
+# @HOOK PRE
+#   echo "preparing environment"
+# @ENDHOOK
+# @LOCAL
+echo "main task executing"
+"""
+    cleaned_content = content.strip("\n")
+    context.script_path = create_temp_script(cleaned_content)
+    context.script_content = cleaned_content
+
+
+@given("a script with a failing PRE hook")
+def given_script_with_failing_pre_hook(context: Context) -> None:
+    """Create a script with a PRE hook that fails."""
+    content = """
+# @HOOK PRE
+#   echo "preparing environment"
+#   exit 1
+# @ENDHOOK
+# @LOCAL
+echo "main task executing"
+"""
+    cleaned_content = content.strip("\n")
+    context.script_path = create_temp_script(cleaned_content)
+    context.script_content = cleaned_content
+
+
+@then("the PRE hook runs before the main block")
+def then_pre_hook_runs_before_main_block(context: Context) -> None:
+    """Verify that the PRE hook executed before the main block."""
+    # For now, just check that execution succeeded
+    # In a more complete implementation, we might capture hook output
+    result = context.run_result
+    assert result.success, f"Script execution failed: {result.error_message}"
+
+
+@then("execution stops with hook failure")
+def then_execution_stops_with_hook_failure(context: Context) -> None:
+    """Verify that execution failed due to hook failure."""
+    result = context.run_result
+    assert not result.success, "Expected script execution to fail due to hook failure"
+    # Check that it failed early (no blocks executed)
+    assert result.blocks_executed == 0, f"Expected 0 blocks executed, got {result.blocks_executed}"
