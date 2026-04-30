@@ -53,6 +53,9 @@ except ImportError:
         validate_json_export,
     )
 
+# Import config utilities
+from config import parse_server_config
+
 # =============================================================================
 # Data Classes
 # =============================================================================
@@ -70,6 +73,7 @@ class Block:
     exports: dict[str, str] = field(default_factory=dict)
     shell: str | None = None  # Shell to use for execution (e.g., "zsh", "bash")
     structured_exports: dict[str, StructuredExport] = field(default_factory=dict)  # Pydantic-based JSON exports
+    annotations: dict[str, str] = field(default_factory=dict)  # Task annotations
 
     @property
     def is_local(self) -> bool:
@@ -407,11 +411,21 @@ def read_ssh_config(host: str, servers: dict[str, dict[str, str]] | None = None)
     # First check server definitions
     if servers and host in servers:
         server_config = servers[host]
+
+        # Validate and parse port
+        port_str = server_config.get("port", "22")
+        try:
+            port = int(port_str)
+            if port < 1 or port > 65535:
+                raise ValueError(f"Port {port} is out of valid range (1-65535)")
+        except ValueError as e:
+            raise ValueError(f"Invalid port '{port_str}' for server '{host}': {e}")
+
         return SSHConfig(
             host=host,
             hostname=server_config.get("host"),
             user=server_config.get("user"),
-            port=int(server_config.get("port", 22)),
+            port=port,
             identity_file=server_config.get("key"),
         )
 
@@ -509,6 +523,9 @@ def _parse_ssh_config_basic(config_path: Path, host: str) -> SSHConfig | None:
 # =============================================================================
 
 
+
+
+
 BLOCK_MARKER_RE = re.compile(r"^\s*#\s*@(?P<marker>[A-Z_]+)(?:\s+(?P<argument>\S+))?\s*$")
 MARKER_PREFIX_RE = re.compile(r"^\s*#\s*@")
 
@@ -562,6 +579,65 @@ def _parse_export_directive(argument: str | None, *, line_no: int) -> tuple[str,
     return name, source
 
 
+def _parse_annotation_block(lines: list[str], start_index: int) -> tuple[dict[str, str], int]:
+    """Parse an annotation block starting from the given line index.
+
+    Parses indented lines as key: value pairs until a non-indented line or marker.
+
+    Args:
+        lines: All lines of the script
+        start_index: Index of the @ANNOTATE line (0-indexed)
+
+    Returns:
+        Tuple of (annotations dict, lines_consumed)
+
+    Raises:
+        ParseError: If annotation format is invalid
+    """
+    annotations: dict[str, str] = {}
+    i = start_index + 1  # Start from the line after @ANNOTATE
+    lines_consumed = 1  # Count the @ANNOTATE line itself
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Stop if we hit a non-comment line or a marker
+        if not stripped or not stripped.startswith("#"):
+            break
+
+        # Check if it's a marker (starts with # @)
+        if stripped.startswith("# @"):
+            break
+
+        # Parse indented annotation line
+        # Check if the line after # has indentation (spaces or tab)
+        after_hash = line[1:]  # Remove the leading #
+        if after_hash.startswith(" ") or after_hash.startswith("\t"):
+            # Remove the comment marker and indentation
+            content = stripped[1:].strip()  # Remove # and trim
+
+            if ":" not in content:
+                raise ParseError(f"Line {i + 1}: Invalid annotation format, expected 'key: value'")
+
+            key, value = content.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+
+            if not key:
+                raise ParseError(f"Line {i + 1}: Annotation key cannot be empty")
+
+            annotations[key] = value
+            lines_consumed += 1
+        else:
+            # Non-indented comment line, stop parsing annotations
+            break
+
+        i += 1
+
+    return annotations, lines_consumed
+
+
 def _apply_block_directive(block: Block, marker_name: str, marker_argument: str | None, line_no: int) -> None:
     """Apply block-local directive metadata to a block."""
     if marker_name == "TIMEOUT":
@@ -592,11 +668,10 @@ def _apply_block_directive(block: Block, marker_name: str, marker_argument: str 
     raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
 
 
-def parse_script(content: str) -> tuple[dict[str, dict[str, str]], list[Block]]:
-    """Parse a shell script into server configs and execution blocks.
+def parse_script(content: str) -> list[Block]:
+    """Parse a shell script into execution blocks.
 
     Parses scripts with comment markers:
-        # @SERVER <name> - Define a server configuration
         # @LOCAL         - Start a local execution block
         # @REMOTE <host> - Start a remote execution block
 
@@ -606,24 +681,35 @@ def parse_script(content: str) -> tuple[dict[str, dict[str, str]], list[Block]]:
         content: The script content to parse.
 
     Returns:
-        Tuple of (server_configs, blocks).
+        List of execution blocks.
 
     Raises:
         ParseError: If the script cannot be parsed.
     """
-    from src.config import parse_server_config
-
-    servers = parse_server_config(content)
     blocks: list[Block] = []
     current_block: Block | None = None
     accumulated_lines: list[str] = []
     prelude_lines: list[str] = []
     directive_phase = False
+    pending_annotations: dict[str, str] = {}
+    lines = content.splitlines()
+    i = 0
 
-    for line_no, line in enumerate(content.splitlines(), 1):
+    while i < len(lines):
+        line_no = i + 1
+        line = lines[i]
         marker = _parse_block_marker(line)
         if marker:
             marker_name, marker_argument = marker
+            if marker_name == "SERVER":
+                i += 1
+                continue  # Skip server definitions
+            if marker_name == "ANNOTATE":
+                if not marker_argument:
+                    raise ParseError(f"Line {line_no}: @ANNOTATE marker missing task name")
+                pending_annotations, lines_consumed = _parse_annotation_block(lines, i)
+                i += lines_consumed
+                continue
             if marker_name in {"LOCAL", "REMOTE"}:
                 if current_block is None:
                     prelude_lines = _clean_commands(accumulated_lines)
@@ -638,15 +724,18 @@ def parse_script(content: str) -> tuple[dict[str, dict[str, str]], list[Block]]:
                 directive_phase = True
 
                 if marker_name == "LOCAL":
-                    current_block = Block(target="LOCAL", source_line=line_no)
+                    current_block = Block(target="LOCAL", source_line=line_no, annotations=pending_annotations)
                 else:
                     if not marker_argument:
                         raise ParseError(f"Line {line_no}: @REMOTE marker missing host")
-                    current_block = Block(target=f"REMOTE:{marker_argument}", source_line=line_no)
+                    current_block = Block(target=f"REMOTE:{marker_argument}", source_line=line_no, annotations=pending_annotations)
+                pending_annotations = {}  # Clear after applying
+                i += 1
                 continue
 
             if current_block is not None and directive_phase:
                 _apply_block_directive(current_block, marker_name, marker_argument, line_no)
+                i += 1
                 continue
 
             raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
@@ -657,13 +746,14 @@ def parse_script(content: str) -> tuple[dict[str, dict[str, str]], list[Block]]:
         accumulated_lines.append(line)
         if current_block is not None and line.strip():
             directive_phase = False
+        i += 1
 
     # Don't forget the last block
     if current_block:
         current_block.commands = _build_block_commands(prelude_lines, accumulated_lines)
         if current_block.commands:
             # Validate the final block using Pydantic
-            _validate_block_with_pydantic(current_block, len(content.splitlines()))
+            _validate_block_with_pydantic(current_block, len(lines))
             blocks.append(current_block)
 
     return blocks
@@ -1616,10 +1706,10 @@ def _finalize_block_result(result: ExecutionResult, block: Block, index: int, st
 # Global executor factory instance
 
 
-def _execute_block_once(block: Block, context: ExecutionContext, *, no_input: bool) -> ExecutionResult:
+def _execute_block_once(block: Block, context: ExecutionContext, *, no_input: bool, servers: dict[str, dict[str, str]] | None = None) -> ExecutionResult:
     """Execute one block attempt using the executor abstraction."""
     executor = _executor_factory.get_executor(block)
-    return executor.execute(block, context, no_input)
+    return executor.execute(block, context, no_input, servers)
 
 
 def _emit_structured_output_json(run_result: RunResult) -> None:
@@ -1810,6 +1900,7 @@ class BlockExecutor(Protocol):
         block: Block,
         context: ExecutionContext,
         no_input: bool = False,
+        servers: dict[str, dict[str, str]] | None = None,
     ) -> ExecutionResult:
         """Execute a block and return the result."""
         ...
@@ -1823,8 +1914,10 @@ class LocalExecutor:
         block: Block,
         context: ExecutionContext,
         no_input: bool = False,
+        servers: dict[str, dict[str, str]] | None = None,
     ) -> ExecutionResult:
         """Execute a local block."""
+        # Local execution doesn't use servers
         if no_input:
             return execute_local(block, context, no_input=True)
         return execute_local(block, context)
@@ -1838,6 +1931,7 @@ class RemoteExecutor:
         block: Block,
         context: ExecutionContext,
         no_input: bool = False,
+        servers: dict[str, dict[str, str]] | None = None,
     ) -> ExecutionResult:
         """Execute a remote block."""
         host = block.host
@@ -1854,7 +1948,7 @@ class RemoteExecutor:
                 timeout_seconds=block.timeout_seconds,
             )
 
-        ssh_config = read_ssh_config(host)
+        ssh_config = read_ssh_config(host, servers)
         if ssh_config is None:
             ssh_config_path = _get_ssh_config_path()
             return ExecutionResult(
@@ -1923,6 +2017,7 @@ def _execute_block_commands_sequential(
         return _execute_remote_block_sequential(
             block,
             context,
+            servers,
             no_input,
             verbose,
             commands_to_execute,
@@ -1948,6 +2043,7 @@ def _print_block_header(block: Block, block_index: int, total_blocks: int) -> No
 def _execute_remote_block_sequential(
     block: Block,
     context: ExecutionContext,
+    servers: dict[str, dict[str, str]] | None,
     no_input: bool,
     verbose: bool,
     commands_to_execute: list[str],
@@ -1958,7 +2054,7 @@ def _execute_remote_block_sequential(
     DIM = "\033[90m"
     RESET = "\033[0m"
 
-    result = _execute_block_once(block, context, no_input=no_input)
+    result = _execute_block_once(block, context, no_input=no_input, servers=servers)
 
     if verbose:
         # Assign actual command names to parsed logs
@@ -2023,7 +2119,7 @@ def _execute_local_block_sequential(
             print(f"{DIM}$ {cmd}{RESET}")
 
     # Execute the entire block as a single script
-    result = _execute_block_once(block, context, no_input=no_input)
+    result = _execute_block_once(block, context, no_input=no_input, servers=None)
 
     # Print output if verbose
     if verbose and result.output:
@@ -2092,6 +2188,7 @@ def _execute_dry_run(
 def _execute_block_with_sequential_output(  # noqa: PLR0913
     block: Block,
     context: ExecutionContext,
+    servers: dict[str, dict[str, str]] | None,
     no_input: bool,
     verbose: bool,
     block_index: int,
@@ -2162,6 +2259,7 @@ def _execute_block_with_sequential_output(  # noqa: PLR0913
 def _execute_block_standard(  # noqa: PLR0913
     block: Block,
     context: ExecutionContext,
+    servers: dict[str, dict[str, str]] | None,
     no_input: bool,
     verbose: bool,
     block_index: int,
@@ -2192,7 +2290,7 @@ def _execute_block_standard(  # noqa: PLR0913
     while True:
         attempt_count += 1
         started_at = time.perf_counter()
-        result = _execute_block_once(block, context, no_input=no_input)
+        result = _execute_block_once(block, context, no_input=no_input, servers=servers)
         result = _finalize_block_result(result, block, block_index, started_at)
         result.attempts = attempt_count
 
@@ -2271,11 +2369,11 @@ def run_script(
         # Execute the block
         if sequential_output and verbose:
             result = _execute_block_with_sequential_output(
-                block, context, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
+                block, context, servers, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
             )
         else:
             result = _execute_block_standard(
-                block, context, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
+                block, context, servers, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
             )
 
         result = _finalize_block_result(result, block, i, time.perf_counter())
@@ -2491,7 +2589,8 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         os.environ["SHELLFLOW_SSH_CONFIG"] = str(Path(args.ssh_config).expanduser())
 
     try:
-        servers, blocks = parse_script(run_args.script)
+        blocks = parse_script(run_args.script)
+        servers = parse_server_config(run_args.script)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return EXIT_PARSE_FAILURE
@@ -2540,7 +2639,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         return EXIT_EXECUTION_FAILURE
 
     try:
-        servers, blocks = parse_script(content)
+        blocks = parse_script(content)
+        servers = parse_server_config(content)
     except ParseError as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return _exit_code_for_failure(FAILURE_PARSE)
