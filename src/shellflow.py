@@ -579,6 +579,27 @@ def _parse_export_directive(argument: str | None, *, line_no: int) -> tuple[str,
     return name, source
 
 
+def _skip_macro_definition(lines: list[str], start_index: int) -> int:
+    """Skip a macro definition block from @MACRO to @ENDMACRO.
+
+    Args:
+        lines: All lines of the script
+        start_index: Index of the @MACRO line
+
+    Returns:
+        The index after the @ENDMACRO line
+    """
+    i = start_index + 1  # Start from the line after @MACRO
+    while i < len(lines):
+        line = lines[i]
+        marker = _parse_block_marker(line)
+        if marker and marker[0] == "ENDMACRO":
+            return i + 1  # Return index after @ENDMACRO
+        i += 1
+    # If we reach the end without finding @ENDMACRO, return the end index
+    return len(lines)
+
+
 def _parse_annotation_block(lines: list[str], start_index: int) -> tuple[dict[str, str], int]:
     """Parse an annotation block starting from the given line index.
 
@@ -709,6 +730,10 @@ def parse_script(content: str) -> list[Block]:
                     raise ParseError(f"Line {line_no}: @ANNOTATE marker missing task name")
                 pending_annotations, lines_consumed = _parse_annotation_block(lines, i)
                 i += lines_consumed
+                continue
+            if marker_name == "MACRO":
+                # Skip macro definitions - they don't create execution blocks
+                i = _skip_macro_definition(lines, i)
                 continue
             if marker_name in {"LOCAL", "REMOTE"}:
                 if current_block is None:

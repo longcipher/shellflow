@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 # Add src to path for importing shellflow
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
+# Import macros module
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src" / "shellflow"))
+from macros import parse_macros
+
 from shellflow import (
     Block,
     ExecutionContext,
@@ -1057,3 +1061,19 @@ def step_then_servers_are_extracted_correctly(context: Context) -> None:
         raise AssertionError(f"Expected host 'example.com', got {servers['web-server']['host']!r}.")
     if servers["web-server"]["user"] != "deploy":
         raise AssertionError(f"Expected user 'deploy', got {servers['web-server']['user']!r}.")
+
+
+@then('the macro "{macro_name}" should contain {count:d} commands')
+def step_then_the_macro_should_contain_commands(context: Context, macro_name: str, count: int) -> None:
+    script_content = getattr(context, "script_content", None)
+    if not script_content:
+        raise ValueError("No script content set. Did you call the Given step first?")
+
+    try:
+        macros = parse_macros(script_content)
+        if macro_name not in macros:
+            raise AssertionError(f"Macro '{macro_name}' not found. Available: {list(macros.keys())}")
+        if len(macros[macro_name]) != count:
+            raise AssertionError(f"Macro '{macro_name}' has {len(macros[macro_name])} commands, expected {count}")
+    except Exception as error:
+        raise AssertionError(f"Failed to parse macros: {error}") from error
