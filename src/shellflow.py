@@ -104,6 +104,7 @@ class ExecutionContext:
     last_output: str = ""
     success: bool = True
     macros: dict[str, list[str]] = field(default_factory=dict)
+    variables: dict[str, str] = field(default_factory=dict)
 
     def to_shell_env(self) -> dict[str, str]:
         """Convert context to environment variables for shell execution."""
@@ -111,6 +112,13 @@ class ExecutionContext:
         shell_env.update(self.env)
         shell_env["SHELLFLOW_LAST_OUTPUT"] = self.last_output
         return shell_env
+
+    def substitute_variables(self, text: str) -> str:
+        """Substitute variables in text using $VAR syntax."""
+        result = text
+        for name, value in self.variables.items():
+            result = result.replace(f"${name}", value)
+        return result
 
 
 class CommandLog:
@@ -740,6 +748,34 @@ def _apply_block_directive(block: Block, marker_name: str, marker_argument: str 
     raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
 
 
+def parse_variables(content: str) -> dict[str, str]:
+    """Parse script-level variables from content.
+
+    Args:
+        content: The script content to parse.
+
+    Returns:
+        Dict of variable name to value.
+
+    Raises:
+        ParseError: If variable parsing fails.
+    """
+    variables: dict[str, str] = {}
+    lines = content.splitlines()
+    for line_no, line in enumerate(lines, 1):
+        marker = _parse_block_marker(line)
+        if marker and marker[0] == "VAR":
+            if not marker[1] or "=" not in marker[1]:
+                raise ParseError(f"Line {line_no}: @VAR expects NAME=value format")
+            name, value = marker[1].split("=", 1)
+            name = name.strip()
+            value = value.strip()
+            if not _is_valid_env_name(name):
+                raise ParseError(f"Line {line_no}: @VAR expects a valid variable name")
+            variables[name] = value
+    return variables
+
+
 def parse_script(content: str, macros: dict[str, list[str]] | None = None) -> list[Block]:
     """Parse a shell script into execution blocks.
 
@@ -785,6 +821,10 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None) -> li
             if marker_name == "MACRO":
                 # Skip macro definitions - they don't create execution blocks
                 i = _skip_macro_definition(lines, i)
+                continue
+            if marker_name == "VAR":
+                # Skip variable definitions - they don't create execution blocks
+                i += 1
                 continue
             if marker_name in {"LOCAL", "REMOTE"}:
                 if current_block is None:
@@ -915,7 +955,9 @@ def _build_executable_script(
     if include_context_exports:
         script_lines.extend(_build_context_exports(context))
     script_lines.extend(_build_shell_bootstrap(shell))
-    script_lines.extend(commands)
+    # Substitute variables in commands
+    substituted_commands = [context.substitute_variables(cmd) for cmd in commands]
+    script_lines.extend(substituted_commands)
     return "\n".join(script_lines)
 
 
@@ -2411,6 +2453,7 @@ def run_script(
     sequential_output: bool = True,  # New parameter for sequential output
     output_tail_lines: int = MAX_OUTPUT_LINES,
     macros: dict[str, list[str]] | None = None,
+    variables: dict[str, str] | None = None,
 ) -> RunResult:
     """Run a list of blocks sequentially.
 
@@ -2425,7 +2468,7 @@ def run_script(
     Returns:
         RunResult with success status and execution info.
     """
-    context = ExecutionContext(macros=macros or {})
+    context = ExecutionContext(macros=macros or {}, variables=variables or {})
     blocks_executed = 0
     block_results: list[ExecutionResult] = []
     run_id = _new_run_id()
@@ -2667,6 +2710,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
 
     try:
         macros = parse_macros(run_args.script)
+        variables = parse_variables(run_args.script)
         blocks = parse_script(run_args.script, macros)
         servers = parse_server_config(run_args.script)
     except ParseError as e:
@@ -2674,7 +2718,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         return EXIT_PARSE_FAILURE
 
     if not blocks:
-        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, macros=macros)
+        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, macros=macros, variables=variables)
         print(result.to_dict())
         return EXIT_SUCCESS
 
@@ -2686,6 +2730,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         dry_run=run_args.dry_run,
         output_tail_lines=MAX_OUTPUT_LINES,
         macros=macros,
+        variables=variables,
     )
 
     # Output structured result
@@ -2719,6 +2764,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         macros = parse_macros(content)
+        variables = parse_variables(content)
         blocks = parse_script(content, macros)
         servers = parse_server_config(content)
     except ParseError as e:
@@ -2726,7 +2772,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return _exit_code_for_failure(FAILURE_PARSE)
 
     if not blocks:
-        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, macros=macros)
+        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, macros=macros, variables=variables)
         if args.json or args.jsonl:
             if args.json:
                 _emit_structured_output_json(empty_result)
@@ -2747,6 +2793,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         output_tail_lines=args.output_lines,
         macros=macros,
+        variables=variables,
     )
 
     if args.audit_log:
