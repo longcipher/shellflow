@@ -895,7 +895,7 @@ __SHELLFLOW_EXITCODE__101
             execute_remote(block, execution_context, None)
 
             # Verify SSH config was looked up
-            mock_read_config.assert_called_once_with("myhost")
+            mock_read_config.assert_called_once_with("myhost", None)
 
             # Verify the port from looked-up config was used
             call_args = mock_run.call_args.args[0]
