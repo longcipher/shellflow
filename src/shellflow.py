@@ -68,6 +68,9 @@ from variables import parse_variables
 # Import hook utilities
 from hooks import execute_hook, parse_hooks
 
+# Import advanced execution modes
+from advanced_modes import run_parallel
+
 # Import doctor utilities
 from doctor import run_doctor
 
@@ -835,6 +838,7 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpe
     prelude_lines: list[str] = []
     directive_phase = False
     pending_annotations: dict[str, str] = {}
+    parallel_annotations: dict[str, str] = {}  # Persistent parallel annotations
     lines = content.splitlines()
     i = 0
 
@@ -869,6 +873,18 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpe
                 # Skip hook definitions - they don't create execution blocks
                 i = _skip_hook_definition(lines, i)
                 continue
+            if marker_name == "PARALLEL":
+                # Handle parallel execution marker
+                # Set parallel mode for subsequent blocks
+                parallel_annotations.clear()  # Clear previous parallel settings
+                if marker_argument:
+                    # @PARALLEL <group_name> - name the parallel group
+                    parallel_annotations["parallel_group"] = marker_argument
+                else:
+                    # @PARALLEL - anonymous parallel group
+                    parallel_annotations["parallel"] = "true"
+                i += 1
+                continue
             if marker_name in {"LOCAL", "REMOTE"}:
                 if current_block is None:
                     prelude_lines = _clean_commands(accumulated_lines)
@@ -883,11 +899,11 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpe
                 directive_phase = True
 
                 if marker_name == "LOCAL":
-                    current_block = Block(target="LOCAL", source_line=line_no, annotations=pending_annotations)
+                    current_block = Block(target="LOCAL", source_line=line_no, annotations={**parallel_annotations, **pending_annotations})
                 else:
                     if not marker_argument:
                         raise ParseError(f"Line {line_no}: @REMOTE marker missing host")
-                    current_block = Block(target=f"REMOTE:{marker_argument}", source_line=line_no, annotations=pending_annotations)
+                    current_block = Block(target=f"REMOTE:{marker_argument}", source_line=line_no, annotations={**parallel_annotations, **pending_annotations})
                 pending_annotations = {}  # Clear after applying
                 i += 1
                 continue
@@ -2301,13 +2317,55 @@ def _execute_local_block_sequential(
 def _get_verbose_colors() -> dict[str, str]:
     """Get ANSI color codes for verbose output."""
     return {
-        "GREEN": "\033[92m",
-        "RED": "\033[91m",
-        "BLUE": "\033[94m",
-        "YELLOW": "\033[93m",
-        "DIM": "\033[90m",
-        "RESET": "\033[0m",
+        "RESET": ANSI_RESET,
+        "RED": ANSI_RED,
+        "GREEN": ANSI_GREEN,
+        "YELLOW": ANSI_YELLOW,
+        "BLUE": ANSI_BLUE,
+        "DIM": ANSI_DIM,
     }
+
+
+def _group_blocks_for_parallel_execution(blocks: list[Block]) -> list[list[Block]]:
+    """Group blocks for parallel execution based on parallel annotations.
+
+    Consecutive blocks with 'parallel' or 'parallel_group' annotations are grouped together.
+
+    Args:
+        blocks: List of blocks to group.
+
+    Returns:
+        List of block groups, where each group is a list of blocks to execute in parallel.
+    """
+    groups: list[list[Block]] = []
+    current_group: list[Block] = []
+
+    for block in blocks:
+        is_parallel = (
+            "parallel" in block.annotations or
+            "parallel_group" in block.annotations
+        )
+
+        if is_parallel and current_group:
+            # Add to current parallel group
+            current_group.append(block)
+        elif is_parallel:
+            # Start new parallel group
+            if current_group:
+                groups.append(current_group)
+            current_group = [block]
+        else:
+            # Sequential block
+            if current_group:
+                groups.append(current_group)
+                current_group = []
+            groups.append([block])
+
+    # Handle any remaining group
+    if current_group:
+        groups.append(current_group)
+
+    return groups
 
 
 def _execute_dry_run(
@@ -2493,6 +2551,7 @@ def run_script(
     verbose: bool = False,
     no_input: bool = False,
     dry_run: bool = False,
+    mode: str = "sequential",  # New parameter for execution mode
     sequential_output: bool = True,  # New parameter for sequential output
     output_tail_lines: int = MAX_OUTPUT_LINES,
     macros: dict[str, list[str]] | None = None,
@@ -2550,57 +2609,116 @@ def run_script(
                 events=events,
             )
 
-    for i, block in enumerate(blocks, 1):
-        block_id = _make_block_id(i)
-        events.append(_make_block_started_event(run_id, block_id, i, block, total_blocks))
+    # Group blocks for execution based on mode
+    if mode == "parallel":
+        # Group consecutive blocks with parallel annotations
+        execution_groups = _group_blocks_for_parallel_execution(blocks)
+    else:
+        # Sequential execution - each block is its own group
+        execution_groups = [[block] for block in blocks]
 
-        # Execute the block
-        if sequential_output and verbose:
-            result = _execute_block_with_sequential_output(
-                block, context, servers, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
-            )
-        else:
-            result = _execute_block_standard(
-                block, context, servers, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
-            )
+    current_block_index = 0
 
-        result = _finalize_block_result(result, block, i, time.perf_counter())
-        blocks_executed += 1
-        block_results.append(result)
-        events.append(_make_block_finished_event(run_id, result, block, total_blocks))
+    for group in execution_groups:
+        if len(group) == 1:
+            # Sequential execution for single blocks
+            block = group[0]
+            current_block_index += 1
+            i = current_block_index
+            block_id = _make_block_id(i)
+            events.append(_make_block_started_event(run_id, block_id, i, block, total_blocks))
 
-        # Update context
-        context.last_output = result.output
-        context.success = result.success
-        result.exported_env = _apply_block_exports(block, result, context)
+            # Execute the block
+            if sequential_output and verbose:
+                result = _execute_block_with_sequential_output(
+                    block, context, servers, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
+                )
+            else:
+                result = _execute_block_standard(
+                    block, context, servers, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
+                )
 
-        # Fail fast on error
-        if not result.success:
-            failure_kind = _failure_kind_for_result(result)
-            exit_code = _exit_code_for_failure(failure_kind)
-            events.append(
-                _make_run_finished_event(
-                    run_id,
+            result = _finalize_block_result(result, block, i, time.perf_counter())
+            blocks_executed += 1
+            block_results.append(result)
+            events.append(_make_block_finished_event(run_id, result, block, total_blocks))
+
+            # Update context
+            context.last_output = result.output
+            context.success = result.success
+            result.exported_env = _apply_block_exports(block, result, context)
+
+            # Fail fast on error
+            if not result.success:
+                failure_kind = _failure_kind_for_result(result)
+                exit_code = _exit_code_for_failure(failure_kind)
+                events.append(
+                    _make_run_finished_event(
+                        run_id,
+                        success=False,
+                        exit_code=exit_code,
+                        blocks_executed=blocks_executed,
+                        total_blocks=total_blocks,
+                        failure_kind=failure_kind,
+                        no_input=no_input,
+                    )
+                )
+                return RunResult(
                     success=False,
-                    exit_code=exit_code,
                     blocks_executed=blocks_executed,
-                    total_blocks=total_blocks,
+                    error_message=f"Block {i} failed: {result.error_message}",
+                    block_results=block_results,
+                    run_id=run_id,
+                    schema_version=SCHEMA_VERSION,
+                    exit_code=exit_code,
                     failure_kind=failure_kind,
                     no_input=no_input,
+                    events=events,
                 )
+        else:
+            # Parallel execution for multiple blocks
+            start_block_index = current_block_index + 1
+            current_block_index += len(group)
+
+            # Execute blocks in parallel
+            parallel_results = run_parallel(
+                group, context, servers, no_input, verbose, output_tail_lines, run_id, total_blocks
             )
-            return RunResult(
-                success=False,
-                blocks_executed=blocks_executed,
-                error_message=f"Block {i} failed: {result.error_message}",
-                block_results=block_results,
-                run_id=run_id,
-                schema_version=SCHEMA_VERSION,
-                exit_code=exit_code,
-                failure_kind=failure_kind,
-                no_input=no_input,
-                events=events,
-            )
+
+            for result in parallel_results:
+                result.block_index = start_block_index + parallel_results.index(result) - 1  # Adjust index
+                blocks_executed += 1
+                block_results.append(result)
+                block = group[result.block_index - start_block_index + 1]
+                events.append(_make_block_finished_event(run_id, result, block, total_blocks))
+
+                # Fail fast on error in parallel execution
+                if not result.success:
+                    failure_kind = _failure_kind_for_result(result)
+                    exit_code = _exit_code_for_failure(failure_kind)
+                    events.append(
+                        _make_run_finished_event(
+                            run_id,
+                            success=False,
+                            exit_code=exit_code,
+                            blocks_executed=blocks_executed,
+                            total_blocks=total_blocks,
+                            failure_kind=failure_kind,
+                            no_input=no_input,
+                        )
+                    )
+                    return RunResult(
+                        success=False,
+                        blocks_executed=blocks_executed,
+                        error_message=f"Block {result.block_index} failed: {result.error_message}",
+                        block_results=block_results,
+                        run_id=run_id,
+                        schema_version=SCHEMA_VERSION,
+                        exit_code=exit_code,
+                        failure_kind=failure_kind,
+                        no_input=no_input,
+                        events=events,
+                    )
 
     events.append(
         _make_run_finished_event(
@@ -2800,7 +2918,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         return EXIT_PARSE_FAILURE
 
     if not blocks:
-        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, macros=macros, helpers=helpers, variables=variables, hooks=hooks)
+        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, mode="sequential", macros=macros, helpers=helpers, variables=variables, hooks=hooks)
         print(result.to_dict())
         return EXIT_SUCCESS
 
@@ -2810,6 +2928,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         verbose=False,  # Agent mode doesn't need verbose output
         no_input=True,  # Always non-interactive for agents
         dry_run=run_args.dry_run,
+        mode="sequential",
         output_tail_lines=MAX_OUTPUT_LINES,
         macros=macros,
         helpers=helpers,
@@ -2858,7 +2977,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return _exit_code_for_failure(FAILURE_PARSE)
 
     if not blocks:
-        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, macros=macros, helpers=helpers, variables=variables, hooks=hooks)
+        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, mode="sequential", macros=macros, helpers=helpers, variables=variables, hooks=hooks)
         if args.json or args.jsonl:
             if args.json:
                 _emit_structured_output_json(empty_result)
@@ -2877,6 +2996,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         verbose=args.verbose and not machine_mode,
         no_input=args.no_input,
         dry_run=args.dry_run,
+        mode="sequential",
         output_tail_lines=args.output_lines,
         macros=macros,
         helpers=helpers,

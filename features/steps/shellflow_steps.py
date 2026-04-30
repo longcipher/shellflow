@@ -869,6 +869,44 @@ def step_when_run_the_script_with_audit_log_path(context: Context) -> None:
     when_run_the_script_with_cli_args(context, "--audit-log", str(audit_log_path), "--jsonl")
 
 
+@when('I run the script with mode "{mode}"')
+def step_when_run_script_with_mode(context: Context, mode: str) -> None:
+    """Run the parsed script with a specific execution mode."""
+    script_content = getattr(context, "script_content", None)
+    if not script_content:
+        raise ValueError("No script content set. Did you call the Given step first?")
+
+    try:
+        macros = parse_macros(script_content)
+        helpers = parse_helpers(script_content)
+        variables = parse_variables(script_content)
+        hooks = parse_hooks(script_content)
+        blocks = parse_script(script_content, macros, helpers, hooks)
+        servers = parse_server_config(script_content)
+    except ParseError as error:
+        context.run_result = None
+        context.block_results = []
+        context.stdout = ""
+        context.stderr = str(error)
+        context.exit_code = 1
+        return
+
+    with (
+        mock.patch(
+            "shellflow.read_ssh_config",
+            side_effect=lambda host, servers=None: _read_ssh_config_for_context(context, host),
+        ),
+        mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote),
+    ):
+        result = run_script(blocks, servers, verbose=getattr(context, "verbose", False), mode=mode, variables=variables, macros=macros, helpers=helpers, hooks=hooks)
+
+    context.run_result = result
+    context.block_results = result.block_results
+    context.stdout = "\n".join(block.output for block in result.block_results if block.output)
+    context.stderr = result.error_message if not result.success else ""
+    context.exit_code = 0 if result.success else 1
+
+
 @when("the script is parsed")
 def step_when_the_script_is_parsed(context: Context) -> None:
     when_the_script_is_parsed(context)
