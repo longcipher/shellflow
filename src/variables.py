@@ -7,7 +7,6 @@ Variables are defined using # @VAR NAME=value markers.
 from __future__ import annotations
 
 import re
-from typing import Any
 
 
 def parse_variables(content: str) -> dict[str, str]:
@@ -38,7 +37,7 @@ def parse_variables(content: str) -> dict[str, str]:
     return variables
 
 
-BLOCK_MARKER_RE = re.compile(r"^\s*#\s*@(?P<marker>[A-Z_]+)(?:\s+(?P<argument>\S+))?\s*$")
+BLOCK_MARKER_RE = re.compile(r"^\s*#\s*@(?P<marker>[A-Za-z_]+)(?:\s+(?P<argument>.*?))?\s*$")
 
 
 def _parse_block_marker(line: str) -> tuple[str, str | None] | None:
@@ -46,7 +45,8 @@ def _parse_block_marker(line: str) -> tuple[str, str | None] | None:
     match = BLOCK_MARKER_RE.match(line)
     if not match:
         return None
-    return match.group("marker"), match.group("argument")
+    argument = match.group("argument")
+    return match.group("marker").upper(), argument.strip() if argument is not None else None
 
 
 def _is_valid_env_name(name: str) -> bool:
@@ -54,6 +54,5 @@ def _is_valid_env_name(name: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
 
 
-class ParseError(Exception):
+class ParseError(ValueError):
     """Exception raised when variable parsing fails."""
-    pass

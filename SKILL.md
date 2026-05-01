@@ -1,52 +1,66 @@
 ---
 name: shellflow
-description: Use when writing or reviewing bash scripts for Shellflow, especially when mixing # @LOCAL and # @REMOTE markers, relying on a shared prelude, passing data through SHELLFLOW_LAST_OUTPUT, or targeting remote hosts resolved from SSH config.
+description: Use when writing or reviewing Shellflow playbooks, especially when mixing # @LOCAL and # @REMOTE blocks, declaring # @option parameters, freezing shared prelude values, using # @TASK/# @MACRO targets, lifecycle hooks, parallel groups, or agent-facing JSON/JSONL output.
 ---
 
 # Shellflow Playbook Authoring
 
 ## Overview
 
-Shellflow playbooks are standard bash scripts with comment markers that split execution into sequential local and remote blocks.
+Shellflow playbooks are normal shell scripts with comment markers. The script remains valid shell for humans, while Shellflow uses markers to split execution into isolated local and remote blocks, pass explicit context between blocks, and emit structured results for agents.
 
-The agent should generate normal shell code first, then apply Shellflow-specific rules for block boundaries, shared prelude handling, remote host selection, and cross-block data passing.
+Generate ordinary shell first. Then apply Shellflow rules for block boundaries, prelude freezing, remote host resolution, dynamic options, task selection, lifecycle hooks, and agent-safe output.
 
 ## When to Use
 
 Use this skill when:
 
 - Writing a new Shellflow playbook.
-- Refactoring an existing bash script into `# @LOCAL` and `# @REMOTE` blocks.
-- Reviewing whether a script actually matches Shellflow's parser and execution model.
-- Explaining why a Shellflow script behaves differently from a single long-running shell session.
+- Refactoring a shell script into `# @LOCAL` and `# @REMOTE` blocks.
+- Reviewing Shellflow parser compatibility.
+- Explaining block isolation, prelude behavior, exports, tasks, hooks, or parallel execution.
+- Preparing a script for `shellflow run --json`, `--jsonl`, or `agent-run`.
 
 Do not use this skill for:
 
-- Generic bash scripting unrelated to Shellflow.
-- Arbitrary SSH orchestration syntax that Shellflow does not parse.
-- Multi-host fan-out or non-bash execution models.
+- Generic bash unrelated to Shellflow.
+- Arbitrary SSH orchestration syntaxes that Shellflow does not parse.
+- Comma-expanded multi-host syntax inside one `# @REMOTE` marker.
+- Embedded workflow logic that belongs in the outer agent.
 
 ## Core Rules
 
-### 1. Write a normal bash script
+### 1. Write normal shell
 
 - Use a regular `.sh` file.
-- Keep the shebang at the top when it helps editors and humans, for example `#!/bin/bash`.
-- Put shell options such as `set -euo pipefail` near the top if every block should inherit them.
+- Keep a shebang when helpful, for example `#!/bin/bash`.
+- Put shell safety flags such as `set -euo pipefail` in the prelude only if every block should inherit them.
+- Prefer clear, self-contained commands over clever shell state.
 
-### 2. Use only supported block markers
+### 2. Use supported markers
 
-Shellflow recognizes these standalone marker lines:
+Top-level markers:
 
 - `# @LOCAL`
 - `# @REMOTE <ssh-host>`
+- `# @SERVER <name>`
+- `# @option <name>[=<default>]`
+- `# @TASK <name>`
+- `# @MACRO <name> ...` / `# @ENDMACRO`
+- `# @HELPER <name>` / `# @ENDHELPER`
+- `# @HOOK <type>` / `# @ENDHOOK`
 
-Rules:
+Block directives must appear immediately after `# @LOCAL` or `# @REMOTE <host>`, before command lines:
 
-- Markers must appear on their own line as comments.
-- `@REMOTE` must include exactly one host argument.
-- Marker names are uppercase in current Shellflow usage.
-- Unknown markers fail parsing.
+- `# @TIMEOUT <seconds>`
+- `# @RETRY <count>`
+- `# @EXPORT NAME=stdout|stderr|output|exit_code`
+- `# @SHELL bash|zsh|sh`
+- `# @PARALLEL [group]`
+
+Write marker names uppercase even though the parser accepts them case-insensitively.
+
+### 3. Keep block boundaries explicit
 
 Good:
 
@@ -61,29 +75,52 @@ uname -a
 Bad:
 
 ```bash
-# @remote staging
-uname -a
-
 echo "# @LOCAL"
+# marker text inside an echo is just shell output, not a block marker
 ```
 
-## 3. Treat everything before the first marker as shared prelude
+`# @REMOTE <ssh-host>` takes one host alias. Do not write `# @REMOTE web-1,web-2`; create separate remote blocks and mark them `# @PARALLEL` if they should run together.
 
-Lines before the first marker are prepended to every executable block.
+### 4. Treat each block as a fresh shell
 
-This area is appropriate for:
+Each block is isolated. Do not rely on these persisting across blocks:
 
-- Shebangs
-- Shell safety flags such as `set -euo pipefail`
-- Small helper functions
-- Shared constants that should exist in every block
+- `cd`
+- shell variables
+- shell functions defined inside a block
+- aliases
+- `export` values
+- shell options set inside a block
 
-This area is not appropriate for one-time side effects, because they will run once per block:
+Use `SHELLFLOW_LAST_OUTPUT` or `# @EXPORT` for explicit handoff.
 
-- `cd some/dir`
-- `echo "starting deployment"`
-- `export BUILD_ID=$(date +%s)` when you expect a single shared value
-- Any command that should happen only once
+Good:
+
+```bash
+# @LOCAL
+# @EXPORT ARTIFACT=stdout
+mktemp
+
+# @LOCAL
+test -n "$ARTIFACT"
+printf 'ready\n' > "$ARTIFACT"
+```
+
+Bad:
+
+```bash
+# @LOCAL
+artifact=$(mktemp)
+
+# @LOCAL
+printf 'ready\n' > "$artifact"
+```
+
+## Shared Prelude and Frozen Values
+
+Lines before the first block marker are the shared prelude. Shellflow prepends non-assignment prelude lines to every executable block.
+
+Uppercase assignments in the prelude are special: Shellflow evaluates them once locally and exports the frozen values into every block.
 
 Good:
 
@@ -91,290 +128,300 @@ Good:
 #!/bin/bash
 set -euo pipefail
 
+BUILD_ID=$(date +%s)
+
 log() {
-  printf '[shellflow] %s\n' "$*"
+  printf '[deploy] %s\n' "$*"
 }
 
 # @LOCAL
-log "building"
-```
-
-Bad:
-
-```bash
-#!/bin/bash
-cd /srv/app
-
-# @LOCAL
-pwd
+echo "$BUILD_ID"
 
 # @REMOTE staging
-pwd
+echo "$BUILD_ID"
 ```
 
-Why it is bad: the `cd /srv/app` line becomes part of every block, including remote blocks.
+Both blocks receive the same `BUILD_ID`.
 
-## 4. Use block directives for timeout, retry, and exports
-
-Block directives must appear immediately after the `# @LOCAL` or `# @REMOTE <host>` marker, before any command lines. They configure execution behavior for that specific block.
-
-### Timeout Directive
-
-`# @TIMEOUT <seconds>` - Abort the block if it exceeds the specified duration.
+Avoid one-time side effects in the prelude, especially if uppercase assignments are present and prelude evaluation will run locally:
 
 ```bash
-# @LOCAL
-# @TIMEOUT 30
-sleep 60
+cd /srv/app       # bad in prelude
+rm -rf tmp/cache  # bad in prelude
 ```
 
-### Retry Directive
+Put one-time operations in explicit blocks instead.
 
-`# @RETRY <count>` - Retry the block up to N times on failure (0 means no retry).
+## Dynamic Options
+
+Use `# @option` to declare parameters a human or agent must fill.
 
 ```bash
-# @LOCAL
-# @RETRY 3
-curl -f https://api.example.com/health
+# @option staging
+# @option branch=main
+# @option release-name=
 ```
 
-### Export Directive
+Semantics:
 
-`# @EXPORT NAME=source` - Capture a value from the block result and pass it to subsequent blocks as an environment variable.
+- `# @option staging` is boolean. `--staging` sets `STAGING=1`; absent means the variable is unset.
+- `# @option branch=main` has a default. `--branch develop` sets `BRANCH=develop`.
+- `# @option release-name=` is required. Provide `--release-name v1` or environment variable `RELEASE_NAME`.
+- Option names become uppercase environment variables with dashes converted to underscores.
+- Unknown dynamic CLI options are parse errors.
 
-Valid sources:
-
-- `stdout` - The block's standard output
-- `stderr` - The block's standard error
-- `output` - Combined stdout and stderr
-- `exit_code` - The block's exit code (as string)
+CLI:
 
 ```bash
-# @LOCAL
-# @EXPORT BUILD_ID=stdout
-echo "build-$(date +%s)"
-
-# @LOCAL
-echo "Building: $BUILD_ID"
+shellflow run deploy.sh --branch develop --release-name v2026.05.01 --staging
 ```
 
-You can use multiple exports in a single block:
+Agent input:
+
+```json
+{
+  "script": "# @option release-name=\n# @LOCAL\necho \"$RELEASE_NAME\"\n",
+  "options": {"release-name": "v2026.05.01"},
+  "dry_run": false
+}
+```
+
+## Tasks and Macros
+
+Use `# @TASK <name>` to label the following block.
 
 ```bash
+# @TASK build
 # @LOCAL
-# @EXPORT STATUS_CODE=exit_code
-# @EXPORT RESPONSE=stdout
-curl -s -w "%{http_code}" -o response.txt https://api.example.com
+echo "build"
+
+# @TASK deploy
+# @REMOTE staging
+echo "deploy"
 ```
 
-### Shell Directive
+Run one task:
 
-`# @SHELL <shell>` - Specify the shell to use for executing this block.
+```bash
+shellflow run deploy.sh --task build
+```
 
-Use this when targeting remote hosts that use a non-bash default shell (e.g., zsh).
+Use a single-line macro to define a task flow:
+
+```bash
+# @MACRO release build deploy smoke-test
+```
+
+Then run:
+
+```bash
+shellflow run deploy.sh --task release
+```
+
+Rules:
+
+- A `--task` target can be either a task name or a macro name.
+- A macro used as a task flow must reference existing task names.
+- Unknown task targets must fail parse rather than silently running the whole script.
+
+Macros can also expand command snippets inside blocks:
+
+```bash
+# @MACRO print_env
+#   env | sort
+# @ENDMACRO
+
+# @LOCAL
+print_env
+```
+
+## Helpers
+
+Helpers are reusable command snippets. They expand when a block line is exactly the helper name.
+
+```bash
+# @HELPER backup_db
+#   pg_dump "$DATABASE_URL" > backup.sql
+# @ENDHELPER
+
+# @LOCAL
+backup_db
+```
+
+Use helpers for local command reuse. Keep them simple and predictable.
+
+## Lifecycle Hooks
+
+Hooks run locally and share Shellflow context:
+
+- `PRE` runs once before main blocks.
+- `BEFORE` runs before each main block.
+- `AFTER` runs after each main block.
+- `SUCCESS` runs after all main blocks succeed.
+- `ERROR` runs after a hook or main block fails.
+- `FINISHED` runs at the end for success or failure.
+
+Aliases:
+
+- `POST` means `AFTER`.
+- `FINALLY` means `FINISHED`.
+
+Example:
+
+```bash
+# @HOOK PRE
+#   echo "prepare"
+# @ENDHOOK
+
+# @HOOK ERROR
+#   echo "collect diagnostics"
+# @ENDHOOK
+
+# @HOOK FINISHED
+#   echo "cleanup"
+# @ENDHOOK
+```
+
+Use hooks for setup, cleanup, and diagnostics. Do not hide primary deployment logic in hooks.
+
+## Parallel Execution
+
+`# @PARALLEL` applies only to the next block, or to the current block when used as a block directive.
+
+Mark every block that should be in the parallel group:
+
+```bash
+# @PARALLEL web
+# @REMOTE web-1
+systemctl restart nginx
+
+# @PARALLEL web
+# @REMOTE web-2
+systemctl restart nginx
+
+# @LOCAL
+echo "after the parallel group"
+```
+
+Run with:
+
+```bash
+shellflow run restart.sh --mode parallel
+```
+
+Without `--mode parallel`, annotated blocks still run sequentially. Consecutive parallel blocks form one group. A non-parallel block ends the group.
+
+Parallel blocks receive a copied context. Do not rely on exports produced by one parallel block being available to another parallel block in the same group.
+
+## Remote Hosts
+
+Remote hosts can come from inline `# @SERVER` definitions:
+
+```bash
+# @SERVER staging
+#   host: 192.168.1.100
+#   user: deploy
+#   port: 22
+#   key: ~/.ssh/id_ed25519
+
+# @REMOTE staging
+hostname
+```
+
+Or from SSH config:
+
+```sshconfig
+Host staging
+    HostName 192.168.1.100
+    User deploy
+    Port 22
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+Rules:
+
+- `@SERVER` requires a `host` field.
+- Inline `key` maps to SSH identity file.
+- `# @REMOTE <host>` must resolve before execution.
+- Unknown remote hosts fail early.
+- Use `--ssh-config <path>` to override `~/.ssh/config`.
+
+## Shells and Remote Tracing
+
+Use `# @SHELL zsh` or `# @SHELL bash` immediately after a remote block marker when the target needs a specific shell.
 
 ```bash
 # @REMOTE zsh-server
 # @SHELL zsh
-# zsh-specific commands now work
 reload
 compdef
 ```
 
-Without `@SHELL`, Shellflow defaults to `bash` for all remote blocks.
+Shellflow starts remote shells in login mode and quietly bootstraps `~/.zshrc` or `~/.bashrc` for zsh/bash blocks.
 
-## 5. Assume every block runs in a fresh shell
-
-Each block is isolated.
-
-Do not assume these persist into the next block:
-
-- Current working directory
-- Shell variables
-- `export` values
-- Aliases
-- Functions defined inside a block
-- Shell options set inside a block
-
-Write each block so it can run independently.
-
-Good:
-
-```bash
-# @LOCAL
-cd /tmp
-artifact=$(mktemp)
-printf 'ready' > "$artifact"
-echo "$artifact"
-
-# @LOCAL
-artifact="$SHELLFLOW_LAST_OUTPUT"
-test -f "$artifact"
-cat "$artifact"
-```
-
-Bad:
-
-```bash
-# @LOCAL
-cd /tmp
-artifact=$(mktemp)
-
-# @LOCAL
-printf 'ready' > "$artifact"
-pwd
-```
-
-Why it is bad: `artifact` and the working directory do not persist.
-
-## 6. Use SHELLFLOW_LAST_OUTPUT for explicit handoff
-
-Shellflow passes the previous block's combined output into the next block as `SHELLFLOW_LAST_OUTPUT`.
-
-Guidelines:
-
-- Prefer passing a single path, ID, or compact value.
-- Quote it when reading: `"$SHELLFLOW_LAST_OUTPUT"`.
-- If the previous block prints multiple lines, expect a multi-line string.
-- Do not treat it as structured JSON unless you intentionally emitted JSON in the previous block.
-
-Good:
-
-```bash
-# @LOCAL
-echo "/tmp/release.tar.gz"
-
-# @REMOTE staging
-tar -tf "$SHELLFLOW_LAST_OUTPUT" >/dev/null
-```
-
-Better for structured data:
-
-```bash
-# @LOCAL
-python - <<'PY'
-import json
-print(json.dumps({"release": "2026.03.15"}))
-PY
-
-# @LOCAL
-python - <<'PY'
-import json
-import os
-payload = json.loads(os.environ["SHELLFLOW_LAST_OUTPUT"])
-print(payload["release"])
-PY
-```
-
-## 7. Use SSH config host aliases, not ad-hoc targets
-
-`# @REMOTE <ssh-host>` should point to a host that resolves through SSH config.
-
-Prefer:
-
-- `# @REMOTE staging`
-- `# @REMOTE production-app`
-
-Avoid assuming Shellflow accepts any arbitrary free-form destination unless it is resolvable by the SSH config in use.
-
-If a remote host is unknown, Shellflow fails before execution.
-
-## 8. Keep blocks self-contained and fail-fast
-
-Shellflow runs blocks in order and stops on the first failure.
-
-Write blocks so that:
-
-- Preconditions are checked inside the block that needs them.
-- Cleanup is local to the block when necessary.
-- Output is intentional and not noisy when later blocks depend on it.
-
-Prefer this:
+Remote command tracing uses a shell `DEBUG` trap and executes the whole block as one native script. This preserves multi-line shell structures:
 
 ```bash
 # @REMOTE staging
-cd /srv/app
-test -f docker-compose.yml
-docker compose pull
-docker compose up -d
+if test -f /srv/app/current; then
+  echo "exists"
+else
+  echo "missing"
+fi
 ```
 
-Over this:
+Do not split multi-line shell syntax into separate blocks.
+
+## Agent-Facing CLI
+
+Useful commands:
 
 ```bash
-# @REMOTE staging
-cd /srv/app
-
-# @REMOTE staging
-docker compose pull
-docker compose up -d
-```
-
-Why: the second block cannot rely on the first block's `cd`.
-
-## 9. CLI Options and Output Modes
-
-Shellflow provides several CLI options for different use cases:
-
-### Basic Options
-
-```bash
-shellflow run script.sh              # Run a script
-shellflow run script.sh -v          # Run with verbose output
-shellflow run script.sh --dry-run   # Preview execution plan without running
-```
-
-### Structured Output
-
-```bash
-shellflow run script.sh --json       # Single JSON report
-shellflow run script.sh --jsonl       # Streaming JSON Lines events
-```
-
-- `--json`: Outputs a single JSON object with the complete run report
-- `--jsonl`: Outputs one JSON object per event (run_started, block_started, block_finished, run_finished)
-
-### Execution Control
-
-```bash
-shellflow run script.sh --no-input   # Non-interactive mode (stdin closed)
-shellflow run script.sh --ssh-config /path/to/config  # Custom SSH config
-```
-
-- `--no-input`: Closes stdin before running blocks; useful for automation
-- `--ssh-config`: Override the default SSH config path (`~/.ssh/config`)
-
-### Audit Logging
-
-```bash
+shellflow run script.sh
+shellflow run script.sh --json
+shellflow run script.sh --jsonl
+shellflow run script.sh --no-input
+shellflow run script.sh --dry-run
+shellflow run script.sh --mode parallel
+shellflow run script.sh --task release
 shellflow run script.sh --audit-log audit.jsonl --jsonl
+shellflow agent-run --json-input '{"script":"# @LOCAL\necho hi\n"}'
+shellflow doctor script.sh
 ```
 
-The `--audit-log` option writes redacted JSON Lines events to a file. Secret-like exports (containing TOKEN, SECRET, or PASSWORD in the name) are automatically redacted to `[REDACTED]`.
+Use:
 
-## 10. Exit Codes
+- `--json` for one final report.
+- `--jsonl` for ordered run/block events.
+- `--no-input` for CI and agent runs.
+- `--dry-run` to inspect the execution plan.
+- `--audit-log` to write redacted JSONL events.
+- `doctor [script]` to check install/config status and parse an optional script.
 
-Shellflow returns distinct exit codes for different failure types:
+Exit codes:
 
-- `0`: Success
-- `1`: General execution failure
-- `2`: Parse failure (invalid script syntax)
-- `3`: SSH config failure (host not found)
-- `4`: Timeout failure (block exceeded timeout)
+- `0`: success
+- `1`: execution failure
+- `2`: parse failure
+- `3`: SSH config failure
+- `4`: timeout failure
 
 ## Authoring Checklist
 
-Before returning a Shellflow playbook, verify that:
+Before returning a Shellflow playbook, verify:
 
-- The script is valid bash without custom DSL syntax.
-- Only `# @LOCAL`, `# @REMOTE <host>`, and block directives (`# @TIMEOUT`, `# @RETRY`, `# @EXPORT`, `# @SHELL`) are used.
-- Block directives appear immediately after the block marker, before any commands.
-- Anything before the first marker is safe to repeat for every block.
+- It is valid shell plus supported comment markers.
+- Block directives appear immediately after the block marker.
 - Every block can run independently in a fresh shell.
-- Cross-block data uses `SHELLFLOW_LAST_OUTPUT` or `@EXPORT` explicitly.
-- Remote targets match the intended SSH host aliases.
-- Commands that should happen once are not accidentally placed in the shared prelude.
-- Export sources are valid (stdout, stderr, output, exit_code).
+- Shared prelude has no accidental one-time side effects.
+- Uppercase prelude assignments are intended to be frozen once locally.
+- Required `# @option name=` values are provided by CLI, env, or agent input.
+- Cross-block data uses `SHELLFLOW_LAST_OUTPUT` or `# @EXPORT`.
+- Remote targets resolve through `# @SERVER` or SSH config.
+- Multi-host work uses separate blocks, not comma hosts.
+- Each parallel block is explicitly marked and run with `--mode parallel`.
+- Hooks are only for setup, cleanup, success, and failure side effects.
+- Agent runs use `--json`, `--jsonl`, or `agent-run` instead of scraping human output.
 
 ## Reference Example
 
@@ -382,42 +429,62 @@ Before returning a Shellflow playbook, verify that:
 #!/bin/bash
 set -euo pipefail
 
+# @option release-name=
+# @option branch=main
+
+BUILD_ID=$(date +%Y%m%d%H%M%S)
+
 log() {
   printf '[deploy] %s\n' "$*"
 }
 
-# @LOCAL
-# @EXPORT BUILD_ID=stdout
-log "building artifact"
-build_id="build-$(date +%Y%m%d%H%M%S)"
-echo "$build_id"
+# @SERVER staging
+#   host: staging.example.com
+#   user: deploy
 
-# @LOCAL
-# @TIMEOUT 60
-# @RETRY 2
-log "deploying to staging"
-echo "Deploying $BUILD_ID to staging"
+# @HOOK ERROR
+#   log "deployment failed for $RELEASE_NAME"
+# @ENDHOOK
 
+# @HOOK FINISHED
+#   log "finished $RELEASE_NAME"
+# @ENDHOOK
+
+# @MACRO release build deploy smoke
+
+# @TASK build
+# @LOCAL
+# @EXPORT ARTIFACT=stdout
+log "building $RELEASE_NAME from $BRANCH"
+printf '/tmp/%s-%s.tar.gz\n' "$RELEASE_NAME" "$BUILD_ID"
+
+# @TASK deploy
 # @REMOTE staging
-# @EXPORT DEPLOYED_HOST=stdout
-log "receiving deployment"
-hostname
+# @TIMEOUT 120
+log "deploying $ARTIFACT"
+test -n "$ARTIFACT"
 
+# @TASK smoke
 # @LOCAL
-log "deployed to: $DEPLOYED_HOST"
-log "build $BUILD_ID complete"
+log "smoke test complete for $RELEASE_NAME"
+```
+
+Run it:
+
+```bash
+shellflow run deploy.sh --task release --release-name v2026.05.01 --branch main --jsonl --no-input
 ```
 
 ## Common Mistakes
 
-- Putting one-time commands before the first marker, then being surprised when they run for every block.
-- Expecting `cd`, `export`, or local shell variables from one block to exist in the next block.
-- Using an undefined remote host alias.
-- Placing block directives after commands instead of immediately after the marker.
-- Using invalid export sources (not stdout, stderr, output, or exit_code).
-- Forgetting that `@SHELL` must be specified before any commands in the block.
-- Forgetting that `@RETRY 0` means no retry attempts.
-- Using `@TIMEOUT` with values too small for normal operation.
-- Printing extra debug output from a block whose output is consumed by the next block via `@EXPORT`.
-- Forgetting to quote `"$SHELLFLOW_LAST_OUTPUT"`.
-- Treating Shellflow as a persistent session instead of sequential isolated shells.
+- Putting `cd`, `rm`, or deployment commands in the prelude.
+- Expecting shell variables from one block to exist in the next block.
+- Forgetting required dynamic options.
+- Using `# @PARALLEL` once and expecting it to apply to every later block.
+- Running parallel annotations without `--mode parallel`.
+- Using `# @REMOTE web-1,web-2` instead of separate remote blocks.
+- Placing `@TIMEOUT`, `@RETRY`, `@EXPORT`, `@SHELL`, or `@PARALLEL` after commands.
+- Using invalid export sources.
+- Treating hook commands as remote cleanup; hooks currently run locally.
+- Printing noisy output from a block whose stdout is exported into later blocks.
+- Forgetting to quote `"$SHELLFLOW_LAST_OUTPUT"` and exported variables.

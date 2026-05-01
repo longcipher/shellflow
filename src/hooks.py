@@ -7,13 +7,13 @@ Hooks are defined using # @HOOK <type> and executed at different lifecycle point
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.shellflow import ExecutionContext, ExecutionResult
 
 
-class ParseError(Exception):
+class ParseError(ValueError):
     """Exception raised when hook parsing fails."""
 
 
@@ -47,7 +47,7 @@ def parse_hooks(content: str) -> dict[str, list[str]]:
             if marker_name == "HOOK":
                 if not marker_argument:
                     raise ParseError(f"Line {i + 1}: @HOOK requires a hook type")
-                hook_type = marker_argument.strip().upper()
+                hook_type = _normalize_hook_type(marker_argument.strip())
                 if hook_type in hooks:
                     raise ParseError(f"Line {i + 1}: Hook '{hook_type}' already defined")
 
@@ -76,10 +76,26 @@ def parse_hooks(content: str) -> dict[str, list[str]]:
 
 def _parse_hook_marker(line: str) -> tuple[str, str] | None:
     """Parse a line as a hook marker if it matches exactly."""
-    match = re.match(r"^\s*#\s*@(?P<marker>HOOK|ENDHOOK)(?:\s+(?P<argument>\S+))?\s*$", line)
+    match = re.match(r"^\s*#\s*@(?P<marker>HOOK|ENDHOOK)(?:\s+(?P<argument>.*?))?\s*$", line, re.IGNORECASE)
     if not match:
         return None
-    return match.group("marker"), match.group("argument") or ""
+    return match.group("marker").upper(), match.group("argument") or ""
+
+
+def _normalize_hook_type(value: str) -> str:
+    """Normalize hook names to Shellflow's lifecycle names."""
+    hook_type = value.upper()
+    aliases = {
+        "POST": "AFTER",
+        "BEFORE": "BEFORE",
+        "PRE": "PRE",
+        "AFTER": "AFTER",
+        "SUCCESS": "SUCCESS",
+        "ERROR": "ERROR",
+        "FINISHED": "FINISHED",
+        "FINALLY": "FINISHED",
+    }
+    return aliases.get(hook_type, hook_type)
 
 
 def _clean_hook_commands(lines: list[str]) -> list[str]:
@@ -99,7 +115,7 @@ def _clean_hook_commands(lines: list[str]) -> list[str]:
         if not stripped:
             continue
         # Remove leading # and any whitespace after it
-        if stripped.startswith('#'):
+        if stripped.startswith("#"):
             content = stripped[1:].strip()
             if content:  # Only keep non-empty content
                 cleaned_lines.append(content)
@@ -110,7 +126,12 @@ def _clean_hook_commands(lines: list[str]) -> list[str]:
     return cleaned_lines
 
 
-def execute_hook(hook_type: str, hooks: dict[str, list[str]], context: "ExecutionContext") -> "ExecutionResult | None":
+def execute_hook(
+    hook_type: str,
+    hooks: dict[str, list[str]],
+    context: ExecutionContext,
+    no_input: bool = False,
+) -> ExecutionResult | None:
     """Execute a hook if it exists.
 
     Args:
@@ -121,11 +142,13 @@ def execute_hook(hook_type: str, hooks: dict[str, list[str]], context: "Executio
     Returns:
         ExecutionResult if hook was executed, None if no hook found
     """
+    hook_type = _normalize_hook_type(hook_type)
     if hook_type not in hooks:
         return None
 
     # Create a temporary block for the hook commands
-    from src.shellflow import Block, execute_local
+    from shellflow import Block, execute_local
+
     hook_block = Block(
         target="LOCAL",
         commands=hooks[hook_type],
@@ -133,4 +156,4 @@ def execute_hook(hook_type: str, hooks: dict[str, list[str]], context: "Executio
     )
 
     # Execute the hook locally
-    return execute_local(hook_block, context)
+    return execute_local(hook_block, context, no_input=no_input)

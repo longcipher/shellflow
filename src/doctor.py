@@ -1,47 +1,45 @@
-"""Doctor command for Shellflow configuration diagnostics.
+"""Doctor command diagnostics for Shellflow."""
 
-This module provides diagnostics for Shellflow configuration and SSH connections.
-"""
+from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 
 
-def run_doctor() -> str:
-    """Run diagnostics and return a report string.
-
-    Returns:
-        A diagnostic report containing information about SSH connections and configuration.
-    """
+def run_doctor(
+    *,
+    script_path: Path | None = None,
+    block_count: int | None = None,
+    remote_hosts: list[str] | None = None,
+) -> str:
+    """Run configuration diagnostics and return a human-readable report."""
     results = []
 
-    # Check SSH configuration
+    if script_path is not None:
+        results.append(f"Script: {script_path} (parsed)")
+    if block_count is not None:
+        results.append(f"Blocks: {block_count} executable block(s)")
+
     ssh_config_path = _get_ssh_config_path()
     if ssh_config_path.exists():
         results.append(f"SSH config file: {ssh_config_path} (found)")
         try:
-            with ssh_config_path.open() as f:
-                content = f.read()
-                host_count = content.count("Host ")
-                results.append(f"SSH connections: {host_count} host(s) configured")
-        except Exception as e:
-            results.append(f"SSH connections: Error reading config - {e}")
+            content = ssh_config_path.read_text()
+        except OSError as exc:
+            results.append(f"SSH connections: Error reading config - {exc}")
+        else:
+            results.append(f"SSH connections: {content.count('Host ')} host(s) configured")
     else:
         results.append(f"SSH config file: {ssh_config_path} (not found)")
         results.append("SSH connections: No SSH config found")
 
-    # Check configuration
-    config_status = []
-    config_status.append("Configuration: Shellflow is properly installed")
+    if remote_hosts:
+        results.append(f"Remote hosts referenced: {', '.join(remote_hosts)}")
 
-    # Check for Python dependencies
-    try:
-        import paramiko
-        config_status.append("Dependencies: paramiko available")
-    except ImportError:
-        config_status.append("Dependencies: paramiko not available")
-
-    results.append("\n".join(config_status))
+    results.append("Configuration: Shellflow is properly installed")
+    dependency_status = "available" if importlib.util.find_spec("paramiko") is not None else "not available"
+    results.append(f"Dependencies: paramiko {dependency_status}")
 
     return "\n".join(results)
 

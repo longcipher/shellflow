@@ -16,15 +16,11 @@ from behave import given, then, when
 if TYPE_CHECKING:
     from behave.runner import Context
 
-# Add src to path for importing shellflow
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
-# Import macros module
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
-from macros import parse_macros
 from helpers import parse_helpers
 from hooks import parse_hooks
-
+from macros import parse_macros
 from shellflow import (
     Block,
     ExecutionContext,
@@ -38,9 +34,6 @@ from shellflow import (
     parse_variables,
     run_script,
 )
-
-# Import doctor module
-from doctor import run_doctor
 
 
 def create_temp_script(content: str) -> Path:
@@ -87,6 +80,7 @@ def _fake_execute_remote(
     """Execute remote blocks in tests without requiring a real SSH server."""
     del context_state
     del no_input
+    del servers
     host = block.host or (ssh_config.host if ssh_config else "unknown")
     script = "\n".join(block.commands)
 
@@ -191,7 +185,7 @@ def _run_cli_script(
     with (
         mock.patch(
             "shellflow.read_ssh_config",
-            side_effect=lambda host, servers=None: SSHConfig(host=host) if host in configured else None,
+            side_effect=lambda host, _servers=None: SSHConfig(host=host) if host in configured else None,
         ),
         mock.patch("shellflow.execute_remote", side_effect=fake_or_real_remote),
         redirect_stdout(stdout_buffer),
@@ -245,11 +239,19 @@ def when_run_the_script(context: Context) -> None:
     with (
         mock.patch(
             "shellflow.read_ssh_config",
-            side_effect=lambda host, servers=None: _read_ssh_config_for_context(context, host),
+            side_effect=lambda host, _servers=None: _read_ssh_config_for_context(context, host),
         ),
         mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote),
     ):
-        result = run_script(blocks, servers, verbose=getattr(context, "verbose", False), variables=variables, macros=macros, helpers=helpers, hooks=hooks)
+        result = run_script(
+            blocks,
+            servers,
+            verbose=getattr(context, "verbose", False),
+            variables=variables,
+            macros=macros,
+            helpers=helpers,
+            hooks=hooks,
+        )
 
     context.run_result = result
     context.block_results = result.block_results
@@ -279,6 +281,7 @@ def when_the_script_is_parsed(context: Context) -> None:
 
     try:
         from helpers import parse_helpers
+
         macros = parse_macros(script_content)
         helpers = parse_helpers(script_content)
         blocks = parse_script(script_content, macros, helpers)
@@ -894,11 +897,20 @@ def step_when_run_script_with_mode(context: Context, mode: str) -> None:
     with (
         mock.patch(
             "shellflow.read_ssh_config",
-            side_effect=lambda host, servers=None: _read_ssh_config_for_context(context, host),
+            side_effect=lambda host, _servers=None: _read_ssh_config_for_context(context, host),
         ),
         mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote),
     ):
-        result = run_script(blocks, servers, verbose=getattr(context, "verbose", False), mode=mode, variables=variables, macros=macros, helpers=helpers, hooks=hooks)
+        result = run_script(
+            blocks,
+            servers,
+            verbose=getattr(context, "verbose", False),
+            mode=mode,
+            variables=variables,
+            macros=macros,
+            helpers=helpers,
+            hooks=hooks,
+        )
 
     context.run_result = result
     context.block_results = result.block_results
@@ -915,6 +927,7 @@ def step_when_the_script_is_parsed(context: Context) -> None:
 @when("parsed")
 def step_when_parsed(context: Context) -> None:
     from src.config import parse_server_config
+
     script_content = getattr(context, "script_content", None)
     if script_content is None:
         raise ValueError("No script content set. Did you call the Given step first?")
@@ -1127,15 +1140,15 @@ def step_then_the_macro_should_contain_commands(context: Context, macro_name: st
 
     try:
         macros = parse_macros(script_content)
-        if macro_name not in macros:
-            raise AssertionError(f"Macro '{macro_name}' not found. Available: {list(macros.keys())}")
-        if len(macros[macro_name]) != count:
-            raise AssertionError(f"Macro '{macro_name}' has {len(macros[macro_name])} commands, expected {count}")
     except Exception as error:
         raise AssertionError(f"Failed to parse macros: {error}") from error
+    if macro_name not in macros:
+        raise AssertionError(f"Macro '{macro_name}' not found. Available: {list(macros.keys())}")
+    if len(macros[macro_name]) != count:
+        raise AssertionError(f"Macro '{macro_name}' has {len(macros[macro_name])} commands, expected {count}")
 
 
-@then('the block should contain {count:d} commands')
+@then("the block should contain {count:d} commands")
 def step_then_the_block_should_contain_commands(context: Context, count: int) -> None:
     """Check that the first parsed block contains the expected number of commands."""
     blocks = getattr(context, "parsed_blocks", None)
@@ -1150,7 +1163,7 @@ def step_then_the_block_should_contain_commands(context: Context, count: int) ->
         raise AssertionError(f"Block has {len(block.commands)} commands, expected {count}. Commands: {block.commands}")
 
 
-@then('the block should contain {count:d} command')
+@then("the block should contain {count:d} command")
 def step_then_the_block_should_contain_command(context: Context, count: int) -> None:
     """Check that the first parsed block contains the expected number of commands (singular form)."""
     step_then_the_block_should_contain_commands(context, count)
@@ -1188,9 +1201,8 @@ def step_variables_substituted(context: Context) -> None:
     if not result.block_results:
         raise AssertionError("No block results found")
 
-    # Check that variables were substituted (this is a basic check - more specific checks would be in test code)
     output = result.block_results[0].output
-    # The test will check specific substitutions
+    assert "myapp" in output
 
 
 @given("a script with variable definitions and usage")
@@ -1231,7 +1243,7 @@ def step_all_variables_substituted(context: Context) -> None:
 
     # Check that both variables are substituted
     output = result.block_results[0].output
-    assert 'myapp' in output
+    assert "myapp" in output
 
 
 @given("a script with a PRE hook")
@@ -1297,7 +1309,9 @@ def when_run_doctor_command(context: Context) -> None:
 @then("the output should contain SSH connections status")
 def then_output_contains_ssh_connections_status(context: Context) -> None:
     """Verify that the doctor output contains SSH connections status."""
-    assert "SSH connections" in context.doctor_output, f"Expected 'SSH connections' in output, got: {context.doctor_output}"
+    assert "SSH connections" in context.doctor_output, (
+        f"Expected 'SSH connections' in output, got: {context.doctor_output}"
+    )
 
 
 @then("the output should contain configuration status")

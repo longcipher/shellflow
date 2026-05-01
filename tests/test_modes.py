@@ -1,7 +1,6 @@
 """Tests for advanced execution modes."""
 
-import pytest
-from shellflow import run_script, parse_script
+from shellflow import parse_script, run_script
 
 
 def test_parallel_execution():
@@ -14,11 +13,11 @@ echo "task1"
 echo "task2"
 """
     blocks = parse_script(script.strip())
-    result = run_script(blocks, mode='parallel')
+    result = run_script(blocks, mode="parallel")
     assert result.success
     combined_output = "\n".join(block_result.output for block_result in result.block_results)
-    assert 'task1' in combined_output
-    assert 'task2' in combined_output
+    assert "task1" in combined_output
+    assert "task2" in combined_output
 
 
 def test_sequential_execution():
@@ -30,11 +29,11 @@ echo "first"
 echo "second"
 """
     blocks = parse_script(script.strip())
-    result = run_script(blocks, mode='sequential')
+    result = run_script(blocks, mode="sequential")
     assert result.success
     combined_output = "\n".join(block_result.output for block_result in result.block_results)
-    assert 'first' in combined_output
-    assert 'second' in combined_output
+    assert "first" in combined_output
+    assert "second" in combined_output
 
 
 def test_parallel_group_annotation():
@@ -43,6 +42,7 @@ def test_parallel_group_annotation():
 # @PARALLEL group1
 # @LOCAL
 echo "group1-task1"
+# @PARALLEL group1
 # @LOCAL
 echo "group1-task2"
 
@@ -52,17 +52,16 @@ echo "sequential-task"
     blocks = parse_script(script.strip())
 
     # Check that blocks have the correct annotations
-    # PARALLEL applies to all subsequent blocks until the end
+    # PARALLEL applies only to the next block.
     assert "parallel_group" in blocks[0].annotations
     assert blocks[0].annotations["parallel_group"] == "group1"
     assert "parallel_group" in blocks[1].annotations
     assert blocks[1].annotations["parallel_group"] == "group1"
-    assert "parallel_group" in blocks[2].annotations
-    assert blocks[2].annotations["parallel_group"] == "group1"
+    assert "parallel_group" not in blocks[2].annotations
 
-    result = run_script(blocks, mode='parallel')
+    result = run_script(blocks, mode="parallel")
     assert result.success
     combined_output = "\n".join(block_result.output for block_result in result.block_results)
-    assert 'group1-task1' in combined_output
-    assert 'group1-task2' in combined_output
-    assert 'sequential-task' in combined_output
+    assert "group1-task1" in combined_output
+    assert "group1-task2" in combined_output
+    assert "sequential-task" in combined_output

@@ -7,7 +7,6 @@ Macros are defined using # @MACRO <name> and # @ENDMACRO markers.
 from __future__ import annotations
 
 import re
-from typing import Any
 
 
 def parse_macros(content: str) -> dict[str, list[str]]:
@@ -40,9 +39,15 @@ def parse_macros(content: str) -> dict[str, list[str]]:
             if marker_name == "MACRO":
                 if not marker_argument:
                     raise ParseError(f"Line {i + 1}: @MACRO requires a macro name")
-                macro_name = marker_argument.strip()
+                parts = marker_argument.strip().split()
+                macro_name = parts[0]
                 if macro_name in macros:
                     raise ParseError(f"Line {i + 1}: Macro '{macro_name}' already defined")
+
+                if len(parts) > 1:
+                    macros[macro_name] = parts[1:]
+                    i += 1
+                    continue
 
                 # Parse macro body until @ENDMACRO
                 i += 1
@@ -69,10 +74,10 @@ def parse_macros(content: str) -> dict[str, list[str]]:
 
 def _parse_macro_marker(line: str) -> tuple[str, str] | None:
     """Parse a line as a macro marker if it matches exactly."""
-    match = re.match(r"^\s*#\s*@(?P<marker>MACRO|ENDMACRO)(?:\s+(?P<argument>\S+))?\s*$", line)
+    match = re.match(r"^\s*#\s*@(?P<marker>MACRO|ENDMACRO)(?:\s+(?P<argument>.*?))?\s*$", line, re.IGNORECASE)
     if not match:
         return None
-    return match.group("marker"), match.group("argument") or ""
+    return match.group("marker").upper(), match.group("argument") or ""
 
 
 def _clean_macro_commands(lines: list[str]) -> list[str]:
@@ -92,7 +97,7 @@ def _clean_macro_commands(lines: list[str]) -> list[str]:
         if not stripped:
             continue
         # Remove leading # and any whitespace after it
-        if stripped.startswith('#'):
+        if stripped.startswith("#"):
             content = stripped[1:].strip()
             if content:  # Only keep non-empty content
                 cleaned_lines.append(content)
@@ -103,6 +108,5 @@ def _clean_macro_commands(lines: list[str]) -> list[str]:
     return cleaned_lines
 
 
-class ParseError(Exception):
+class ParseError(ValueError):
     """Exception raised when macro parsing fails."""
-    pass

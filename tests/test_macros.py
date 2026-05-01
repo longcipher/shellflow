@@ -5,12 +5,8 @@ Tests for parse_macros function and macro expansion in src/shellflow.py.
 
 from __future__ import annotations
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-
 from macros import parse_macros
-from shellflow import parse_script, ParseError
+from shellflow import parse_script
 
 
 def test_parse_macro_groups():
@@ -21,8 +17,8 @@ def test_parse_macro_groups():
 # @ENDMACRO
 """
     macros = parse_macros(script)
-    assert 'deploy' in macros
-    assert len(macros['deploy']) == 2
+    assert "deploy" in macros
+    assert len(macros["deploy"]) == 2
 
 
 def test_macro_expansion():

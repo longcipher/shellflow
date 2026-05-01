@@ -7,7 +7,6 @@ Helpers are defined using # @HELPER <name> and # @ENDHELPER markers.
 from __future__ import annotations
 
 import re
-from typing import Any
 
 
 def parse_helpers(content: str) -> dict[str, list[str]]:
@@ -69,10 +68,10 @@ def parse_helpers(content: str) -> dict[str, list[str]]:
 
 def _parse_helper_marker(line: str) -> tuple[str, str] | None:
     """Parse a line as a helper marker if it matches exactly."""
-    match = re.match(r"^\s*#\s*@(?P<marker>HELPER|ENDHELPER)(?:\s+(?P<argument>\S+))?\s*$", line)
+    match = re.match(r"^\s*#\s*@(?P<marker>HELPER|ENDHELPER)(?:\s+(?P<argument>.*?))?\s*$", line, re.IGNORECASE)
     if not match:
         return None
-    return match.group("marker"), match.group("argument") or ""
+    return match.group("marker").upper(), match.group("argument") or ""
 
 
 def _clean_helper_commands(lines: list[str]) -> list[str]:
@@ -92,7 +91,7 @@ def _clean_helper_commands(lines: list[str]) -> list[str]:
         if not stripped:
             continue
         # Remove leading # and any whitespace after it
-        if stripped.startswith('#'):
+        if stripped.startswith("#"):
             content = stripped[1:].strip()
             if content:  # Only keep non-empty content
                 cleaned_lines.append(content)
@@ -103,6 +102,5 @@ def _clean_helper_commands(lines: list[str]) -> list[str]:
     return cleaned_lines
 
 
-class ParseError(Exception):
+class ParseError(ValueError):
     """Exception raised when helper parsing fails."""
-    pass

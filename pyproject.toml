@@ -1,6 +1,6 @@
 [project]
 name = "shellflow"
-version = "0.4.1"
+version = "0.4.2"
 description = "A minimal shell script orchestrator with SSH support"
 readme = "README.md"
 license = "Apache-2.0"
@@ -36,6 +36,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel.force-include]
 "src/shellflow.py" = "shellflow.py"
 "src/shellflow_models.py" = "shellflow_models.py"
+"src/advanced_modes.py" = "advanced_modes.py"
+"src/config.py" = "config.py"
+"src/doctor.py" = "doctor.py"
+"src/helpers.py" = "helpers.py"
+"src/hooks.py" = "hooks.py"
+"src/macros.py" = "macros.py"
+"src/variables.py" = "variables.py"
 
 [dependency-groups]
 dev = [
@@ -44,9 +51,9 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "pytest-benchmark>=5.2.3",
     "ruff>=0.15.12",
-    "ty>=0.0.32",
+    "ty>=0.0.33",
     "behave>=1.3.3",
-    "hypothesis>=6.152.3",
+    "hypothesis>=6.152.4",
     "shellflow",
 ]
 

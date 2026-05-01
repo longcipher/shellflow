@@ -14,5 +14,5 @@ def test_parse_task_annotations():
 echo "deploying"
 """
     blocks = parse_script(script)
-    assert blocks[0].annotations['description'] == 'Deploy web app'
-    assert blocks[0].annotations['timeout'] == '300'
+    assert blocks[0].annotations["description"] == "Deploy web app"
+    assert blocks[0].annotations["timeout"] == "300"

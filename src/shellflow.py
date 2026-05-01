@@ -21,6 +21,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -54,25 +55,24 @@ except ImportError:
     )
 
 # Import config utilities
+# Import advanced execution modes
+from advanced_modes import run_parallel
 from config import parse_server_config
 
-# Import macro utilities
-from macros import parse_macros
+# Import doctor utilities
+from doctor import run_doctor
 
 # Import helper utilities
 from helpers import parse_helpers
 
-# Import variable utilities
-from variables import parse_variables
-
 # Import hook utilities
 from hooks import execute_hook, parse_hooks
 
-# Import advanced execution modes
-from advanced_modes import run_parallel
+# Import macro utilities
+from macros import parse_macros
 
-# Import doctor utilities
-from doctor import run_doctor
+# Import variable utilities
+from variables import parse_variables
 
 # =============================================================================
 # Data Classes
@@ -339,6 +339,17 @@ class SSHConfig:
     identity_file: str | None = None
 
 
+@dataclass(frozen=True)
+class OptionDefinition:
+    """A dynamic option declared by a Shellflow script."""
+
+    name: str
+    env_name: str
+    default: str | None = None
+    is_boolean: bool = False
+    is_required: bool = False
+
+
 # =============================================================================
 # Exceptions
 # =============================================================================
@@ -445,10 +456,10 @@ def read_ssh_config(host: str, servers: dict[str, dict[str, str]] | None = None)
         port_str = server_config.get("port", "22")
         try:
             port = int(port_str)
-            if port < 1 or port > 65535:
-                raise ValueError(f"Port {port} is out of valid range (1-65535)")
         except ValueError as e:
-            raise ValueError(f"Invalid port '{port_str}' for server '{host}': {e}")
+            raise ValueError(f"Invalid port '{port_str}' for server '{host}': {e}") from e
+        if port < 1 or port > 65535:
+            raise ValueError(f"Invalid port '{port_str}' for server '{host}': out of valid range (1-65535)")
 
         return SSHConfig(
             host=host,
@@ -552,10 +563,7 @@ def _parse_ssh_config_basic(config_path: Path, host: str) -> SSHConfig | None:
 # =============================================================================
 
 
-
-
-
-BLOCK_MARKER_RE = re.compile(r"^\s*#\s*@(?P<marker>[A-Z_]+)(?:\s+(?P<argument>\S+))?\s*$")
+BLOCK_MARKER_RE = re.compile(r"^\s*#\s*@(?P<marker>[A-Za-z_]+)(?:\s+(?P<argument>.*?))?\s*$")
 MARKER_PREFIX_RE = re.compile(r"^\s*#\s*@")
 
 
@@ -564,33 +572,137 @@ def _parse_block_marker(line: str) -> tuple[str, str | None] | None:
     match = BLOCK_MARKER_RE.match(line)
     if not match:
         return None
-    return match.group("marker"), match.group("argument")
+    argument = match.group("argument")
+    return match.group("marker").upper(), argument.strip() if argument is not None else None
 
 
-def _expand_macros_and_helpers_in_commands(commands: list[str], macros: dict[str, list[str]] | None, helpers: dict[str, list[str]] | None, line_no: int) -> list[str]:
+def _expand_macros_and_helpers_in_commands(
+    commands: list[str],
+    macros: dict[str, list[str]] | None,
+    helpers: dict[str, list[str]] | None,
+    line_no: int,
+) -> list[str]:
     """Expand macro and helper calls in a list of commands."""
     if not macros and not helpers:
         return commands
 
     # Common shell builtins and commands that shouldn't be treated as undefined macros/helpers
     shell_builtins = {
-        'echo', 'cd', 'pwd', 'ls', 'cat', 'grep', 'sed', 'awk', 'find', 'xargs',
-        'sort', 'uniq', 'head', 'tail', 'wc', 'cut', 'tr', 'rev', 'tac', 'nl',
-        'mkdir', 'rmdir', 'rm', 'cp', 'mv', 'touch', 'chmod', 'chown', 'ln',
-        'tar', 'gzip', 'gunzip', 'bzip2', 'bunzip2', 'zip', 'unzip',
-        'ssh', 'scp', 'rsync', 'curl', 'wget', 'ping', 'traceroute',
-        'ps', 'top', 'kill', 'killall', 'pkill', 'pgrep',
-        'sudo', 'su', 'whoami', 'id', 'groups', 'passwd',
-        'date', 'cal', 'uptime', 'df', 'du', 'free', 'vmstat', 'iostat',
-        'which', 'whereis', 'locate', 'find', 'updatedb',
-        'make', 'gcc', 'g++', 'javac', 'java', 'python', 'python3', 'pip',
-        'npm', 'yarn', 'node', 'ruby', 'perl', 'php',
-        'git', 'svn', 'hg', 'bzr',
-        'docker', 'docker-compose', 'kubectl', 'helm',
-        'systemctl', 'service', 'chkconfig', 'update-rc.d',
-        'apt', 'yum', 'dnf', 'pacman', 'brew',
-        'if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'do', 'done',
-        'case', 'esac', 'select', 'function', 'return', 'exit', 'break', 'continue'
+        "echo",
+        "cd",
+        "pwd",
+        "ls",
+        "cat",
+        "grep",
+        "sed",
+        "awk",
+        "find",
+        "xargs",
+        "sort",
+        "uniq",
+        "head",
+        "tail",
+        "wc",
+        "cut",
+        "tr",
+        "rev",
+        "tac",
+        "nl",
+        "mkdir",
+        "rmdir",
+        "rm",
+        "cp",
+        "mv",
+        "touch",
+        "chmod",
+        "chown",
+        "ln",
+        "tar",
+        "gzip",
+        "gunzip",
+        "bzip2",
+        "bunzip2",
+        "zip",
+        "unzip",
+        "ssh",
+        "scp",
+        "rsync",
+        "curl",
+        "wget",
+        "ping",
+        "traceroute",
+        "ps",
+        "top",
+        "kill",
+        "killall",
+        "pkill",
+        "pgrep",
+        "sudo",
+        "su",
+        "whoami",
+        "id",
+        "groups",
+        "passwd",
+        "date",
+        "cal",
+        "uptime",
+        "df",
+        "du",
+        "free",
+        "vmstat",
+        "iostat",
+        "which",
+        "whereis",
+        "locate",
+        "updatedb",
+        "make",
+        "gcc",
+        "g++",
+        "javac",
+        "java",
+        "python",
+        "python3",
+        "pip",
+        "npm",
+        "yarn",
+        "node",
+        "ruby",
+        "perl",
+        "php",
+        "git",
+        "svn",
+        "hg",
+        "bzr",
+        "docker",
+        "docker-compose",
+        "kubectl",
+        "helm",
+        "systemctl",
+        "service",
+        "chkconfig",
+        "update-rc.d",
+        "apt",
+        "yum",
+        "dnf",
+        "pacman",
+        "brew",
+        "if",
+        "then",
+        "else",
+        "elif",
+        "fi",
+        "for",
+        "while",
+        "do",
+        "done",
+        "case",
+        "esac",
+        "select",
+        "function",
+        "return",
+        "exit",
+        "break",
+        "continue",
     }
 
     expanded_commands: list[str] = []
@@ -605,7 +717,7 @@ def _expand_macros_and_helpers_in_commands(commands: list[str], macros: dict[str
             elif macros and stripped in macros:
                 # Expand the macro
                 expanded_commands.extend(macros[stripped])
-            elif re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', stripped) and stripped not in shell_builtins:
+            elif re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", stripped) and stripped not in shell_builtins:
                 # Single identifier that looks like a macro/helper but isn't defined and not a builtin
                 raise ParseError(f"Line {line_no}: Undefined macro or helper '{stripped}'")
             else:
@@ -617,7 +729,13 @@ def _expand_macros_and_helpers_in_commands(commands: list[str], macros: dict[str
     return expanded_commands
 
 
-def _build_block_commands(prelude: list[str], body: list[str], macros: dict[str, list[str]] | None = None, helpers: dict[str, list[str]] | None = None, line_no: int = 0) -> list[str]:
+def _build_block_commands(
+    prelude: list[str],
+    body: list[str],
+    macros: dict[str, list[str]] | None = None,
+    helpers: dict[str, list[str]] | None = None,
+    line_no: int = 0,
+) -> list[str]:
     """Combine shared prelude with block-specific commands."""
     cleaned_body = _clean_commands(body)
     if not cleaned_body:
@@ -659,6 +777,234 @@ def _parse_export_directive(argument: str | None, *, line_no: int) -> tuple[str,
     return name, source
 
 
+def _option_env_name(name: str) -> str:
+    """Convert an option name to its canonical shell environment variable."""
+    return name.replace("-", "_").upper()
+
+
+def parse_options(content: str) -> dict[str, OptionDefinition]:
+    """Parse Scotty-style # @option declarations from script content."""
+    options: dict[str, OptionDefinition] = {}
+    for line_no, line in enumerate(content.splitlines(), 1):
+        marker = _parse_block_marker(line)
+        if not marker or marker[0] != "OPTION":
+            continue
+
+        signature = marker[1]
+        if not signature:
+            raise ParseError(f"Line {line_no}: @OPTION requires a name")
+
+        if "=" in signature:
+            name, default = signature.split("=", 1)
+            name = name.strip()
+            default = _strip_optional_quotes(default.strip())
+            is_required = default == ""
+            is_boolean = False
+            default_value = None if is_required else default
+        else:
+            name = signature.strip()
+            is_required = False
+            is_boolean = True
+            default_value = None
+
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", name):
+            raise ParseError(f"Line {line_no}: Invalid @OPTION name '{name}'")
+
+        options[name] = OptionDefinition(
+            name=name,
+            env_name=_option_env_name(name),
+            default=default_value,
+            is_boolean=is_boolean,
+            is_required=is_required,
+        )
+    return options
+
+
+def _strip_optional_quotes(value: str) -> str:
+    """Remove simple matching quotes around a directive value."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _parse_option_overrides(extra_args: list[str]) -> dict[str, str | bool]:
+    """Parse dynamic CLI options left over after argparse handles static flags."""
+    overrides: dict[str, str | bool] = {}
+    i = 0
+    while i < len(extra_args):
+        raw = extra_args[i]
+        if not raw.startswith("--"):
+            raise ParseError(f"Unexpected argument '{raw}'")
+
+        item = raw[2:]
+        if not item:
+            raise ParseError("Unexpected empty option")
+
+        if "=" in item:
+            name, value = item.split("=", 1)
+            overrides[name] = value
+            i += 1
+            continue
+
+        name = item
+        if i + 1 < len(extra_args) and not extra_args[i + 1].startswith("--"):
+            overrides[name] = extra_args[i + 1]
+            i += 2
+        else:
+            overrides[name] = True
+            i += 1
+    return overrides
+
+
+def resolve_option_values(
+    options: dict[str, OptionDefinition],
+    overrides: dict[str, str | bool] | None = None,
+) -> dict[str, str]:
+    """Resolve declared option values using CLI, environment, then defaults."""
+    overrides = overrides or {}
+    values: dict[str, str] = {}
+    unknown = sorted(set(overrides) - set(options))
+    if unknown:
+        joined = ", ".join(f"--{name}" for name in unknown)
+        raise ParseError(f"Unknown option(s): {joined}")
+
+    for option in options.values():
+        raw_value = overrides.get(option.name)
+        if option.is_boolean:
+            if raw_value is True:
+                values[option.env_name] = "1"
+            elif isinstance(raw_value, str):
+                values[option.env_name] = raw_value
+            continue
+
+        value: str | None
+        if isinstance(raw_value, bool):
+            raise ParseError(f"--{option.name} expects a value")
+        value = raw_value if raw_value is not None else os.environ.get(option.env_name) or option.default
+
+        if option.is_required and not value:
+            raise ParseError(f"Missing required option --{option.name}")
+        if value is not None:
+            values[option.env_name] = value
+    return values
+
+
+def select_blocks_for_target(
+    blocks: list[Block],
+    macros: dict[str, list[str]],
+    target: str | None,
+) -> list[Block]:
+    """Select blocks for a named task or macro target."""
+    if not target:
+        return blocks
+
+    tasks_in_file = {block.annotations.get("task") for block in blocks if block.annotations.get("task")}
+    tasks_in_file.discard(None)
+    if target in macros:
+        task_names = macros[target]
+        missing = [name for name in task_names if name not in tasks_in_file]
+        if missing:
+            raise ParseError(f"Macro '{target}' references unknown task(s): {', '.join(missing)}")
+        wanted = set(task_names)
+        selected = [block for block in blocks if block.annotations.get("task") in wanted]
+        selected.sort(key=lambda block: task_names.index(block.annotations["task"]))
+        return selected
+
+    if target in tasks_in_file:
+        return [block for block in blocks if block.annotations.get("task") == target]
+
+    raise ParseError(f"Unknown task or macro target '{target}'")
+
+
+def _freeze_preamble(prelude_lines: list[str], injected_env: dict[str, str] | None = None) -> list[str]:
+    """Evaluate uppercase prelude assignments once and return frozen exports."""
+    injected_env = injected_env or {}
+    variable_names = _extract_preamble_variable_names(prelude_lines)
+    frozen_env: dict[str, str] = dict(injected_env)
+
+    if variable_names:
+        frozen_env.update(_evaluate_preamble_variables(prelude_lines, variable_names, injected_env))
+
+    remaining = _strip_preamble_assignments(prelude_lines)
+    export_lines = [f"export {name}={shlex.quote(value)}" for name, value in sorted(frozen_env.items())]
+    return [*export_lines, *remaining]
+
+
+def _extract_preamble_variable_names(lines: list[str]) -> list[str]:
+    """Return uppercase assignment names from prelude lines."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        match = re.match(r"^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=", line)
+        if match and match.group(1) not in seen:
+            names.append(match.group(1))
+            seen.add(match.group(1))
+    return names
+
+
+def _evaluate_preamble_variables(
+    prelude_lines: list[str],
+    variable_names: list[str],
+    injected_env: dict[str, str],
+) -> dict[str, str]:
+    """Run the prelude locally and capture selected variable values."""
+    begin_marker = f"__SHELLFLOW_PREAMBLE_BEGIN_{uuid.uuid4().hex}__"
+    end_marker = f"__SHELLFLOW_PREAMBLE_END_{uuid.uuid4().hex}__"
+    dump_lines = [f'printf "%s=%s\\n" {shlex.quote(name)} "${{{name}}}"' for name in variable_names]
+    script = "\n".join(
+        [
+            "set -e",
+            *prelude_lines,
+            f"echo {shlex.quote(begin_marker)}",
+            *dump_lines,
+            f"echo {shlex.quote(end_marker)}",
+        ]
+    )
+    env = os.environ.copy()
+    env.update(injected_env)
+    try:
+        result = subprocess.run(
+            ["/bin/bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ParseError(f"Failed to evaluate preamble locally: {exc}") from exc
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+        raise ParseError(f"Failed to evaluate preamble locally: {message}")
+
+    return _parse_preamble_dump(result.stdout, begin_marker, end_marker, set(variable_names))
+
+
+def _parse_preamble_dump(output: str, begin_marker: str, end_marker: str, variable_names: set[str]) -> dict[str, str]:
+    """Parse the captured variable section from prelude output."""
+    lines = output.splitlines()
+    try:
+        start = lines.index(begin_marker)
+        end = lines.index(end_marker)
+    except ValueError as exc:
+        raise ParseError("Failed to evaluate preamble locally: missing variable markers") from exc
+    if end < start:
+        raise ParseError("Failed to evaluate preamble locally: malformed variable markers")
+
+    values: dict[str, str] = {}
+    for line in lines[start + 1 : end]:
+        name, separator, value = line.partition("=")
+        if separator and name in variable_names:
+            values[name] = value
+    return values
+
+
+def _strip_preamble_assignments(lines: list[str]) -> list[str]:
+    """Remove frozen uppercase assignment lines from the prelude."""
+    return [line for line in lines if not re.match(r"^\s*(?:export\s+)?[A-Z_][A-Z0-9_]*=", line)]
+
+
 def _skip_macro_definition(lines: list[str], start_index: int) -> int:
     """Skip a macro definition block from @MACRO to @ENDMACRO.
 
@@ -676,8 +1022,8 @@ def _skip_macro_definition(lines: list[str], start_index: int) -> int:
         if marker and marker[0] == "ENDMACRO":
             return i + 1  # Return index after @ENDMACRO
         i += 1
-    # If we reach the end without finding @ENDMACRO, return the end index
-    return len(lines)
+    # Single-line macros do not have @ENDMACRO.
+    return start_index + 1
 
 
 def _skip_helper_definition(lines: list[str], start_index: int) -> int:
@@ -756,7 +1102,7 @@ def _parse_annotation_block(lines: list[str], start_index: int) -> tuple[dict[st
         # Parse indented annotation line
         # Check if the line after # has indentation (spaces or tab)
         after_hash = line[1:]  # Remove the leading #
-        if after_hash.startswith(" ") or after_hash.startswith("\t"):
+        if after_hash.startswith((" ", "\t")):
             # Remove the comment marker and indentation
             content = stripped[1:].strip()  # Remove # and trim
 
@@ -811,10 +1157,13 @@ def _apply_block_directive(block: Block, marker_name: str, marker_argument: str 
     raise ParseError(f"Line {line_no}: Unknown marker @{marker_name}")
 
 
-
-
-
-def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpers: dict[str, list[str]] | None = None, hooks: dict[str, list[str]] | None = None) -> list[Block]:
+def parse_script(  # noqa: PLR0915
+    content: str,
+    macros: dict[str, list[str]] | None = None,
+    helpers: dict[str, list[str]] | None = None,
+    hooks: dict[str, list[str]] | None = None,
+    option_env: dict[str, str] | None = None,
+) -> list[Block]:
     """Parse a shell script into execution blocks.
 
     Parses scripts with comment markers:
@@ -832,13 +1181,15 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpe
     Raises:
         ParseError: If the script cannot be parsed.
     """
+    del hooks
     blocks: list[Block] = []
     current_block: Block | None = None
     accumulated_lines: list[str] = []
     prelude_lines: list[str] = []
     directive_phase = False
     pending_annotations: dict[str, str] = {}
-    parallel_annotations: dict[str, str] = {}  # Persistent parallel annotations
+    pending_parallel_annotations: dict[str, str] = {}
+    current_task_name: str | None = None
     lines = content.splitlines()
     i = 0
 
@@ -851,6 +1202,33 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpe
             if marker_name == "SERVER":
                 i += 1
                 continue  # Skip server definitions
+            if marker_name == "OPTION":
+                i += 1
+                continue  # Skip option declarations
+            if marker_name == "TASK":
+                if not marker_argument:
+                    raise ParseError(f"Line {line_no}: @TASK requires a task name")
+                if current_block is None:
+                    if not blocks:
+                        prelude_lines = _freeze_preamble(_clean_commands(accumulated_lines), option_env)
+                        accumulated_lines = []
+                else:
+                    current_block.commands = _build_block_commands(
+                        prelude_lines,
+                        accumulated_lines,
+                        macros,
+                        helpers,
+                        line_no,
+                    )
+                    if current_block.commands:
+                        _validate_block_with_pydantic(current_block, line_no)
+                        blocks.append(current_block)
+                    current_block = None
+                    accumulated_lines = []
+                    directive_phase = False
+                current_task_name = marker_argument
+                i += 1
+                continue
             if marker_name == "ANNOTATE":
                 if not marker_argument:
                     raise ParseError(f"Line {line_no}: @ANNOTATE marker missing task name")
@@ -874,22 +1252,31 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpe
                 i = _skip_hook_definition(lines, i)
                 continue
             if marker_name == "PARALLEL":
-                # Handle parallel execution marker
-                # Set parallel mode for subsequent blocks
-                parallel_annotations.clear()  # Clear previous parallel settings
+                if current_block is not None and directive_phase:
+                    if marker_argument:
+                        current_block.annotations["parallel_group"] = marker_argument
+                    else:
+                        current_block.annotations["parallel"] = "true"
+                    i += 1
+                    continue
+
                 if marker_argument:
-                    # @PARALLEL <group_name> - name the parallel group
-                    parallel_annotations["parallel_group"] = marker_argument
+                    pending_parallel_annotations = {"parallel_group": marker_argument}
                 else:
-                    # @PARALLEL - anonymous parallel group
-                    parallel_annotations["parallel"] = "true"
+                    pending_parallel_annotations = {"parallel": "true"}
                 i += 1
                 continue
             if marker_name in {"LOCAL", "REMOTE"}:
                 if current_block is None:
-                    prelude_lines = _clean_commands(accumulated_lines)
+                    prelude_lines = _freeze_preamble(_clean_commands(accumulated_lines), option_env)
                 else:
-                    current_block.commands = _build_block_commands(prelude_lines, accumulated_lines, macros, helpers, line_no)
+                    current_block.commands = _build_block_commands(
+                        prelude_lines,
+                        accumulated_lines,
+                        macros,
+                        helpers,
+                        line_no,
+                    )
                     if current_block.commands:
                         # Validate the completed block using Pydantic
                         _validate_block_with_pydantic(current_block, line_no)
@@ -899,12 +1286,23 @@ def parse_script(content: str, macros: dict[str, list[str]] | None = None, helpe
                 directive_phase = True
 
                 if marker_name == "LOCAL":
-                    current_block = Block(target="LOCAL", source_line=line_no, annotations={**parallel_annotations, **pending_annotations})
+                    annotations = {**pending_parallel_annotations, **pending_annotations}
+                    if current_task_name is not None:
+                        annotations["task"] = current_task_name
+                    current_block = Block(target="LOCAL", source_line=line_no, annotations=annotations)
                 else:
                     if not marker_argument:
                         raise ParseError(f"Line {line_no}: @REMOTE marker missing host")
-                    current_block = Block(target=f"REMOTE:{marker_argument}", source_line=line_no, annotations={**parallel_annotations, **pending_annotations})
+                    annotations = {**pending_parallel_annotations, **pending_annotations}
+                    if current_task_name is not None:
+                        annotations["task"] = current_task_name
+                    current_block = Block(
+                        target=f"REMOTE:{marker_argument}",
+                        source_line=line_no,
+                        annotations=annotations,
+                    )
                 pending_annotations = {}  # Clear after applying
+                pending_parallel_annotations = {}
                 i += 1
                 continue
 
@@ -1191,10 +1589,50 @@ def _strip_trace_markers(output: str) -> str:
     """Remove shellflow trace marker lines from captured output."""
     cleaned_lines: list[str] = []
     for line in output.splitlines():
-        if TRACE_MARKER in line:
+        if TRACE_MARKER in line or line.startswith("__SHELLFLOW_CMD_"):
             continue
         cleaned_lines.append(line)
     return "\n".join(cleaned_lines).strip()
+
+
+def _parse_debug_trace_command_logs(stderr: str, *, success: bool, exit_code: int) -> list[CommandLog]:
+    """Parse DEBUG-trap command markers from stderr into command logs."""
+    command_logs: list[CommandLog] = []
+    for line in stderr.splitlines():
+        if not line.startswith("__SHELLFLOW_CMD_"):
+            continue
+        _, _, command = line.partition(":")
+        command = command.strip()
+        if not command or _is_trace_noise(command):
+            continue
+        command_logs.append(
+            CommandLog(
+                command=command,
+                output="",
+                exit_code=0,
+                status="completed",
+            )
+        )
+
+    if command_logs and not success:
+        command_logs[-1].exit_code = exit_code
+        command_logs[-1].status = "failed"
+    return command_logs
+
+
+def _is_trace_noise(command: str) -> bool:
+    """Filter bootstrap commands from DEBUG-trap output."""
+    noise_patterns = (
+        r"^__SHELLFLOW_",
+        r"^__shellflow_trace",
+        r"^trap\b",
+        r"^set\b",
+        r"^export\s+SHELLFLOW_LAST_OUTPUT=",
+        r"^export\s+[A-Z_][A-Z0-9_]*=",
+        r"^test -f ~/.(?:bashrc|zshrc)",
+        r"^\[{1,2}\s",
+    )
+    return any(re.match(pattern, command) for pattern in noise_patterns)
 
 
 def _iter_display_commands(commands: list[str]) -> list[str]:
@@ -1347,30 +1785,37 @@ def _parse_remote_command_logs(  # noqa: PLR0915
 
 
 def _build_remote_trace_script(block: Block, context: ExecutionContext, shell: str) -> str:
-    """Build a remote script with delimiter-based output separation.
-
-    Each command's combined stdout/stderr is wrapped between unique delimiters
-    so that the Python caller can cleanly associate output with commands even
-    when shell init files produce xtrace noise.
-    """
+    """Build a remote script that preserves native Bash syntax while tracing commands."""
     delimiter = uuid.uuid4().hex[:16]
     script_lines: list[str] = [
         "set +x 2>/dev/null || true",
-        f"__SHELLFLOW_DELIM__={delimiter}",
+        "set -e",
+        f"__SHELLFLOW_DELIM__={shlex.quote(delimiter)}",
     ]
     script_lines.extend(_build_context_exports(context))
     script_lines.extend(_build_shell_bootstrap(shell))
-
-    for command in block.commands:
-        if not command.strip() or command.lstrip().startswith("#"):
-            continue
-        script_lines.append('echo "__SHELLFLOW_START_${__SHELLFLOW_DELIM__}__"')
-        script_lines.append(f"{{ {command} ; }} 2>&1")
-        script_lines.append("__SHELLFLOW_EC__=$?")
-        script_lines.append('echo "__SHELLFLOW_END_${__SHELLFLOW_DELIM__}__"')
-        script_lines.append('echo "__SHELLFLOW_EXITCODE__${__SHELLFLOW_EC__}"')
+    script_lines.extend(_build_debug_trap(shell))
+    script_lines.extend(block.commands)
 
     return "\n".join(script_lines)
+
+
+def _build_debug_trap(shell: str) -> list[str]:
+    """Build shell-specific command tracing without wrapping user lines."""
+    shell_name = Path(shell).name
+    if shell_name == "zsh":
+        return [
+            "__shellflow_trace() {",
+            '  printf "__SHELLFLOW_CMD_%s:%s\\n" "$__SHELLFLOW_DELIM__" "$ZSH_DEBUG_CMD" >&2',
+            "}",
+            "trap __shellflow_trace DEBUG",
+        ]
+    return [
+        "__shellflow_trace() {",
+        '  printf "__SHELLFLOW_CMD_%s:%s\\n" "$__SHELLFLOW_DELIM__" "$BASH_COMMAND" >&2',
+        "}",
+        "trap __shellflow_trace DEBUG",
+    ]
 
 
 def _run_remote_subprocess(
@@ -1681,13 +2126,19 @@ def execute_remote(
         )
         cleaned_stdout = _strip_trace_markers(stdout)
         cleaned_stderr = _strip_trace_markers(stderr)
-        command_logs = _parse_remote_command_logs(
-            stdout,
+        command_logs = _parse_debug_trace_command_logs(
+            stderr,
             success=exit_code == 0 and not interrupted and not timed_out,
             exit_code=exit_code,
-            interrupted=interrupted,
-            trailing_error_output=cleaned_stderr,
         )
+        if not command_logs:
+            command_logs = _parse_remote_command_logs(
+                stdout,
+                success=exit_code == 0 and not interrupted and not timed_out,
+                exit_code=exit_code,
+                interrupted=interrupted,
+                trailing_error_output=cleaned_stderr,
+            )
 
         success = exit_code == 0 and not interrupted and not timed_out
         failure_kind = None if success else FAILURE_RUNTIME
@@ -1883,7 +2334,13 @@ def _finalize_block_result(result: ExecutionResult, block: Block, index: int, st
 # Global executor factory instance
 
 
-def _execute_block_once(block: Block, context: ExecutionContext, *, no_input: bool, servers: dict[str, dict[str, str]] | None = None) -> ExecutionResult:
+def _execute_block_once(
+    block: Block,
+    context: ExecutionContext,
+    *,
+    no_input: bool,
+    servers: dict[str, dict[str, str]] | None = None,
+) -> ExecutionResult:
     """Execute one block attempt using the executor abstraction."""
     executor = _executor_factory.get_executor(block)
     return executor.execute(block, context, no_input, servers)
@@ -2094,6 +2551,7 @@ class LocalExecutor:
         servers: dict[str, dict[str, str]] | None = None,
     ) -> ExecutionResult:
         """Execute a local block."""
+        del servers
         # Local execution doesn't use servers
         if no_input:
             return execute_local(block, context, no_input=True)
@@ -2237,12 +2695,14 @@ def _execute_remote_block_sequential(
         # Assign actual command names to parsed logs
         if result.command_logs:
             for i, cl in enumerate(result.command_logs):
-                if i < len(commands_to_execute):
+                if cl.command == "<remote-command>" and i < len(commands_to_execute):
                     cl.command = commands_to_execute[i]
 
         # Print each command with its output
         if result.command_logs:
             _print_command_logs(result.command_logs, output_tail_lines)
+            if result.output and not any(command_log.output for command_log in result.command_logs):
+                print(_truncate_output_lines(result.output, output_tail_lines))
         else:
             # Fallback: no command logs, just show commands
             for cmd in commands_to_execute:
@@ -2341,10 +2801,7 @@ def _group_blocks_for_parallel_execution(blocks: list[Block]) -> list[list[Block
     current_group: list[Block] = []
 
     for block in blocks:
-        is_parallel = (
-            "parallel" in block.annotations or
-            "parallel_group" in block.annotations
-        )
+        is_parallel = "parallel" in block.annotations or "parallel_group" in block.annotations
 
         if is_parallel and current_group:
             # Add to current parallel group
@@ -2545,7 +3002,7 @@ def _execute_block_standard(  # noqa: PLR0913
     return result
 
 
-def run_script(
+def run_script(  # noqa: PLR0911, PLR0913, PLR0915
     blocks: list[Block],
     servers: dict[str, dict[str, str]] | None = None,
     verbose: bool = False,
@@ -2588,14 +3045,21 @@ def run_script(
 
     # Execute PRE hooks before main blocks
     if "PRE" in context.hooks:
-        hook_result = execute_hook("PRE", context.hooks, context)
+        hook_result = execute_hook("PRE", context.hooks, context, no_input=no_input)
         if hook_result and not hook_result.success:
+            execute_hook("ERROR", context.hooks, context, no_input=no_input)
+            execute_hook("FINISHED", context.hooks, context, no_input=no_input)
             # PRE hook failed, fail the entire run
-            events.append(_make_run_finished_event(
-                run_id, success=False, exit_code=hook_result.exit_code,
-                blocks_executed=0, total_blocks=total_blocks,
-                failure_kind="hook_pre"
-            ))
+            events.append(
+                _make_run_finished_event(
+                    run_id,
+                    success=False,
+                    exit_code=hook_result.exit_code,
+                    blocks_executed=0,
+                    total_blocks=total_blocks,
+                    failure_kind="hook_pre",
+                )
+            )
             return RunResult(
                 success=False,
                 blocks_executed=0,
@@ -2628,30 +3092,88 @@ def run_script(
             block_id = _make_block_id(i)
             events.append(_make_block_started_event(run_id, block_id, i, block, total_blocks))
 
+            before_hook = execute_hook("BEFORE", context.hooks, context, no_input=no_input)
+            if before_hook and not before_hook.success:
+                execute_hook("ERROR", context.hooks, context, no_input=no_input)
+                execute_hook("FINISHED", context.hooks, context, no_input=no_input)
+                failure_kind = FAILURE_RUNTIME
+                exit_code = _exit_code_for_failure(failure_kind)
+                events.append(
+                    _make_run_finished_event(
+                        run_id,
+                        success=False,
+                        exit_code=exit_code,
+                        blocks_executed=blocks_executed,
+                        total_blocks=total_blocks,
+                        failure_kind="hook_before",
+                        no_input=no_input,
+                    )
+                )
+                return RunResult(
+                    success=False,
+                    blocks_executed=blocks_executed,
+                    error_message=f"BEFORE hook failed: {before_hook.error_message}",
+                    block_results=block_results,
+                    run_id=run_id,
+                    schema_version=SCHEMA_VERSION,
+                    exit_code=exit_code,
+                    failure_kind="hook_before",
+                    no_input=no_input,
+                    events=events,
+                )
+
             # Execute the block
             if sequential_output and verbose:
                 result = _execute_block_with_sequential_output(
-                    block, context, servers, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
+                    block,
+                    context,
+                    servers,
+                    no_input,
+                    verbose,
+                    i,
+                    len(blocks),
+                    output_tail_lines,
+                    colors,
+                    events,
+                    run_id,
                 )
             else:
                 result = _execute_block_standard(
-                    block, context, servers, no_input, verbose, i, len(blocks), output_tail_lines, colors, events, run_id
+                    block,
+                    context,
+                    servers,
+                    no_input,
+                    verbose,
+                    i,
+                    len(blocks),
+                    output_tail_lines,
+                    colors,
+                    events,
+                    run_id,
                 )
 
-            result = _finalize_block_result(result, block, i, time.perf_counter())
             blocks_executed += 1
             block_results.append(result)
-            events.append(_make_block_finished_event(run_id, result, block, total_blocks))
 
             # Update context
             context.last_output = result.output
             context.success = result.success
             result.exported_env = _apply_block_exports(block, result, context)
+            events.append(_make_block_finished_event(run_id, result, block, total_blocks))
+
+            after_hook = execute_hook("AFTER", context.hooks, context, no_input=no_input)
+            if after_hook and not after_hook.success and result.success:
+                result.success = False
+                result.exit_code = after_hook.exit_code
+                result.error_message = f"AFTER hook failed: {after_hook.error_message}"
+                result.failure_kind = FAILURE_RUNTIME
 
             # Fail fast on error
             if not result.success:
                 failure_kind = _failure_kind_for_result(result)
                 exit_code = _exit_code_for_failure(failure_kind)
+                execute_hook("ERROR", context.hooks, context, no_input=no_input)
+                execute_hook("FINISHED", context.hooks, context, no_input=no_input)
                 events.append(
                     _make_run_finished_event(
                         run_id,
@@ -2680,22 +3202,34 @@ def run_script(
             start_block_index = current_block_index + 1
             current_block_index += len(group)
 
+            for offset, block in enumerate(group):
+                i = start_block_index + offset
+                events.append(_make_block_started_event(run_id, _make_block_id(i), i, block, total_blocks))
+
             # Execute blocks in parallel
             parallel_results = run_parallel(
                 group, context, servers, no_input, verbose, output_tail_lines, run_id, total_blocks
             )
 
-            for result in parallel_results:
-                result.block_index = start_block_index + parallel_results.index(result) - 1  # Adjust index
+            for offset, result in enumerate(parallel_results):
+                block = group[offset]
+                absolute_index = start_block_index + offset
+                result.block_index = absolute_index
+                result.block_id = _make_block_id(absolute_index)
+                result.source_line = block.source_line
                 blocks_executed += 1
                 block_results.append(result)
-                block = group[result.block_index - start_block_index + 1]
+                result.exported_env = _apply_block_exports(block, result, context)
+                context.last_output = result.output
+                context.success = result.success
                 events.append(_make_block_finished_event(run_id, result, block, total_blocks))
 
                 # Fail fast on error in parallel execution
                 if not result.success:
                     failure_kind = _failure_kind_for_result(result)
                     exit_code = _exit_code_for_failure(failure_kind)
+                    execute_hook("ERROR", context.hooks, context, no_input=no_input)
+                    execute_hook("FINISHED", context.hooks, context, no_input=no_input)
                     events.append(
                         _make_run_finished_event(
                             run_id,
@@ -2719,6 +3253,60 @@ def run_script(
                         no_input=no_input,
                         events=events,
                     )
+
+    success_hook = execute_hook("SUCCESS", context.hooks, context, no_input=no_input)
+    if success_hook and not success_hook.success:
+        execute_hook("ERROR", context.hooks, context, no_input=no_input)
+        execute_hook("FINISHED", context.hooks, context, no_input=no_input)
+        events.append(
+            _make_run_finished_event(
+                run_id,
+                success=False,
+                exit_code=EXIT_EXECUTION_FAILURE,
+                blocks_executed=blocks_executed,
+                total_blocks=total_blocks,
+                failure_kind="hook_success",
+                no_input=no_input,
+            )
+        )
+        return RunResult(
+            success=False,
+            blocks_executed=blocks_executed,
+            error_message=f"SUCCESS hook failed: {success_hook.error_message}",
+            block_results=block_results,
+            run_id=run_id,
+            schema_version=SCHEMA_VERSION,
+            exit_code=EXIT_EXECUTION_FAILURE,
+            failure_kind="hook_success",
+            no_input=no_input,
+            events=events,
+        )
+
+    finished_hook = execute_hook("FINISHED", context.hooks, context, no_input=no_input)
+    if finished_hook and not finished_hook.success:
+        events.append(
+            _make_run_finished_event(
+                run_id,
+                success=False,
+                exit_code=EXIT_EXECUTION_FAILURE,
+                blocks_executed=blocks_executed,
+                total_blocks=total_blocks,
+                failure_kind="hook_finished",
+                no_input=no_input,
+            )
+        )
+        return RunResult(
+            success=False,
+            blocks_executed=blocks_executed,
+            error_message=f"FINISHED hook failed: {finished_hook.error_message}",
+            block_results=block_results,
+            run_id=run_id,
+            schema_version=SCHEMA_VERSION,
+            exit_code=EXIT_EXECUTION_FAILURE,
+            failure_kind="hook_finished",
+            no_input=no_input,
+            events=events,
+        )
 
     events.append(
         _make_run_finished_event(
@@ -2813,6 +3401,16 @@ Examples:
         help="Preview the execution plan without running any block commands",
     )
     run_parser.add_argument(
+        "--mode",
+        choices=("sequential", "parallel"),
+        default="sequential",
+        help="Execution mode for blocks annotated with @PARALLEL",
+    )
+    run_parser.add_argument(
+        "--task",
+        help="Run a named @TASK or @MACRO target",
+    )
+    run_parser.add_argument(
         "--audit-log",
         dest="audit_log",
         help="Write a redacted JSON Lines audit log to the given path",
@@ -2851,6 +3449,11 @@ Examples:
         description="Run diagnostics to verify Shellflow configuration and SSH connectivity.",
     )
     doctor_parser.add_argument(
+        "script",
+        nargs="?",
+        help="Optional Shellflow script to validate",
+    )
+    doctor_parser.add_argument(
         "--ssh-config",
         help="Path to an SSH config file to use instead of ~/.ssh/config",
     )
@@ -2868,11 +3471,15 @@ def main(args: list[str] | None = None) -> int:
         Exit code (0 for success, non-zero for failure).
     """
     parser = create_parser()
-    parsed_args = parser.parse_args(args)
+    parsed_args, extra_args = parser.parse_known_args(args)
+    parsed_args.extra_args = extra_args
 
     if not parsed_args.command:
         parser.print_help()
         return EXIT_EXECUTION_FAILURE
+
+    if extra_args and parsed_args.command != "run":
+        parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
 
     if parsed_args.command == "run":
         return cmd_run(parsed_args)
@@ -2908,18 +3515,32 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         os.environ["SHELLFLOW_SSH_CONFIG"] = str(Path(args.ssh_config).expanduser())
 
     try:
+        options = parse_options(run_args.script)
+        option_overrides = getattr(run_args, "options", {}) or {}
+        option_env = resolve_option_values(options, option_overrides)
         macros = parse_macros(run_args.script)
         helpers = parse_helpers(run_args.script)
         variables = parse_variables(run_args.script)
-        blocks = parse_script(run_args.script, macros, helpers)
+        hooks = parse_hooks(run_args.script)
+        blocks = parse_script(run_args.script, macros, helpers, hooks, option_env)
         servers = parse_server_config(run_args.script)
-    except ParseError as e:
+    except (ParseError, ValueError) as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return EXIT_PARSE_FAILURE
 
     if not blocks:
-        result = run_script([], servers, no_input=True, dry_run=run_args.dry_run, mode="sequential", macros=macros, helpers=helpers, variables=variables, hooks=hooks)
-        print(result.to_dict())
+        result = run_script(
+            [],
+            servers,
+            no_input=True,
+            dry_run=run_args.dry_run,
+            mode="sequential",
+            macros=macros,
+            helpers=helpers,
+            variables=variables,
+            hooks=hooks,
+        )
+        print(json.dumps(result.to_dict()))
         return EXIT_SUCCESS
 
     result = run_script(
@@ -2966,18 +3587,32 @@ def cmd_run(args: argparse.Namespace) -> int:
         return EXIT_EXECUTION_FAILURE
 
     try:
+        options = parse_options(content)
+        option_overrides = _parse_option_overrides(getattr(args, "extra_args", []))
+        option_env = resolve_option_values(options, option_overrides)
         macros = parse_macros(content)
         helpers = parse_helpers(content)
         variables = parse_variables(content)
         hooks = parse_hooks(content)
-        blocks = parse_script(content, macros, helpers, hooks)
+        blocks = parse_script(content, macros, helpers, hooks, option_env)
+        blocks = select_blocks_for_target(blocks, macros, getattr(args, "task", None))
         servers = parse_server_config(content)
-    except ParseError as e:
+    except (ParseError, ValueError) as e:
         sys.stderr.write(f"Parse error: {e}\n")
         return _exit_code_for_failure(FAILURE_PARSE)
 
     if not blocks:
-        empty_result = run_script([], servers, no_input=args.no_input, dry_run=args.dry_run, mode="sequential", macros=macros, helpers=helpers, variables=variables, hooks=hooks)
+        empty_result = run_script(
+            [],
+            servers,
+            no_input=args.no_input,
+            dry_run=args.dry_run,
+            mode=args.mode,
+            macros=macros,
+            helpers=helpers,
+            variables=variables,
+            hooks=hooks,
+        )
         if args.json or args.jsonl:
             if args.json:
                 _emit_structured_output_json(empty_result)
@@ -2996,7 +3631,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         verbose=args.verbose and not machine_mode,
         no_input=args.no_input,
         dry_run=args.dry_run,
-        mode="sequential",
+        mode=args.mode,
         output_tail_lines=args.output_lines,
         macros=macros,
         helpers=helpers,
@@ -3037,12 +3672,34 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         os.environ["SHELLFLOW_SSH_CONFIG"] = str(Path(args.ssh_config).expanduser())
 
     try:
-        result = run_doctor()
-        print(result)
-        return EXIT_SUCCESS
-    except Exception as e:
+        script_path = Path(args.script) if args.script else None
+        blocks: list[Block] = []
+        remote_hosts: list[str] = []
+        if script_path is not None:
+            if not script_path.exists():
+                sys.stderr.write(f"Doctor check failed: script not found: {script_path}\n")
+                return EXIT_EXECUTION_FAILURE
+            content = script_path.read_text()
+            options = parse_options(content)
+            option_env = resolve_option_values(options)
+            macros = parse_macros(content)
+            helpers = parse_helpers(content)
+            hooks = parse_hooks(content)
+            blocks = parse_script(content, macros, helpers, hooks, option_env)
+            parse_server_config(content)
+            remote_hosts = sorted({block.host for block in blocks if block.host})
+
+    except (OSError, ParseError, ValueError) as e:
         sys.stderr.write(f"Doctor check failed: {e}\n")
         return EXIT_EXECUTION_FAILURE
+    else:
+        result = run_doctor(
+            script_path=script_path,
+            block_count=len(blocks) if script_path else None,
+            remote_hosts=remote_hosts,
+        )
+        print(result)
+        return EXIT_SUCCESS
 
 
 def _get_version() -> str:

@@ -15,4 +15,4 @@ echo $APP_NAME
     variables = parse_variables(script)
     result = run_script(blocks, variables=variables)
     assert result.success
-    assert 'myapp' in result.block_results[0].output
+    assert "myapp" in result.block_results[0].output
