@@ -9,19 +9,22 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shellflow import Block, ExecutionContext, ExecutionResult
 
 
 def run_parallel(
-    blocks,
-    context,
-    servers=None,
-    no_input=False,
-    verbose=False,
-    output_tail_lines=20,
-    run_id="",
-    total_blocks=0,
-):
+    blocks: list[Block],
+    context: ExecutionContext,
+    servers: dict[str, dict[str, str]] | None = None,
+    no_input: bool = False,
+    verbose: bool = False,
+    output_tail_lines: int = 20,
+    run_id: str = "",
+    total_blocks: int = 0,
+) -> list[ExecutionResult]:
     """Execute blocks in parallel using a thread pool.
 
     Args:
@@ -39,10 +42,10 @@ def run_parallel(
     """
     # Import here to avoid circular imports
     from shellflow import (
+        ExecutionContext,
         ExecutionResult,
         _execute_block_standard,
         _finalize_block_result,
-        _apply_block_exports,
         _get_verbose_colors,
     )
 
@@ -53,29 +56,41 @@ def run_parallel(
     colors = _get_verbose_colors()
 
     results: list[ExecutionResult] = []
-    lock = threading.Lock()
+    print_lock = threading.Lock()
 
     def execute_block_worker(block: Block, block_index: int) -> ExecutionResult:
         """Execute a single block and return its result."""
         block_id = f"block-{block_index}"
         start_time = time.perf_counter()
+        child_context = ExecutionContext(
+            env=dict(context.env),
+            last_output=context.last_output,
+            success=context.success,
+            macros=dict(context.macros),
+            helpers=dict(context.helpers),
+            variables=dict(context.variables),
+            hooks=dict(context.hooks),
+        )
 
         # Execute the block
-        result = _execute_block_standard(
-            block, context, servers, no_input, verbose, block_index, total_blocks,
-            output_tail_lines, colors, [], run_id
-        )
+        with print_lock:
+            result = _execute_block_standard(
+                block,
+                child_context,
+                servers,
+                no_input,
+                verbose,
+                block_index,
+                total_blocks,
+                output_tail_lines,
+                colors,
+                [],
+                run_id,
+            )
 
         result = _finalize_block_result(result, block, block_index, start_time)
         result.block_id = block_id
         result.block_index = block_index
-
-        # Apply exports to shared context (thread-safe)
-        with lock:
-            result.exported_env = _apply_block_exports(block, result, context)
-            # Update shared context
-            context.last_output = result.output
-            context.success = result.success
 
         return result
 
@@ -83,8 +98,7 @@ def run_parallel(
     with ThreadPoolExecutor(max_workers=len(blocks)) as executor:
         # Submit all tasks
         future_to_block = {
-            executor.submit(execute_block_worker, block, i + 1): (block, i + 1)
-            for i, block in enumerate(blocks)
+            executor.submit(execute_block_worker, block, i + 1): (block, i + 1) for i, block in enumerate(blocks)
         }
 
         # Collect results as they complete
@@ -93,7 +107,7 @@ def run_parallel(
             try:
                 result = future.result()
                 results.append(result)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 # Handle any exceptions from the worker thread
                 error_result = ExecutionResult(
                     success=False,

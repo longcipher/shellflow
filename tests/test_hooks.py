@@ -1,7 +1,7 @@
 """Tests for hook system."""
 
-from src.shellflow import parse_script, run_script
 from src.hooks import parse_hooks
+from src.shellflow import parse_script, run_script
 
 
 def test_pre_execution_hook():

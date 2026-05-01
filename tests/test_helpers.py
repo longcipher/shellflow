@@ -5,12 +5,8 @@ Tests for parse_helpers function and helper expansion in src/shellflow.py.
 
 from __future__ import annotations
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-
 from helpers import parse_helpers
-from shellflow import parse_script, run_script, ParseError
+from shellflow import parse_script, run_script
 
 
 def test_parse_helper_groups():
@@ -20,9 +16,9 @@ def test_parse_helper_groups():
 # @ENDHELPER
 """
     helpers = parse_helpers(script)
-    assert 'backup_db' in helpers
-    assert len(helpers['backup_db']) == 1
-    assert helpers['backup_db'][0] == 'mysqldump db > backup.sql'
+    assert "backup_db" in helpers
+    assert len(helpers["backup_db"]) == 1
+    assert helpers["backup_db"][0] == "mysqldump db > backup.sql"
 
 
 def test_helper_expansion():
@@ -38,7 +34,7 @@ backup_db
     blocks = parse_script(script, None, helpers)
     assert len(blocks) == 1
     assert len(blocks[0].commands) == 1
-    assert blocks[0].commands[0] == 'mysqldump db > backup.sql'
+    assert blocks[0].commands[0] == "mysqldump db > backup.sql"
 
 
 def test_helper_expansion_with_regular_commands():
@@ -57,7 +53,7 @@ echo "backup complete"
     assert len(blocks) == 1
     assert len(blocks[0].commands) == 3
     assert blocks[0].commands[0] == 'echo "starting backup"'
-    assert blocks[0].commands[1] == 'mysqldump db > backup.sql'
+    assert blocks[0].commands[1] == "mysqldump db > backup.sql"
     assert blocks[0].commands[2] == 'echo "backup complete"'
 
 

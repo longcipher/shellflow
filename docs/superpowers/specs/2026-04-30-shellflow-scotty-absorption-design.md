@@ -18,6 +18,7 @@ This design specification outlines the absorption of 8 key features from Scotty 
 **Current State**: Shellflow uses raw hostnames in `@REMOTE host` directives.
 
 **Proposed Enhancement**:
+
 ```bash
 # @servers web=web1.example.com,web2.example.com db=db.example.com
 # @REMOTE web
@@ -25,6 +26,7 @@ echo "Deploy to web servers"
 ```
 
 **Implementation**:
+
 - Add `ServerRegistry` class to manage named server aliases
 - Extend parser to recognize `@servers` directive
 - Allow both `@REMOTE server_alias` and `@REMOTE hostname` syntax
@@ -37,6 +39,7 @@ echo "Deploy to web servers"
 **Current State**: Commands are grouped in anonymous blocks.
 
 **Proposed Enhancement**:
+
 ```bash
 # @task deploy on:web
 git pull origin main
@@ -48,6 +51,7 @@ php artisan migrate
 ```
 
 **Implementation**:
+
 - Add `TaskRegistry` class for named task storage
 - Extend parser to recognize `@task name on:servers` syntax
 - Tasks become callable units that can be referenced by macros
@@ -60,6 +64,7 @@ php artisan migrate
 **Current State**: Scripts execute linearly from top to bottom.
 
 **Proposed Enhancement**:
+
 ```bash
 # @macro full-deploy deploy migrate cleanup
 # @macro quick-deploy deploy
@@ -68,6 +73,7 @@ php artisan migrate
 ```
 
 **Implementation**:
+
 - Add `MacroRegistry` class for workflow composition
 - CLI accepts macro names as targets: `shellflow run script.sh macro_name`
 - Macros resolve to ordered task execution sequences
@@ -80,6 +86,7 @@ php artisan migrate
 **Current State**: Variables set via environment or `@EXPORT`.
 
 **Proposed Enhancement**:
+
 ```bash
 # Variables at script top-level
 BRANCH="main" 
@@ -91,6 +98,7 @@ git checkout $BRANCH
 ```
 
 **Implementation**:
+
 - Extend preamble evaluation to capture top-level variable assignments
 - Variables become available in all task execution contexts
 - Support both static values and dynamic expressions
@@ -103,6 +111,7 @@ git checkout $BRANCH
 **Current State**: Functions can be defined but aren't reusable across tasks.
 
 **Proposed Enhancement**:
+
 ```bash
 notify_slack() {
   curl -X POST -H 'Content-type: application/json' \
@@ -115,6 +124,7 @@ notify_slack
 ```
 
 **Implementation**:
+
 - Functions defined at script level become available in all tasks
 - Function registry tracks available helpers
 - Support for function libraries and imports
@@ -126,6 +136,7 @@ notify_slack
 **Current State**: No lifecycle hooks.
 
 **Proposed Enhancement**:
+
 ```bash
 # @before
 setup_environment() {
@@ -144,6 +155,7 @@ rollback_on_failure() {
 ```
 
 **Implementation**:
+
 - Add `HookRegistry` class for lifecycle event management
 - Hooks execute at appropriate points in run lifecycle
 - Support `@before`, `@after`, `@error`, `@success`, `@finished` events
@@ -156,6 +168,7 @@ rollback_on_failure() {
 **Current State**: No configuration validation.
 
 **Proposed Enhancement**:
+
 ```bash
 $ shellflow doctor script.sh
 ✓ SSH connectivity to all defined servers
@@ -165,6 +178,7 @@ $ shellflow doctor script.sh
 ```
 
 **Implementation**:
+
 - New `doctor` subcommand in CLI
 - Validates SSH connections to all referenced hosts
 - Checks tool availability on remote systems
@@ -178,18 +192,20 @@ $ shellflow doctor script.sh
 **Current State**: Basic run with verbose output.
 
 **Proposed Enhancement**:
+
 ```bash
 # Dry run mode
-$ shellflow run script.sh --pretend
+shellflow run script.sh --pretend
 
 # Continue on errors  
-$ shellflow run script.sh --continue-on-error
+shellflow run script.sh --continue-on-error
 
 # Summary output only
-$ shellflow run script.sh --summary
+shellflow run script.sh --summary
 ```
 
 **Implementation**:
+
 - `--pretend`: Show commands that would execute without running them
 - `--continue-on-error`: Don't stop execution on first failure
 - `--summary`: Condensed output showing only key results
@@ -204,13 +220,13 @@ $ shellflow run script.sh --summary
 ```python
 class ServerRegistry:
     """Manages named server aliases and host resolution."""
-    
+
 class TaskRegistry:  
     """Stores named tasks with their server assignments."""
-    
+
 class MacroRegistry:
     """Manages macro definitions and task composition."""
-    
+
 class HookRegistry:
     """Handles lifecycle hook registration and execution."""
 ```
@@ -230,16 +246,19 @@ class HookRegistry:
 ## Testing Strategy
 
 ### Unit Tests
+
 - Registry classes: CRUD operations, validation logic
 - Parser extensions: New directive recognition and parsing
 - CLI commands: Option parsing and execution paths
 
 ### Integration Tests  
+
 - End-to-end script execution with new features
 - SSH connectivity and remote execution validation
 - Hook execution and error handling scenarios
 
 ### BDD Scenarios (behave)
+
 ```gherkin
 Given a script with server definitions
 When I run shellflow doctor
@@ -251,6 +270,7 @@ Then tasks should run in the defined order
 ```
 
 ### Backward Compatibility Tests
+
 - All existing test suites must continue passing
 - Regression testing for edge cases
 - Performance benchmarking to ensure no degradation
@@ -258,16 +278,19 @@ Then tasks should run in the defined order
 ## Implementation Phases
 
 ### Phase 1: Core Infrastructure (High Priority)
+
 1. Server and Task registries
 2. Parser extensions for basic directives
 3. Doctor command skeleton
 
 ### Phase 2: Execution Features (Medium Priority)  
+
 1. Task execution engine
 2. Macro resolution and execution
 3. Hook system integration
 
 ### Phase 3: Advanced Features (Lower Priority)
+
 1. Complete doctor command with SSH validation
 2. Advanced execution modes (--pretend, --continue-on-error)
 3. Performance optimizations and refinements
@@ -275,11 +298,13 @@ Then tasks should run in the defined order
 ## Migration Guide
 
 ### For Existing Users
+
 - No changes required; existing scripts work unchanged
 - New features are opt-in through new syntax
 - Can gradually adopt features in existing scripts
 
 ### For New Users
+
 - Start with familiar block syntax
 - Adopt server aliases and tasks as complexity grows
 - Use macros for reusable deployment workflows

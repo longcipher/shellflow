@@ -28,6 +28,7 @@ class ShellFlowRunArgs(BaseModel):
     )
     dry_run: bool = Field(default=False, description="如果为 true, 则仅解析脚本并验证 SSH 连接, 不实际执行命令。")
     timeout_global: int | None = Field(default=None, description="整个剧本执行的全局超时时间(秒)")
+    options: dict[str, str | bool] = Field(default_factory=dict, description="由脚本 # @option 声明的动态参数值。")
 
 
 # =============================================================================

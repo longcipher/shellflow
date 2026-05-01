@@ -13,12 +13,14 @@
 ## File Structure
 
 ### Existing Files (Modified)
+
 - `src/shellflow.py`: Main module - extend Block, ExecutionContext, ExecutionResult, RunResult, SSHConfig classes and CLI commands.
 - `tests/`: Add new unit tests for each feature.
 - `features/`: Add new BDD scenarios.
 - `pyproject.toml`: Update dependencies if needed.
 
 ### New Files (Created)
+
 - `src/config.py`: Handle server definitions and configurations.
 - `src/variables.py`: Variable system implementation.
 - `src/hooks.py`: Hook system implementation.
@@ -34,10 +36,10 @@
 ### Task 1: Server Definitions
 
 **Files:**
+
 - Create: `src/config.py`
 - Modify: `src/shellflow.py` (SSHConfig class and parser)
 - Test: `tests/test_config.py`, `features/config.feature`
-
 - [ ] **Step 1: Write the failing test for server definitions parsing**
 
 ```python
@@ -99,7 +101,7 @@ def parse_server_config(script):
 Run: `pytest tests/test_config.py -v`
 Add to `features/config.feature`:
 
-```
+```text
 Feature: Server Definitions
   Scenario: Parse server config
     Given a script with server definitions
@@ -121,9 +123,9 @@ git commit -m "feat: add server definitions parsing"
 ### Task 2: Task Annotations
 
 **Files:**
+
 - Modify: `src/shellflow.py` (Block class)
 - Test: `tests/test_annotations.py`, `features/annotations.feature`
-
 - [ ] **Step 1: Write the failing test for task annotations**
 
 ```python
@@ -180,10 +182,10 @@ git commit -m "feat: add task annotations"
 ### Task 3: Macro Groups
 
 **Files:**
+
 - Create: `src/macros.py`
 - Modify: `src/shellflow.py`
 - Test: `tests/test_macros.py`, `features/macros.feature`
-
 - [ ] **Step 1: Write failing test for macro groups**
 
 ```python
@@ -212,10 +214,10 @@ In `src/macros.py`
 ### Task 4: Variable System
 
 **Files:**
+
 - Create: `src/variables.py`
 - Modify: `src/shellflow.py` (ExecutionContext)
 - Test: `tests/test_variables.py`, `features/variables.feature`
-
 - [ ] **Step 1: Failing test for variable substitution**
 
 ```python
@@ -238,10 +240,10 @@ echo $APP_NAME
 ### Task 5: Helper Functions
 
 **Files:**
+
 - Create: `src/helpers.py`
 - Modify: `src/shellflow.py`
 - Test: `tests/test_helpers.py`, `features/helpers.feature`
-
 - [ ] **Step 1: Failing test for helper functions**
 
 ```python
@@ -266,10 +268,10 @@ backup_db
 ### Task 6: Hook System
 
 **Files:**
+
 - Create: `src/hooks.py`
 - Modify: `src/shellflow.py` (ExecutionContext)
 - Test: `tests/test_hooks.py`, `features/hooks.feature`
-
 - [ ] **Step 1: Failing test for hooks**
 
 ```python
@@ -293,10 +295,10 @@ echo "main task"
 ### Task 7: Doctor Command
 
 **Files:**
+
 - Create: `src/doctor.py`
 - Modify: `src/shellflow.py` (CLI)
 - Test: `tests/test_doctor.py`, `features/doctor.feature`
-
 - [ ] **Step 1: Failing test for doctor command**
 
 ```python
@@ -315,10 +317,10 @@ def test_doctor_command():
 ### Task 8: Advanced Execution Modes
 
 **Files:**
+
 - Create: `src/advanced_modes.py`
 - Modify: `src/shellflow.py` (RunResult, runner)
 - Test: `tests/test_modes.py`, `features/modes.feature`
-
 - [ ] **Step 1: Failing test for parallel execution**
 
 ```python
