@@ -1427,6 +1427,7 @@ def _build_shell_bootstrap(shell: str | None) -> list[str]:
     if shell_name == "zsh":
         return [
             "set +x 2>/dev/null || true",
+            "unset preexec_functions precmd_functions 2>/dev/null || true",
             "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }",
         ]
     if shell_name == "bash":
