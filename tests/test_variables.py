@@ -1,7 +1,7 @@
 """Unit tests for variable functionality."""
 
 from shellflow import parse_script, run_script
-from variables import parse_variables
+from shellflow.config import parse_variables
 
 
 def test_variable_substitution():

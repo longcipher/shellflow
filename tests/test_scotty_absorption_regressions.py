@@ -12,16 +12,10 @@ if TYPE_CHECKING:
 
     import pytest
 
-from shellflow import (
-    Block,
-    ExecutionContext,
-    _build_remote_trace_script,
-    _parse_debug_trace_command_logs,
-    cmd_run,
-    main,
-    parse_script,
-    run_script,
-)
+from shellflow import Block, ExecutionContext, main, parse_script, run_script
+from shellflow.cli import cmd_run
+from shellflow.config import parse_hooks
+from shellflow.executor import _build_remote_trace_script, _parse_debug_trace_command_logs
 
 
 def test_remote_trace_preserves_multiline_bash() -> None:
@@ -243,8 +237,6 @@ def test_lifecycle_hooks_run_on_success_and_finished(tmp_path: Path) -> None:
 echo main
 """.strip()
     )
-    from hooks import parse_hooks
-
     result = run_script(
         blocks,
         hooks=parse_hooks(
@@ -280,8 +272,6 @@ def test_error_and_finished_hooks_run_after_failure(tmp_path: Path) -> None:
 # @LOCAL
 exit 7
 """.strip()
-    from hooks import parse_hooks
-
     result = run_script(parse_script(script, hooks=parse_hooks(script)), hooks=parse_hooks(script))
 
     assert not result.success

@@ -25,24 +25,17 @@ Repository = "https://github.com/longcipher/shellflow"
 Issues = "https://github.com/longcipher/shellflow/issues"
 
 [project.scripts]
-shellflow = "shellflow:main"
+shellflow = "shellflow.main:main"
 
 [build-system]
 requires = ["hatchling>=1.18.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
+packages = ["src/shellflow"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"src/shellflow.py" = "shellflow.py"
 "src/shellflow_models.py" = "shellflow_models.py"
-"src/advanced_modes.py" = "advanced_modes.py"
-"src/config.py" = "config.py"
-"src/doctor.py" = "doctor.py"
-"src/helpers.py" = "helpers.py"
-"src/hooks.py" = "hooks.py"
-"src/macros.py" = "macros.py"
-"src/variables.py" = "variables.py"
 
 [dependency-groups]
 dev = [

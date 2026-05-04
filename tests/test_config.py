@@ -1,7 +1,8 @@
 # tests/test_config.py
 import pytest
 
-from src.config import parse_server_config
+from shellflow import ParseError
+from shellflow.config import parse_server_config
 
 
 def test_parse_server_definition():
@@ -63,7 +64,7 @@ def test_missing_required_host_field():
 #   user: deploy
 #   port: 22
 """
-    with pytest.raises(ValueError, match="Missing required field 'host'"):
+    with pytest.raises(ParseError, match="Missing required field 'host'"):
         parse_server_config(script)
 
 
@@ -73,7 +74,7 @@ def test_malformed_config_line():
 #   host: example.com
 #   invalid line without colon
 """
-    with pytest.raises(ValueError, match="Malformed config line"):
+    with pytest.raises(ParseError, match="Malformed config line"):
         parse_server_config(script)
 
 
@@ -82,7 +83,7 @@ def test_empty_server_name():
 # @SERVER
 #   host: example.com
 """
-    with pytest.raises(ValueError, match="Server name cannot be empty"):
+    with pytest.raises(ParseError, match="Server name cannot be empty"):
         parse_server_config(script)
 
 

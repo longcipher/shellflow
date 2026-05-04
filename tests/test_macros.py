@@ -5,8 +5,8 @@ Tests for parse_macros function and macro expansion in src/shellflow.py.
 
 from __future__ import annotations
 
-from macros import parse_macros
 from shellflow import parse_script
+from shellflow.config import parse_macros
 
 
 def test_parse_macro_groups():

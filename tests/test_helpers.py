@@ -5,8 +5,8 @@ Tests for parse_helpers function and helper expansion in src/shellflow.py.
 
 from __future__ import annotations
 
-from helpers import parse_helpers
 from shellflow import parse_script, run_script
+from shellflow.config import parse_helpers
 
 
 def test_parse_helper_groups():
