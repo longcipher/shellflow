@@ -41,9 +41,8 @@ def run_parallel(
         List of execution results in the order they completed.
     """
     # Import here to avoid circular imports
-    from shellflow import (
-        ExecutionContext,
-        ExecutionResult,
+    from shellflow.models import ExecutionContext, ExecutionResult
+    from shellflow.runner import (
         _execute_block_standard,
         _finalize_block_result,
         _get_verbose_colors,

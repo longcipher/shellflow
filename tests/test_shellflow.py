@@ -28,6 +28,7 @@ from shellflow import (
     RunResult,
     ShellflowError,
     SSHConfig,
+    StructuredExport,
     _build_executable_script,
     _clean_commands,
     _is_valid_env_name,
@@ -40,6 +41,7 @@ from shellflow import (
     read_ssh_config,
     run_script,
 )
+from shellflow.executor import _apply_block_exports
 
 _MOCK_DELIM = "mockdelim001"
 
@@ -473,7 +475,7 @@ class TestExecuteLocal:
 
         mock_result = mock.Mock(returncode=0, stdout="hello\n", stderr="")
 
-        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+        with mock.patch("shellflow.executor.subprocess.run", return_value=mock_result) as mock_run:
             result = execute_local(block, execution_context)
 
         assert result.success is True
@@ -488,7 +490,7 @@ class TestExecuteLocal:
 
         mock_result = mock.Mock(returncode=0, stdout="hello\n", stderr="")
 
-        with mock.patch("shellflow.subprocess.run", return_value=mock_result) as mock_run:
+        with mock.patch("shellflow.executor.subprocess.run", return_value=mock_result) as mock_run:
             result = execute_local(block, execution_context, no_input=True)
 
         assert result.success is True
@@ -578,7 +580,7 @@ class TestExecuteLocal:
         """Test handling of subprocess errors."""
         # Create a mock that raises SubprocessError
         with mock.patch(
-            "shellflow.subprocess.run",
+            "shellflow.executor.subprocess.run",
             side_effect=subprocess.SubprocessError("Mocked error"),
         ):
             block = Block(target="LOCAL", commands=["echo hello"])
@@ -655,7 +657,7 @@ __SHELLFLOW_EXITCODE__101
         ssh_config = SSHConfig(host="server1")
 
         with mock.patch(
-            "shellflow._run_remote_subprocess",
+            "shellflow.executor._run_remote_subprocess",
             return_value=(_mock_remote_output("hostname", "server1"), "", 0, False, False),
         ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config)
@@ -672,7 +674,7 @@ __SHELLFLOW_EXITCODE__101
         ssh_config = SSHConfig(host="server1")
 
         with mock.patch(
-            "shellflow._run_remote_subprocess",
+            "shellflow.executor._run_remote_subprocess",
             return_value=(_mock_remote_output("hostname", "server1"), "", 0, False, False),
         ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config, no_input=True)
@@ -712,7 +714,7 @@ __SHELLFLOW_EXITCODE__101
         )
 
         with mock.patch(
-            "shellflow._run_remote_subprocess",
+            "shellflow.executor._run_remote_subprocess",
             return_value=(_mock_remote_output("hostname", "server1"), "", 0, False, False),
         ):
             result = execute_remote(block, execution_context, ssh_config)
@@ -736,7 +738,7 @@ __SHELLFLOW_EXITCODE__101
         )
 
         with mock.patch(
-            "shellflow._run_remote_subprocess",
+            "shellflow.executor._run_remote_subprocess",
             return_value=(_mock_remote_output("uptime"), "", 0, False, False),
         ) as mock_run:
             execute_remote(block, execution_context, ssh_config)
@@ -751,6 +753,23 @@ __SHELLFLOW_EXITCODE__101
             assert "-i" in call_args
             assert "/path/to/key" in call_args
 
+    def test_ssh_hostname_is_used_as_remote_target(
+        self,
+        execution_context: ExecutionContext,
+    ) -> None:
+        """Inline server hostnames should become the actual SSH target instead of the alias."""
+        block = Block(target="REMOTE:myhost", commands=["uptime"])
+        ssh_config = SSHConfig(host="myhost", hostname="192.168.1.50")
+
+        with mock.patch(
+            "shellflow.executor._run_remote_subprocess",
+            return_value=(_mock_remote_output("uptime"), "", 0, False, False),
+        ) as mock_run:
+            execute_remote(block, execution_context, ssh_config)
+
+        call_args = mock_run.call_args.args[0]
+        assert call_args[-5] == "192.168.1.50"
+
     def test_custom_remote_shell_runs_as_login_shell(
         self,
         execution_context: ExecutionContext,
@@ -760,7 +779,7 @@ __SHELLFLOW_EXITCODE__101
         ssh_config = SSHConfig(host="myhost")
 
         with mock.patch(
-            "shellflow._run_remote_subprocess",
+            "shellflow.executor._run_remote_subprocess",
             return_value=(_mock_remote_output("mise --version", "2026.1.0"), "", 0, False, False),
         ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config)
@@ -778,7 +797,7 @@ __SHELLFLOW_EXITCODE__101
         ssh_config = SSHConfig(host="myhost")
 
         with mock.patch(
-            "shellflow._run_remote_subprocess",
+            "shellflow.executor._run_remote_subprocess",
             return_value=(_mock_remote_output("mise --version", "2026.1.0"), "", 0, False, False),
         ) as mock_run:
             result = execute_remote(block, execution_context, ssh_config)
@@ -807,7 +826,7 @@ __SHELLFLOW_EXITCODE__101
                 clear=True,
             ),
             mock.patch(
-                "shellflow._run_remote_subprocess",
+                "shellflow.executor._run_remote_subprocess",
                 return_value=(_mock_remote_output("env"), "", 0, False, False),
             ) as mock_run,
         ):
@@ -827,7 +846,7 @@ __SHELLFLOW_EXITCODE__101
         ssh_config = SSHConfig(host="server1")
 
         with mock.patch(
-            "shellflow._run_remote_subprocess",
+            "shellflow.executor._run_remote_subprocess",
             return_value=(_mock_remote_output("false", "", 1), "Permission denied", 1, False, False),
         ):
             result = execute_remote(block, execution_context, ssh_config)
@@ -842,7 +861,7 @@ __SHELLFLOW_EXITCODE__101
         ssh_config = SSHConfig(host="server1")
 
         with mock.patch(
-            "shellflow._run_remote_subprocess",
+            "shellflow.executor._run_remote_subprocess",
             return_value=(_mock_remote_output("sleep 30", "partial output", 130), "", 130, True, False),
         ):
             result = execute_remote(block, execution_context, ssh_config)
@@ -860,7 +879,7 @@ __SHELLFLOW_EXITCODE__101
         ssh_config = SSHConfig(host="server1")
 
         with mock.patch(
-            "shellflow._run_remote_subprocess",
+            "shellflow.executor._run_remote_subprocess",
             side_effect=subprocess.SubprocessError("SSH failed"),
         ):
             result = execute_remote(block, execution_context, ssh_config)
@@ -884,11 +903,11 @@ __SHELLFLOW_EXITCODE__101
 
         with (
             mock.patch(
-                "shellflow.read_ssh_config",
+                "shellflow.executor.read_ssh_config",
                 return_value=mock_ssh_config,
             ) as mock_read_config,
             mock.patch(
-                "shellflow._run_remote_subprocess",
+                "shellflow.executor._run_remote_subprocess",
                 return_value=(_mock_remote_output("hostname"), "", 0, False, False),
             ) as mock_run,
         ):
@@ -1031,7 +1050,7 @@ echo \"hello\"
             parse_script(script)
 
     def test_prelude_is_prepended_to_each_block(self) -> None:
-        """Test that lines before the first marker are applied to each block."""
+        """Test that lines before the first marker are preserved as a shared execution preamble."""
         script = """#!/bin/bash
 set -eu
 
@@ -1043,8 +1062,10 @@ echo "two"
 """
         blocks = parse_script(script)
 
-        assert blocks[0].commands[:2] == ["#!/bin/bash", "set -eu"]
-        assert blocks[1].commands[:2] == ["#!/bin/bash", "set -eu"]
+        assert blocks[0].preamble_commands[:2] == ["#!/bin/bash", "set -eu"]
+        assert blocks[1].preamble_commands[:2] == ["#!/bin/bash", "set -eu"]
+        assert blocks[0].commands == ['echo "one"']
+        assert blocks[1].commands == ['echo "two"']
 
     def test_consecutive_markers_same_type(self) -> None:
         """Test consecutive markers of same type."""
@@ -1311,8 +1332,8 @@ class TestRunScript:
         ]
 
         with (
-            mock.patch("shellflow.execute_local") as mock_execute_local,
-            mock.patch("shellflow.execute_remote") as mock_execute_remote,
+            mock.patch("shellflow.executor.execute_local") as mock_execute_local,
+            mock.patch("shellflow.executor.execute_remote") as mock_execute_remote,
         ):
             result = run_script(blocks, dry_run=True)
 
@@ -1328,6 +1349,39 @@ class TestRunScript:
         assert result.events[2].target == "REMOTE:staging"
         mock_execute_local.assert_not_called()
         mock_execute_remote.assert_not_called()
+
+    def test_parse_and_dry_run_do_not_execute_preamble(self, tmp_path: Path) -> None:
+        """Parsing and dry-run must not trigger local side effects from the prelude."""
+        marker = tmp_path / "preamble.marker"
+        script = f"""printf "executed" > "{marker}"
+# @LOCAL
+echo "hello"
+"""
+
+        blocks = parse_script(script)
+        assert marker.exists() is False
+
+        result = run_script(blocks, dry_run=True)
+
+        assert result.success is True
+        assert marker.exists() is False
+
+    def test_structured_json_exports_store_json_literal_in_env(self) -> None:
+        """Structured exports should keep objects in reports and JSON strings in shell env."""
+        block = Block(
+            target="LOCAL",
+            commands=["echo hi"],
+            structured_exports={
+                "PAYLOAD": StructuredExport(name="PAYLOAD", source="stdout", json_schema={"type": "object"}),
+            },
+        )
+        result = ExecutionResult(success=True, output='{"ok": true}', stdout='{"ok": true}')
+        context = ExecutionContext()
+
+        exported_env = _apply_block_exports(block, result, context)
+
+        assert exported_env["PAYLOAD"] == {"ok": True}
+        assert context.env["PAYLOAD"] == '{"ok":true}'
 
     def test_named_exports_propagate_to_later_blocks(self) -> None:
         """Test explicit exports are added to later block environments."""
@@ -1357,7 +1411,7 @@ class TestRunScript:
                 stdout="VERSION=1.2.3",
             )
 
-        with mock.patch("shellflow.execute_local", side_effect=fake_execute_local):
+        with mock.patch("shellflow.executor.execute_local", side_effect=fake_execute_local):
             result = run_script(blocks)
 
         assert result.success is True
@@ -1422,7 +1476,7 @@ class TestRunScript:
             ),
         ]
 
-        with mock.patch("shellflow.execute_local", side_effect=attempt_results) as mock_execute:
+        with mock.patch("shellflow.executor.execute_local", side_effect=attempt_results) as mock_execute:
             result = run_script(blocks)
 
         assert result.success is True
@@ -1451,7 +1505,7 @@ class TestRunScript:
             failure_kind="timeout",
         )
 
-        with mock.patch("shellflow.execute_local", return_value=timed_out_result) as mock_execute:
+        with mock.patch("shellflow.executor.execute_local", return_value=timed_out_result) as mock_execute:
             result = run_script(blocks)
 
         assert result.success is False
@@ -1630,11 +1684,11 @@ echo \"hello\"
 
         with (
             mock.patch(
-                "shellflow.read_ssh_config",
+                "shellflow.executor.read_ssh_config",
                 return_value=SSHConfig(host="server1"),
             ),
             mock.patch(
-                "shellflow._run_remote_subprocess",
+                "shellflow.executor._run_remote_subprocess",
                 return_value=(_mock_remote_output("hostname", "server1"), "", 0, False, False),
             ),
         ):
@@ -1649,8 +1703,8 @@ echo \"hello\"
         ]
 
         with (
-            mock.patch("shellflow.read_ssh_config", return_value=None),
-            mock.patch("shellflow._run_remote_subprocess") as mock_run,
+            mock.patch("shellflow.executor.read_ssh_config", return_value=None),
+            mock.patch("shellflow.executor._run_remote_subprocess") as mock_run,
         ):
             result = run_script(blocks)
 
@@ -1682,11 +1736,11 @@ echo \"hello\"
 
         with (
             mock.patch(
-                "shellflow.read_ssh_config",
+                "shellflow.executor.read_ssh_config",
                 return_value=SSHConfig(host="server1"),
             ),
             mock.patch(
-                "shellflow.execute_remote",
+                "shellflow.executor.execute_remote",
                 return_value=ExecutionResult(success=True, output="server1"),
             ),
         ):
@@ -1705,9 +1759,9 @@ echo \"hello\"
         ]
 
         with (
-            mock.patch("shellflow.read_ssh_config", return_value=SSHConfig(host="server1")),
+            mock.patch("shellflow.executor.read_ssh_config", return_value=SSHConfig(host="server1")),
             mock.patch(
-                "shellflow.execute_remote",
+                "shellflow.executor.execute_remote",
                 return_value=ExecutionResult(
                     success=True,
                     output="ignored combined output",
@@ -1838,7 +1892,7 @@ class TestMain:
 echo "hello"
 """)
 
-        with mock.patch("shellflow.run_script") as mock_run:
+        with mock.patch("shellflow.runner.run_script") as mock_run:
             mock_run.return_value = RunResult(success=True, blocks_executed=1)
             result = main(["run", str(script_path)])
 
@@ -1851,7 +1905,7 @@ echo "hello"
 exit 1
 """)
 
-        with mock.patch("shellflow.run_script") as mock_run:
+        with mock.patch("shellflow.runner.run_script") as mock_run:
             mock_run.return_value = RunResult(
                 success=False,
                 blocks_executed=1,
@@ -2010,7 +2064,7 @@ class TestCmdRun:
 echo "hello"
 """)
 
-        with mock.patch("shellflow.read_ssh_config", return_value=None):
+        with mock.patch("shellflow.executor.read_ssh_config", return_value=None):
             result = main(["run", str(script_path)])
 
         assert result == 3
@@ -2038,7 +2092,7 @@ echo "hello"
             ],
         )
 
-        with mock.patch("shellflow.run_script", return_value=timed_out_result):
+        with mock.patch("shellflow.runner.run_script", return_value=timed_out_result):
             result = main(["run", str(script_path), "--json"])
 
         assert result == 4
@@ -2086,15 +2140,17 @@ echo "This should not run"
 class TestPackagingConfig:
     """Tests for build packaging configuration."""
 
-    def test_wheel_configuration_includes_single_module_entrypoint(self) -> None:
-        """Test wheel build config includes the single-file module at top level."""
+    def test_wheel_configuration_packages_the_shellflow_module_tree(self) -> None:
+        """Test wheel build config packages the shellflow package instead of remapping its entrypoint."""
         pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
         pyproject_data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
 
         wheel_config = pyproject_data["tool"]["hatch"]["build"]["targets"]["wheel"]
         force_include = wheel_config.get("force-include", {})
 
-        assert force_include.get("src/shellflow.py") == "shellflow.py"
+        assert wheel_config["packages"] == ["src/shellflow"]
+        assert "src/shellflow/main.py" not in force_include
+        assert force_include["src/shellflow_models.py"] == "shellflow_models.py"
 
     def test_context_variable_passing(self) -> None:
         """Test that context variables are passed between blocks."""
