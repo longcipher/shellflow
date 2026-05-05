@@ -123,6 +123,14 @@ def _build_executable_script(
     return "\n".join(script_lines)
 
 
+def _build_zsh_hook_cleanup() -> list[str]:
+    """Disable zsh interactive hooks that pollute non-interactive automation."""
+    return [
+        "unset preexec_functions precmd_functions chpwd_functions 2>/dev/null || true",
+        "unfunction preexec precmd chpwd 2>/dev/null || true",
+    ]
+
+
 def _build_shell_bootstrap(shell: str | None) -> list[str]:
     """Build shell-specific bootstrap lines needed for non-interactive automation."""
     if not shell:
@@ -132,8 +140,10 @@ def _build_shell_bootstrap(shell: str | None) -> list[str]:
     if shell_name == "zsh":
         return [
             "set +x 2>/dev/null || true",
-            "unset preexec_functions precmd_functions 2>/dev/null || true",
+            *_build_zsh_hook_cleanup(),
             "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }",
+            "set +x 2>/dev/null || true",
+            *_build_zsh_hook_cleanup(),
         ]
     if shell_name == "bash":
         return [
