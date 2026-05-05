@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any
 
+from . import executor as executor_module
 from .constants import (
     ANSI_BLUE,
     ANSI_DIM,
@@ -21,7 +22,7 @@ from .constants import (
     MAX_OUTPUT_LINES,
     SCHEMA_VERSION,
 )
-from .executor import _apply_block_exports, _execute_block_once
+from .executor import _apply_block_exports, _execute_block_once, execute_local_traced
 from .models import Block, ExecutionContext, ExecutionResult, ReportEvent, RunResult
 from .parser import _expand_macros_and_helpers_in_commands, _freeze_preamble
 
@@ -800,6 +801,11 @@ def _print_command_logs(command_logs: list[Any], output_tail_lines: int) -> None
             print(_truncate_output_lines(command_log.output, output_tail_lines))
 
 
+def _print_live_command_status(command: str, command_index: int, total_commands: int) -> None:
+    """Print the currently executing command as soon as its trace marker appears."""
+    print(f"> [{command_index}/{total_commands}] {command}", flush=True)
+
+
 def _group_blocks_for_parallel_execution(blocks: list[Block]) -> list[list[Block]]:
     """Group blocks for parallel execution based on parallel annotations.
 
@@ -912,7 +918,21 @@ def _execute_remote_block_sequential(
     DIM = ANSI_DIM
     RESET = ANSI_RESET
 
-    result = _execute_block_once(block, context, no_input=no_input, servers=servers)
+    live_command_index = 0
+
+    def on_command(command: str) -> None:
+        nonlocal live_command_index
+        live_command_index += 1
+        _print_live_command_status(command, live_command_index, len(commands_to_execute))
+
+    result = executor_module.execute_remote(
+        block,
+        context,
+        ssh_config=None,
+        no_input=no_input,
+        servers=servers,
+        on_command=on_command if verbose else None,
+    )
 
     if verbose:
         # Assign actual command names to parsed logs
@@ -979,23 +999,31 @@ def _execute_local_block_sequential(
     commands_to_execute: list[str],
     output_tail_lines: int,
 ) -> ExecutionResult:
-    """Execute local block as a single script for proper multi-line command handling."""
+    """Execute a local block with traced per-command verbose output."""
     RED = ANSI_RED
-    DIM = ANSI_DIM
     RESET = ANSI_RESET
 
-    # Print all commands before executing (for verbose mode)
+    live_command_index = 0
+
+    def on_command(command: str) -> None:
+        nonlocal live_command_index
+        live_command_index += 1
+        _print_live_command_status(command, live_command_index, len(commands_to_execute))
+
+    result = execute_local_traced(
+        block,
+        context,
+        no_input=no_input,
+        on_command=on_command if verbose else None,
+    )
+
     if verbose:
-        for cmd in commands_to_execute:
-            print(f"{DIM}$ {cmd}{RESET}")
-
-    # Execute the entire block as a single script
-    result = _execute_block_once(block, context, no_input=no_input, servers=None)
-
-    # Print output if verbose
-    if verbose and result.output:
-        truncated = _truncate_output_lines(result.output, output_tail_lines)
-        print(truncated)
+        if result.command_logs:
+            _print_command_logs(result.command_logs, output_tail_lines)
+            if result.output and not any(command_log.output for command_log in result.command_logs):
+                print(_truncate_output_lines(result.output, output_tail_lines))
+        elif result.output:
+            print(_truncate_output_lines(result.output, output_tail_lines))
 
     # Print exit code if failed
     if not result.success and verbose:
