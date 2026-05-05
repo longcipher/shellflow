@@ -41,7 +41,7 @@ from shellflow import (
     read_ssh_config,
     run_script,
 )
-from shellflow.executor import _apply_block_exports
+from shellflow.executor import _apply_block_exports, _build_remote_trace_script, _parse_debug_trace_command_logs
 
 _MOCK_DELIM = "mockdelim001"
 
@@ -954,6 +954,38 @@ class TestShellBootstrapIntegration:
 
         assert result.returncode == 0
         assert str(fake_mise) in result.stdout
+
+    @pytest.mark.skipif(not ZSH_AVAILABLE, reason="zsh not available")
+    def test_remote_zsh_trace_ignores_preexec_hook_noise(self, tmp_path: Path) -> None:
+        """Remote zsh tracing should keep user commands even if ~/.zshrc defines hooks."""
+        (tmp_path / ".zshrc").write_text(
+            """
+preexec() {
+  cmd_timestamp=`date +%s`
+  date +%s >/dev/null
+}
+""".strip()
+            + "\n"
+        )
+
+        payload = _build_remote_trace_script(
+            Block(target="REMOTE:testhost", commands=["echo ready"], shell="zsh"),  # noqa: S604
+            ExecutionContext(),
+            "zsh",
+        )
+
+        result = subprocess.run(
+            ["/bin/zsh", "--no-rcs", "-s", "-e"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            check=False,
+        )
+
+        assert result.returncode == 0
+        logs = _parse_debug_trace_command_logs(result.stderr, success=True, exit_code=0)
+        assert [log.command for log in logs] == ["echo ready"]
 
     def test_bash_bootstrap_ignores_nonzero_bashrc_and_keeps_path_customizations(self, tmp_path: Path) -> None:
         """Test guarded bashrc bootstrap still exposes commands after a non-zero rc return."""
