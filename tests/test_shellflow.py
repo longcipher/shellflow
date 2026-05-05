@@ -1965,6 +1965,90 @@ echo \"hello\"
         assert captured.out.index(first_status) < captured.out.index(first_command)
         assert captured.out.index(second_status) < captured.out.index(second_command)
 
+    def test_verbose_remote_live_status_ignores_injected_preamble_commands(self, capsys: Any) -> None:
+        """Verbose remote progress should count only user-authored block commands."""
+        blocks = parse_script(
+            """#!/bin/bash
+set -euo pipefail
+
+# @REMOTE server1
+printf 'REMOTE-FIRST\\n'
+printf 'REMOTE-SECOND\\n'
+"""
+        )
+
+        def run_remote_with_preamble_trace(
+            ssh_args: list[str],
+            remote_script: str,
+            *,
+            timeout_seconds: int | None,
+            on_command: Any = None,
+        ) -> tuple[str, str, int, bool, bool]:
+            del ssh_args, remote_script, timeout_seconds
+            if on_command is not None:
+                on_command("printf 'REMOTE-FIRST\\n'")
+                on_command("printf 'REMOTE-SECOND\\n'")
+            traced_stdout = "".join(
+                [
+                    "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-FIRST\\n'\n",
+                    "REMOTE-FIRST\n",
+                    "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-SECOND\\n'\n",
+                    "REMOTE-SECOND\n",
+                ]
+            )
+            return traced_stdout, "", 0, False, False
+
+        with (
+            mock.patch("shellflow.executor.read_ssh_config", return_value=SSHConfig(host="server1")),
+            mock.patch("shellflow.executor._run_remote_subprocess", side_effect=run_remote_with_preamble_trace),
+        ):
+            result = run_script(blocks, verbose=True)
+
+        captured = capsys.readouterr()
+
+        assert result.success is True
+        assert "> [1/2] printf 'REMOTE-FIRST\\n'" in captured.out
+        assert "> [2/2] printf 'REMOTE-SECOND\\n'" in captured.out
+        assert "> [1/4]" not in captured.out
+        assert "> [2/4]" not in captured.out
+
+    def test_verbose_remote_fallback_log_mapping_ignores_injected_preamble_commands(self, capsys: Any) -> None:
+        """Fallback remote command labels should stay aligned with user-authored commands."""
+        blocks = parse_script(
+            """#!/bin/bash
+set -euo pipefail
+
+# @REMOTE server1
+printf 'REMOTE-FIRST\\n'
+printf 'REMOTE-SECOND\\n'
+"""
+        )
+
+        with (
+            mock.patch("shellflow.executor.read_ssh_config", return_value=SSHConfig(host="server1")),
+            mock.patch(
+                "shellflow.executor.execute_remote",
+                return_value=ExecutionResult(
+                    success=True,
+                    output="ignored combined output",
+                    exit_code=0,
+                    command_logs=[
+                        CommandLog(command="<remote-command>", output="REMOTE-FIRST", exit_code=0, status="completed"),
+                        CommandLog(command="<remote-command>", output="REMOTE-SECOND", exit_code=0, status="completed"),
+                    ],
+                ),
+            ),
+        ):
+            result = run_script(blocks, verbose=True)
+
+        captured = capsys.readouterr()
+
+        assert result.success is True
+        assert "$ printf 'REMOTE-FIRST\\n'" in captured.out
+        assert "$ printf 'REMOTE-SECOND\\n'" in captured.out
+        assert "$ #!/bin/bash" not in captured.out
+        assert "$ set -euo pipefail" not in captured.out
+
 
 # =============================================================================
 # CLI Tests

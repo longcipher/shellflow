@@ -45,6 +45,7 @@ class Block:
         structured_exports: JSON schema-validated exports
         preamble_commands: Shared prelude commands to freeze once at execution time
         preamble_env: Injected environment used while freezing the shared prelude
+        display_commands: User-authored commands to show in human-facing output
         annotations: Task and execution metadata
     """
 
@@ -58,6 +59,7 @@ class Block:
     structured_exports: dict[str, StructuredExport] = field(default_factory=dict)
     preamble_commands: list[str] = field(default_factory=list)
     preamble_env: dict[str, str] = field(default_factory=dict)
+    display_commands: list[str] = field(default_factory=list)
     annotations: dict[str, str] = field(default_factory=dict)
 
     @property

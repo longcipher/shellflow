@@ -744,6 +744,7 @@ def _prepare_blocks_for_execution(
                 commands=[*cached_preambles[key], *block.commands],
                 preamble_commands=[],
                 preamble_env={},
+                display_commands=list(block.commands),
             )
         )
 
@@ -765,6 +766,8 @@ def _copy_execution_context(context: ExecutionContext) -> ExecutionContext:
 
 def _commands_for_display(block: Block) -> list[str]:
     """Return commands to show in dry-run and verbose output."""
+    if block.display_commands:
+        return list(block.display_commands)
     if block.preamble_commands:
         return [*block.preamble_commands, *block.commands]
     return list(block.commands)
