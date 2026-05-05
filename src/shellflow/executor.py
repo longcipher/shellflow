@@ -6,9 +6,10 @@ import json
 import shlex
 import signal
 import subprocess
+import threading
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .constants import TRACE_MARKER
 from .models import Block, BlockExecutor, CommandLog, ExecutionContext, ExecutionResult, SSHConfig
@@ -281,28 +282,29 @@ def _build_remote_trace_script(block: Block, context: ExecutionContext, shell: s
         "set +x 2>/dev/null || true",
         "set -e",
         f"__SHELLFLOW_DELIM__={shlex.quote(delimiter)}",
+        "exec 3>&1 4>&2",
     ]
     script_lines.extend(_build_context_exports(context))
     script_lines.extend(_build_shell_bootstrap(shell))
-    script_lines.extend(_build_debug_trap(shell))
+    script_lines.extend(_build_debug_trap(shell, trace_fd="3"))
     script_lines.extend(block.commands)
 
     return "\n".join(script_lines)
 
 
-def _build_debug_trap(shell: str) -> list[str]:
+def _build_debug_trap(shell: str, trace_fd: str = "2") -> list[str]:
     """Build shell-specific command tracing without wrapping user lines."""
     shell_name = Path(shell).name
     if shell_name == "zsh":
         return [
             "__shellflow_trace() {",
-            '  printf "__SHELLFLOW_CMD_%s:%s\\n" "$__SHELLFLOW_DELIM__" "$ZSH_DEBUG_CMD" >&2',
+            f'  printf "__SHELLFLOW_CMD_%s:%s\\n" "$__SHELLFLOW_DELIM__" "$ZSH_DEBUG_CMD" >&{trace_fd}',
             "}",
             "trap __shellflow_trace DEBUG",
         ]
     return [
         "__shellflow_trace() {",
-        '  printf "__SHELLFLOW_CMD_%s:%s\\n" "$__SHELLFLOW_DELIM__" "$BASH_COMMAND" >&2',
+        f'  printf "__SHELLFLOW_CMD_%s:%s\\n" "$__SHELLFLOW_DELIM__" "$BASH_COMMAND" >&{trace_fd}',
         "}",
         "trap __shellflow_trace DEBUG",
     ]
@@ -313,6 +315,7 @@ def _run_remote_subprocess(
     remote_script: str,
     *,
     timeout_seconds: int | None,
+    on_command: Callable[[str], None] | None = None,
 ) -> tuple[str, str, int, bool, bool]:
     """Run an SSH subprocess and preserve partial output on timeout or interruption."""
     process = subprocess.Popen(
@@ -322,30 +325,11 @@ def _run_remote_subprocess(
         stderr=subprocess.PIPE,
         text=True,
     )
-    interrupted = False
-    timed_out = False
-
-    try:
-        stdout, stderr = process.communicate(remote_script, timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        process.kill()
-        stdout, stderr = process.communicate()
-    except KeyboardInterrupt:
-        interrupted = True
-        process.send_signal(signal.SIGINT)
-        try:
-            stdout, stderr = process.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-
-    return (
-        stdout or "",
-        stderr or "",
-        process.returncode if process.returncode is not None else -1,
-        interrupted,
-        timed_out,
+    return _run_traced_subprocess(
+        process,
+        input_text=remote_script,
+        timeout_seconds=timeout_seconds,
+        on_command=on_command,
     )
 
 
@@ -429,12 +413,98 @@ def execute_local(
         return ShellflowExceptionHandler.handle_os_error(e, block, no_input)
 
 
+def execute_local_traced(
+    block: Block,
+    context: ExecutionContext,
+    no_input: bool = False,
+    on_command: Callable[[str], None] | None = None,
+) -> ExecutionResult:
+    """Execute a local block while preserving per-command trace logs."""
+    if not block.commands:
+        return ExecutionResult(success=True, output="")
+
+    script = _build_local_trace_script(block, context)
+    env = context.to_shell_env()
+
+    if no_input:
+        process = subprocess.Popen(
+            ["/bin/bash", "-se", "-c", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        input_text = None
+    else:
+        process = subprocess.Popen(
+            ["/bin/bash", "-se"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        input_text = script
+
+    try:
+        stdout, stderr, exit_code, interrupted, timed_out = _run_traced_subprocess(
+            process,
+            input_text=input_text,
+            timeout_seconds=block.timeout_seconds,
+            on_command=on_command,
+        )
+        cleaned_stderr = _strip_trace_markers(stderr).strip()
+        command_logs = _parse_grouped_trace_output(
+            stdout,
+            success=exit_code == 0 and not interrupted and not timed_out,
+            exit_code=exit_code,
+            interrupted=interrupted,
+            timed_out=timed_out,
+            trailing_error_output=cleaned_stderr,
+        )
+    except subprocess.SubprocessError as e:
+        return ShellflowExceptionHandler.handle_subprocess_error(e, block, no_input)
+    except OSError as e:
+        return ShellflowExceptionHandler.handle_os_error(e, block, no_input)
+
+    cleaned_stdout = _strip_trace_markers(stdout).strip()
+    cleaned_stderr = _strip_trace_markers(stderr).strip()
+
+    success = exit_code == 0 and not interrupted and not timed_out
+    failure_kind = None if success else "runtime"
+    result_exit_code = exit_code
+    error_message = "" if success else f"Exit code: {exit_code}"
+
+    if timed_out:
+        result_exit_code = -1
+        error_message = f"Timed out after {block.timeout_seconds} second(s)"
+        failure_kind = "timeout"
+    elif interrupted:
+        error_message = "Interrupted by user"
+
+    return ExecutionResult(
+        success=success,
+        output=_combine_output(cleaned_stdout, cleaned_stderr),
+        exit_code=result_exit_code,
+        error_message=error_message,
+        stdout=cleaned_stdout,
+        stderr=cleaned_stderr,
+        timed_out=timed_out,
+        timeout_seconds=block.timeout_seconds,
+        failure_kind=failure_kind,
+        no_input=no_input,
+        command_logs=command_logs,
+    )
+
+
 def execute_remote(
     block: Block,
     context: ExecutionContext,
     ssh_config: SSHConfig | None,
     no_input: bool = False,
     servers: dict[str, dict[str, str]] | None = None,
+    on_command: Callable[[str], None] | None = None,
 ) -> ExecutionResult:
     """Execute a remote block via SSH.
 
@@ -509,24 +579,29 @@ def execute_remote(
             ssh_args,
             remote_script,
             timeout_seconds=block.timeout_seconds,
+            on_command=on_command,
         )
         cleaned_stdout = _strip_trace_markers(stdout)
         cleaned_stderr = _strip_trace_markers(stderr)
-        command_logs = _parse_debug_trace_command_logs(
-            stderr,
-            success=exit_code == 0 and not interrupted and not timed_out,
-            exit_code=exit_code,
-        )
-        if not command_logs:
+        success = exit_code == 0 and not interrupted and not timed_out
+        if "__SHELLFLOW_CMD_" in stdout:
+            command_logs = _parse_grouped_trace_output(
+                stdout,
+                success=success,
+                exit_code=exit_code,
+                interrupted=interrupted,
+                timed_out=timed_out,
+                trailing_error_output=cleaned_stderr,
+            )
+        else:
             command_logs = _parse_remote_command_logs(
                 stdout,
-                success=exit_code == 0 and not interrupted and not timed_out,
+                success=success,
                 exit_code=exit_code,
                 interrupted=interrupted,
                 trailing_error_output=cleaned_stderr,
             )
 
-        success = exit_code == 0 and not interrupted and not timed_out
         failure_kind = None if success else "runtime"
         result_exit_code = exit_code
         error_message = "" if success else f"SSH exit code: {exit_code}"
@@ -678,6 +753,209 @@ def _parse_remote_command_logs(  # noqa: PLR0915
             )
 
     return command_logs
+
+
+def _build_local_trace_script(
+    block: Block,
+    context: ExecutionContext,
+) -> str:
+    """Build a local script that emits DEBUG-trap command markers to stderr."""
+    delimiter = uuid.uuid4().hex[:16]
+    script_lines = [
+        "set +x 2>/dev/null || true",
+        "set -e",
+        f"__SHELLFLOW_DELIM__={shlex.quote(delimiter)}",
+        "exec 3>&1 4>&2",
+    ]
+    script_lines.extend(_build_context_exports(context))
+    script_lines.extend(_build_debug_trap("bash", trace_fd="3"))
+    script_lines.extend(block.commands)
+    return "\n".join(script_lines)
+
+
+def _run_traced_subprocess(
+    process: subprocess.Popen[str],
+    *,
+    input_text: str | None,
+    timeout_seconds: int | None,
+    on_command: Callable[[str], None] | None = None,
+) -> tuple[str, str, int, bool, bool]:
+    """Read traced stdout/stderr streams while surfacing live command markers."""
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    stdout_stream = process.stdout
+    stderr_stream = process.stderr
+    if stdout_stream is None or stderr_stream is None:
+        raise subprocess.SubprocessError("traced subprocess did not expose stdout/stderr pipes")
+
+    def read_stdout() -> None:
+        try:
+            for line in iter(stdout_stream.readline, ""):
+                stdout_chunks.append(line)
+                command = _extract_trace_command_line(line)
+                if command is not None and on_command is not None:
+                    on_command(command)
+        finally:
+            stdout_stream.close()
+
+    def read_stderr() -> None:
+        try:
+            for line in iter(stderr_stream.readline, ""):
+                stderr_chunks.append(line)
+        finally:
+            stderr_stream.close()
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    interrupted = False
+    timed_out = False
+    stdin_stream = process.stdin
+
+    try:
+        if stdin_stream is not None:
+            if input_text is not None:
+                try:
+                    stdin_stream.write(input_text)
+                except BrokenPipeError:
+                    pass
+            stdin_stream.close()
+
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        process.wait()
+    except KeyboardInterrupt:
+        interrupted = True
+        process.send_signal(signal.SIGINT)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    finally:
+        if stdin_stream is not None and not stdin_stream.closed:
+            stdin_stream.close()
+
+    stdout_thread.join()
+    stderr_thread.join()
+
+    return (
+        "".join(stdout_chunks),
+        "".join(stderr_chunks),
+        process.returncode if process.returncode is not None else -1,
+        interrupted,
+        timed_out,
+    )
+
+
+def _parse_grouped_trace_output(
+    combined_output: str,
+    *,
+    success: bool,
+    exit_code: int,
+    interrupted: bool = False,
+    timed_out: bool = False,
+    trailing_error_output: str = "",
+) -> list[CommandLog]:
+    """Parse a combined traced output stream into per-command logs."""
+    command_logs: list[CommandLog] = []
+    command_output_chunks: list[list[str]] = []
+    for chunk in combined_output.splitlines(keepends=True):
+        command = _extract_trace_command_line(chunk)
+        if command is not None:
+            command_logs.append(CommandLog(command=command))
+            command_output_chunks.append([])
+            continue
+
+        _append_command_output(command_output_chunks, chunk)
+
+    _finalize_command_logs(
+        command_logs,
+        command_output_chunks,
+        exit_code=exit_code,
+        interrupted=interrupted,
+        timed_out=timed_out,
+        success=success,
+        trailing_error_output=trailing_error_output,
+    )
+
+    return command_logs
+
+
+def _append_command_output(command_output_chunks: list[list[str]], chunk: str) -> None:
+    """Append output to the currently active traced command."""
+    if not command_output_chunks:
+        return
+    command_output_chunks[-1].append(chunk)
+
+
+def _extract_trace_command_line(line: str) -> str | None:
+    """Return the traced shell command for a marker line."""
+    if not line.startswith("__SHELLFLOW_CMD_"):
+        return None
+
+    _, _, command = line.partition(":")
+    command = command.strip()
+    if not command or _is_trace_noise(command):
+        return None
+    return command
+
+
+def _finalize_command_logs(
+    command_logs: list[CommandLog],
+    command_output_chunks: list[list[str]],
+    *,
+    exit_code: int,
+    interrupted: bool,
+    timed_out: bool,
+    success: bool,
+    trailing_error_output: str,
+) -> None:
+    """Populate grouped command outputs and terminal status for traced logs."""
+    for command_log, output_chunks in zip(command_logs, command_output_chunks, strict=False):
+        command_log.output = "".join(output_chunks).strip()
+        command_log.exit_code = 0
+        command_log.status = "completed"
+        command_log.success = True
+
+    if not command_logs:
+        if trailing_error_output.strip():
+            command_logs.append(
+                CommandLog(
+                    command="<local-command>",
+                    output=trailing_error_output.strip(),
+                    exit_code=exit_code,
+                    status="completed" if success else "failed",
+                    success=success,
+                )
+            )
+        return
+
+    last_command = command_logs[-1]
+    if trailing_error_output.strip():
+        last_command.output = _combine_output(last_command.output, trailing_error_output)
+
+    if timed_out:
+        last_command.exit_code = -1
+        last_command.status = "failed"
+        last_command.success = False
+        return
+
+    if interrupted:
+        last_command.exit_code = exit_code
+        last_command.status = "interrupted"
+        last_command.success = False
+        return
+
+    if not success:
+        last_command.exit_code = exit_code
+        last_command.status = "failed"
+        last_command.success = False
 
 
 # Import here to avoid circular imports

@@ -41,12 +41,11 @@ def test_remote_trace_preserves_multiline_bash() -> None:
     )
 
     assert result.returncode == 0
-    assert result.stdout.strip() == "no"
-    assert "__SHELLFLOW_CMD_" in result.stderr
+    assert result.stdout.endswith("no\n")
+    assert "__SHELLFLOW_CMD_" in result.stdout
 
 
 def test_remote_trace_preserves_repeated_command_entries() -> None:
-    """Repeated loop commands should remain visible to the agent trace."""
     logs = _parse_debug_trace_command_logs(
         """__SHELLFLOW_CMD_deadbeef:for i in 1 2
 __SHELLFLOW_CMD_deadbeef:echo "$i"
