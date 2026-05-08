@@ -8,8 +8,12 @@ import signal
 import subprocess
 import threading
 import uuid
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from .constants import TRACE_MARKER
 from .models import Block, BlockExecutor, CommandLog, ExecutionContext, ExecutionResult, SSHConfig
@@ -316,6 +320,7 @@ def _run_remote_subprocess(
     *,
     timeout_seconds: int | None,
     on_command: Callable[[str], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> tuple[str, str, int, bool, bool]:
     """Run an SSH subprocess and preserve partial output on timeout or interruption."""
     process = subprocess.Popen(
@@ -330,6 +335,7 @@ def _run_remote_subprocess(
         input_text=remote_script,
         timeout_seconds=timeout_seconds,
         on_command=on_command,
+        on_output=on_output,
     )
 
 
@@ -418,6 +424,7 @@ def execute_local_traced(
     context: ExecutionContext,
     no_input: bool = False,
     on_command: Callable[[str], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> ExecutionResult:
     """Execute a local block while preserving per-command trace logs."""
     if not block.commands:
@@ -453,6 +460,7 @@ def execute_local_traced(
             input_text=input_text,
             timeout_seconds=block.timeout_seconds,
             on_command=on_command,
+            on_output=on_output,
         )
         cleaned_stderr = _strip_trace_markers(stderr).strip()
         command_logs = _parse_grouped_trace_output(
@@ -505,6 +513,7 @@ def execute_remote(
     no_input: bool = False,
     servers: dict[str, dict[str, str]] | None = None,
     on_command: Callable[[str], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> ExecutionResult:
     """Execute a remote block via SSH.
 
@@ -580,6 +589,7 @@ def execute_remote(
             remote_script,
             timeout_seconds=block.timeout_seconds,
             on_command=on_command,
+            on_output=on_output,
         )
         cleaned_stdout = _strip_trace_markers(stdout)
         cleaned_stderr = _strip_trace_markers(stderr)
@@ -779,6 +789,7 @@ def _run_traced_subprocess(
     input_text: str | None,
     timeout_seconds: int | None,
     on_command: Callable[[str], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> tuple[str, str, int, bool, bool]:
     """Read traced stdout/stderr streams while surfacing live command markers."""
     stdout_chunks: list[str] = []
@@ -789,25 +800,16 @@ def _run_traced_subprocess(
     if stdout_stream is None or stderr_stream is None:
         raise subprocess.SubprocessError("traced subprocess did not expose stdout/stderr pipes")
 
-    def read_stdout() -> None:
-        try:
-            for line in iter(stdout_stream.readline, ""):
-                stdout_chunks.append(line)
-                command = _extract_trace_command_line(line)
-                if command is not None and on_command is not None:
-                    on_command(command)
-        finally:
-            stdout_stream.close()
-
-    def read_stderr() -> None:
-        try:
-            for line in iter(stderr_stream.readline, ""):
-                stderr_chunks.append(line)
-        finally:
-            stderr_stream.close()
-
-    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
-    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stdout_thread = threading.Thread(
+        target=_read_traced_stdout_stream,
+        args=(stdout_stream, stdout_chunks, on_command, on_output),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_read_traced_output_stream,
+        args=(stderr_stream, stderr_chunks, on_output),
+        daemon=True,
+    )
     stdout_thread.start()
     stderr_thread.start()
 
@@ -816,14 +818,7 @@ def _run_traced_subprocess(
     stdin_stream = process.stdin
 
     try:
-        if stdin_stream is not None:
-            if input_text is not None:
-                try:
-                    stdin_stream.write(input_text)
-                except BrokenPipeError:
-                    pass
-            stdin_stream.close()
-
+        _write_process_input(stdin_stream, input_text)
         process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
@@ -851,6 +846,50 @@ def _run_traced_subprocess(
         interrupted,
         timed_out,
     )
+
+
+def _read_traced_stdout_stream(
+    stdout_stream: Any,
+    stdout_chunks: list[str],
+    on_command: Callable[[str], None] | None,
+    on_output: Callable[[str], None] | None,
+) -> None:
+    """Read traced stdout, separating command markers from regular output."""
+    try:
+        for line in iter(stdout_stream.readline, ""):
+            stdout_chunks.append(line)
+            command = _extract_trace_command_line(line)
+            if command is not None and on_command is not None:
+                on_command(command)
+            elif command is None and on_output is not None:
+                on_output(line)
+    finally:
+        stdout_stream.close()
+
+
+def _read_traced_output_stream(
+    stream: Any,
+    chunks: list[str],
+    on_output: Callable[[str], None] | None,
+) -> None:
+    """Read a traced process output stream and forward raw chunks."""
+    try:
+        for line in iter(stream.readline, ""):
+            chunks.append(line)
+            if on_output is not None:
+                on_output(line)
+    finally:
+        stream.close()
+
+
+def _write_process_input(stdin_stream: Any, input_text: str | None) -> None:
+    """Write the traced script to stdin, tolerating early process exits."""
+    if stdin_stream is None:
+        return
+    if input_text is not None:
+        with suppress(BrokenPipeError):
+            stdin_stream.write(input_text)
+    stdin_stream.close()
 
 
 def _parse_grouped_trace_output(

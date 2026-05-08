@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .cli import create_parser
-from .config import read_ssh_config
+from .config import parse_server_config, parse_variables, read_ssh_config
 from .constants import (
     EXIT_EXECUTION_FAILURE,
     EXIT_PARSE_FAILURE,
@@ -101,6 +101,8 @@ __all__ = [
     "execute_remote",
     "main",
     "parse_script",
+    "parse_server_config",
+    "parse_variables",
     "read_ssh_config",
     "run_script",
 ]
