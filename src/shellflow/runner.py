@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -809,6 +810,44 @@ def _print_live_command_status(command: str, command_index: int, total_commands:
     print(f"> [{command_index}/{total_commands}] {command}", flush=True)
 
 
+class _LiveCommandOutputPrinter:
+    """Print each traced command's buffered output before the next command starts."""
+
+    def __init__(self, total_commands: int, output_tail_lines: int) -> None:
+        self.total_commands = total_commands
+        self.output_tail_lines = output_tail_lines
+        self.command_count = 0
+        self._output_chunks: list[str] = []
+        self._lock = threading.Lock()
+
+    def start_command(self, command: str) -> None:
+        """Start a command section, flushing the previous command's output first."""
+        with self._lock:
+            if self.command_count:
+                self._flush_locked()
+            self.command_count += 1
+            _print_live_command_status(command, self.command_count, self.total_commands)
+
+    def append_output(self, chunk: str) -> None:
+        """Buffer output for the active traced command."""
+        if not chunk:
+            return
+        with self._lock:
+            self._output_chunks.append(chunk)
+
+    def finish(self) -> None:
+        """Flush the final command's output after the traced process exits."""
+        with self._lock:
+            if self.command_count:
+                self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        output = "".join(self._output_chunks).strip()
+        self._output_chunks = []
+        if output:
+            print(_truncate_output_lines(output, self.output_tail_lines), flush=True)
+
+
 def _group_blocks_for_parallel_execution(blocks: list[Block]) -> list[list[Block]]:
     """Group blocks for parallel execution based on parallel annotations.
 
@@ -921,12 +960,7 @@ def _execute_remote_block_sequential(
     DIM = ANSI_DIM
     RESET = ANSI_RESET
 
-    live_command_index = 0
-
-    def on_command(command: str) -> None:
-        nonlocal live_command_index
-        live_command_index += 1
-        _print_live_command_status(command, live_command_index, len(commands_to_execute))
+    live_printer = _LiveCommandOutputPrinter(len(commands_to_execute), output_tail_lines) if verbose else None
 
     result = executor_module.execute_remote(
         block,
@@ -934,28 +968,33 @@ def _execute_remote_block_sequential(
         ssh_config=None,
         no_input=no_input,
         servers=servers,
-        on_command=on_command if verbose else None,
+        on_command=live_printer.start_command if live_printer else None,
+        on_output=live_printer.append_output if live_printer else None,
     )
 
     if verbose:
+        if live_printer:
+            live_printer.finish()
+
         # Assign actual command names to parsed logs
         if result.command_logs:
             for i, cl in enumerate(result.command_logs):
                 if cl.command == "<remote-command>" and i < len(commands_to_execute):
                     cl.command = commands_to_execute[i]
 
-        # Print each command with its output
-        if result.command_logs:
-            _print_command_logs(result.command_logs, output_tail_lines)
-            if result.output and not any(command_log.output for command_log in result.command_logs):
-                print(_truncate_output_lines(result.output, output_tail_lines))
-        else:
-            # Fallback: no command logs, just show commands
-            for cmd in commands_to_execute:
-                print(f"{DIM}$ {cmd}{RESET}")
-            if result.output:
-                truncated = _truncate_output_lines(result.output, output_tail_lines)
-                print(truncated)
+        # Print grouped logs only when no live trace markers were observed.
+        if not (live_printer and live_printer.command_count):
+            if result.command_logs:
+                _print_command_logs(result.command_logs, output_tail_lines)
+                if result.output and not any(command_log.output for command_log in result.command_logs):
+                    print(_truncate_output_lines(result.output, output_tail_lines))
+            else:
+                # Fallback: no command logs, just show commands
+                for cmd in commands_to_execute:
+                    print(f"{DIM}$ {cmd}{RESET}")
+                if result.output:
+                    truncated = _truncate_output_lines(result.output, output_tail_lines)
+                    print(truncated)
 
     context.last_output = result.output
     context.success = result.success
@@ -1006,27 +1045,27 @@ def _execute_local_block_sequential(
     RED = ANSI_RED
     RESET = ANSI_RESET
 
-    live_command_index = 0
-
-    def on_command(command: str) -> None:
-        nonlocal live_command_index
-        live_command_index += 1
-        _print_live_command_status(command, live_command_index, len(commands_to_execute))
+    live_printer = _LiveCommandOutputPrinter(len(commands_to_execute), output_tail_lines) if verbose else None
 
     result = execute_local_traced(
         block,
         context,
         no_input=no_input,
-        on_command=on_command if verbose else None,
+        on_command=live_printer.start_command if live_printer else None,
+        on_output=live_printer.append_output if live_printer else None,
     )
 
     if verbose:
-        if result.command_logs:
-            _print_command_logs(result.command_logs, output_tail_lines)
-            if result.output and not any(command_log.output for command_log in result.command_logs):
+        if live_printer:
+            live_printer.finish()
+
+        if not (live_printer and live_printer.command_count):
+            if result.command_logs:
+                _print_command_logs(result.command_logs, output_tail_lines)
+                if result.output and not any(command_log.output for command_log in result.command_logs):
+                    print(_truncate_output_lines(result.output, output_tail_lines))
+            elif result.output:
                 print(_truncate_output_lines(result.output, output_tail_lines))
-        elif result.output:
-            print(_truncate_output_lines(result.output, output_tail_lines))
 
     # Print exit code if failed
     if not result.success and verbose:

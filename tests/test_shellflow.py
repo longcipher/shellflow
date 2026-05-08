@@ -1755,9 +1755,9 @@ echo \"hello\"
         captured = capsys.readouterr()
         assert result.success is True
         assert "LOCAL" in captured.out or "local" in captured.out.lower()
-        assert '\x1b[90m$ echo "__RESULT__"\x1b[0m' in captured.out
-        command_index = captured.out.index('$ echo "__RESULT__"')
-        result_index = captured.out.index("__RESULT__", command_index + len('$ echo "__RESULT__"'))
+        assert '> [1/1] echo "__RESULT__"' in captured.out
+        command_index = captured.out.index('> [1/1] echo "__RESULT__"')
+        result_index = captured.out.index("__RESULT__", command_index + len('> [1/1] echo "__RESULT__"'))
         assert command_index < result_index
         assert result_index < captured.out.index("✓ Success")
 
@@ -1776,8 +1776,8 @@ echo \"hello\"
         result = run_script(blocks, verbose=True)
 
         captured = capsys.readouterr()
-        first_command = "$ printf 'FIRST-OUTPUT\\n'"
-        second_command = "$ printf 'SECOND-OUTPUT\\n'"
+        first_command = "> [1/2] printf 'FIRST-OUTPUT\\n'"
+        second_command = "> [2/2] printf 'SECOND-OUTPUT\\n'"
         first_command_index = captured.out.index(first_command)
         second_command_index = captured.out.index(second_command)
         first_output_index = captured.out.index("FIRST-OUTPUT", first_command_index + len(first_command))
@@ -1785,6 +1785,8 @@ echo \"hello\"
 
         assert result.success is True
         assert first_command_index < first_output_index < second_command_index < second_output_index
+        assert "$ printf 'FIRST-OUTPUT\\n'" not in captured.out
+        assert "$ printf 'SECOND-OUTPUT\\n'" not in captured.out
 
     def test_verbose_local_output_prints_live_current_command_status(self, capsys: Any) -> None:
         """Verbose local output should announce the current command before grouped logs print."""
@@ -1803,14 +1805,18 @@ echo \"hello\"
         captured = capsys.readouterr()
         first_status = "> [1/2] printf 'FIRST-STATUS\\n'"
         second_status = "> [2/2] printf 'SECOND-STATUS\\n'"
-        first_command = "$ printf 'FIRST-STATUS\\n'"
-        second_command = "$ printf 'SECOND-STATUS\\n'"
+        first_output = "FIRST-STATUS"
+        second_output = "SECOND-STATUS"
 
         assert result.success is True
         assert first_status in captured.out
         assert second_status in captured.out
-        assert captured.out.index(first_status) < captured.out.index(first_command)
-        assert captured.out.index(second_status) < captured.out.index(second_command)
+        first_status_index = captured.out.index(first_status)
+        second_status_index = captured.out.index(second_status)
+        first_output_index = captured.out.index(first_output, first_status_index + len(first_status))
+        second_output_index = captured.out.index(second_output, second_status_index + len(second_status))
+        assert first_status_index < first_output_index
+        assert second_status_index < second_output_index
 
     def test_verbose_remote_context_output_is_clean(self, capsys: Any) -> None:
         """Test verbose remote output shows clean context instead of shell trace internals."""
@@ -1885,34 +1891,52 @@ echo \"hello\"
             ),
         ]
 
-        traced_stdout = "".join(
-            [
-                "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-FIRST\\n'\n",
-                "REMOTE-FIRST\n",
-                "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-SECOND\\n'\n",
-                "REMOTE-SECOND\n",
-            ]
+        traced_stdout = (
+            "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-FIRST\\n'\n"
+            "REMOTE-FIRST\n"
+            "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-SECOND\\n'\n"
+            "REMOTE-SECOND\n"
         )
+
+        def run_remote_with_live_trace(
+            ssh_args: list[str],
+            remote_script: str,
+            *,
+            timeout_seconds: int | None,
+            on_command: Any = None,
+            on_output: Any = None,
+        ) -> tuple[str, str, int, bool, bool]:
+            del ssh_args, remote_script, timeout_seconds
+            if on_command is not None:
+                on_command("printf 'REMOTE-FIRST\\n'")
+            if on_output is not None:
+                on_output("REMOTE-FIRST\n")
+            if on_command is not None:
+                on_command("printf 'REMOTE-SECOND\\n'")
+            if on_output is not None:
+                on_output("REMOTE-SECOND\n")
+            return traced_stdout, "", 0, False, False
 
         with (
             mock.patch("shellflow.executor.read_ssh_config", return_value=SSHConfig(host="server1")),
-            mock.patch(
-                "shellflow.executor._run_remote_subprocess",
-                return_value=(traced_stdout, "", 0, False, False),
-            ),
+            mock.patch("shellflow.executor._run_remote_subprocess", side_effect=run_remote_with_live_trace),
         ):
             result = run_script(blocks, verbose=True)
 
         captured = capsys.readouterr()
         first_command = "$ printf 'REMOTE-FIRST\\n'"
         second_command = "$ printf 'REMOTE-SECOND\\n'"
-        first_command_index = captured.out.index(first_command)
-        second_command_index = captured.out.index(second_command)
-        first_output_index = captured.out.index("REMOTE-FIRST", first_command_index + len(first_command))
-        second_output_index = captured.out.index("REMOTE-SECOND", second_command_index + len(second_command))
+        first_status = "> [1/2] printf 'REMOTE-FIRST\\n'"
+        second_status = "> [2/2] printf 'REMOTE-SECOND\\n'"
+        first_status_index = captured.out.index(first_status)
+        second_status_index = captured.out.index(second_status)
+        first_output_index = captured.out.index("REMOTE-FIRST", first_status_index + len(first_status))
+        second_output_index = captured.out.index("REMOTE-SECOND", second_status_index + len(second_status))
 
         assert result.success is True
-        assert first_command_index < first_output_index < second_command_index < second_output_index
+        assert first_status_index < first_output_index < second_status_index < second_output_index
+        assert first_command not in captured.out
+        assert second_command not in captured.out
 
     def test_verbose_remote_output_prints_live_current_command_status(self, capsys: Any) -> None:
         """Verbose remote output should announce traced commands before grouped logs print."""
@@ -1932,18 +1956,22 @@ echo \"hello\"
             *,
             timeout_seconds: int | None,
             on_command: Any = None,
+            on_output: Any = None,
         ) -> tuple[str, str, int, bool, bool]:
             del ssh_args, remote_script, timeout_seconds
             if on_command is not None:
                 on_command("printf 'REMOTE-STATUS-ONE\\n'")
+            if on_output is not None:
+                on_output("REMOTE-STATUS-ONE\n")
+            if on_command is not None:
                 on_command("printf 'REMOTE-STATUS-TWO\\n'")
-            traced_stdout = "".join(
-                [
-                    "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-STATUS-ONE\\n'\n",
-                    "REMOTE-STATUS-ONE\n",
-                    "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-STATUS-TWO\\n'\n",
-                    "REMOTE-STATUS-TWO\n",
-                ]
+            if on_output is not None:
+                on_output("REMOTE-STATUS-TWO\n")
+            traced_stdout = (
+                "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-STATUS-ONE\\n'\n"
+                "REMOTE-STATUS-ONE\n"
+                "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-STATUS-TWO\\n'\n"
+                "REMOTE-STATUS-TWO\n"
             )
             return traced_stdout, "", 0, False, False
 
@@ -1958,12 +1986,20 @@ echo \"hello\"
         second_status = "> [2/2] printf 'REMOTE-STATUS-TWO\\n'"
         first_command = "$ printf 'REMOTE-STATUS-ONE\\n'"
         second_command = "$ printf 'REMOTE-STATUS-TWO\\n'"
+        first_output = "REMOTE-STATUS-ONE"
+        second_output = "REMOTE-STATUS-TWO"
 
         assert result.success is True
         assert first_status in captured.out
         assert second_status in captured.out
-        assert captured.out.index(first_status) < captured.out.index(first_command)
-        assert captured.out.index(second_status) < captured.out.index(second_command)
+        first_status_index = captured.out.index(first_status)
+        second_status_index = captured.out.index(second_status)
+        first_output_index = captured.out.index(first_output, first_status_index + len(first_status))
+        second_output_index = captured.out.index(second_output, second_status_index + len(second_status))
+        assert first_status_index < first_output_index
+        assert second_status_index < second_output_index
+        assert first_command not in captured.out
+        assert second_command not in captured.out
 
     def test_verbose_remote_live_status_ignores_injected_preamble_commands(self, capsys: Any) -> None:
         """Verbose remote progress should count only user-authored block commands."""
@@ -1983,18 +2019,17 @@ printf 'REMOTE-SECOND\\n'
             *,
             timeout_seconds: int | None,
             on_command: Any = None,
+            on_output: Any = None,
         ) -> tuple[str, str, int, bool, bool]:
-            del ssh_args, remote_script, timeout_seconds
+            del ssh_args, remote_script, timeout_seconds, on_output
             if on_command is not None:
                 on_command("printf 'REMOTE-FIRST\\n'")
                 on_command("printf 'REMOTE-SECOND\\n'")
-            traced_stdout = "".join(
-                [
-                    "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-FIRST\\n'\n",
-                    "REMOTE-FIRST\n",
-                    "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-SECOND\\n'\n",
-                    "REMOTE-SECOND\n",
-                ]
+            traced_stdout = (
+                "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-FIRST\\n'\n"
+                "REMOTE-FIRST\n"
+                "__SHELLFLOW_CMD_deadbeef:printf 'REMOTE-SECOND\\n'\n"
+                "REMOTE-SECOND\n"
             )
             return traced_stdout, "", 0, False, False
 
