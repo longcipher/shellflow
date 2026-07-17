@@ -6,7 +6,6 @@ import re
 import shlex
 import subprocess
 import uuid
-from typing import Literal, cast
 
 from .constants import VALID_EXPORT_SOURCES
 from .exceptions import ParseError
@@ -838,7 +837,7 @@ def _validate_block_with_pydantic(block: Block, line_no: int) -> None:
             target=target,
             timeout=block.timeout_seconds,
             retry=block.retry_count,
-            shell=cast("Literal['bash', 'zsh', 'sh']", block.shell if block.shell in ("bash", "zsh", "sh") else "bash"),
+            shell=block.shell if block.shell in ("bash", "zsh", "sh") else "bash",
         )
 
         # The validation happens during model construction
