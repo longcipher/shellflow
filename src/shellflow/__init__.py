@@ -55,7 +55,7 @@ from .models import (
 from .parser import _clean_commands, parse_script
 from .runner import run_script
 
-__version__ = "0.4.3"
+__version__ = "0.4.9"
 
 __all__ = [
     "EXIT_EXECUTION_FAILURE",
