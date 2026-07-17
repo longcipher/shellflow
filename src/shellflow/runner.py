@@ -995,12 +995,14 @@ def _execute_remote_block_sequential(
                 if result.output:
                     truncated = _truncate_output_lines(result.output, output_tail_lines)
                     print(truncated)
+        elif not result.success and result.stderr:
+            print(f"{RED}{result.stderr.strip()}{RESET}")
 
     context.last_output = result.output
     context.success = result.success
 
     if not result.success and verbose:
-        print(f"{RED}✗ Command failed with exit code {result.exit_code}{RESET}\n")
+        print(f"{RED}✗ {result.error_message}{RESET}\n")
 
     return result
 
