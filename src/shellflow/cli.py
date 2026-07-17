@@ -245,7 +245,7 @@ def cmd_run(args: argparse.Namespace) -> int:  # noqa: PLR0915
     if not result.success:
         exit_code = result.exit_code if result.exit_code != EXIT_SUCCESS else EXIT_EXECUTION_FAILURE
         if not machine_mode:
-            sys.stderr.write(f"Execution failed: {result.error_message}\n")
+            sys.stderr.write(f"\n{result.error_message}\n")
         return exit_code
 
     if args.verbose and not machine_mode:

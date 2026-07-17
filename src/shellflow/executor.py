@@ -227,6 +227,26 @@ def _combine_output(stdout: str, stderr: str) -> str:
     return output or error_output
 
 
+def _build_remote_error_message(exit_code: int, command_logs: list[CommandLog], stderr: str) -> str:
+    """Build a descriptive error message for a failed remote block."""
+    failed_command = ""
+    if command_logs:
+        for cl in reversed(command_logs):
+            if cl.status == "failed" or (cl.exit_code is not None and cl.exit_code != 0):
+                failed_command = cl.command
+                break
+        if not failed_command and command_logs:
+            failed_command = command_logs[-1].command
+    stderr_detail = stderr.strip()
+    if failed_command:
+        error_message = f"Command failed (exit {exit_code}): {failed_command}"
+    else:
+        error_message = f"SSH exit code: {exit_code}"
+    if stderr_detail:
+        error_message += f"\n{stderr_detail}"
+    return error_message
+
+
 def _strip_trace_markers(output: str) -> str:
     """Remove shellflow trace marker lines from captured output."""
     cleaned_lines: list[str] = []
@@ -614,7 +634,7 @@ def execute_remote(
 
         failure_kind = None if success else "runtime"
         result_exit_code = exit_code
-        error_message = "" if success else f"SSH exit code: {exit_code}"
+        error_message = "" if success else _build_remote_error_message(exit_code, command_logs, cleaned_stderr)
 
         if timed_out:
             result_exit_code = -1
