@@ -184,10 +184,10 @@ def _run_cli_script(
 
     with (
         mock.patch(
-            "shellflow.read_ssh_config",
+            "shellflow.executor.read_ssh_config",
             side_effect=lambda host, _servers=None: SSHConfig(host=host) if host in configured else None,
         ),
-        mock.patch("shellflow.execute_remote", side_effect=fake_or_real_remote),
+        mock.patch("shellflow.executor.execute_remote", side_effect=fake_or_real_remote),
         redirect_stdout(stdout_buffer),
         redirect_stderr(stderr_buffer),
     ):
@@ -238,10 +238,10 @@ def when_run_the_script(context: Context) -> None:
 
     with (
         mock.patch(
-            "shellflow.read_ssh_config",
+            "shellflow.executor.read_ssh_config",
             side_effect=lambda host, _servers=None: _read_ssh_config_for_context(context, host),
         ),
-        mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote),
+        mock.patch("shellflow.executor.execute_remote", side_effect=_fake_execute_remote),
     ):
         result = run_script(
             blocks,
@@ -807,7 +807,7 @@ def step_when_inspect_generated_remote_script_payload(context: Context) -> None:
         raise AssertionError(f"Remote host not configured for test: {block.host}")
 
     with mock.patch(
-        "shellflow._run_remote_subprocess",
+        "shellflow.executor._run_remote_subprocess",
         return_value=("", "", 0, False, False),
     ) as mock_run:
         result = execute_remote(block, ExecutionContext(), ssh_config)
@@ -896,10 +896,10 @@ def step_when_run_script_with_mode(context: Context, mode: str) -> None:
 
     with (
         mock.patch(
-            "shellflow.read_ssh_config",
+            "shellflow.executor.read_ssh_config",
             side_effect=lambda host, _servers=None: _read_ssh_config_for_context(context, host),
         ),
-        mock.patch("shellflow.execute_remote", side_effect=_fake_execute_remote),
+        mock.patch("shellflow.executor.execute_remote", side_effect=_fake_execute_remote),
     ):
         result = run_script(
             blocks,
