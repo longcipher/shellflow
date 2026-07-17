@@ -804,10 +804,10 @@ __SHELLFLOW_EXITCODE__101
 
         assert result.success is True
         sent_script = mock_run.call_args.args[1]
-        assert "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }" in sent_script
-        assert sent_script.index(
-            "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }"
-        ) < sent_script.index("mise --version")
+        assert "test -f ~/.zshrc && source ~/.zshrc >/dev/null 2>&1" in sent_script
+        assert sent_script.index("test -f ~/.zshrc && source ~/.zshrc >/dev/null 2>&1") < sent_script.index(
+            "mise --version"
+        )
 
     def test_remote_execution_only_exports_explicit_context(
         self,

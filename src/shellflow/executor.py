@@ -128,16 +128,35 @@ def _build_executable_script(
     return "\n".join(script_lines)
 
 
-def _build_zsh_hook_cleanup() -> list[str]:
-    """Disable zsh interactive hooks that pollute non-interactive automation."""
+def _zsh_cleanup_interactive_hooks() -> list[str]:
+    """Disable zsh interactive hooks that pollute non-interactive automation.
+
+    Returns individual commands WITHOUT set +e/set -e wrapping - the caller
+    is responsible for error handling context.
+    """
     return [
-        "unset preexec_functions precmd_functions chpwd_functions 2>/dev/null || true",
-        "unfunction preexec precmd chpwd 2>/dev/null || true",
+        "unset preexec_functions precmd_functions chpwd_functions 2>/dev/null",
+        "(( $+functions[preexec] )) && unfunction preexec 2>/dev/null",
+        "(( $+functions[precmd] )) && unfunction precmd 2>/dev/null",
+        "(( $+functions[chpwd] )) && unfunction chpwd 2>/dev/null",
     ]
 
 
 def _build_shell_bootstrap(shell: str | None) -> list[str]:
-    """Build shell-specific bootstrap lines needed for non-interactive automation."""
+    """Build shell-specific bootstrap lines needed for non-interactive automation.
+
+    We manually source rc files (.zshrc/.bashrc) because users often set PATH
+    and other environment variables there. To do this safely in non-interactive
+    SSH sessions (where TERM=dumb):
+    1. Set TERM to a safe value (xterm-256color) to prevent prompt tools (starship, etc.)
+       from failing due to dumb terminal detection
+    2. Use set +e before sourcing, set -e after, to prevent rc file errors from
+       aborting the script
+    3. Silence output from rc file sourcing
+    4. Clean up interactive hooks (precmd/preexec/chpwd) AFTER sourcing but BEFORE
+       re-enabling set -e, because these hooks may run when errexit is enabled
+       and cause spurious failures
+    """
     if not shell:
         return []
 
@@ -145,14 +164,24 @@ def _build_shell_bootstrap(shell: str | None) -> list[str]:
     if shell_name == "zsh":
         return [
             "set +x 2>/dev/null || true",
-            *_build_zsh_hook_cleanup(),
-            "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }",
+            # Clean up any inherited hooks before we start
+            "set +e",
+            *_zsh_cleanup_interactive_hooks(),
+            # Set a safe TERM to prevent starship/prompt tools from failing on dumb terminals
+            'export TERM="${TERM:-xterm-256color}"',
+            "[[ $TERM == dumb ]] && export TERM=xterm-256color",
+            # Source .zshrc, then immediately clean up hooks it may have defined
+            # BEFORE re-enabling set -e (precmd hooks run when errexit is on)
+            "test -f ~/.zshrc && source ~/.zshrc >/dev/null 2>&1",
+            *_zsh_cleanup_interactive_hooks(),
+            "set -e",
             "set +x 2>/dev/null || true",
-            *_build_zsh_hook_cleanup(),
         ]
     if shell_name == "bash":
         return [
             "set +x 2>/dev/null || true",
+            'export TERM="${TERM:-xterm-256color}"',
+            "[[ $TERM == dumb ]] && export TERM=xterm-256color",
             "test -f ~/.bashrc && { set +e; . ~/.bashrc >/dev/null 2>&1; set -e; }",
         ]
     return ["set +x 2>/dev/null || true"]
@@ -227,23 +256,44 @@ def _combine_output(stdout: str, stderr: str) -> str:
     return output or error_output
 
 
-def _build_remote_error_message(exit_code: int, command_logs: list[CommandLog], stderr: str) -> str:
+def _build_remote_error_message(
+    exit_code: int,
+    command_logs: list[CommandLog],
+    stderr: str,
+    stdout: str = "",
+) -> str:
     """Build a descriptive error message for a failed remote block."""
     failed_command = ""
+    failed_output = ""
     if command_logs:
         for cl in reversed(command_logs):
             if cl.status == "failed" or (cl.exit_code is not None and cl.exit_code != 0):
                 failed_command = cl.command
+                failed_output = cl.output
                 break
         if not failed_command and command_logs:
             failed_command = command_logs[-1].command
+            failed_output = command_logs[-1].output
+
     stderr_detail = stderr.strip()
+    stdout_detail = stdout.strip()
+
     if failed_command:
-        error_message = f"Command failed (exit {exit_code}): {failed_command}"
+        error_message = f"Command failed (exit code {exit_code}):\n  $ {failed_command}"
     else:
-        error_message = f"SSH exit code: {exit_code}"
-    if stderr_detail:
-        error_message += f"\n{stderr_detail}"
+        error_message = f"Remote execution failed (exit code {exit_code})"
+
+    if failed_output:
+        error_message += f"\n--- command output ---\n{failed_output}"
+
+    if stderr_detail and stderr_detail not in failed_output:
+        error_message += f"\n--- stderr ---\n{stderr_detail}"
+
+    if stdout_detail and stdout_detail not in failed_output and stdout_detail not in stderr_detail:
+        last_lines = "\n".join(stdout_detail.splitlines()[-20:])
+        if last_lines:
+            error_message += f"\n--- last output ---\n{last_lines}"
+
     return error_message
 
 
@@ -293,6 +343,9 @@ def _is_trace_noise(command: str) -> bool:
         r"^export\s+[A-Z_][A-Z0-9_]*=",
         r"^test -f ~/.(?:bashrc|zshrc)",
         r"^\[{1,2}\s",
+        r"^unset\s+pre(?:exec|cmd|chpwd)_functions\b",
+        r"^\(\( \$\+functions\[",
+        r"^exec\s+[0-9]+>&[0-9]+",
     )
     import re
 
@@ -595,7 +648,11 @@ def execute_remote(
         ssh_args.extend(["-F", str(ssh_config_path)])
 
     shell = block.shell or "bash"
-    # Use --no-rcs for zsh or --norc for bash to prevent sourcing initialization files
+    # Use --no-rcs/--norc to prevent default rc file sourcing, then we manually
+    # source rc files in the bootstrap with proper error handling (set +e around source,
+    # and TERM set to avoid prompt tool errors in dumb terminals).
+    # Note: --no-rcs/--norc still allows .zshenv to be read (zsh), which is correct
+    # as that file is meant for environment setup for all shells.
     ssh_target = ssh_config.hostname or host
     if "zsh" in shell:
         ssh_args.extend(["-o", "BatchMode=yes", ssh_target, shell, "--no-rcs", "-s", "-e"])
@@ -634,7 +691,9 @@ def execute_remote(
 
         failure_kind = None if success else "runtime"
         result_exit_code = exit_code
-        error_message = "" if success else _build_remote_error_message(exit_code, command_logs, cleaned_stderr)
+        error_message = (
+            "" if success else _build_remote_error_message(exit_code, command_logs, cleaned_stderr, cleaned_stdout)
+        )
 
         if timed_out:
             result_exit_code = -1

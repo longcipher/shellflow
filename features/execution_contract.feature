@@ -32,7 +32,7 @@ Feature: Agent-facing execution contract
     Given host "testhost" is configured in SSH config
     And a script file with a remote "zsh" block
     When I inspect the generated remote script payload
-    Then the output should contain "test -f ~/.zshrc && { source ~/.zshrc >/dev/null 2>&1 || true; }"
+    Then the output should contain "test -f ~/.zshrc && source ~/.zshrc >/dev/null 2>&1"
     And the output should contain "bootstrap-check"
 
   Scenario: Remote bash payload bootstraps bashrc before user commands

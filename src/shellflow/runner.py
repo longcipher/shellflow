@@ -1001,8 +1001,8 @@ def _execute_remote_block_sequential(
     context.last_output = result.output
     context.success = result.success
 
-    if not result.success and verbose:
-        print(f"{RED}✗ {result.error_message}{RESET}\n")
+    # Note: error message is printed by _execute_block_with_sequential_output
+    # to avoid duplicate printing
 
     return result
 
