@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Mock `rsync` for integration tests: records argv, emits deterministic
+# itemize output for --dry-run, and always exits 0.
+set -u
+
+MOCK_DIR="${MOCK_DIR:?MOCK_DIR not set}"
+LOG="$MOCK_DIR/rsync.log"
+
+printf 'ARGS: %s\n' "$*" >> "$LOG"
+
+# Preflight probe: `rsync --version`.
+for arg in "$@"; do
+  if [[ "$arg" == "--version" ]]; then
+    echo "rsync mock 3.2.0"
+    exit 0
+  fi
+done
+
+if [[ " $* " == *" --dry-run "* ]]; then
+  echo "sending incremental file list"
+  echo ">f+++++++++ target/release/myapp"
+  echo "*deleting old-app"
+fi
+exit 0

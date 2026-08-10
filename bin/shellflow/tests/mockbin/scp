@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Mock `scp` for integration tests: records argv, simulates a successful
+# single-file transfer, and always exits 0.
+set -u
+
+MOCK_DIR="${MOCK_DIR:?MOCK_DIR not set}"
+LOG="$MOCK_DIR/scp.log"
+
+printf 'ARGS: %s\n' "$*" >> "$LOG"
+
+# The final argument is `user@host:path`. Record the source path.
+printf 'SRC: %s\n' "${@: -2:1}" >> "$LOG"
+printf 'DST: %s\n' "${@: -1:1}" >> "$LOG"
+exit 0

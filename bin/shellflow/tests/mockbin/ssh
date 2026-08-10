@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Mock `ssh` for integration tests.
+#
+# Records argv and stdin for later assertion, then behaves per invocation:
+#   `-V`            -> print version, exit 0 (preflight probe)
+#   host *echo*     -> echo stdin back on stdout (lets tests observe payload)
+#   host *ok*       -> exit 0
+#   host *fail*     -> exit 7 after printing a message to stderr
+#   host *hang*     -> sleep forever (used with --timeout)
+#   default         -> exit 255 (simulates an ssh connection failure)
+set -u
+
+MOCK_DIR="${MOCK_DIR:?MOCK_DIR not set}"
+LOG="$MOCK_DIR/ssh.log"
+
+printf 'ARGS: %s\n' "$*" >> "$LOG"
+
+# Preflight probe: `ssh -V`. Must succeed without touching stdin.
+for arg in "$@"; do
+  if [[ "$arg" == "-V" ]]; then
+    echo "OpenSSH mock 9.0" >&2
+    exit 0
+  fi
+done
+
+# The destination is the first non-flag argument (e.g. `ssh host -T bash -s`).
+host=""
+for arg in "$@"; do
+  case "$arg" in
+    -*) ;;
+    *)
+      host="$arg"
+      break
+      ;;
+  esac
+done
+printf 'HOST: %s\n' "$host" >> "$LOG"
+
+# Persist whatever was piped to us so tests can assert on the payload.
+cat > "$MOCK_DIR/ssh-stdin-$host.txt"
+
+case "$host" in
+  *norsync*)
+    # Host without rsync: the rsync probe (`command -v rsync`) must fail,
+    # while real commands succeed — forces the scp fallback path.
+    if [[ " $* " == *"command -v rsync"* ]]; then
+      echo "command not found: rsync" >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+  *echo*)
+    # Re-emit the recorded payload so tests can observe streamed output.
+    # A READY/DONE barrier makes fan-out observable without wall-clock races:
+    # concurrent hosts produce READY,READY,DONE,DONE; serialized hosts produce
+    # READY,DONE,READY,DONE.
+    echo "READY-$host" >> "$MOCK_DIR/order.log"
+    sleep 0.3
+    echo "DONE-$host" >> "$MOCK_DIR/order.log"
+    cat "$MOCK_DIR/ssh-stdin-$host.txt"
+    exit 0
+    ;;
+  *ok*)
+    exit 0
+    ;;
+  *fail*)
+    echo "mock: intentional failure" >&2
+    exit 7
+    ;;
+  *hang*)
+    sleep 300
+    exit 0
+    ;;
+  *)
+    echo "ssh: connect to host $host port 22: Operation timed out" >&2
+    exit 255
+    ;;
+esac
