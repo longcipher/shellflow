@@ -1,6 +1,6 @@
 [project]
 name = "shellflow"
-version = "0.4.9"
+version = "0.4.10"
 description = "A minimal shell script orchestrator with SSH support"
 readme = "README.md"
 license = "Apache-2.0"
@@ -42,10 +42,10 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-asyncio>=1.4.0",
     "pytest-benchmark>=5.2.3",
-    "ruff>=0.15.22",
-    "ty>=0.0.60",
+    "ruff>=0.16.2",
+    "ty>=0.0.69",
     "behave>=1.3.3",
-    "hypothesis>=6.156.6",
+    "hypothesis>=6.165.2",
     "shellflow",
 ]
 
