@@ -26,13 +26,16 @@ use tokio::{
 };
 
 use crate::{
-    cli::Cli,
+    cli::RunArgs,
+    secrets::resolve_secrets,
     ui::{HostStatus, Outcome, Stream, Ui},
 };
 
 /// The error classification mapped to the CLI exit code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunError {
+    /// A configuration/plan-build failure (exit 1), e.g. secrets resolution.
+    Config,
     /// A transport/setup failure (exit 3).
     Transport,
     /// A script execution failure (exit 4).
@@ -42,6 +45,7 @@ pub(crate) enum RunError {
 impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Config => write!(f, "configuration failure"),
             Self::Transport => write!(f, "transport/setup failure"),
             Self::Script => write!(f, "script execution failure"),
         }
@@ -105,16 +109,19 @@ struct StepConfig {
     verbose: u8,
     /// Optional timeout in seconds.
     timeout: Option<u64>,
+    /// Execute remote blocks/copies on the local machine (`--local`).
+    local: bool,
 }
 
 impl StepConfig {
-    const fn new(cli: &Cli, timeout: Option<u64>) -> Self {
+    const fn new(run: &RunArgs, timeout: Option<u64>) -> Self {
         Self {
-            dry_run: cli.dry_run || cli.diff,
-            diff: cli.diff,
-            check: cli.check,
-            verbose: cli.verbose,
+            dry_run: run.flags.dry_run || run.flags.diff,
+            diff: run.flags.diff,
+            check: run.flags.check,
+            verbose: run.flags.verbose,
             timeout,
+            local: run.flags.local,
         }
     }
 }
@@ -123,15 +130,24 @@ impl StepConfig {
 ///
 /// Completed step statistics are appended to `progress` so that a signal
 /// cancelling the run can still report what finished before the interrupt.
-pub(crate) async fn execute_plan(cli: &Cli, plan: ExecutionPlan, progress: Progress) -> RunOutcome {
-    let ui =
-        Arc::new(Mutex::new(Ui::new(cli.verbose, cli.no_color, cli.output, cli.log_file.clone())));
+pub(crate) async fn execute_plan(
+    run: &RunArgs,
+    plan: ExecutionPlan,
+    progress: Progress,
+) -> RunOutcome {
+    let flags = &run.flags;
+    let ui = Arc::new(Mutex::new(Ui::new(
+        flags.verbose,
+        flags.no_color,
+        flags.output,
+        flags.log_file.clone(),
+    )));
 
     // Only literal `@env KEY=value` entries are masked: their values are
     // written in the deploy file and may be secrets. Passthrough entries read
     // from shellflow's own environment are already visible to the user and
     // must not be redacted (e.g. `HOME` would otherwise render as `***`).
-    let secrets: Vec<String> = plan
+    let mut secrets: Vec<String> = plan
         .env
         .iter()
         .filter_map(|entry| match entry {
@@ -139,23 +155,42 @@ pub(crate) async fn execute_plan(cli: &Cli, plan: ExecutionPlan, progress: Progr
             EnvEntry::Passthrough { .. } => None,
         })
         .collect();
+
+    let run_state = Arc::new(Mutex::new(RunState::default()));
+
+    // Resolve `@secrets` before the first step: decrypt, inject into run-state
+    // env, and register every value for masking.
+    if !plan.secrets.is_empty() {
+        match resolve_secrets(&plan.secrets, flags.identity.as_deref(), flags.mask_min_len) {
+            Ok((env_pairs, masks)) => {
+                secrets.extend(masks);
+                let mut state = run_state.lock().await;
+                for (key, value) in env_pairs {
+                    state.vars.insert(key, value);
+                }
+            }
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                return RunOutcome::Failed(RunError::Config);
+            }
+        }
+    }
     ui.lock().await.set_secrets(secrets);
 
-    if cli.dry_run {
+    if flags.dry_run {
         crate::ui::dry_run_banner();
     }
 
-    let restrict = cli.target_restrict();
+    let restrict = run.target_restrict();
     // `--parallel 0` (default) means unbounded, per the documented "all".
     // An `Option` avoids `Semaphore::new(usize::MAX)`, which would exceed
     // tokio's MAX_PERMITS and panic.
     let semaphore: Option<Arc<Semaphore>> =
-        (cli.parallel != 0).then(|| Arc::new(Semaphore::new(cli.parallel)));
-    let run_state = Arc::new(Mutex::new(RunState::default()));
+        (flags.parallel != 0).then(|| Arc::new(Semaphore::new(flags.parallel)));
 
     // Apply --only / --skip filtering.
     let selected: Vec<(usize, &Step)> =
-        plan.steps.iter().enumerate().filter(|(idx, step)| is_selected(cli, *idx, step)).collect();
+        plan.steps.iter().enumerate().filter(|(idx, step)| is_selected(run, *idx, step)).collect();
     let total = selected.len();
 
     if ui.lock().await.verbosity().info() {
@@ -176,7 +211,7 @@ pub(crate) async fn execute_plan(cli: &Cli, plan: ExecutionPlan, progress: Progr
         crate::ui::step_header(step_no, total, step);
 
         let started = std::time::Instant::now();
-        let config = StepConfig::new(cli, cli.timeout.or_else(|| step.timeout()));
+        let config = StepConfig::new(run, flags.timeout.or_else(|| step.timeout()));
         let outcome = match step {
             Step::Local(local) => run_local_step(&ui, &run_state, local, config).await,
             Step::Remote(remote) => match resolve_hosts(&plan, &remote.target, &restrict) {
@@ -219,7 +254,7 @@ pub(crate) async fn execute_plan(cli: &Cli, plan: ExecutionPlan, progress: Progr
             if first_error.is_none() {
                 first_error = Some(err);
             }
-            if cli.continue_on_error {
+            if flags.continue_on_error {
                 crate::ui::step_failed(step_no, &err.to_string());
             } else {
                 fail_fast_error = Some(err);
@@ -227,7 +262,7 @@ pub(crate) async fn execute_plan(cli: &Cli, plan: ExecutionPlan, progress: Progr
         }
     }
 
-    if cli.continue_on_error || fail_fast_error.is_none() {
+    if flags.continue_on_error || fail_fast_error.is_none() {
         let summary: Vec<(usize, Duration, Vec<HostStatus>)> =
             stats.iter().map(|s| (s.index, s.elapsed, s.statuses.clone())).collect();
         crate::ui::final_summary(&summary);
@@ -240,17 +275,17 @@ pub(crate) async fn execute_plan(cli: &Cli, plan: ExecutionPlan, progress: Progr
 }
 
 /// Whether a step matches `--only` / `--skip` selectors (name or 1-based index).
-fn is_selected(cli: &Cli, idx: usize, step: &Step) -> bool {
+fn is_selected(run: &RunArgs, idx: usize, step: &Step) -> bool {
     let matches_selector = |selector: &str| -> bool {
         if selector == step.name().unwrap_or_default() {
             return true;
         }
         matches!(selector.parse::<usize>(), Ok(n) if n == idx + 1)
     };
-    if !cli.only.is_empty() && !cli.only.iter().any(|s| matches_selector(s)) {
+    if !run.flags.only.is_empty() && !run.flags.only.iter().any(|s| matches_selector(s)) {
         return false;
     }
-    if cli.skip.iter().any(|s| matches_selector(s)) {
+    if run.flags.skip.iter().any(|s| matches_selector(s)) {
         return false;
     }
     true
@@ -328,23 +363,14 @@ async fn run_local_step(
         cmd.env("SHELLFLOW_CAPTURE", &path);
         Some(path)
     };
-    cmd.kill_on_drop(true);
 
     if config.verbose >= 2 {
         crate::ui::note(&format!("  ↳ local command: bash -c {:?}", body));
     }
 
-    let status = match config.timeout {
-        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), cmd.status()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(err)) => return Err(err).wrap_err("failed to run local bash"),
-            Err(_) => {
-                crate::ui::warn("local step timed out — killed");
-                bail!("local step timed out after {secs}s");
-            }
-        },
-        None => cmd.status().await.wrap_err("failed to run local bash")?,
-    };
+    // Stream output through the UI so secrets are masked and `--log-file`
+    // captures local output too.
+    let status = run_bash_streamed(ui, "localhost", cmd, config.timeout).await?;
 
     if !status.success() {
         bail!("local script exited with status {status}");
@@ -381,6 +407,78 @@ async fn run_local_guard(guard: &str, timeout: Option<u64>) -> bool {
         },
     };
     status.success()
+}
+
+/// Run a child process to completion, honoring the timeout with a friendly
+/// kill + message.
+async fn run_command_status(
+    mut cmd: Command,
+    timeout: Option<u64>,
+    label: &str,
+) -> Result<std::process::ExitStatus> {
+    let status = match timeout {
+        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), cmd.status()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(err)) => return Err(err).wrap_err(format!("failed to run {label}")),
+            Err(_) => {
+                crate::ui::warn(&format!("{label} timed out — killed"));
+                bail!("{label} timed out after {secs}s");
+            }
+        },
+        None => cmd.status().await.wrap_err(format!("failed to run {label}"))?,
+    };
+    Ok(status)
+}
+
+/// Run a local `bash`/child, streaming stdout/stderr through the UI so secret
+/// masking and `--log-file` apply to local output too.
+async fn run_bash_streamed(
+    ui: &ArcUi,
+    host: &str,
+    mut cmd: Command,
+    timeout: Option<u64>,
+) -> Result<std::process::ExitStatus> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().wrap_err("failed to spawn bash")?;
+
+    let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("stdout not piped"))?;
+    let stderr = child.stderr.take().ok_or_else(|| eyre::eyre!("stderr not piped"))?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<(Stream, String)>(256);
+    let host_alias = host.to_string();
+    let out_task = tokio::spawn(forward_stream(stdout, tx.clone(), Stream::Stdout));
+    let err_task = tokio::spawn(forward_stream(stderr, tx, Stream::Stderr));
+
+    let ui_handle = Arc::clone(ui);
+    let read_task = tokio::spawn(async move {
+        let mut rx = rx;
+        while let Some((stream, line)) = rx.recv().await {
+            ui_handle.lock().await.host_line(&host_alias, stream, &line);
+        }
+    });
+
+    let status = match timeout {
+        Some(secs) => {
+            let timed_out = tokio::time::timeout(Duration::from_secs(secs), child.wait()).await;
+            match timed_out {
+                Ok(Ok(status)) => status,
+                Ok(Err(err)) => return Err(eyre::Report::new(err)),
+                Err(_) => {
+                    read_task.abort();
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    bail!("local step timed out after {secs}s");
+                }
+            }
+        }
+        None => child.wait().await?,
+    };
+
+    let _ = out_task.await;
+    let _ = err_task.await;
+    let _ = read_task.await;
+    Ok(status)
 }
 
 async fn run_bash_n(script: &str) -> Result<()> {
@@ -489,6 +587,10 @@ async fn run_remote_step(
     hosts: Vec<ResolvedHost>,
     config: StepConfig,
 ) -> Result<Vec<(String, HostOutcome)>> {
+    if config.local {
+        return run_remote_step_local(ui, run_state, remote, config).await;
+    }
+
     if config.dry_run || config.verbose >= 2 {
         ui.lock()
             .await
@@ -515,6 +617,51 @@ async fn run_remote_step(
     }
 
     collect_hosts(tasks).await
+}
+
+/// `--local` mode: run a remote block's payload through the local `bash`
+/// (once, not per host). Guards are evaluated locally; dry-run/check use
+/// `bash -n`. This makes playbooks debuggable on a machine with no SSH access
+/// to the targets.
+async fn run_remote_step_local(
+    ui: &ArcUi,
+    run_state: &Arc<Mutex<RunState>>,
+    remote: &RemoteStep,
+    config: StepConfig,
+) -> Result<Vec<(String, HostOutcome)>> {
+    if config.dry_run || config.verbose >= 2 {
+        ui.lock().await.payload_preview(
+            &format!("Local Payload (remote block @{})", remote.target.text),
+            &remote.script,
+        );
+    }
+
+    if let Some(guard) = &remote.guard &&
+        !run_local_guard(guard, config.timeout).await
+    {
+        crate::ui::note("  ↳ local guard failed — skipping block");
+        return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
+    }
+
+    if config.check || config.dry_run {
+        run_bash_n(&remote.script).await?;
+        crate::ui::note("  ↳ local syntax check (bash -n): OK");
+        return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
+    }
+
+    let env = build_env(run_state, &remote.env).await;
+    let trace_line = if config.verbose >= 3 { "set -x\n" } else { "" };
+    let payload = format!("set -eu\n{}{}{}", render_env(&env), trace_line, remote.script);
+
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(&payload);
+    // Stream output through the UI so secrets are masked and `--log-file`
+    // captures local-mode output too.
+    let status = run_bash_streamed(ui, "localhost", cmd, config.timeout).await?;
+    if !status.success() {
+        bail!("local (remote block) exited with status {status}");
+    }
+    Ok(vec![("localhost".to_string(), HostOutcome::Ok)])
 }
 
 async fn run_remote_host(
@@ -769,6 +916,10 @@ async fn run_copy_step(
         }
     };
 
+    if config.local {
+        return run_copy_step_local(ui, &src, &dst, copy.delete, config).await;
+    }
+
     if config.check {
         crate::ui::note("  ↳ syntax check: copy step (no execution)");
         return Ok(Vec::new());
@@ -794,6 +945,49 @@ async fn run_copy_step(
     }
 
     collect_hosts(tasks).await
+}
+
+/// `--local` mode: mirror a copy step with a local `cp -a` (once). `--delete`
+/// clears the destination first. Debugging only; remote delta semantics do
+/// not apply.
+async fn run_copy_step_local(
+    _ui: &ArcUi,
+    src: &str,
+    dst: &str,
+    delete: bool,
+    config: StepConfig,
+) -> Result<Vec<(String, HostOutcome)>> {
+    if config.check {
+        crate::ui::note("  ↳ syntax check: copy step (no execution)");
+        return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
+    }
+    if config.dry_run || config.verbose >= 2 {
+        crate::ui::note(&format!("  ↳ local copy {src} -> {dst}"));
+    }
+    if config.dry_run {
+        return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
+    }
+
+    if delete {
+        let _ = std::fs::remove_dir_all(dst);
+        let _ = std::fs::remove_file(dst);
+    }
+
+    if let Some(parent) = std::path::Path::new(dst).parent() &&
+        !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("failed to create {} for local copy", parent.display()))?;
+    }
+
+    let mut cmd = Command::new("cp");
+    cmd.arg("-a").arg(src).arg(dst);
+    cmd.kill_on_drop(true);
+    let status = run_command_status(cmd, config.timeout, "local copy").await?;
+    if !status.success() {
+        bail!("local copy exited with status {status}");
+    }
+    Ok(vec![("localhost".to_string(), HostOutcome::Ok)])
 }
 
 async fn run_rsync_host(

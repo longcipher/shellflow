@@ -10,10 +10,12 @@ license = "Apache-2.0"
 repository = "TODO"
 
 [workspace.dependencies]
+age = "0.12.1"
 clap = "4.6.6"
 colored = "3.1.1"
 eyre = "0.6.12"
 proptest = "1.11.0"
+tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = "1.53.1"
 tracing-subscriber = "0.3.23"

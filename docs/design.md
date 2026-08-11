@@ -1,5 +1,9 @@
 # shellflow — Design Document
 
+> Related design: [`design-secrets.md`](design-secrets.md) covers the embedded
+> `age` integration (`keys`/`secret`), the `@secrets` directive, the `deploy`
+> subcommand, and `--local` mode.
+
 ## 1. Executive Summary
 
 `shellflow` is a minimal, modern, single-binary Rust CLI for shell-native

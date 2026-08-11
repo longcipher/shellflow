@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     error::ParseError,
-    plan::{CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, Step, Target},
+    plan::{CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, SecretEntry, Step, Target},
     ssh_spec::SshSpec,
 };
 
@@ -118,6 +118,10 @@ impl State {
             "env" => {
                 self.flush();
                 self.declare_env(payload, line)
+            }
+            "secrets" => {
+                self.flush();
+                self.declare_secrets(payload, line)
             }
             "local" => {
                 self.flush();
@@ -306,6 +310,39 @@ impl State {
             EnvEntry::Passthrough { key: payload.to_string() }
         };
         self.plan.env.push(entry);
+        Ok(())
+    }
+
+    fn declare_secrets(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        let mut parts = payload.split_whitespace();
+        let file = parts.next().ok_or_else(|| ParseError::InvalidDirective {
+            line,
+            directive: "secrets".to_string(),
+            reason: "missing encrypted file path".to_string(),
+        })?;
+
+        let mut identity: Option<String> = None;
+        while let Some(token) = parts.next() {
+            match token {
+                "--identity" => {
+                    let value = parts.next().ok_or_else(|| ParseError::InvalidDirective {
+                        line,
+                        directive: "secrets".to_string(),
+                        reason: "`--identity` requires a path".to_string(),
+                    })?;
+                    identity = Some(value.to_string());
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "secrets".to_string(),
+                        reason: format!("unexpected token `{other}`"),
+                    });
+                }
+            }
+        }
+
+        self.plan.secrets.push(SecretEntry { file: file.to_string(), identity });
         Ok(())
     }
 
@@ -749,6 +786,43 @@ mod tests {
             }
             other => return Err(format!("expected UnknownDirective, got {other:?}")),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_directive_records_file_and_identity() -> Result<(), String> {
+        let plan = parse(
+            "# @secrets conf/prod.env.age\n# @secrets extra.env.age --identity /tmp/key.txt\n",
+        )?;
+        assert_eq!(plan.secrets.len(), 2);
+        assert_eq!(plan.secrets[0].file, "conf/prod.env.age");
+        assert_eq!(plan.secrets[0].identity, None);
+        assert_eq!(plan.secrets[1].file, "extra.env.age");
+        assert_eq!(plan.secrets[1].identity.as_deref(), Some("/tmp/key.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn secrets_requires_a_file() {
+        assert!(matches!(
+            parse_script("# @secrets\n"),
+            Err(ParseError::InvalidDirective { directive, .. }) if directive == "secrets"
+        ));
+        assert!(matches!(
+            parse_script("# @secrets x.age --identity\n"),
+            Err(ParseError::InvalidDirective { directive, .. }) if directive == "secrets"
+        ));
+        assert!(matches!(
+            parse_script("# @secrets x.age --bogus\n"),
+            Err(ParseError::InvalidDirective { directive, .. }) if directive == "secrets"
+        ));
+    }
+
+    #[test]
+    fn secrets_flush_pending_block_like_env() -> Result<(), String> {
+        let plan = parse("# @local\necho before\n# @secrets s.age\n# @local\necho after\n")?;
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.secrets.len(), 1);
         Ok(())
     }
 

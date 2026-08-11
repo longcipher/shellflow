@@ -15,7 +15,7 @@ pub use env::{MASK, mask_line, render_env, shell_quote_single};
 pub use error::{InterpolateError, ParseError};
 pub use parser::parse_script;
 pub use plan::{
-    CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, ResolvedHost, RunState, Step, Target,
-    interpolate, resolve_hosts,
+    CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, ResolvedHost, RunState, SecretEntry,
+    Step, Target, interpolate, resolve_hosts,
 };
 pub use ssh_spec::SshSpec;

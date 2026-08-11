@@ -12,7 +12,16 @@ const REQUIRED_TOOLS: &[(&str, &[&str])] =
 /// Returns `Ok(())` when all tools are found, otherwise a message listing the
 /// missing tools.
 pub(crate) fn preflight_check() -> Result<(), String> {
-    let missing: Vec<&str> = REQUIRED_TOOLS
+    check_tools(REQUIRED_TOOLS)
+}
+
+/// Verify the tools required by `--local` mode (only `bash`).
+pub(crate) fn preflight_check_local() -> Result<(), String> {
+    check_tools(&[("bash", &["--version"])])
+}
+
+fn check_tools(tools: &[(&str, &[&str])]) -> Result<(), String> {
+    let missing: Vec<&str> = tools
         .iter()
         .filter(|(name, probe_args)| !tool_works(name, probe_args))
         .map(|(name, _)| *name)
