@@ -227,19 +227,38 @@ fn check_cross_service(
     Ok(())
 }
 
-/// The remote install script: install binary/units/configs, write one
-/// host-key-bound credential per env key, then clean up the staging dir.
+/// The credential→environment wrapper installed on every target.
+///
+/// Export each file in `$CREDENTIALS_DIRECTORY` as an environment variable
+/// named after the file, then `exec` the real binary. This lets units run
+/// third-party/closed-source applications (which read env vars directly)
+/// with **zero application changes** — the same tmpfs-backed, per-unit,
+/// host-key-bound protection as the in-app loader (§8.3 of the design doc).
+///
+/// The script lives at `scripts/cred-wrap` in the repository; `include_str!`
+/// keeps the deployed artifact identical to the committed file.
+pub(crate) const CRED_WRAP_PATH: &str = "/usr/local/libexec/shellflow/cred-wrap";
+
+const CRED_WRAP: &str = include_str!("../../../scripts/cred-wrap");
+
+/// The remote install script: install the cred-wrap helper, binary, units,
+/// and configs; write one host-key-bound credential per env key; then clean
+/// up the staging dir.
 fn install_script(service: &str, keys: &[String]) -> String {
     let keys = keys.join(" ");
     format!(
         r#"set -eu
 sudo install -d -m 0700 -o root -g root /etc/credstore.encrypted
 sudo install -d -m 0755 -o root -g root /opt/{service}/bin /opt/{service}/config
+sudo install -d -m 0755 -o root -g root /usr/local/libexec/shellflow
+cat > /tmp/shellflow/{service}/cred-wrap <<'SHELLFLOW_CRED_WRAP'
+{cred_wrap}SHELLFLOW_CRED_WRAP
+sudo install -m 0755 -o root -g root /tmp/shellflow/{service}/cred-wrap {cred_wrap_path}
 sudo install -m 0755 -o root -g root /tmp/shellflow/{service}/app /opt/{service}/bin/app
-if [ -d /tmp/shellflow/{service}/units ]; then
+if [ -d /tmp/shellflow/{service}/units ] && compgen -G '/tmp/shellflow/{service}/units/*.service' >/dev/null; then
   sudo install -m 0644 -o root -g root -t /etc/systemd/system /tmp/shellflow/{service}/units/*.service
 fi
-if [ -d /tmp/shellflow/{service}/configs ]; then
+if [ -d /tmp/shellflow/{service}/configs ] && compgen -G '/tmp/shellflow/{service}/configs/*' >/dev/null; then
   sudo install -m 0644 -o root -g root -t /opt/{service}/config /tmp/shellflow/{service}/configs/*
 fi
 for key in {keys}; do
@@ -247,7 +266,9 @@ for key in {keys}; do
   sudo chmod 0600 "/etc/credstore.encrypted/${{key}}"
 done
 rm -rf /tmp/shellflow/{service}
-"#
+"#,
+        cred_wrap = CRED_WRAP,
+        cred_wrap_path = CRED_WRAP_PATH,
     )
 }
 
@@ -265,7 +286,7 @@ fn restart_script(units: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{install_script, restart_script};
+    use super::{CRED_WRAP_PATH, install_script, restart_script};
 
     #[test]
     fn install_script_embeds_keys_without_exposure_in_argv() {
@@ -274,6 +295,16 @@ mod tests {
         // Indirect expansion reads the value from the env header at runtime.
         assert!(script.contains("${!key}"));
         assert!(script.contains("/opt/demo/bin/app"));
+    }
+
+    #[test]
+    fn install_script_installs_cred_wrap() {
+        let script = install_script("demo", &["API_KEY".to_string()]);
+        // The wrapper is installed once per target for third-party apps.
+        assert!(script.contains("SHELLFLOW_CRED_WRAP"));
+        assert!(script.contains(&format!("cred-wrap {CRED_WRAP_PATH}")));
+        assert!(script.contains("export \"$key=$(cat \"$f\")\""));
+        assert!(script.contains("exec \"$@\""));
     }
 
     #[test]

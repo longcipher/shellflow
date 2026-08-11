@@ -181,10 +181,11 @@ shellflow deploy <service> [flags]                 deploy one service to a group
 `deploy <service>` reads a conventional layout (overridable by flags):
 `hosts/inventory.sh` for `@server`/`@group`, `services/<service>/env/*.env.age`
 (merged lexically), `services/<service>/units/*.service`, and
-`services/<service>/configs/*`. It ships binary/units/configs, writes one
-host-key-bound `systemd-creds` credential per env key
-(`/etc/credstore.encrypted/<KEY>`), and reloads/restarts the units. Shared keys
-with conflicting values across services are rejected.
+`services/<service>/configs/*`. It ships binary/units/configs, installs the
+`cred-wrap` credential→env wrapper (lets third-party apps that read env vars
+run with zero code changes), writes one host-key-bound `systemd-creds`
+credential per env key (`/etc/credstore.encrypted/<KEY>`), and reloads/restarts
+the units. Shared keys with conflicting values across services are rejected.
 
 Exit codes: `0` success · `1` plan/parse/config error · `2` CLI usage · `3`
 transport/setup failure · `4` script execution failure · `130` interrupted.

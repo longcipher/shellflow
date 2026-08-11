@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# shellflow cred-wrap: export systemd credentials as environment variables.
+#
+# Installed by `shellflow deploy` at /usr/local/libexec/shellflow/cred-wrap on
+# every target. Units run it as an ExecStart prefix so that third-party or
+# closed-source applications (which read environment variables directly) work
+# with zero application changes:
+#
+#   [Service]
+#   ImportCredential=API_KEY
+#   ExecStart=/usr/local/libexec/shellflow/cred-wrap /opt/app/bin/app --config ...
+#
+# It exports every file in $CREDENTIALS_DIRECTORY using the filename as the
+# variable name, then execs the real binary. Security properties match the
+# in-app loader: values live only in the unit's read-only tmpfs credential
+# directory, are bound to the host key, and are destroyed with the unit.
+set -eu
+
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
+  for f in "$CREDENTIALS_DIRECTORY"/*; do
+    [ -f "$f" ] || continue
+    key="$(basename "$f")"
+    case "$key" in
+      [A-Za-z_][A-Za-z0-9_]*) ;;
+      *) continue ;;
+    esac
+    export "$key=$(cat "$f")"
+  done
+fi
+
+exec "$@"
