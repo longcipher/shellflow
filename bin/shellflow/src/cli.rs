@@ -223,36 +223,8 @@ pub(crate) struct SecretCredsArgs {
     pub file: PathBuf,
 }
 
-/// Arguments for `shellflow deploy`.
-#[derive(Debug, Args, Clone)]
-pub(crate) struct DeployArgs {
-    /// Service name (directory under `--service-dir`).
-    #[arg(value_name = "SERVICE")]
-    pub service: String,
-
-    /// Path to the binary to install.
-    #[arg(long, value_name = "PATH")]
-    pub binary: Option<PathBuf>,
-
-    /// Inventory file with `@server`/`@group` directives.
-    #[arg(long, value_name = "PATH", default_value = "hosts/inventory.sh")]
-    pub inventory: PathBuf,
-
-    /// Root directory containing `services/<service>/…`.
-    #[arg(long, value_name = "PATH", default_value = "services")]
-    pub service_dir: PathBuf,
-
-    /// Target group (or server) to deploy to.
-    #[arg(long, value_name = "GROUP", default_value = "all")]
-    pub group: String,
-
-    /// Shared execution flags (includes `--identity` for decryption).
-    #[command(flatten)]
-    pub flags: RunFlags,
-}
-
 /// The top-level CLI: a `run` subcommand (also the default via the bare
-/// positional `SCRIPT`), plus `keys`, `secret`, and `deploy`.
+/// positional `SCRIPT`), plus `keys` and `secret`.
 #[derive(Debug, Parser)]
 #[command(name = "shellflow", version, about, long_about)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -275,8 +247,6 @@ pub(crate) enum Command {
     Keys(KeysArgs),
     /// Encrypt, decrypt, and edit age-encrypted env files.
     Secret(SecretArgs),
-    /// Standardized multi-host service deployment.
-    Deploy(DeployArgs),
 }
 
 impl RunArgs {

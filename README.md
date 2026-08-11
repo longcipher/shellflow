@@ -77,9 +77,6 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
 - **Embedded age tooling** — `keys` (generate/public) and `secret`
   (encrypt/decrypt/edit/creds) subcommands manage identities and encrypted env
   files; no `age`/`rage` CLI required on the controller.
-- **`deploy` subcommand** — standardized multi-host service deployment from a
-  conventional layout (`hosts/inventory.sh`, `services/<svc>/env|units|configs`),
-  including per-key `systemd-creds` credential generation on each target.
 - **`--local` mode** — run remote blocks and copies on the controller instead
   of over SSH, so playbooks are debuggable without network access or target
   sudo. Output is still streamed through the UI (masked, auditable).
@@ -139,7 +136,6 @@ COMMANDS:
   run     Run a deploy script (default; `shellflow deploy.sh` still works)
   keys    Manage age identities (generate, public)
   secret  Encrypt, decrypt, and edit age-encrypted env files
-  deploy  Standardized multi-host service deployment
 
 ARGS:
   <SCRIPT>  Deploy script path [default: deploy.sh]
@@ -159,7 +155,7 @@ OPTIONS:
       --output <MODE>         stream (default) | grouped
   -l, --log-file <PATH>       Append streamed lines (tagged host+stream)
       --no-color              Disable ANSI colors
-  -i, --identity <PATH>       Age identity for @secrets/deploy decryption
+  -i, --identity <PATH>       Age identity for @secrets decryption
       --mask-min-len <N>      Minimum value length to mask for @secrets [default: 6]
       --local                 Run remote blocks/copies locally (debugging)
   -h, --help                  Print help
@@ -175,20 +171,164 @@ shellflow secret encrypt -r age1... [-o OUT] [FILE]
 shellflow secret decrypt [-i PATH] [-o OUT] [FILE]
 shellflow secret edit [-i PATH] -r age1... FILE    decrypt -> $EDITOR -> re-encrypt
 shellflow secret creds [-i PATH] FILE              print ImportCredential=KEY lines
-shellflow deploy <service> [flags]                 deploy one service to a group
 ```
-
-`deploy <service>` reads a conventional layout (overridable by flags):
-`hosts/inventory.sh` for `@server`/`@group`, `services/<service>/env/*.env.age`
-(merged lexically), `services/<service>/units/*.service`, and
-`services/<service>/configs/*`. It ships binary/units/configs, installs the
-`cred-wrap` credential→env wrapper (lets third-party apps that read env vars
-run with zero code changes), writes one host-key-bound `systemd-creds`
-credential per env key (`/etc/credstore.encrypted/<KEY>`), and reloads/restarts
-the units. Shared keys with conflicting values across services are rejected.
 
 Exit codes: `0` success · `1` plan/parse/config error · `2` CLI usage · `3`
 transport/setup failure · `4` script execution failure · `130` interrupted.
+
+## Complete secrets workflow
+
+This section walks through the full lifecycle: from initializing encryption
+keys, to encrypting secrets, to deploying them to remote servers.
+
+### 1. Generate an age identity
+
+The first step is to create an age identity (private key). This key lives only
+on the controller machine — targets never need it.
+
+```bash
+# Generate a new identity (default path: ~/.config/age/keys.txt)
+shellflow keys generate
+
+# Or specify a custom output path
+shellflow keys generate -o ~/.config/age/my-project-keys.txt
+
+# View the public key (needed for encryption)
+shellflow keys public
+# -> age1abc123def456...
+```
+
+### 2. Create an encrypted env file
+
+Write your secrets to a plaintext file (one `KEY=VALUE` per line), then encrypt
+it with the public key. The plaintext file should never be committed to git.
+
+```bash
+# Create a plaintext env file (FOR ILLUSTRATION ONLY — delete after encrypting)
+cat > prod.env <<'EOF'
+API_KEY=sk-prod-abcdef1234567890
+API_SECRET=ss-prod-xyz7890123456789
+DB_PASSWORD=db-pass-s3cur3-2024!
+LOG_LEVEL=info
+EOF
+
+# Encrypt with the public key
+shellflow secret encrypt \
+  -r "$(shellflow keys public)" \
+  -o services/myapp/env/prod.env.age \
+  prod.env
+
+# Verify the file is encrypted (binary, unreadable)
+head -c 80 services/myapp/env/prod.env.age
+# -> age-encrypted...garbage
+
+# Securely delete the plaintext
+shred -u prod.env
+```
+
+### 3. Debug and inspect encrypted values
+
+View which keys are in an encrypted file without decrypting to disk:
+
+```bash
+# Print the ImportCredential=KEY lines (for systemd unit files)
+shellflow secret creds services/myapp/env/prod.env.age
+# -> ImportCredential=API_KEY
+# -> ImportCredential=API_SECRET
+# -> ImportCredential=DB_PASSWORD
+
+# Decrypt to stdout for a quick peek
+shellflow secret decrypt services/myapp/env/prod.env.age
+# -> API_KEY=sk-prod-abcdef1234567890
+# -> API_SECRET=ss-prod-xyz7890123456789
+# -> ...
+
+# Edit a value in-place (decrypts, opens $EDITOR, re-encrypts)
+# NOTE: --recipients is required to re-encrypt (age is anonymous)
+shellflow secret edit \
+  -i ~/.config/age/keys.txt \
+  -r "$(shellflow keys public)" \
+  services/myapp/env/prod.env.age
+```
+
+### 4. Use `@secrets` in a playbook
+
+Reference the encrypted file in a playbook with the `@secrets` directive.
+shellflow decrypts it at runtime, injects the keys as environment variables,
+and masks all values in output.
+
+```bash
+#!/usr/bin/env shellflow
+# @server trade    trade
+# @server api      api
+# @group  all      trade,api
+
+# Decrypt and inject secrets (masked in output)
+# @secrets services/myapp/env/prod.env.age
+
+# @remote all
+# @timeout 120
+set -eu
+# LT_SECRET_KEYS is automatically exported by @secrets
+for key in $LT_SECRET_KEYS; do
+  printf '%s' "${!key}" | sudo systemd-creds encrypt \
+    --with-key=host --name="$key" - "/etc/credstore.encrypted/${key}"
+done
+sudo systemctl daemon-reload
+sudo systemctl restart myapp
+```
+
+Run it:
+
+```bash
+# Local dry-run to verify
+shellflow --dry-run --diff --local -i ~/.config/age/keys.txt playbook.sh
+
+# Real run against all hosts
+shellflow -i ~/.config/age/keys.txt playbook.sh
+
+# Single host canary
+shellflow -t trade -i ~/.config/age/keys.txt playbook.sh
+```
+
+### 5. End-to-end: deploy demo-secret-app
+
+The repository includes a complete working example:
+[`playbooks/deploy-demo.sh`](playbooks/deploy-demo.sh) deploys the
+`demo-secret-app` binary to `trade` and `api` servers (configured in
+`~/.ssh/config`).
+
+The demo uses the **cred-wrap** approach: systemd host-key-bound credentials
+are exported as environment variables by the `cred-wrap` wrapper before
+exec'ing the app. No application code changes needed — works with any
+third-party or closed-source project that reads env vars.
+
+```bash
+# 1. Preview the deployment
+shellflow --dry-run --diff playbooks/deploy-demo.sh
+
+# 2. Real deployment
+shellflow playbooks/deploy-demo.sh
+
+# 3. Verify on a remote host
+ssh trade "sudo journalctl -u demo-secret-app.service --no-pager -n 20"
+```
+
+Expected output on the target:
+
+```
+--- demo-secret-app ---
+LOG_LEVEL=info
+
+  API_KEY=sk-p...7890 (len=24)
+  API_SECRET=ss-p...6789 (len=24)
+  DB_PASSWORD=db-p...024! (len=20)
+
+All secrets present. App is ready.
+```
+
+See [`docs/workflow-demo-secret-app.md`](docs/workflow-demo-secret-app.md) for
+the full detailed walkthrough.
 
 ## Examples
 
@@ -203,17 +343,15 @@ shellflow -k playbooks/deploy.sh          # syntax-check everything
 shellflow -c --only ship-marker playbooks/deploy.sh  # copy step, keep going
 shellflow --local deploy.sh            # run remote blocks locally for debugging
 
-# Secrets (embedded age; no age/rage CLI needed)
+# Secrets workflow
 shellflow keys generate -o ~/.config/age/keys.txt
 shellflow secret encrypt -r "$(shellflow keys public)" -o prod.env.age < prod.env
 shellflow secret edit -r "$(shellflow keys public)" prod.env.age
-shellflow secret creds prod.env.age     # -> ImportCredential=KEY lines
-shellflow run -i ~/.config/age/keys.txt --local playbook-with-secrets.sh
+shellflow secret creds prod.env.age
+shellflow -i ~/.config/age/keys.txt --local playbook-with-secrets.sh
 
-# Standardized deployment
-shellflow deploy web --local --dry-run --diff
-shellflow deploy web                    # ship + install + restart (all hosts)
-shellflow deploy web -t web-1           # canary a single host
+# Full deployment
+shellflow playbooks/deploy-demo.sh
 ```
 
 [`playbooks/deploy.sh`](playbooks/deploy.sh) is a runnable playbook that

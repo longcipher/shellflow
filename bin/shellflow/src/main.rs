@@ -9,7 +9,6 @@
 #![allow(clippy::print_stderr)]
 
 mod cli;
-mod deploy;
 mod executor;
 mod keys;
 mod preflight;
@@ -17,14 +16,14 @@ mod secret;
 mod secrets;
 mod ui;
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use clap::Parser;
 use eyre::{Context as _, Result};
 use tokio::sync::Mutex;
 
 use crate::{
-    cli::{Cli, Command, DeployArgs, RunArgs},
+    cli::{Cli, Command, RunArgs},
     executor::{RunError, RunOutcome, StepStats, execute_plan},
     preflight::{preflight_check, preflight_check_local},
     ui::HostStatus,
@@ -55,7 +54,6 @@ async fn main() -> Result<()> {
                 1
             }
         },
-        Some(Command::Deploy(args)) => deploy_command(args).await,
     };
     std::process::exit(code);
 }
@@ -87,26 +85,6 @@ async fn run_or_deploy(run: &RunArgs) -> i32 {
     };
 
     run_plan(run, plan).await
-}
-
-/// The `deploy` subcommand: build the plan from the repository layout, then
-/// execute it with the shared engine.
-async fn deploy_command(args: &DeployArgs) -> i32 {
-    if let Err(msg) = run_preflight_flags(&args.flags) {
-        eprintln!("error: {msg}");
-        return 3;
-    }
-
-    let plan = match deploy::build_plan(args) {
-        Ok(plan) => plan,
-        Err(err) => {
-            eprintln!("error: {err:#}");
-            return 1;
-        }
-    };
-
-    let run = RunArgs { script: Path::new("deploy.sh").to_path_buf(), flags: args.flags.clone() };
-    run_plan(&run, plan).await
 }
 
 /// Preflight for the `run` path; `--local` needs only `bash`.
