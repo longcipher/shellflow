@@ -236,6 +236,11 @@ public in `shellflow-core`), then runs it through the existing executor:
    (`rsync` delta, or `scp` fallback; dry-run/diff supported).
 2. **install** — one `@remote` block per group:
    - install binary, units (`/etc/systemd/system/`), configs;
+   - install the **`cred-wrap`** helper once per host
+     (`/usr/local/libexec/shellflow/cred-wrap`): a credential→env wrapper that
+     exports every file in `$CREDENTIALS_DIRECTORY` and `exec`s the real
+     binary — third-party/closed-source apps that only read env vars need
+     **zero code changes** (the in-app loader is only for self-owned code);
    - create `/etc/credstore.encrypted` (0700 root);
    - for each key from the merged env: `printf '%s' "${!key}" | systemd-creds
      encrypt --with-key=host --name="$key" - /etc/credstore.encrypted/<KEY>`;
