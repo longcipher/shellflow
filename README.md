@@ -69,6 +69,20 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
   trace output, and log files, and never appear in any argv. The `@env KEY`
   passthrough form inherits from shellflow's own environment and is not
   redacted.
+- **Encrypted config (`@secrets`)** — `# @secrets file.env.age` decrypts an
+  `age`-encrypted env file on the controller, injects every key into the
+  block environment, exports the space-separated key list as
+  `LT_SECRET_KEYS`, and masks all values in previews/traces/logs. Targets
+  never see the decryption identity.
+- **Embedded age tooling** — `keys` (generate/public) and `secret`
+  (encrypt/decrypt/edit/creds) subcommands manage identities and encrypted env
+  files; no `age`/`rage` CLI required on the controller.
+- **`deploy` subcommand** — standardized multi-host service deployment from a
+  conventional layout (`hosts/inventory.sh`, `services/<svc>/env|units|configs`),
+  including per-key `systemd-creds` credential generation on each target.
+- **`--local` mode** — run remote blocks and copies on the controller instead
+  of over SSH, so playbooks are debuggable without network access or target
+  sudo. Output is still streamed through the UI (masked, auditable).
 
 ## Install
 
@@ -92,6 +106,7 @@ lines belong to the current block.
 | `@server` | `# @server <name> <ssh-spec>` | Alias a host. `<ssh-spec>` = `[user@]host[:port]`, or a `~/.ssh/config` host alias |
 | `@group` | `# @group <name> <member>[,<member>…]` | Alias a group of servers |
 | `@env` | `# @env <KEY>` / `# @env <KEY>=<value>` | Inject an env var into later blocks; no `=value` copies from shellflow's environment. Literal values are masked in output |
+| `@secrets` | `# @secrets <file.env.age> [--identity <PATH>]` | Decrypt an age-encrypted env file at run time; inject keys into later blocks, export the key list as `LT_SECRET_KEYS`, and mask all values. Resolution is a hard error without a usable identity |
 | `@local` | `# @local` | Following lines run locally (default) |
 | `@remote` | `# @remote <target>` | Following lines stream to the target (alias, group, or raw spec) |
 | `@copy` | `# @copy <src> -> <dst> @<target> [--delete]` | Copy a local path to the target (rsync, or scp fallback); creates the destination directory; supports `$VAR` interpolation |
@@ -118,6 +133,13 @@ Key rules:
 
 ```text
 USAGE: shellflow [OPTIONS] [SCRIPT]
+       shellflow <COMMAND>
+
+COMMANDS:
+  run     Run a deploy script (default; `shellflow deploy.sh` still works)
+  keys    Manage age identities (generate, public)
+  secret  Encrypt, decrypt, and edit age-encrypted env files
+  deploy  Standardized multi-host service deployment
 
 ARGS:
   <SCRIPT>  Deploy script path [default: deploy.sh]
@@ -137,11 +159,34 @@ OPTIONS:
       --output <MODE>         stream (default) | grouped
   -l, --log-file <PATH>       Append streamed lines (tagged host+stream)
       --no-color              Disable ANSI colors
+  -i, --identity <PATH>       Age identity for @secrets/deploy decryption
+      --mask-min-len <N>      Minimum value length to mask for @secrets [default: 6]
+      --local                 Run remote blocks/copies locally (debugging)
   -h, --help                  Print help
   -V, --version               Print version
 ```
 
-Exit codes: `0` success · `1` plan/parse error · `2` CLI usage · `3`
+Subcommand details:
+
+```text
+shellflow keys generate [-o PATH]         write a new identity (never overwrites)
+shellflow keys public [-i PATH]           print the age1... public key
+shellflow secret encrypt -r age1... [-o OUT] [FILE]
+shellflow secret decrypt [-i PATH] [-o OUT] [FILE]
+shellflow secret edit [-i PATH] -r age1... FILE    decrypt -> $EDITOR -> re-encrypt
+shellflow secret creds [-i PATH] FILE              print ImportCredential=KEY lines
+shellflow deploy <service> [flags]                 deploy one service to a group
+```
+
+`deploy <service>` reads a conventional layout (overridable by flags):
+`hosts/inventory.sh` for `@server`/`@group`, `services/<service>/env/*.env.age`
+(merged lexically), `services/<service>/units/*.service`, and
+`services/<service>/configs/*`. It ships binary/units/configs, writes one
+host-key-bound `systemd-creds` credential per env key
+(`/etc/credstore.encrypted/<KEY>`), and reloads/restarts the units. Shared keys
+with conflicting values across services are rejected.
+
+Exit codes: `0` success · `1` plan/parse/config error · `2` CLI usage · `3`
 transport/setup failure · `4` script execution failure · `130` interrupted.
 
 ## Examples
@@ -155,6 +200,19 @@ shellflow -t api playbooks/deploy.sh      # deploy to a single host
 shellflow --only facts playbooks/deploy.sh     # run just one named block
 shellflow -k playbooks/deploy.sh          # syntax-check everything
 shellflow -c --only ship-marker playbooks/deploy.sh  # copy step, keep going
+shellflow --local deploy.sh            # run remote blocks locally for debugging
+
+# Secrets (embedded age; no age/rage CLI needed)
+shellflow keys generate -o ~/.config/age/keys.txt
+shellflow secret encrypt -r "$(shellflow keys public)" -o prod.env.age < prod.env
+shellflow secret edit -r "$(shellflow keys public)" prod.env.age
+shellflow secret creds prod.env.age     # -> ImportCredential=KEY lines
+shellflow run -i ~/.config/age/keys.txt --local playbook-with-secrets.sh
+
+# Standardized deployment
+shellflow deploy web --local --dry-run --diff
+shellflow deploy web                    # ship + install + restart (all hosts)
+shellflow deploy web -t web-1           # canary a single host
 ```
 
 [`playbooks/deploy.sh`](playbooks/deploy.sh) is a runnable playbook that

@@ -44,6 +44,18 @@ pub enum EnvEntry {
     },
 }
 
+/// An encrypted secrets file referenced by `@secrets`.
+///
+/// The parser records only the path; decryption happens at execution time in
+/// the binary, keeping `shellflow-core` pure and I/O-free.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretEntry {
+    /// Path to the encrypted age file (`.env.age`).
+    pub file: String,
+    /// Optional explicit identity path (`--identity`), resolved by the runner.
+    pub identity: Option<String>,
+}
+
 /// A block of Bash lines executed on the local machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalStep {
@@ -169,6 +181,8 @@ pub struct ExecutionPlan {
     pub groups: BTreeMap<String, Vec<String>>,
     /// All `@env` entries in declaration order.
     pub env: Vec<EnvEntry>,
+    /// All `@secrets` file references in declaration order.
+    pub secrets: Vec<SecretEntry>,
     /// The steps, in declaration order.
     pub steps: Vec<Step>,
 }

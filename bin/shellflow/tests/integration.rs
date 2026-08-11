@@ -652,3 +652,137 @@ unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
+
+// ---------------------------------------------------------------------------
+// Local mode + secrets (keys/secret/@secrets subcommands)
+// ---------------------------------------------------------------------------
+
+impl Sandbox {
+    /// Run the binary with arbitrary args (no script positional) under the
+    /// mock PATH.
+    fn run_args(&self, args: &[&str]) -> TestResult<Output> {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_shellflow"));
+        cmd.args(args);
+        cmd.env("MOCK_DIR", self.mock_dir());
+        cmd.env("PATH", format!("{}:/usr/bin:/bin", self.mock_dir().display()));
+        cmd.output().map_err(|e| e.to_string())
+    }
+}
+
+#[test]
+fn local_mode_runs_remote_blocks_without_ssh() -> TestResult<()> {
+    let sb = Sandbox::new("local-mode")?;
+    let script = sb.script("# @remote web\necho LOCAL_REMOTE_OUTPUT\n")?;
+    let out = sb.run(&script, &["--local"])?;
+    assert_eq!(status_code(&out), 0);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("LOCAL_REMOTE_OUTPUT"), "local remote output missing: {stdout}");
+    // The mock ssh must never have been invoked.
+    assert!(!sb.dir.join(SSH_LOG).exists(), "ssh should not run in local mode");
+    Ok(())
+}
+
+#[test]
+fn local_copy_creates_parent_dir() -> TestResult<()> {
+    let sb = Sandbox::new("local-copy")?;
+    let src = sb.dir.join("src.txt");
+    fs::write(&src, "data").map_err(|e| e.to_string())?;
+    let dst = std::env::temp_dir().join("shellflow-it-local-copy-dst.txt");
+    let _ = fs::remove_file(&dst);
+    let script = sb.script(&format!("# @copy {} -> {} @web\n", src.display(), dst.display()))?;
+    let out = sb.run(&script, &["--local"])?;
+    assert_eq!(status_code(&out), 0);
+    assert!(dst.exists(), "local copy should create the parent and file");
+    let _ = fs::remove_file(&dst);
+    Ok(())
+}
+
+#[test]
+fn keys_and_secret_round_trip() -> TestResult<()> {
+    let sb = Sandbox::new("keys")?;
+    let key = sb.dir.join("keys.txt");
+    let out = sb.run_args(&["keys", "generate", "-o", &key.display().to_string()])?;
+    assert_eq!(status_code(&out), 0, "keys generate failed: {out:?}");
+    assert!(key.exists());
+
+    let out = sb.run_args(&["keys", "public", "-i", &key.display().to_string()])?;
+    assert_eq!(status_code(&out), 0);
+    let pubkey = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(pubkey.starts_with("age1"), "unexpected public key: {pubkey}");
+
+    let plain = sb.dir.join("plain.env");
+    fs::write(&plain, "DB_PASSWORD=topsecret\nRUST_LOG=info\n").map_err(|e| e.to_string())?;
+    let age = sb.dir.join("plain.env.age");
+    let out = sb.run_args(&[
+        "secret",
+        "encrypt",
+        "-r",
+        &pubkey,
+        "-o",
+        &age.display().to_string(),
+        &plain.display().to_string(),
+    ])?;
+    assert_eq!(status_code(&out), 0, "encrypt failed: {out:?}");
+
+    let out = sb.run_args(&[
+        "secret",
+        "decrypt",
+        "-i",
+        &key.display().to_string(),
+        &age.display().to_string(),
+    ])?;
+    assert_eq!(status_code(&out), 0);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("DB_PASSWORD=topsecret"), "decrypt mismatch: {stdout}");
+
+    let out = sb.run_args(&[
+        "secret",
+        "creds",
+        "-i",
+        &key.display().to_string(),
+        &age.display().to_string(),
+    ])?;
+    assert_eq!(status_code(&out), 0);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ImportCredential=DB_PASSWORD"), "creds mismatch: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn secrets_injected_and_masked_in_local_mode() -> TestResult<()> {
+    let sb = Sandbox::new("secrets")?;
+    let key = sb.dir.join("keys.txt");
+    let out = sb.run_args(&["keys", "generate", "-o", &key.display().to_string()])?;
+    assert_eq!(status_code(&out), 0);
+
+    let out = sb.run_args(&["keys", "public", "-i", &key.display().to_string()])?;
+    let pubkey = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let plain = sb.dir.join("s.env");
+    fs::write(&plain, "MY_SECRET=supersecret_xyz_123\n").map_err(|e| e.to_string())?;
+    let age = sb.dir.join("s.env.age");
+    let out = sb.run_args(&[
+        "secret",
+        "encrypt",
+        "-r",
+        &pubkey,
+        "-o",
+        &age.display().to_string(),
+        &plain.display().to_string(),
+    ])?;
+    assert_eq!(status_code(&out), 0);
+
+    let script = sb.script(&format!(
+        "# @secrets {}\n\
+         # @remote web\n\
+         echo \"value=$MY_SECRET keys=$LT_SECRET_KEYS\"\n",
+        age.display()
+    ))?;
+    let out = sb.run(&script, &["--local", "-i", &key.display().to_string()])?;
+    assert_eq!(status_code(&out), 0, "run failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("supersecret_xyz_123"), "secret leaked: {stdout}");
+    assert!(stdout.contains("***"), "secret not masked: {stdout}");
+    assert!(stdout.contains("MY_SECRET"), "LT_SECRET_KEYS missing: {stdout}");
+    Ok(())
+}
