@@ -7,6 +7,7 @@
 //! process — no orphans survive.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -126,6 +127,80 @@ impl StepConfig {
     }
 }
 
+/// The login shell detected on a remote host.
+///
+/// Remote payloads stream over `ssh host <shell> -l -s` so a target sees the
+/// same login profile files as a manual `ssh host`. When the probe fails or
+/// the shell is unsupported, bash is the fallback, preserving the "targets
+/// only need bash" contract (§9).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RemoteShell {
+    #[default]
+    Bash,
+    Zsh,
+}
+
+impl RemoteShell {
+    /// Detect the shell from the basename of a `$SHELL` value; anything that
+    /// is not `zsh` (fish, nushell, unknown, empty) falls back to bash.
+    /// Surrounding whitespace (e.g. a trailing newline from `printf`) is
+    /// trimmed first.
+    #[must_use]
+    fn detect(shell: &str) -> Self {
+        match shell.trim().rsplit('/').next() {
+            Some("zsh") => Self::Zsh,
+            _ => Self::Bash,
+        }
+    }
+
+    /// The interpreter argv passed to `ssh host …`, e.g. `bash -l -s`.
+    ///
+    /// Syntax checks always run under plain `bash -n -s`: they only need a
+    /// parser, never a login environment, and bash is guaranteed present.
+    #[must_use]
+    const fn invoke(self, syntax_only: bool) -> &'static str {
+        if syntax_only {
+            return "bash -n -s";
+        }
+        match self {
+            Self::Bash => "bash -l -s",
+            Self::Zsh => "zsh -l -s",
+        }
+    }
+}
+
+/// The probed login environment of a remote host: which login shell to use
+/// for streaming, the PATH that an interactive login would see, and whether
+/// `rsync` is available for copy steps.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RemoteEnv {
+    /// Login shell (`bash -l -s` / `zsh -l -s`).
+    shell: RemoteShell,
+    /// PATH from the user's rc file (where toolchain managers export it).
+    ///
+    /// The rc file is *not* sourced inside payloads — interactive configs
+    /// (oh-my-zsh hooks, aliases, prompts) break `set -eu` in scripts — so we
+    /// extract only the resulting PATH during the probe and inject it into
+    /// the payload's env block instead.
+    path: Option<String>,
+    /// Whether the remote host has `rsync` on its PATH (drives the scp
+    /// fallback for `@copy`).
+    has_rsync: bool,
+}
+
+/// Shared, per-run cache of probed remote environments, keyed by ssh
+/// destination so a multi-step playbook probes each host exactly once.
+type ShellCache = Arc<Mutex<HashMap<String, RemoteEnv>>>;
+
+/// Cache key for a host: `user@host[:port]`.
+#[must_use]
+fn shell_cache_key(host: &ResolvedHost) -> String {
+    match host.spec.port {
+        Some(port) => format!("{}:{port}", host.spec.dest()),
+        None => host.spec.dest(),
+    }
+}
+
 /// Execute the plan and return the overall outcome.
 ///
 /// Completed step statistics are appended to `progress` so that a signal
@@ -157,6 +232,9 @@ pub(crate) async fn execute_plan(
         .collect();
 
     let run_state = Arc::new(Mutex::new(RunState::default()));
+    // Remote login shells are probed once per host and cached for the whole
+    // run (see `RemoteShell` / `resolve_remote_shell`).
+    let shell_cache: ShellCache = Arc::new(Mutex::new(HashMap::new()));
 
     // Resolve `@secrets` before the first step: decrypt, inject into run-state
     // env, and register every value for masking.
@@ -216,7 +294,16 @@ pub(crate) async fn execute_plan(
             Step::Local(local) => run_local_step(&ui, &run_state, local, config).await,
             Step::Remote(remote) => match resolve_hosts(&plan, &remote.target, &restrict) {
                 Ok(hosts) => {
-                    run_remote_step(&ui, &semaphore, &run_state, remote, hosts, config).await
+                    run_remote_step(
+                        &ui,
+                        &semaphore,
+                        &run_state,
+                        remote,
+                        hosts,
+                        config,
+                        &shell_cache,
+                    )
+                    .await
                 }
                 Err(err) => {
                     crate::ui::step_failed(step_no, &err.to_string());
@@ -225,7 +312,10 @@ pub(crate) async fn execute_plan(
                 }
             },
             Step::Copy(copy) => match resolve_hosts(&plan, &copy.target, &restrict) {
-                Ok(hosts) => run_copy_step(&ui, &semaphore, &run_state, copy, hosts, config).await,
+                Ok(hosts) => {
+                    run_copy_step(&ui, &semaphore, &run_state, copy, hosts, config, &shell_cache)
+                        .await
+                }
                 Err(err) => {
                     crate::ui::step_failed(step_no, &err.to_string());
                     fail_fast_error = Some(RunError::Script);
@@ -314,44 +404,40 @@ fn outcome_to_statuses(outcome: &Result<Vec<(String, HostOutcome)>>) -> Vec<Host
 // Local steps
 // ---------------------------------------------------------------------------
 
-async fn run_local_step(
+/// Execute a Bash block as a local `bash -c` process, sharing the same
+/// `set -eu`/`set -x` header and fail-fast semantics as remote blocks.
+///
+/// This is the single local-execution primitive used by both local steps and
+/// `--local` mode (where remote blocks run on the controller). The `capture`
+/// argument, when non-empty, appends `@export` capture lines and reads the
+/// values back into `run_state` afterwards.
+async fn run_local_block(
     ui: &ArcUi,
     run_state: &Arc<Mutex<RunState>>,
-    local: &LocalStep,
+    script: &str,
+    env: &[EnvEntry],
     config: StepConfig,
-) -> Result<Vec<(String, HostOutcome)>> {
-    if let Some(guard) = &local.guard &&
-        !run_local_guard(guard, config.timeout).await
-    {
-        crate::ui::note("  ↳ local guard failed — skipping block");
-        return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
-    }
-
-    if config.dry_run || config.verbose >= 2 {
-        ui.lock().await.payload_preview("Local Payload", &local.script);
-    }
-
+    capture: &[String],
+) -> Result<()> {
     if config.check || config.dry_run {
-        run_bash_n(&local.script).await?;
+        run_bash_n(script).await?;
         crate::ui::note("  ↳ local syntax check (bash -n): OK");
-        return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
+        return Ok(());
     }
 
-    let env = build_env(run_state, &local.env).await;
+    let resolved = build_env(run_state, env).await;
     let mut cmd = Command::new("bash");
     cmd.arg("-c");
-    cmd.envs(env);
+    cmd.envs(resolved);
 
-    // Mirror the remote payload header: `set -eu` by default, `set -x` at
-    // -vvv, so local and remote blocks share the same fail-fast semantics.
+    // `set -eu` by default, `set -eux` at -vvv, so local and remote blocks
+    // share the same fail-fast semantics.
     let header = if config.verbose >= 3 { "set -eux\n" } else { "set -eu\n" };
-    let body = if local.export.is_empty() {
-        local.script.clone()
-    } else {
-        append_capture(&local.script, &local.export)
-    };
+    let body =
+        if capture.is_empty() { script.to_string() } else { append_capture(script, capture) };
     cmd.arg(format!("{header}{body}"));
-    let capture_path = if local.export.is_empty() {
+
+    let capture_path = if capture.is_empty() {
         None
     } else {
         let path = capture_file_path();
@@ -376,10 +462,33 @@ async fn run_local_step(
         bail!("local script exited with status {status}");
     }
 
-    if let Some(path) = &capture_path {
-        capture_exports(run_state, &local.export, path).await?;
+    if let Some(path) = capture_path {
+        capture_exports(run_state, capture, &path).await?;
     }
-    Ok(vec![("localhost".to_string(), HostOutcome::Ok)])
+    Ok(())
+}
+
+async fn run_local_step(
+    ui: &ArcUi,
+    run_state: &Arc<Mutex<RunState>>,
+    local: &LocalStep,
+    config: StepConfig,
+) -> Result<Vec<(String, HostOutcome)>> {
+    if let Some(guard) = &local.guard &&
+        !run_local_guard(guard, config.timeout).await
+    {
+        crate::ui::note("  ↳ local guard failed — skipping block");
+        return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
+    }
+
+    if config.dry_run || config.verbose >= 2 {
+        ui.lock().await.payload_preview("Local Payload", &local.script);
+    }
+
+    match run_local_block(ui, run_state, &local.script, &local.env, config, &local.export).await {
+        Ok(()) => Ok(vec![("localhost".to_string(), HostOutcome::Ok)]),
+        Err(err) => Err(err),
+    }
 }
 
 async fn run_local_guard(guard: &str, timeout: Option<u64>) -> bool {
@@ -586,6 +695,7 @@ async fn run_remote_step(
     remote: &RemoteStep,
     hosts: Vec<ResolvedHost>,
     config: StepConfig,
+    shell_cache: &ShellCache,
 ) -> Result<Vec<(String, HostOutcome)>> {
     if config.local {
         return run_remote_step_local(ui, run_state, remote, config).await;
@@ -599,20 +709,26 @@ async fn run_remote_step(
 
     let env = build_env(run_state, &remote.env).await;
     let trace_line = if config.verbose >= 3 { "set -x\n" } else { "" };
-    let payload = format!("set -eu\n{}{}{}", render_env(&env), trace_line, remote.script);
-
+    // The payload is assembled per host: each host's probed login PATH is
+    // injected into its env block, so the rc file never needs sourcing inside
+    // the payload (interactive configs break `set -eu` in scripts).
+    let parts = PayloadParts {
+        script: remote.script.clone(),
+        guard: remote.guard.clone(),
+        env,
+        trace_line,
+    };
     let mut tasks = JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(ui);
         let semaphore = semaphore.clone();
-        let payload = payload.clone();
-        let guard = remote.guard.clone();
-        let env = env.clone();
+        let parts = parts.clone();
+        let shell_cache = Arc::clone(shell_cache);
         tasks.spawn(async move {
             if let Some(semaphore) = &semaphore {
                 let _permit = Arc::clone(semaphore).acquire_owned().await;
             }
-            run_remote_host(ui, &host, &payload, guard.as_deref(), &env, config).await
+            run_remote_host(ui, &host, &parts, config, shell_cache).await
         });
     }
 
@@ -643,46 +759,50 @@ async fn run_remote_step_local(
         return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
     }
 
-    if config.check || config.dry_run {
-        run_bash_n(&remote.script).await?;
-        crate::ui::note("  ↳ local syntax check (bash -n): OK");
-        return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
+    // Reuse the local execution primitive; remote blocks have no `@export`.
+    match run_local_block(ui, run_state, &remote.script, &remote.env, config, &[]).await {
+        Ok(()) => Ok(vec![("localhost".to_string(), HostOutcome::Ok)]),
+        Err(err) => Err(err),
     }
+}
 
-    let env = build_env(run_state, &remote.env).await;
-    let trace_line = if config.verbose >= 3 { "set -x\n" } else { "" };
-    let payload = format!("set -eu\n{}{}{}", render_env(&env), trace_line, remote.script);
-
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(&payload);
-    // Stream output through the UI so secrets are masked and `--log-file`
-    // captures local-mode output too.
-    let status = run_bash_streamed(ui, "localhost", cmd, config.timeout).await?;
-    if !status.success() {
-        bail!("local (remote block) exited with status {status}");
-    }
-    Ok(vec![("localhost".to_string(), HostOutcome::Ok)])
+/// The per-block payload inputs shared across hosts.
+///
+/// The env is extended per host with that host's probed login PATH before the
+/// payload is assembled (see [`with_login_path`]).
+#[derive(Clone)]
+struct PayloadParts {
+    /// The block's Bash lines, verbatim.
+    script: String,
+    /// Optional `@only_if` guard command.
+    guard: Option<String>,
+    /// The block env (`@env`/`@export` state).
+    env: Vec<(String, String)>,
+    /// `set -x\n` at `-vvv`, otherwise empty.
+    trace_line: &'static str,
 }
 
 async fn run_remote_host(
     ui: ArcUi,
     host: &ResolvedHost,
-    payload: &str,
-    guard: Option<&str>,
-    env: &[(String, String)],
+    parts: &PayloadParts,
     config: StepConfig,
+    shell_cache: ShellCache,
 ) -> (String, HostOutcome) {
     // Dry-run/check: syntax-check the payload on each host, never execute.
+    // No env probe: plain `bash -n -s` needs no login environment.
     if config.check || config.dry_run {
+        let payload =
+            format!("set -eu\n{}{}{}", render_env(&parts.env), parts.trace_line, parts.script);
         if config.verbose >= 2 {
-            let cmd = build_ssh_cmd(host, true, config);
+            let cmd = build_ssh_cmd(host, RemoteShell::Bash, true, config);
             crate::ui::note(&format!("  [{}] ssh {}", host.alias, display_args(&cmd)));
         }
         return match run_ssh_child(
             ui,
             host,
-            build_ssh_cmd(host, true, config),
-            payload,
+            build_ssh_cmd(host, RemoteShell::Bash, true, config),
+            &payload,
             config.timeout,
         )
         .await
@@ -691,17 +811,19 @@ async fn run_remote_host(
                 crate::ui::note(&format!("[{}] syntax check (bash -n): OK", host.alias));
                 (host.alias.clone(), HostOutcome::Ok)
             }
-            Err(err) => {
-                crate::ui::warn(&format!("[{}] {err:#}", host.alias));
-                (host.alias.clone(), classify_ssh_err(&err))
+            Err(outcome) => {
+                crate::ui::warn(&format!("[{}] {outcome:?}", host.alias));
+                (host.alias.clone(), classify_ssh(outcome))
             }
         };
     }
 
-    // Real run: evaluate the guard (with the same env as the block), then
-    // stream the payload.
-    if let Some(guard) = guard {
-        match run_remote_guard(host, guard, env, config.timeout).await {
+    // Real run: probe (and cache) the login environment once, evaluate the
+    // guard, then stream the payload — all with the probed PATH injected.
+    let remote_env = resolve_remote_env(host, &shell_cache).await;
+    let payload_env = with_login_path(parts.env.clone(), remote_env.path.as_deref());
+    if let Some(guard) = &parts.guard {
+        match run_remote_guard(host, remote_env.shell, guard, &payload_env, config.timeout).await {
             GuardResult::Pass => {}
             GuardResult::Fail => {
                 crate::ui::note(&format!("[{}] SKIPPED (guard)", host.alias));
@@ -713,41 +835,142 @@ async fn run_remote_host(
         }
     }
 
-    let cmd = build_ssh_cmd(host, false, config);
+    let payload =
+        format!("set -eu\n{}{}{}", render_env(&payload_env), parts.trace_line, parts.script);
+    let cmd = build_ssh_cmd(host, remote_env.shell, false, config);
     if config.verbose >= 2 {
         crate::ui::note(&format!("  [{}] ssh {}", host.alias, display_args(&cmd)));
     }
-    match run_ssh_child(ui, host, cmd, payload, config.timeout).await {
+    match run_ssh_child(ui, host, cmd, &payload, config.timeout).await {
         Ok(()) => (host.alias.clone(), HostOutcome::Ok),
-        Err(err) => {
-            crate::ui::warn(&format!("[{}] {err:#}", host.alias));
-            (host.alias.clone(), classify_ssh_err(&err))
+        Err(outcome) => {
+            crate::ui::warn(&format!("[{}] {outcome:?}", host.alias));
+            (host.alias.clone(), classify_ssh(outcome))
         }
     }
 }
 
-/// Build the `ssh` command for a host: `ssh [-p port] [-v] host <bash…>`.
-fn build_ssh_cmd(host: &ResolvedHost, syntax_only: bool, config: StepConfig) -> Command {
+/// Layer the probed login PATH onto the block env: an explicit `@env
+/// PATH=…`/`@export PATH` always wins, otherwise the probe result is used.
+#[must_use]
+fn with_login_path(mut env: Vec<(String, String)>, path: Option<&str>) -> Vec<(String, String)> {
+    if env.iter().any(|(k, _)| k == "PATH") {
+        return env;
+    }
+    if let Some(path) = path {
+        env.push(("PATH".to_string(), path.to_string()));
+    }
+    env
+}
+
+/// Build the `ssh` command for a host: `ssh [-p port] [-v] host <interp>`.
+///
+/// Real runs use the host's login shell (`<shell> -l -s`) so remote blocks
+/// see the user's login PATH; syntax checks stay on plain `bash -n -s`.
+fn build_ssh_cmd(
+    host: &ResolvedHost,
+    shell: RemoteShell,
+    syntax_only: bool,
+    config: StepConfig,
+) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.args(host.spec.to_ssh_args()).arg("-T");
     if config.verbose >= 3 {
         cmd.arg("-v");
     }
-    cmd.arg(if syntax_only { "bash -n -s" } else { "bash -s" });
+    cmd.arg(shell.invoke(syntax_only));
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
     cmd
 }
 
-/// Map an ssh error string to a host outcome.
-fn classify_ssh_err(err: &eyre::Report) -> HostOutcome {
-    let msg = err.to_string();
-    if msg.contains("timed out") {
-        HostOutcome::TimedOut
-    } else if msg.contains("exit 255") {
-        HostOutcome::Failed(RunError::Transport)
-    } else {
-        HostOutcome::Failed(RunError::Script)
+/// Look up (or probe and cache) the login environment for a host.
+///
+/// The probe is a single `ssh host …` round trip, run once per host per
+/// playbook run (the cache lives for the whole run).
+async fn resolve_remote_env(host: &ResolvedHost, cache: &ShellCache) -> RemoteEnv {
+    let key = shell_cache_key(host);
+    if let Some(env) = cache.lock().await.get(&key) {
+        return env.clone();
+    }
+    let env = probe_remote_env(host).await;
+    cache.lock().await.insert(key, env.clone());
+    env
+}
+
+/// The remote probe script: prints the login shell on line 1 and the PATH
+/// that an interactive login would see on line 2.
+///
+/// The rc file is sourced *inside the probe shell only* (`>/dev/null 2>&1`
+/// keeps any greeting or noise off stdout) so the resulting PATH — including
+/// toolchain managers' entries — is captured without ever loading the rc's
+/// hooks/aliases into a `set -eu` payload. A missing rc, an unknown shell,
+/// or a probe failure simply leaves the PATH unset (payloads then run with
+/// the plain ssh PATH).
+const PROBE_SCRIPT: &str = r#"
+{
+    printf '%s\n' "$SHELL";
+    if [ -n "$ZSH_VERSION" ]; then
+        . "$HOME/.zshrc" >/dev/null 2>&1 || true
+    elif [ -n "$BASH_VERSION" ]; then
+        . "$HOME/.bashrc" >/dev/null 2>&1 || true
+    fi
+    printf '%s\n' "$PATH";
+}
+"#;
+
+/// Probe the remote login environment (shell + rc-extended PATH + rsync
+/// availability) over ssh. The shell/PATH probe and the rsync probe are run in
+/// a single ssh round trip so a host is probed exactly once per run and the
+/// result is cached (see [`resolve_remote_env`]).
+///
+/// A failed, timed-out, or empty probe falls back to a plain bash environment
+/// with no rsync (the scp fallback then applies for `@copy`).
+async fn probe_remote_env(host: &ResolvedHost) -> RemoteEnv {
+    // Combine the login-shell probe and the rsync probe into one script so a
+    // single ssh connection yields both facts.
+    let script = format!(
+        "{}\ncommand -v rsync >/dev/null 2>&1 && echo SHELLFLOW_HAS_RSYNC",
+        PROBE_SCRIPT.trim()
+    );
+    let mut cmd = Command::new("ssh");
+    cmd.args(host.spec.to_ssh_args()).arg("-T");
+    cmd.arg(script);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.kill_on_drop(true);
+    let output = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
+        Ok(Ok(output)) if output.status.success() => output,
+        _ => return RemoteEnv::default(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let shell = RemoteShell::detect(lines.next().unwrap_or_default());
+    let path = lines.next().filter(|p| !p.is_empty()).map(ToOwned::to_owned);
+    let has_rsync = lines.any(|l| l == "SHELLFLOW_HAS_RSYNC");
+    RemoteEnv { shell, path, has_rsync }
+}
+
+/// The classified result of an SSH child process (remote payload or guard).
+///
+/// This replaces fragile string matching on `eyre` messages: every failure
+/// path constructs one of these variants explicitly, so transport vs. script
+/// vs. timeout classification is centralized and cannot drift from wording.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshOutcome {
+    /// Connection/setup failure (e.g. ssh exit 255, unreachable host).
+    Transport,
+    /// The remote command exited non-zero.
+    Script,
+    /// The transfer exceeded its timeout and was killed.
+    TimedOut,
+}
+
+/// Map a classified SSH result to a host outcome.
+const fn classify_ssh(outcome: SshOutcome) -> HostOutcome {
+    match outcome {
+        SshOutcome::Transport => HostOutcome::Failed(RunError::Transport),
+        SshOutcome::Script => HostOutcome::Failed(RunError::Script),
+        SshOutcome::TimedOut => HostOutcome::TimedOut,
     }
 }
 
@@ -761,21 +984,22 @@ enum GuardResult {
     Transport,
 }
 
-/// Evaluate a guard command on a remote host via `ssh host bash -s`.
+/// Evaluate a guard command on a remote host via `ssh host <shell> -l -s`.
 ///
-/// The guard runs with the same env header as the block (so `@export`ed
-/// variables and `@env` entries are visible). Subject to the same
+/// The guard runs under the same login shell and env header (including the
+/// probed login PATH) as the block it guards. Subject to the same
 /// `--timeout`/`@timeout`; a timed-out or unreachable guard is treated as a
 /// transport failure.
 async fn run_remote_guard(
     host: &ResolvedHost,
+    shell: RemoteShell,
     guard: &str,
     env: &[(String, String)],
     timeout: Option<u64>,
 ) -> GuardResult {
     let mut cmd = Command::new("ssh");
     cmd.args(host.spec.to_ssh_args()).arg("-T");
-    cmd.arg("bash -s");
+    cmd.arg(shell.invoke(false));
     cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
     cmd.kill_on_drop(true);
     let mut child = match cmd.spawn() {
@@ -808,19 +1032,20 @@ async fn run_ssh_child(
     mut cmd: Command,
     payload: &str,
     timeout: Option<u64>,
-) -> Result<()> {
-    let mut child = cmd.spawn().wrap_err("failed to spawn ssh")?;
+) -> Result<(), SshOutcome> {
+    let mut child = cmd.spawn().map_err(|_| SshOutcome::Transport)?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        if let Err(err) = stdin.write_all(payload.as_bytes()).await {
+        if stdin.write_all(payload.as_bytes()).await.is_err() {
+            let _ = child.start_kill();
             let _ = child.wait().await;
-            bail!("failed to write payload: {err}");
+            return Err(SshOutcome::Transport);
         }
         drop(stdin);
     }
 
-    let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("stdout not piped"))?;
-    let stderr = child.stderr.take().ok_or_else(|| eyre::eyre!("stderr not piped"))?;
+    let stdout = child.stdout.take().ok_or(SshOutcome::Transport)?;
+    let stderr = child.stderr.take().ok_or(SshOutcome::Transport)?;
 
     // Two reader tasks + one channel: both streams fully drained. The parent
     // holds no sender, so the channel closes when both readers finish.
@@ -841,16 +1066,32 @@ async fn run_ssh_child(
             let timed_out = tokio::time::timeout(Duration::from_secs(secs), child.wait()).await;
             match timed_out {
                 Ok(Ok(status)) => status,
-                Ok(Err(err)) => return Err(eyre::Report::new(err)),
+                Ok(Err(_)) => {
+                    let _ = out_task.await;
+                    let _ = err_task.await;
+                    let _ = read_task.await;
+                    return Err(SshOutcome::Transport);
+                }
                 Err(_) => {
                     read_task.abort();
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    bail!("remote step timed out after {secs}s");
+                    let _ = out_task.await;
+                    let _ = err_task.await;
+                    return Err(SshOutcome::TimedOut);
                 }
             }
         }
-        None => child.wait().await?,
+        None => {
+            if let Ok(status) = child.wait().await {
+                status
+            } else {
+                let _ = out_task.await;
+                let _ = err_task.await;
+                let _ = read_task.await;
+                return Err(SshOutcome::Transport);
+            }
+        }
     };
 
     // Drain remaining buffered output.
@@ -860,9 +1101,9 @@ async fn run_ssh_child(
 
     if !status.success() {
         if status.code() == Some(255) {
-            bail!("ssh transport error (exit 255)");
+            return Err(SshOutcome::Transport);
         }
-        bail!("remote script exited with status {status}");
+        return Err(SshOutcome::Script);
     }
     Ok(())
 }
@@ -893,6 +1134,7 @@ async fn run_copy_step(
     copy: &CopyStep,
     hosts: Vec<ResolvedHost>,
     config: StepConfig,
+    shell_cache: &ShellCache,
 ) -> Result<Vec<(String, HostOutcome)>> {
     // Interpolate `$VAR` from captured state. In dry-run/check the local
     // steps did not execute, so unresolved variables are a warning + skip
@@ -936,11 +1178,15 @@ async fn run_copy_step(
         let src = src.clone();
         let dst = dst.clone();
         let delete = copy.delete;
+        let shell_cache = Arc::clone(shell_cache);
         tasks.spawn(async move {
             if let Some(semaphore) = &semaphore {
                 let _permit = Arc::clone(semaphore).acquire_owned().await;
             }
-            run_rsync_host(ui, &host, &src, &dst, delete, config).await
+            // Reuse the per-run login-env cache, which now also carries the
+            // rsync probe — no extra ssh round trip per copy step (design §7.4).
+            let has_rsync = resolve_remote_env(&host, &shell_cache).await.has_rsync;
+            run_rsync_host(ui, &host, &src, &dst, delete, config, has_rsync).await
         });
     }
 
@@ -997,13 +1243,14 @@ async fn run_rsync_host(
     dst: &str,
     delete: bool,
     config: StepConfig,
+    has_rsync: bool,
 ) -> (String, HostOutcome) {
     let remote_shell = host.spec.rsync_remote_shell().unwrap_or_else(|| "ssh".to_string());
 
-    // Probe for a remote `rsync`. When it is missing (common on minimal
-    // hosts), fall back to `ssh mkdir -p` + `scp` so `@copy` still works and
-    // the target only ever needs `bash` (design §9).
-    let has_rsync = probe_remote_rsync(host).await;
+    // When the target lacks `rsync` (common on minimal hosts), fall back to
+    // `ssh mkdir -p` + `scp` so `@copy` still works and the target only ever
+    // needs `bash` (design §9). `has_rsync` comes from the per-run cache, not a
+    // fresh probe.
     if config.verbose >= 2 {
         crate::ui::note(&format!(
             "  [{}] remote rsync: {}",
@@ -1030,15 +1277,6 @@ async fn run_rsync_host(
             }
         }
     }
-}
-
-/// Whether the remote host has `rsync` on its PATH.
-async fn probe_remote_rsync(host: &ResolvedHost) -> bool {
-    let mut cmd = Command::new("ssh");
-    cmd.args(host.spec.to_ssh_args()).arg("-T").arg("command -v rsync");
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    cmd.kill_on_drop(true);
-    cmd.status().await.is_ok_and(|s| s.success())
 }
 
 /// Copy via rsync with a remote `mkdir -p` wrapper.
@@ -1255,12 +1493,36 @@ async fn collect_hosts(
 
 /// Whether an rsync stdout line is an `-i` itemized change entry (as opposed
 /// to status prose like "sending incremental file list" / "sent N bytes").
+///
+/// rsync's itemize format is a fixed 11-column summary followed by a space and
+/// the path (e.g. `>f+++++++++ path`, `*deleting   path`). We require that
+/// shape rather than just a leading character, so normal command output that
+/// happens to start with `>`, `<`, `*`, `.`, or `c` is never swallowed by
+/// `--diff`.
 fn is_rsync_itemize_line(line: &str) -> bool {
-    line.starts_with('>') ||
-        line.starts_with('<') ||
-        line.starts_with('*') ||
-        line.starts_with('.') ||
-        line.starts_with('c')
+    let bytes = line.as_bytes();
+    // A normal itemize line is a 10-character summary followed by a space and
+    // the path. rsync also emits a shorter "*deleting  <path>" marker for
+    // removals, which we accept as well.
+    if line.starts_with("*deleting") {
+        return bytes.len() > "*deleting".len() && bytes["*deleting".len()] == b' ';
+    }
+    // Need at least the 10-letter summary, a separator space, and a path.
+    if bytes.len() < 12 {
+        return false;
+    }
+    if bytes[10] != b' ' {
+        return false;
+    }
+    bytes[..10].iter().all(|&b| {
+        b.is_ascii_alphanumeric() ||
+            b == b'.' ||
+            b == b'*' ||
+            b == b'<' ||
+            b == b'>' ||
+            b == b'c' ||
+            b == b'+'
+    })
 }
 
 /// Format a command's argv for display without exposing env values.
@@ -1284,4 +1546,95 @@ fn step_error_if_failed(hosts: &[(String, HostOutcome)]) -> Option<RunError> {
         HostOutcome::TimedOut => Some(RunError::Script),
         HostOutcome::Ok | HostOutcome::Skipped => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use shellflow_core::{ResolvedHost, SshSpec};
+
+    use super::{RemoteEnv, RemoteShell, shell_cache_key, with_login_path};
+
+    #[test]
+    fn detects_bash_and_zsh() {
+        assert_eq!(RemoteShell::detect("/usr/bin/bash"), RemoteShell::Bash);
+        assert_eq!(RemoteShell::detect("/bin/zsh"), RemoteShell::Zsh);
+        assert_eq!(RemoteShell::detect("fish"), RemoteShell::Bash);
+        assert_eq!(RemoteShell::detect(""), RemoteShell::Bash);
+        // Probe output often carries a trailing newline; it must be trimmed.
+        assert_eq!(RemoteShell::detect("/bin/zsh\n"), RemoteShell::Zsh);
+    }
+
+    #[test]
+    fn invokes_login_interpreter() {
+        assert_eq!(RemoteShell::Bash.invoke(false), "bash -l -s");
+        assert_eq!(RemoteShell::Zsh.invoke(false), "zsh -l -s");
+        // Syntax checks never need a login environment.
+        assert_eq!(RemoteShell::Bash.invoke(true), "bash -n -s");
+        assert_eq!(RemoteShell::Zsh.invoke(true), "bash -n -s");
+    }
+
+    #[test]
+    fn shell_cache_key_includes_port() {
+        let host =
+            ResolvedHost { alias: "web".to_string(), spec: SshSpec::parse("deploy@h1").unwrap() };
+        assert_eq!(shell_cache_key(&host), "deploy@h1");
+        let host = ResolvedHost {
+            alias: "web".to_string(),
+            spec: SshSpec::parse("deploy@h1:2222").unwrap(),
+        };
+        assert_eq!(shell_cache_key(&host), "deploy@h1:2222");
+    }
+
+    #[test]
+    fn login_path_is_appended_to_env() {
+        let env = with_login_path(vec![("K".to_string(), "v".to_string())], Some("/opt/bin"));
+        assert_eq!(
+            env,
+            vec![("K".to_string(), "v".to_string()), ("PATH".to_string(), "/opt/bin".to_string())]
+        );
+    }
+
+    #[test]
+    fn missing_path_leaves_env_unchanged() {
+        let env = with_login_path(vec![("K".to_string(), "v".to_string())], None);
+        assert_eq!(env, vec![("K".to_string(), "v".to_string())]);
+    }
+
+    #[test]
+    fn explicit_path_wins_over_probe() {
+        let env =
+            with_login_path(vec![("PATH".to_string(), "/explicit".to_string())], Some("/probed"));
+        assert_eq!(env, vec![("PATH".to_string(), "/explicit".to_string())]);
+    }
+
+    #[test]
+    fn probe_script_sources_rc_only_in_the_probe_shell() {
+        // The probe sources the rc inside the probe shell only; the payload
+        // env carries the extracted PATH, never the rc itself.
+        assert!(super::PROBE_SCRIPT.contains(". \"$HOME/.zshrc\""), "zsh rc branch missing");
+        assert!(super::PROBE_SCRIPT.contains(". \"$HOME/.bashrc\""), "bash rc branch missing");
+        assert!(super::PROBE_SCRIPT.contains(">/dev/null 2>&1"), "rc output must be silenced");
+        assert!(super::PROBE_SCRIPT.contains("printf '%s\\n' \"$PATH\""), "PATH must be printed");
+    }
+
+    #[test]
+    fn rsync_itemize_detection_is_strict() {
+        // A real itemize line: 10-letter summary, space, path.
+        assert!(super::is_rsync_itemize_line(">f++++++++ target/release/app"));
+        assert!(super::is_rsync_itemize_line("*deleting   old-app"));
+        // Status prose is NOT an itemize line.
+        assert!(!super::is_rsync_itemize_line("sending incremental file list"));
+        assert!(!super::is_rsync_itemize_line("sent 1,234 bytes  received 56 bytes"));
+        // A normal command line that happens to start with '>' is NOT swallowed.
+        assert!(!super::is_rsync_itemize_line("> important output from my script"));
+        // Too short to be an itemize line.
+        assert!(!super::is_rsync_itemize_line(">f+ path"));
+    }
+
+    #[test]
+    fn remote_env_defaults_to_plain_bash() {
+        let env = RemoteEnv::default();
+        assert_eq!(env.shell, RemoteShell::Bash);
+        assert_eq!(env.path, None);
+    }
 }

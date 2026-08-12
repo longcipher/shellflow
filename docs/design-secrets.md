@@ -1,4 +1,4 @@
-# Design: Secrets-aware Deployment (`age` integration, `@secrets`, `deploy` subcommand)
+# Design: Secrets-aware Deployment (`age` integration, `@secrets`, `--local` mode)
 
 ## 1. Motivation & Goals
 
@@ -28,10 +28,7 @@ same pipeline.
 3. **Uniform secret hygiene.** Secrets are masked in previews, traces, and
    audit logs; never appear in any argv; never touch disk on the controller or
    the targets.
-4. **Standardized service deployment.** A `deploy` subcommand turns a
-   conventional repository layout into a real, idempotent multi-host
-   deployment — including per-key systemd credentials — with no custom script.
-5. **Zero target-side crypto.** Targets only need `bash` and systemd ≥ 254.
+4. **Zero target-side crypto.** Targets only need `bash` and systemd ≥ 254.
 
 ### Non-goals
 
@@ -41,9 +38,8 @@ same pipeline.
   target's systemd re-seal per host.
 - **Not a Vault/KMS.** Single-operator asymmetric encryption of whole files,
   consistent with the existing shell-native, minimal-toolchain philosophy.
-- **No new deployment language.** `@secrets` and `deploy` build on the
-  existing directive DSL and `ExecutionPlan`; playbooks remain 100% valid
-  Bash.
+- **No new deployment language.** `@secrets` builds on the existing
+  directive DSL and `ExecutionPlan`; playbooks remain 100% valid Bash.
 
 ## 2. Design Overview
 
@@ -52,11 +48,10 @@ controller (only shellflow + ssh/rsync/bash)              targets (bash + system
 ┌───────────────────────────────────────────────┐        ┌──────────────────────────────────┐
 │ keys generate / public          identity      │        │                                  │
 │ secret encrypt / decrypt / edit               │        │                                  │
-│ @secrets file.env.age  ──decrypt──> env vars │        │                                  │
-│   (masked everywhere, never in argv)         │ ssh    │                                  │
-│ deploy <svc> ──compose plan──> Copy+Remote ──┼───────>│ install binary/units/configs     │
-│                                              │        │ per-key systemd-creds encrypt    │
-│                                              │        │ daemon-reload + restart          │
+│ @secrets file.env.age  ──decrypt──> env vars │  ssh   │   remote bash blocks receive the  │
+│   (masked everywhere, never in argv)         │───────>│   decrypted env (masked) over the  │
+│                                              │        │   encrypted channel; targets need │
+│                                              │        │   only bash (+ systemd-creds)     │
 └───────────────────────────────────────────────┘        └──────────────────────────────────┘
 ```
 
@@ -66,14 +61,11 @@ Key pieces:
    `age` crate (the reference Rust implementation that `rage` itself wraps).
    Handles identity loading, file encrypt/decrypt, recipient read-back, and
    `KEY=VALUE` env parsing. No I/O leaks into `shellflow-core`.
-2. **CLI subcommands** — `keys`, `secret`, `deploy`; the bare positional form
+2. **CLI subcommands** — `keys`, `secret`; the bare positional form
    (`shellflow deploy.sh`) keeps working as `run`.
 3. **`@secrets` directive** — decrypts an age file at execution time, injects
    the keys as environment variables into subsequent blocks, exports a
    `LT_SECRET_KEYS` list, and registers every value for masking.
-4. **`deploy` subcommand** — composes a standard `ExecutionPlan` in memory
-   from a conventional repository layout and reuses the existing executor,
-   fan-out, dry-run/diff, and UI.
 
 ## 3. `age` Integration
 
@@ -114,12 +106,11 @@ shellflow secret encrypt [-r age1…]... [-o OUT] FILE
 shellflow secret decrypt [-i KEY] [FILE]
 shellflow secret edit [-i KEY] FILE   # decrypt -> $EDITOR -> re-encrypt
 shellflow secret creds FILE           # print ImportCredential=KEY lines
-shellflow deploy <service> [flags]    # standardized multi-host deployment
 ```
 
 `run` keeps accepting the positional script so `shellflow deploy.sh` remains
 backward compatible; all existing flags (`-v/-n/-d/-t/-o/-s/-p/-c/-k`, etc.)
-apply to `run` and to `deploy`.
+apply to `run`.
 
 ## 5. `@secrets` Directive
 
@@ -188,7 +179,7 @@ The executor resolves all `SecretEntry` values once, before the first step:
 secret. Short values (e.g. `1`, `on`) would corrupt output, so `@secrets`
 masking applies only to values of length ≥ a threshold. The threshold
 defaults to `6` and is configurable via `$SHELLFLOW_MASK_MIN_LEN` (or
-`--mask-min-len` on `run`/`deploy`). Explicit `@env KEY=value` literals keep
+`--mask-min-len` on `run`). Explicit `@env KEY=value` literals keep
 their current unconditional masking.
 
 Masking covers host lines, payload previews, and `--log-file` output through
@@ -201,80 +192,13 @@ the existing `Ui` path; secrets never appear in any spawned argv.
 - Missing identity, undecryptable file, or malformed env content is a hard
   error before any step runs (never a silent skip).
 
-## 6. `deploy` Subcommand
-
-### 6.1 Conventional layout
-
-`deploy <service>` works against a conventional repository layout (all paths
-overridable by flags):
-
-```text
-deploy-repo/
-├── hosts/
-│   └── inventory.sh            # # @server / # @group lines (single source)
-├── keys/
-│   └── recipients/             # *.pub files for `secret encrypt`
-└── services/
-    └── <service>/
-        ├── env/                # encrypted env files, merged in order
-        │   ├── common.env.age  # shared keys (all services must agree)
-        │   └── prod.env.age    # service-specific keys
-        ├── units/              # *.service templates for the target
-        └── configs/            # non-secret configuration shipped verbatim
-```
-
-Defaults: `hosts/inventory.sh`; env files `services/<svc>/env/*.env.age`
-merged lexically; units from `services/<svc>/units/`; configs from
-`services/<svc>/configs/`; binary `target/release/<service>`.
-
-### 6.2 Composed plan
-
-`deploy` builds an `ExecutionPlan` in memory (the step structs are already
-public in `shellflow-core`), then runs it through the existing executor:
-
-1. **ship** — `@copy` the binary, unit files, and configs to each host
-   (`rsync` delta, or `scp` fallback; dry-run/diff supported).
-2. **install** — one `@remote` block per group:
-   - install binary, units (`/etc/systemd/system/`), configs;
-   - install the **`cred-wrap`** helper once per host
-     (`/usr/local/libexec/shellflow/cred-wrap`): a credential→env wrapper that
-     exports every file in `$CREDENTIALS_DIRECTORY` and `exec`s the real
-     binary — third-party/closed-source apps that only read env vars need
-     **zero code changes** (the in-app loader is only for self-owned code);
-   - create `/etc/credstore.encrypted` (0700 root);
-   - for each key from the merged env: `printf '%s' "${!key}" | systemd-creds
-     encrypt --with-key=host --name="$key" - /etc/credstore.encrypted/<KEY>`;
-     credential filenames equal the key names so `ImportCredential=<KEY>`
-     resolves in the store;
-   - `daemon-reload` + `enable` + `restart` + `is-active` check.
-3. **verify** — exit non-zero if any host failed or any unit is inactive.
-
-`deploy` reuses `resolve_hosts`, `--target`, `--parallel`, `--only/--skip`,
-`--dry-run/--diff`, `--timeout`, and the `Ui` masking/audit path unchanged.
-
-### 6.3 Consistency validation
-
-Because systemd credential stores are global per host, two services must not
-publish different values for the same key name. `deploy` decrypts every
-referenced service's env files at plan-build time and **fails** if a shared
-key has conflicting values, with a message naming the key and both files.
-`shellflow secret creds FILE` prints the matching `ImportCredential=` lines so
-unit files can be generated from the same source of truth instead of being
-hand-maintained.
-
-### 6.4 Target requirements
-
-Targets need `bash` (for remote blocks) and systemd ≥ 254 (for
-`systemd-creds` / `ImportCredential=`). No `age`/`rage`/`shellflow` install on
-targets. Remote `systemd-creds` runs as the ssh user via passwordless `sudo`.
-
 ## 7. Crate & Module Impact
 
 | Area | Change |
 |---|---|
 | `crates/shellflow-secrets` (new) | `age` wrapper: identity load, encrypt/decrypt, recipient read-back, env-file parser. Library-only; unit + proptest. |
 | `crates/shellflow-core` | `ExecutionPlan.secrets: Vec<SecretEntry>`; parser recognizes `@secrets` (path only, no I/O). |
-| `bin/shellflow` | clap subcommands (`run` default); executor resolves secrets into run-state env + mask list; `deploy` composes the plan; `Ui` gains a min-length mask threshold. |
+| `bin/shellflow` | clap subcommands (`run` default); executor resolves secrets into run-state env + mask list; `Ui` gains a min-length mask threshold. |
 | `bin/shellflow/src/preflight.rs` | unchanged (`age` is embedded; `bash`/`ssh`/`rsync` remain the only required tools). |
 
 Dependency additions (via `cargo add`, workspace-managed): `age`,
@@ -321,10 +245,8 @@ stays free of async, I/O, and crypto.
    `decrypt`, `edit`, `creds`.
 3. **M3 — `@secrets` directive.** Parser entry, executor resolution, masking
    threshold, `LT_SECRET_KEYS`.
-4. **M4 — `deploy` subcommand.** Plan composition, consistency validation,
-   systemd-creds install step.
-5. **M5 — Docs & examples.** Update `README.md`, `docs/design.md`, add an
-   end-to-end example playbook and a `deploy` reference.
+4. **M4 — Docs & examples.** Update `README.md`, `docs/design.md`, add an
+   end-to-end example playbook.
 
 Each milestone ends with `just format && just lint && just test &&
 just mutation` green.
@@ -342,11 +264,6 @@ philosophy. The Go `age` implementation is not used.
 The directive keeps playbooks static and valid Bash, moves decryption into
 the tool (where masking already lives), and eliminates render scripts and
 temporary files.
-
-### D-3. `deploy` composes the plan in memory instead of rendering a playbook
-
-The step model is already public; composing `ExecutionPlan` reuses the entire
-executor/UI path with no new execution machinery and no generated artifacts.
 
 ### D-4. Masking with a min-length threshold
 

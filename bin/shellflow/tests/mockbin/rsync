@@ -18,7 +18,7 @@ done
 
 if [[ " $* " == *" --dry-run "* ]]; then
   echo "sending incremental file list"
-  echo ">f+++++++++ target/release/myapp"
-  echo "*deleting old-app"
+  echo ">f++++++++ target/release/myapp"
+  echo "*deleting   old-app"
 fi
 exit 0

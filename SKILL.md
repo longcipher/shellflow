@@ -17,7 +17,10 @@ ssh - concurrently, idempotently and 10x faster than ansible.
 The input is a **plain Bash script** whose blocks are delimited by `# @`
 comment directives. `bash deploy.sh` runs the file unchanged; `shellflow`
 drives the blocks: local execution, rsync/scp file copies, and concurrent
-remote execution over `ssh host bash -s`. Targets only need `bash`.
+remote execution over the host's login shell (`ssh host bash -l -s` /
+`zsh -l -s`, probed once per run, with the rc-extended login PATH injected
+into each payload so toolchain PATHs resolve as in a manual `ssh host`).
+Targets only need `bash`.
 
 ## When to use
 

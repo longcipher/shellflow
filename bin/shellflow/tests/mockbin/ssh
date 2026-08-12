@@ -36,6 +36,24 @@ for arg in "$@"; do
 done
 printf 'HOST: %s\n' "$host" >> "$LOG"
 
+# Login-environment probe (`ssh host <PROBE_SCRIPT>`): answer immediately so
+# tests never hit the host-specific behavior below. Line 1 = login shell
+# (zsh for hosts with `zsh` in the name, bash otherwise), line 2 = the PATH
+# (the mock PATH, so tests can assert the PATH injection into payloads),
+# line 3 = `SHELLFLOW_HAS_RSYNC` when the host provides rsync (the `norsync`
+# host deliberately omits it to exercise the scp fallback).
+if [[ " $*" == *'$SHELL'* && " $*" == *'$PATH'* ]]; then
+  case "$host" in
+    *zsh*) printf '/usr/bin/zsh\n%s\n' "$PATH" ;;
+    *)     printf '/usr/bin/bash\n%s\n' "$PATH" ;;
+  esac
+  case "$host" in
+    *norsync*) ;;
+    *) printf 'SHELLFLOW_HAS_RSYNC\n' ;;
+  esac
+  exit 0
+fi
+
 # Persist whatever was piped to us so tests can assert on the payload.
 cat > "$MOCK_DIR/ssh-stdin-$host.txt"
 
@@ -61,6 +79,10 @@ case "$host" in
     exit 0
     ;;
   *ok*)
+    exit 0
+    ;;
+  *zsh*)
+    # Login shell is zsh; a plain payload run succeeds.
     exit 0
     ;;
   *fail*)

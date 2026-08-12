@@ -52,7 +52,10 @@ pub(crate) fn resolve_secrets(
         let pairs = parse_env_file(&plain)
             .wrap_err_with(|| format!("malformed env file `{}`", entry.file))?;
         for (key, value) in pairs {
-            if value.len() >= mask_min_len {
+            // De-duplicate masks so repeated values are not redundantly
+            // replaced; `mask_line` also sorts longest-first to avoid prefix
+            // leakage.
+            if value.len() >= mask_min_len && !masks.contains(&value) {
                 masks.push(value.clone());
             }
             keys.push(key.clone());

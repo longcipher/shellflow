@@ -1,8 +1,8 @@
 # shellflow — Design Document
 
 > Related design: [`design-secrets.md`](design-secrets.md) covers the embedded
-> `age` integration (`keys`/`secret`), the `@secrets` directive, the `deploy`
-> subcommand, and `--local` mode.
+> `age` integration (`keys`/`secret`), the `@secrets` directive, and `--local`
+> mode.
 
 ## 1. Executive Summary
 
@@ -68,9 +68,9 @@ Mina's core trick: concatenate the whole remote task into one script and feed it
 once via stdin. We do exactly this:
 
 ```text
-shellflow                     ssh -T user@host bash -s          remote host
+shellflow                     ssh -T user@host bash -l -s     remote host
 ┌─────────────┐   stdin    ┌──────────────────────────────┐   ┌─────────┐
-│  payload    │ ─────────> │  set -eu + env + remote block │ ─>│ bash    │
+│  payload    │ ─────────> │ set -eu + env(PATH) + block  │ ─>│ bash    │
 │  (memory)   │            │  (env precedes set -x, §7.2)  │   │ stdout  │
 └─────────────┘            └──────────────────────────────┘   │ stderr  │
         ▲                                                      │         │
@@ -212,6 +212,13 @@ pub struct CopyStep {
     pub dst: String,
     pub target: Target,
     pub delete: bool,
+    /// `@only_if` is **not supported on `@copy`** — the parser rejects it and
+    /// this field stays `None` in valid plans (retained for struct symmetry).
+    pub guard: Option<String>,
+    /// Per-step timeout in seconds (`@timeout`); bounds the rsync/scp transfer.
+    pub timeout: Option<u64>,
+    /// `@env` snapshot in effect when the copy was declared.
+    pub env: Vec<EnvEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -278,28 +285,36 @@ shellflow/
 ├── Cargo.toml                 # workspace deps & lints (already configured)
 ├── Justfile                   # format/lint/test/mutation/build (already configured)
 ├── docs/
-│   └── design.md              # this document
+│   ├── design.md              # this document
+│   └── design-secrets.md      # age integration, @secrets, --local mode
 ├── bin/
 │   └── shellflow/             # CLI + execution engine (I/O boundary)
 │       ├── Cargo.toml
 │       ├── src/
 │       │   ├── main.rs        # clap entry, tracing init, orchestration
 │       │   ├── cli.rs         # Args (clap derive)
-│       │   ├── ui.rs          # colored streaming output, plan summary
-│       │   └── executor.rs    # run_local / run_remote / run_copy
+│       │   ├── ui.rs          # colored streaming output, plan summary, masking
+│       │   ├── executor.rs    # run_local / run_remote / run_copy, fan-out
+│       │   ├── secrets.rs     # @secrets resolution -> run-state env + mask list
+│       │   ├── secret.rs      # `secret` subcommand (encrypt/decrypt/edit/creds)
+│       │   ├── keys.rs        # `keys` subcommand (generate/public)
+│       │   └── preflight.rs   # required-tool preflight check
 │       └── tests/
 │           ├── integration.rs # end-to-end with mock ssh/rsync shims
-│           ├── fixtures/      # sample deploy scripts
-│           └── mockbin/       # fake ssh/rsync (Bash shims recording argv)
+│           └── mockbin/       # fake ssh/rsync/scp (Bash shims recording argv)
 └── crates/
-    └── shellflow-core/        # parser + plan types (pure, no I/O)
+    ├── shellflow-core/        # parser + plan types (pure, no I/O)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs
+    │       ├── plan.rs        # data model (§4.3)
+    │       ├── env.rs         # env rendering + masking (pure string logic)
+    │       ├── parser.rs      # line scanner -> ExecutionPlan
+    │       └── ssh_spec.rs    # SshSpec parse / to_args / rsync dest
+    └── shellflow-secrets/     # age wrapper (encrypt/decrypt, env parser)
         ├── Cargo.toml
         └── src/
-            ├── lib.rs
-            ├── plan.rs        # data model (§4.3)
-            ├── directive.rs   # directive recognition + payload parsing
-            ├── parser.rs      # line scanner -> ExecutionPlan
-            └── ssh_spec.rs    # SshSpec parse / to_args / rsync dest
+            └── lib.rs         # identity load, crypto, KEY=VALUE env parsing
 ```
 
 ### 5.2 Crate responsibilities
@@ -314,6 +329,16 @@ shellflow/
   secret values — pure string logic, unit-testable.
 - Exposes `ParseError` (with line numbers) via `thiserror`.
 - No tokio, no stdio, no network. Everything is unit- and proptest-able.
+
+**`shellflow-secrets`** — pure crypto/parsing wrapper, no I/O at the crate
+boundary beyond what `age` requires.
+
+- Wraps the `age` crate (X25519 identities) for identity loading, file
+  encrypt/decrypt, and recipient read-back.
+- Parses `KEY=VALUE` env files (blank lines and `#` comments ignored; first
+  `=` splits the key) for `@secrets` resolution.
+- Library-only: no `tokio`, no `std::process`. Unit- and proptest-tested.
+- `shellflow-core` stays free of async, I/O, and crypto.
 
 **`bin/shellflow`** — the I/O boundary.
 
@@ -333,14 +358,21 @@ Added via `cargo add` only (never hand-edited into `Cargo.toml`):
 # workspace level
 cargo add eyre tokio tracing-subscriber --workspace   # already present
 cargo add colored --workspace                          # ANSI UI in bin
+cargo add age tempfile --workspace                     # secrets crate
 
 # bin/shellflow
 cargo add clap tokio eyre colored tracing-subscriber -p shellflow --workspace
-cargo add shellflow-core -p shellflow --path crates/shellflow-core
+cargo add shellflow-core shellflow-secrets -p shellflow --path crates/...
 
 # crates/shellflow-core
 cargo add thiserror -p shellflow-core --workspace
 cargo add proptest -p shellflow-core --workspace --dev
+
+# crates/shellflow-secrets
+cargo add age -p shellflow-secrets --workspace
+cargo add thiserror -p shellflow-secrets --workspace
+cargo add proptest -p shellflow-secrets --workspace --dev
+cargo add tempfile -p shellflow-secrets --workspace --dev
 ```
 
 | Crate | Where | Why |
@@ -348,15 +380,19 @@ cargo add proptest -p shellflow-core --workspace --dev
 | `clap` (derive) | bin | CLI parsing |
 | `tokio` | bin | async process supervision, `JoinSet` |
 | `eyre` | bin | application error handling (per AGENTS.md) |
-| `thiserror` | core | library error types (per AGENTS.md) |
-| `tracing-subscriber` | bin | env-filtered logging init (`tracing` macros unused in v1) |
+| `thiserror` | core/secrets | library error types (per AGENTS.md) |
+| `tracing-subscriber` | bin | env-filtered logging init |
 | `colored` | bin | host-prefix and step-header ANSI styling |
-| `shellflow-core` | bin | local path dependency |
-| `proptest` (dev) | core | property tests in the normal test loop |
+| `age` | secrets | embedded X25519 encryption (no `rage` binary) |
+| `shellflow-core` | bin | local path dependency (parser + plan) |
+| `shellflow-secrets` | bin | local path dependency (crypto + env parser) |
+| `proptest` (dev) | core/secrets | property tests in the normal test loop |
+| `tempfile` (dev) | secrets | temp-file fixtures in tests |
 
 Explicitly **not** used: `anyhow` (forbidden), `russh`/`libssh2`/`ssh2` (we wrap
 system `ssh`), `futures` (unnecessary — `JoinSet` covers fan-out), `scc`
-(no shared concurrent maps in this design), `winnow`/`pest` (see D-3).
+(no shared concurrent maps in this design), `winnow`/`pest` (see D-3),
+`reqwest`/`dashmap` (forbidden by AGENTS.md).
 
 ## 6. CLI Interface
 
@@ -431,23 +467,27 @@ let mut child = Command::new("ssh")
     .args(spec.to_ssh_args())          // ["-p", "2222", "deploy@10.0.0.2"]
     .arg("-T")
     .arg("-v")                         // only when verbose >= 3
-    .arg(if dry_run { "bash -s -n" } else { "bash -s" })
+    .arg(if syntax_only { "bash -n -s" } else { env.shell.invoke(false) })
+    //                                     ^ real runs use the host's login
+    //                                       shell, e.g. `bash -l -s` / `zsh -l -s`
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .spawn()?;
 
-// Payload layout — env lines always precede tracing so exports are never traced:
+// Payload layout — env lines always precede tracing so exports are never
+// traced:
 //   set -eu
+//   export PATH='***'         <- probed login PATH (from the rc file)
 //   export KEY='***'          <- env block (from @env/@export state)
 //   set -x                    <- only at -vvv, AFTER the env block
 //   <user script>
 let payload = format!(
     "set -eu\n{env_lines}{trace_line}{script}",
-    env_lines = render_env(&state),        // single-quote-escaped values
+    env_lines = render_env(&env_with_login_path), // single-quote-escaped values
     trace_line = if verbose >= 3 { "set -x\n" } else { "" },
 );
-// 1. Write payload, then DROP stdin so remote `bash -s` sees EOF.
+// 1. Write payload, then DROP stdin so remote bash/zsh sees EOF.
 child.stdin.take().unwrap().write_all(payload.as_bytes()).await?;
 // 2. Concurrently read stdout (white) and stderr (red / yellow at -vvv),
 //    prefixing every line with [host]; known env values are masked (see §9).
@@ -460,6 +500,18 @@ Key points:
 
 - **One connection per host per remote block** — the payload is streamed from
   memory, not from a temp file. This is the Mina win.
+- **Login-shell parity**: before the first remote block of a run, each host is
+  probed once (cached per run) with a script that prints the login shell
+  (`$SHELL`) and the PATH an interactive login would see — the rc file
+  (`.zshrc`/`.bashrc`) is sourced *inside the probe shell only*, where
+  toolchain managers (proto/nvm/rustup/mise) export their PATH entries.
+  Payloads then stream over `<shell> -l -s` (`bash -l -s` / `zsh -l -s`) with
+  that PATH injected into the env block. The rc file is **never sourced inside
+  the payload**: interactive configs (oh-my-zsh hooks, aliases, prompts) break
+  `set -eu` in scripts. Unsupported shells (fish/nushell), unreachable hosts,
+  and probe failures fall back to plain `bash -l -s` with no injected PATH, and
+  `--check`/`--dry-run` stay on `bash -n -s` (no probe, no login env). An
+  explicit `@env PATH=…`/`@export PATH` always wins over the probe.
 - `set -eu` by default (crash on unset vars and errors); `-vvv` upgrades to
   `set -ex` for live tracing.
 - `@env`/captured variables are injected as a `export KEY='value';` block at
@@ -482,18 +534,21 @@ cmd.arg(src).arg(format!("{}:{dst}", spec.to_dest())); // user@host:path
 ```
 
 `rsync --dry-run -i` computes the real local↔remote delta and itemizes it
-(`>f+++++++++` new file, `f..t......` timestamp-only, `*deleting` removal) —
+(`>f++++++++` new file, `f..t......` timestamp-only, `*deleting` removal) —
 this *is* our diff engine (pyinfra feature #2).
 
-**Target directory creation & no-rsync fallback.** Every copy probes the
-remote for `rsync` (`ssh host command -v rsync`). When present, the transfer
-runs under `--rsync-path "mkdir -p <parent-dir> && rsync"` so a file-style
-destination's parent directory is created automatically (matching rsync's
-own `dir/` semantics). When rsync is missing on the target, `@copy` falls
-back to `ssh mkdir -p <parent-dir>` + `scp src host:<parent-dir>/`, keeping
-the design promise that targets only need `bash` (§9). This preserves the
-delta/idempotency properties in the common case and degrades gracefully to a
-plain copy on minimal hosts.
+**Target directory creation & no-rsync fallback.** Whether the target has
+`rsync` is discovered **once per host per run** during the login-environment
+probe (a single `ssh` round trip that also yields the login shell and PATH;
+see §7.2). The result is cached in the per-run `ShellCache` and reused for
+every copy step — no extra probe connection. When `rsync` is present on the
+target, the transfer runs under `--rsync-path "mkdir -p <parent-dir> &&
+rsync"` so a file-style destination's parent directory is created
+automatically (matching rsync's own `dir/` semantics). When rsync is missing
+on the target, `@copy` falls back to `ssh mkdir -p <parent-dir>` + `scp src
+host:<parent-dir>/`, keeping the design promise that targets only need `bash`
+(§9). This preserves the delta/idempotency properties in the common case and
+degrades gracefully to a plain copy on minimal hosts.
 
 ### 7.4 Concurrency & output integrity
 
@@ -623,7 +678,10 @@ Three cooperating layers, deliberately *not* a state engine:
   requires passwordless sudo or a pre-provisioned key. This is documented
   behavior, not a bug.
 - **Remote requirement**: only `bash` on the target; `rsync`/`ssh` needed only
-  on the controller.
+  on the controller. Remote blocks additionally run under the host's login
+  shell (`$SHELL` probed once per run, `bash`/`zsh` supported; anything else
+  falls back to bash) with the rc-extended login PATH injected into each
+  payload, mirroring a manual `ssh host` — see §7.2.
 - **Secrets in `@env`/`@export`.** Values never appear in any process argv. For
   local steps they are passed via `Command::env()`; for remote steps they exist
   only inside the payload streamed over stdin, placed *before* any `set -x` so
@@ -771,7 +829,7 @@ secret in `ssh`'s argv, visible to `ps` and to `-vv` argv printing).
 
 | Requirement | How the design satisfies it |
 |---|---|
-| `bin/` CLI + `crates/` libs | `bin/shellflow` + `crates/shellflow-core` |
+| `bin/` CLI + `crates/` libs | `bin/shellflow` + `crates/shellflow-core` + `crates/shellflow-secrets` |
 | `cargo add` only; `workspace = true` | §5.3 |
 | `eyre` app / `thiserror` lib | §5.2, D-6 |
 | `tracing` for logs | bin initializes `tracing_subscriber`; `println!` reserved for streaming UI with the documented `#![allow(clippy::print_stdout)]` |

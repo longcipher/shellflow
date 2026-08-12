@@ -1,7 +1,7 @@
 //! `shellflow` — ultra-fast, shell-native deployment tool.
 //!
 //! The binary owns the I/O boundary: it parses the CLI, runs preflight,
-//! dispatches to subcommands (`run`/`keys`/`secret`/`deploy`), and drives the
+//! dispatches to subcommands (`run`/`keys`/`secret`), and drives the
 //! execution engine. CLI crates may print to stdout/stderr for user-facing
 //! streaming output (the workspace denies this by default for library code).
 

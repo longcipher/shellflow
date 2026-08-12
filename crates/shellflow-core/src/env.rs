@@ -40,13 +40,22 @@ pub fn render_env(entries: &[(String, String)]) -> String {
 
 /// Redact a value by replacing every occurrence of known secrets with
 /// [`MASK`].
+///
+/// Secrets are masked longest-first (and de-duplicated) so a value that is a
+/// prefix of another (e.g. `KEY=abc` vs `KEY_LONG=abcdef`) cannot leave the
+/// longer secret's tail exposed after the shorter one is replaced.
 #[must_use]
 pub fn mask_line(line: &str, secrets: &[String]) -> String {
+    if secrets.is_empty() {
+        return line.to_string();
+    }
+    // Longest-first, de-duplicated, non-empty. Sorting a small list per line is
+    // cheap and keeps the masking order-independent of caller insertion order.
+    let mut ordered: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
+    ordered.sort_unstable_by_key(|a| std::cmp::Reverse(a.len()));
+    ordered.dedup();
     let mut out = line.to_string();
-    for secret in secrets {
-        if secret.is_empty() {
-            continue;
-        }
+    for secret in ordered {
         out = out.replace(secret, MASK);
     }
     out
@@ -86,6 +95,23 @@ mod tests {
         let line = "export DB_PASSWORD='s3cr3t';";
         let redacted = mask_line(line, &["s3cr3t".to_string()]);
         assert_eq!(redacted, "export DB_PASSWORD='***';");
+    }
+
+    #[test]
+    fn mask_longest_first_avoid_prefix_leak() {
+        // The shorter secret is a prefix of the longer one. Masking longest
+        // first must not leave the longer secret's tail exposed.
+        let line = "KEY=abcdef KEY_LONG=abcdefXYZ";
+        let redacted = mask_line(line, &["abcdef".to_string(), "abcdefXYZ".to_string()]);
+        assert_eq!(redacted, "KEY=*** KEY_LONG=***");
+        assert!(!redacted.contains("XYZ"));
+    }
+
+    #[test]
+    fn mask_dedups_repeated_values() {
+        let line = "A=secret B=secret";
+        let redacted = mask_line(line, &["secret".to_string(), "secret".to_string()]);
+        assert_eq!(redacted, "A=*** B=***");
     }
 
     #[test]
