@@ -51,19 +51,16 @@ fn main() {
 
     let mut all_ok = true;
     for key in &secrets {
-        match read_secret(key) {
-            Some(val) => {
-                println!(
-                    "  {key}={masked} (len={len})",
-                    key = key,
-                    masked = mask(&val),
-                    len = val.len()
-                );
-            }
-            None => {
-                eprintln!("  {key}=<MISSING>");
-                all_ok = false;
-            }
+        if let Some(val) = read_secret(key) {
+            println!(
+                "  {key}={masked} (len={len})",
+                key = key,
+                masked = mask(&val),
+                len = val.len()
+            );
+        } else {
+            eprintln!("  {key}=<MISSING>");
+            all_ok = false;
         }
     }
 
