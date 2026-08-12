@@ -20,7 +20,7 @@ lint:
   cargo sort -w -g -c
   cargo +nightly fmt --all -- --check
   RUSTC_WRAPPER= cargo +nightly clippy --all -- -D warnings
-  cargo shear
+  RUSTC_WRAPPER= cargo shear
 
 # Run tests
 test:
