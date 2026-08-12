@@ -104,9 +104,18 @@ pub struct CopyStep {
     /// Mirror deletions on the remote side (`--delete`).
     pub delete: bool,
     /// Optional precondition from `@only_if`.
+    ///
+    /// `@only_if` is **not supported on `@copy`** and the parser rejects it
+    /// (see [`crate::parser`]); the field is retained for struct symmetry
+    /// with [`LocalStep`] / [`RemoteStep`] and stays `None` in valid plans.
     pub guard: Option<String>,
     /// Optional per-step timeout in seconds from `@timeout`.
+    ///
+    /// `@timeout` is honored for copy steps (it bounds the `rsync`/`scp`
+    /// transfer), unlike `guard`.
     pub timeout: Option<u64>,
+    /// Environment snapshot (`@env`) in effect when the block was declared.
+    pub env: Vec<EnvEntry>,
 }
 
 /// One executable unit of the plan.

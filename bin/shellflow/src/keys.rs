@@ -10,12 +10,17 @@ use shellflow_secrets::identity::{
 use crate::cli::KeysCmd;
 
 /// Expand a leading `~` to the home directory.
-fn expand_home(path: &Path) -> PathBuf {
+///
+/// Returns an error (rather than silently writing to a relative path) when
+/// `$HOME` is unset, e.g. in a minimal container.
+fn expand_home(path: &Path) -> Result<PathBuf> {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix("~/") {
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest)
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| eyre!("cannot expand `~` in `{}`: $HOME is not set", path.display()))?;
+        Ok(PathBuf::from(home).join(rest))
     } else {
-        path.to_path_buf()
+        Ok(path.to_path_buf())
     }
 }
 
@@ -32,7 +37,7 @@ pub(crate) fn run(cmd: &KeysCmd) -> Result<()> {
 }
 
 fn generate(output: &Path) -> Result<()> {
-    let path = expand_home(output);
+    let path = expand_home(output)?;
     if path.exists() {
         bail!("refusing to overwrite existing identity file {}", path.display());
     }

@@ -132,7 +132,7 @@ fn local_then_remote_streaming() -> TestResult<()> {
     assert!(stdout.contains("[echo1] echo REMOTE_STEP"), "remote output missing: {stdout}");
     let log = sb.ssh_log();
     assert!(log.contains("echo@h1"), "ssh target missing: {log}");
-    assert!(log.contains("bash -s"), "remote mode missing: {log}");
+    assert!(log.contains("bash -l -s"), "login-shell remote mode missing: {log}");
     Ok(())
 }
 
@@ -148,9 +148,73 @@ fn payload_contains_env_and_header() -> TestResult<()> {
     let out = sb.run(&script, &[])?;
     assert_eq!(status_code(&out), 0);
     let stdin = sb.read("ssh-stdin-echo@h1.txt");
+    // `set -eu` opens the payload, then the env block (including the probed
+    // login PATH), then the user script. The rc file itself is never sourced
+    // inside the payload.
     assert!(stdin.starts_with("set -eu\n"), "payload header missing: {stdin:?}");
     assert!(stdin.contains("export GREETING='hi';"), "env injection missing: {stdin:?}");
+    assert!(stdin.contains("export PATH='"), "login PATH injection missing: {stdin:?}");
+    assert!(!stdin.contains(".zshrc"), "rc file must not be sourced in payload: {stdin:?}");
     assert!(stdin.ends_with("echo \"$GREETING\"\n"), "script body missing: {stdin:?}");
+    Ok(())
+}
+
+#[test]
+fn remote_runs_under_login_shell() -> TestResult<()> {
+    // Real runs stream payloads over `<shell> -l -s` (a login shell) with the
+    // probed rc-extended PATH injected into the env block, so the target sees
+    // the same toolchain PATH as a manual `ssh host`.
+    let sb = Sandbox::new("loginbash")?;
+    let script = sb.script(
+        "# @server echo1 echo@h1\n\
+         # @remote echo1\n\
+         echo hi\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = sb.ssh_log();
+    assert!(log.contains("bash -l -s"), "login shell missing: {log}");
+    let stdin = sb.read("ssh-stdin-echo@h1.txt");
+    assert!(stdin.contains("export PATH='"), "login PATH injection missing: {stdin:?}");
+    Ok(())
+}
+
+#[test]
+fn zsh_host_runs_under_zsh_login_shell() -> TestResult<()> {
+    // Hosts whose login shell is zsh get `zsh -l -s` and their rc-extended
+    // PATH (the file proto/nvm/mise append to) is injected into the payload.
+    let sb = Sandbox::new("loginzsh")?;
+    let script = sb.script(
+        "# @server zshhost zsh@h1\n\
+         # @remote zshhost\n\
+         echo hi\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = sb.ssh_log();
+    assert!(log.contains("zsh -l -s"), "zsh login shell missing: {log}");
+    let stdin = sb.read("ssh-stdin-zsh@h1.txt");
+    assert!(stdin.contains("export PATH='"), "login PATH injection missing: {stdin:?}");
+    Ok(())
+}
+
+#[test]
+fn shell_probe_is_cached_per_host() -> TestResult<()> {
+    // Two remote steps to the same host must probe the login environment
+    // exactly once across the whole run.
+    let sb = Sandbox::new("probecache")?;
+    let script = sb.script(
+        "# @server echo1 echo@h1\n\
+         # @remote echo1\n\
+         echo one\n\
+         # @remote echo1\n\
+         echo two\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = sb.ssh_log();
+    let probes = log.matches("$SHELL").count();
+    assert_eq!(probes, 1, "env probe should run once per host:\n{log}");
     Ok(())
 }
 
@@ -218,7 +282,7 @@ fn dry_run_rsync_itemizes() -> TestResult<()> {
     assert!(log.contains("--delete"), "delete missing: {log}");
     assert!(log.contains("-i"), "itemize missing: {log}");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(">f+++++++++"), "itemize output missing: {stdout}");
+    assert!(stdout.contains(">f++++++++"), "itemize output missing: {stdout}");
     Ok(())
 }
 
@@ -404,7 +468,7 @@ fn diff_hides_rsync_status_lines() -> TestResult<()> {
         !stdout.contains("sending incremental file list"),
         "--diff should hide rsync status prose: {stdout}"
     );
-    assert!(stdout.contains(">f+++++++++"), "--diff should keep itemize lines: {stdout}");
+    assert!(stdout.contains(">f++++++++"), "--diff should keep itemize lines: {stdout}");
     Ok(())
 }
 
@@ -506,6 +570,23 @@ fn skip_excludes_matching_step() -> TestResult<()> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("FIRST_STEP"), "skip 1 should drop first step: {stdout}");
     assert!(stdout.contains("SECOND_STEP"), "step 2 should still run: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn copy_with_only_if_guard_is_parse_error() -> TestResult<()> {
+    // `@only_if` on `@copy` is rejected at parse time (exit 1) rather than
+    // silently copying where the guard would fail.
+    let sb = Sandbox::new("copyguard")?;
+    let script = sb.script(
+        "# @server ok1 ok@h1\n\
+         # @only_if test -f /etc/nope\n\
+         # @copy ./out -> /srv/app @ok1\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 1, "copy+guard must be a parse error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("copy"), "error should name the copy directive: {stderr}");
     Ok(())
 }
 
@@ -639,18 +720,14 @@ fn sigint_exits_130() -> TestResult<()> {
     while !sb.dir.join(SSH_LOG).exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    unsafe {
-        libc_kill(child.id() as i32, 2); // SIGINT
-    }
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .map_err(|e| e.to_string())?;
     let status = child.wait().map_err(|e| e.to_string())?;
     assert_eq!(status.code(), Some(130), "SIGINT must exit 130");
     Ok(())
-}
-
-// Minimal SIGINT delivery via `kill(2)`; avoids a libc dependency.
-unsafe extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 // ---------------------------------------------------------------------------

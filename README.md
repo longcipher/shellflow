@@ -37,7 +37,15 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
   `bash`. `shellflow` connects with your system `ssh`, so `~/.ssh/config`,
   keys, `ssh-agent`, jump hosts, and YubiKeys just work.
 - **Mina-style streaming** — each remote block is streamed to every host over a
-  single `ssh host bash -s` connection from memory. No per-command round trips.
+  single `ssh host <login-shell> -s` connection from memory. No per-command
+  round trips.
+- **Login-shell parity** — remote blocks run under the host's login shell
+  (`bash -l -s` / `zsh -l -s`, bash fallback) with the PATH that an
+  interactive login would see (rc file `.zshrc`/`.bashrc` probed once per host
+  per run, PATH injected into the payload env) — so toolchains installed by
+  managers (proto/nvm/rustup/mise) resolve exactly as in a manual `ssh host`,
+  without loading interactive rc side effects into scripts.
+  `--check`/`--dry-run` stay on plain `bash -n -s`.
 - **Deployer-style pipeline** — `@local` build → `@copy` → `@remote` deploy,
   with concurrent multi-host fan-out (`JoinSet` + semaphore, `--parallel`
   defaults to all hosts).

@@ -377,9 +377,20 @@ impl State {
     }
 
     fn add_copy(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        // `@only_if` is unsupported on `@copy`: a copy step transfers files,
+        // not a script, so a guard has no well-defined evaluation context.
+        // Rejecting at parse time prevents a silently-ignored guard (which
+        // would copy even where the precondition fails).
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "copy".to_string(),
+                reason: "`@only_if` is not supported on `@copy`".to_string(),
+            });
+        }
         let name = self.pending_name.take();
-        let guard = self.pending_guard.take();
         let timeout = self.pending_timeout.take();
+        let env = self.plan.env.clone();
 
         let (src, rest) = payload.split_once("->").ok_or_else(|| ParseError::InvalidDirective {
             line,
@@ -429,8 +440,9 @@ impl State {
             dst,
             target: Target::new(target),
             delete,
-            guard,
+            guard: None,
             timeout,
+            env,
         }));
         Ok(())
     }
@@ -816,6 +828,28 @@ mod tests {
             parse_script("# @secrets x.age --bogus\n"),
             Err(ParseError::InvalidDirective { directive, .. }) if directive == "secrets"
         ));
+    }
+
+    #[test]
+    fn copy_rejects_only_if_guard() {
+        // `@only_if` is not valid on `@copy`; the parser must reject it at
+        // parse time rather than silently skipping the guard.
+        assert!(matches!(
+            parse_script("# @only_if test -f /etc/x\n# @copy a -> b @web\n"),
+            Err(ParseError::InvalidDirective { directive, .. }) if directive == "copy"
+        ));
+    }
+
+    #[test]
+    fn copy_captures_env_snapshot() -> Result<(), String> {
+        let plan = parse("# @env KEY=value\n# @copy a -> b @web\n")?;
+        assert_eq!(plan.steps.len(), 1);
+        let copy = as_copy(&plan.steps[0])?;
+        assert_eq!(
+            copy.env,
+            vec![EnvEntry::Literal { key: "KEY".to_string(), value: "value".to_string() }]
+        );
+        Ok(())
     }
 
     #[test]
