@@ -7,7 +7,13 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "TODO"
+repository = "https://github.com/longcipher/shellflow"
+homepage = "https://github.com/longcipher/shellflow"
+authors = ["longcipher"]
+keywords = ["shellflow", "automation", "ssh"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+rust-version = "1.85"
 
 [workspace.dependencies]
 age = "0.12.1"

@@ -14,10 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
-          toolchain: nightly
 
       - uses: taiki-e/install-action@v2
         with:
