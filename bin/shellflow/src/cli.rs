@@ -8,6 +8,29 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 
+/// Env var that overrides the default `@secrets` masking threshold.
+const MASK_MIN_LEN_ENV: &str = "SHELLFLOW_MASK_MIN_LEN";
+
+/// The built-in default minimum length of a `@secrets` value that is masked.
+///
+/// `mask_line` does a global substring replacement, so masking a very short
+/// value would shred unrelated output; values below the threshold are left
+/// alone.
+const DEFAULT_MASK_MIN_LEN: usize = 6;
+
+/// The default `@secrets` masking threshold: `$SHELLFLOW_MASK_MIN_LEN` when it
+/// holds a valid non-negative integer, otherwise [`DEFAULT_MASK_MIN_LEN`].
+///
+/// An unparsable value is ignored rather than fatal, so a typo in the
+/// environment cannot break a deploy.
+#[must_use]
+pub(crate) fn default_mask_min_len() -> usize {
+    std::env::var(MASK_MIN_LEN_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MASK_MIN_LEN)
+}
+
 /// Output mode for concurrent host logs.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum OutputMode {
@@ -85,8 +108,11 @@ pub(crate) struct RunFlags {
     pub identity: Option<PathBuf>,
 
     /// Minimum value length to mask for values sourced from `@secrets` files.
-    #[arg(long, value_name = "N", default_value_t = 6)]
-    pub mask_min_len: usize,
+    ///
+    /// Defaults to `$SHELLFLOW_MASK_MIN_LEN`, or 6 when that is unset or
+    /// unparsable.
+    #[arg(long, value_name = "N")]
+    pub mask_min_len: Option<usize>,
 }
 
 /// Arguments for the `run` subcommand (also the default).
@@ -265,6 +291,13 @@ impl RunArgs {
             })
             .unwrap_or_default()
     }
+
+    /// The effective `@secrets` masking threshold: an explicit
+    /// `--mask-min-len`, else `$SHELLFLOW_MASK_MIN_LEN`, else 6.
+    #[must_use]
+    pub(crate) fn mask_min_len(&self) -> usize {
+        self.flags.mask_min_len.unwrap_or_else(default_mask_min_len)
+    }
 }
 
 #[cfg(test)]
@@ -331,5 +364,69 @@ mod tests {
         let cli = Cli::parse_from(["shellflow", "--local", "deploy.sh"]);
         assert!(cli.command.is_none());
         assert!(cli.run.flags.local);
+    }
+
+    /// The env var is process-global, so every test that mutates it takes
+    /// this lock first.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_mask_env<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: serialized by ENV_LOCK; no other test reads this var
+        // concurrently and the value is a non-secret test fixture.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(super::MASK_MIN_LEN_ENV, v),
+                None => std::env::remove_var(super::MASK_MIN_LEN_ENV),
+            }
+        }
+        let out = body();
+        // SAFETY: serialized by ENV_LOCK, as above.
+        unsafe {
+            std::env::remove_var(super::MASK_MIN_LEN_ENV);
+        }
+        out
+    }
+
+    #[test]
+    fn mask_min_len_defaults_to_six() {
+        with_mask_env(None, || {
+            assert_eq!(super::default_mask_min_len(), 6);
+            let cli = Cli::parse_from(["shellflow", "deploy.sh"]);
+            assert_eq!(cli.run.mask_min_len(), 6);
+        });
+    }
+
+    #[test]
+    fn mask_min_len_env_var_overrides_the_default() {
+        with_mask_env(Some("3"), || {
+            assert_eq!(super::default_mask_min_len(), 3);
+            let cli = Cli::parse_from(["shellflow", "deploy.sh"]);
+            assert_eq!(cli.run.mask_min_len(), 3);
+        });
+    }
+
+    #[test]
+    fn explicit_flag_beats_the_env_var() {
+        with_mask_env(Some("3"), || {
+            let cli = Cli::parse_from(["shellflow", "--mask-min-len", "12", "deploy.sh"]);
+            assert_eq!(cli.run.mask_min_len(), 12);
+        });
+    }
+
+    #[test]
+    fn invalid_env_value_falls_back_to_the_default() {
+        for bad in ["", "  ", "abc", "-1", "6.5"] {
+            with_mask_env(Some(bad), || {
+                assert_eq!(super::default_mask_min_len(), 6, "unexpected threshold for {bad:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn env_var_is_trimmed() {
+        with_mask_env(Some(" 9\n"), || {
+            assert_eq!(super::default_mask_min_len(), 9);
+        });
     }
 }

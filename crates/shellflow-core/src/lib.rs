@@ -7,12 +7,14 @@
 
 pub mod env;
 pub mod error;
+pub mod heredoc;
 pub mod parser;
 pub mod plan;
 pub mod ssh_spec;
 
 pub use env::{MASK, mask_line, render_env, shell_quote_single};
 pub use error::{InterpolateError, ParseError};
+pub use heredoc::{Heredoc, HeredocTracker};
 pub use parser::parse_script;
 pub use plan::{
     CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, ResolvedHost, RunState, SecretEntry,

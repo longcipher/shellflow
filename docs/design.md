@@ -130,6 +130,10 @@ All other lines (including plain comments) belong to the current block.
    first directive that only contains comments/blank lines.
 6. CRLF line endings are tolerated (`\r` stripped).
 7. Lines are included verbatim in the payload, preserving fidelity.
+8. A here-document body is opaque: `<<TAG` / `<<-TAG` openers are tracked
+   lexically and every line up to the exact terminator is script content,
+   exempt from directive detection. Bodies are consumed FIFO because one
+   line may open several here-documents.
 
 ### 4.2 Reference example
 
@@ -258,10 +262,18 @@ pub fn resolve_hosts(
 
 ### 4.4 Known limitations (documented)
 
-- Directive detection is lexical. A `# @foo` line inside a heredoc body or a
-  multi-line string is not recognized as a directive (it would be treated as
-  script content — which is safe, just not a directive). Deploy scripts must
-  keep directives at the top level.
+- Directive detection is lexical. A `# @foo` line inside a **here-document
+  body** is recognized as body data, not a directive, so generated content
+  (systemd units, templates, YAML) can never rewrite block boundaries. A
+  `# @foo` line inside a multi-line *string* that is not a here-document is
+  still treated as a directive, because a lexical scanner cannot see
+  multi-line string spans. Deploy scripts should keep directives at the top
+  level.
+- A here-document whose delimiter the shell expands (`<<$TAG`,
+  `` <<`gen_tag` ``) cannot be tracked statically, so its body keeps the
+  untracked behavior. Quoted (`<<'TAG'`, `<<"TAG"`) and backslash-escaped
+  (`<<\TAG`) delimiters are literal and are tracked exactly. See
+  `crates/shellflow-core/src/heredoc.rs`.
 - No conditional/loop constructs in the DSL itself. Script authors use plain
   Bash (`if`, `for`, `command -v`, `[ -f ] || …`) for control flow, and
   `@only_if` for host-level preconditions.
@@ -416,6 +428,8 @@ OPTIONS:
       --timeout <SECS>        Per-step timeout for all steps [default: none]
       --output <MODE>         stream (default) | grouped — print each host's
                               logs as one block when that host finishes
+      --mask-min-len <N>      Minimum @secrets value length that is masked;
+                              defaults to $SHELLFLOW_MASK_MIN_LEN, else 6
   -l, --log-file <PATH>       Append every streamed line (tagged host+stream)
                               to a file for audit
       --no-color              Disable ANSI colors
@@ -575,15 +589,27 @@ degrades gracefully to a plain copy on minimal hosts.
 - **Preflight.** Before running anything, shellflow verifies that `bash`,
   `ssh`, and `rsync` exist on `PATH` and fails with a friendly message (exit 3)
   if any is missing — no mid-run `Command::new` surprise.
+- **Process groups.** Every child is spawned with `process_group(0)`, so it
+  leads a fresh process group. Signalling only the *direct child* is not
+  enough: a block runs `bash -c`, whose own descendants (`cargo` -> `rustc`, a
+  `sleep 300 &`) would survive. Two mechanisms cover the whole tree:
+  - `terminate()` — on a timeout or transport failure: `SIGTERM` the group,
+    wait up to a 5s grace period for the direct child, then `SIGKILL` the
+    group unconditionally (a grandchild that traps `SIGTERM` must not outlive
+    the step just because its parent exited promptly).
+  - `GroupGuard` — an RAII guard dropped on *every* exit path, including the
+    task cancellation caused by SIGINT, which `SIGKILL`s the group unless it
+    was disarmed after a clean reap.
+  Killing the group also closes the inherited stdout/stderr pipe ends, so an
+  orphan can no longer keep the log stream open after a step has finished.
 - **Timeouts.** `--timeout <secs>` applies globally; `@timeout` overrides per
-  step. Each host task wraps `child.wait()` in `tokio::time::timeout`; on expiry
-  it SIGTERMs the child, waits a 5s grace period, then SIGKILLs it and records
-  the host as `TIMEOUT` (a failure: abort or continue per
-  `--continue-on-error`).
+  step. Each host task wraps `child.wait()` in `tokio::time::timeout`; on
+  expiry it tears the group down as above and records the host as `TIMEOUT` (a
+  failure: abort or continue per `--continue-on-error`).
 - **Signals.** `tokio::signal` installs SIGINT/SIGTERM handlers. On receipt,
-  shellflow cancels all in-flight host tasks, SIGTERM→SIGKILLs every tracked
-  child, prints a summary of completed/failed/pending steps, and exits 130. No
-  orphan processes survive.
+  shellflow cancels all in-flight host tasks, the `GroupGuard`s tear down every
+  process group, shellflow prints a summary of completed/failed/pending steps,
+  and exits 130. No orphan processes survive.
 
 ### 7.6 Cross-step state (`@export`)
 
@@ -712,7 +738,11 @@ Example-based unit tests (colocated `#[cfg(test)]`):
 - env-block rendering: single-quote escaping, ordering before `set -x`,
   masking of known values;
 - `resolve_hosts`: alias / group / raw spec / `--target` restriction;
-- `SshSpec`: `user@host:port` → `["-p", "2222", "user@host"]` and rsync dest.
+- `SshSpec`: `user@host:port` → `["-p", "2222", "user@host"]` and rsync dest;
+- here-documents: quoted/escaped/plain/`<<-` delimiters, `<<<` here-strings,
+  quoted regions and trailing comments not opening one, multiple openers on
+  one line drained FIFO, tab-only terminator indentation, CRLF, unterminated
+  bodies, and the property that a body line never splits the plan.
 
 `proptest` properties (in the ordinary `cargo test` path):
 
@@ -740,7 +770,16 @@ End-to-end tests with **mock `ssh`/`rsync` shims** placed earlier on `PATH`
 - `--output grouped` emits per-host blocks; `--log-file` contains tagged lines;
 - preflight: PATH without `ssh` fails fast with exit 3 and a friendly message;
 - `-vvv` with an `@env` secret: the mock's echoed payload shows the value
-  masked as `***`.
+  masked as `***`, including in the local `bash -c` preview;
+- a `# @remote` line inside a here-document body: no `ssh` invocation at all,
+  while a directive after the terminator still runs;
+- `@secrets --identity` decrypts with the pinned key and no run-wide `-i`;
+- `SHELLFLOW_MASK_MIN_LEN` and `--mask-min-len` both gate short-value masking;
+- preflight fails when `scp` is missing even though `bash`/`ssh`/`rsync` exist;
+- a step with no hosts renders `—`, and `--only` keeps header and summary
+  numbering in sync;
+- process-group teardown: a background grandchild of a timed-out local block
+  is gone afterwards, and a child that traps `SIGTERM` is `SIGKILL`ed.
 
 These tests require local `bash`, `ssh`-less (mock shims), and no network.
 

@@ -2,12 +2,17 @@
 //! and syncs files with rsync, with fan-out, timeouts, and dry-run/diff
 //! semantics.
 //!
-//! All child processes are spawned with `kill_on_drop(true)`, so aborting the
-//! run task (on SIGINT/SIGTERM) terminates every in-flight `ssh`/`rsync`/`bash`
-//! process — no orphans survive.
+//! Every child is spawned in its own process group and torn down through
+//! [`terminate`], which escalates `SIGTERM` -> `SIGKILL`. Signalling only the
+//! direct child would leave whatever tree a block spawned (`cargo` ->
+//! `rustc`, `sudo` -> `systemctl`) running after Ctrl-C, so the whole group
+//! is signalled; the `SIGKILL` fallback guarantees termination even when a
+//! child traps or blocks `SIGTERM`. `kill_on_drop(true)` remains set as a
+//! last-resort net for paths that drop a child without awaiting `terminate`.
 
 use std::{
     collections::HashMap,
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -15,13 +20,17 @@ use std::{
 };
 
 use eyre::{Context, Result, bail};
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
 use shellflow_core::{
     CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, ResolvedHost, RunState, Step,
     interpolate, render_env, resolve_hosts,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Command,
+    process::{Child, Command},
     sync::{Mutex, Semaphore},
     task::JoinSet,
 };
@@ -31,6 +40,83 @@ use crate::{
     secrets::resolve_secrets,
     ui::{HostStatus, Outcome, Stream, Ui},
 };
+
+/// Grace period between the polite `SIGTERM` and the final `SIGKILL`
+/// (design §7.5).
+const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// Put `cmd` in a fresh process group so its whole tree can be signalled.
+///
+/// `process_group(0)` makes the child a group leader (its pgid equals its
+/// pid), so [`signal_group`] reaches every descendant.
+fn isolate(cmd: &mut Command) {
+    cmd.as_std_mut().process_group(0);
+}
+
+/// Signal every process in `pid`'s group, tolerating an already-dead group.
+///
+/// `pid` must be the pid of a child spawned through [`isolate`], so the group
+/// holds only this run's descendants.
+fn signal_group(pid: u32, signal: Signal) {
+    // `ESRCH` just means the group is already gone, which is the desired
+    // end state after a successful `wait`.
+    let _ = killpg(Pid::from_raw(pid as i32), signal);
+}
+
+/// Terminate a child and everything it spawned.
+///
+/// Sends `SIGTERM`, waits up to [`KILL_GRACE`] for the direct child, then
+/// escalates to `SIGKILL` for the **whole group**. The escalation is
+/// unconditional on purpose: a grandchild that traps `SIGTERM` (or a block
+/// running `sleep 300 &`) must not survive just because its parent exited
+/// promptly. Safe to call on an already-reaped child.
+async fn terminate(child: &mut Child) {
+    let Some(pid) = child.id() else {
+        // Already reaped: there is no process left to signal.
+        return;
+    };
+    signal_group(pid, Signal::SIGTERM);
+    let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+    // Anything still in the group dies here. When the group is already gone
+    // this is a harmless `ESRCH`.
+    signal_group(pid, Signal::SIGKILL);
+    // Belt and braces: SIGKILL the direct child in case the group signal was
+    // lost, then reap it so no zombie is left behind.
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// Keeps a spawned child's process group from outliving the current scope.
+///
+/// `Command::kill_on_drop` reaps only the direct child, so a block's
+/// background descendants (`cargo` -> `rustc`, `sleep 300 &`) would survive an
+/// aborted run and contradict the "no orphans" guarantee. Dropping this guard
+/// — which happens on *every* exit path, including a task cancelled by
+/// SIGINT — escalates the whole group to `SIGKILL`.
+///
+/// Call [`GroupGuard::disarm`] once the child has been reaped normally, so a
+/// step that finished cleanly signals nothing.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    /// Track the group of an already-spawned child.
+    fn new(child: &Child) -> Self {
+        Self(child.id())
+    }
+
+    /// Stop guarding: the child completed normally.
+    const fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            signal_group(pid, Signal::SIGKILL);
+        }
+    }
+}
 
 /// The error classification mapped to the CLI exit code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,7 +325,7 @@ pub(crate) async fn execute_plan(
     // Resolve `@secrets` before the first step: decrypt, inject into run-state
     // env, and register every value for masking.
     if !plan.secrets.is_empty() {
-        match resolve_secrets(&plan.secrets, flags.identity.as_deref(), flags.mask_min_len) {
+        match resolve_secrets(&plan.secrets, flags.identity.as_deref(), run.mask_min_len()) {
             Ok((env_pairs, masks)) => {
                 secrets.extend(masks);
                 let mut state = run_state.lock().await;
@@ -281,7 +367,7 @@ pub(crate) async fn execute_plan(
     // still exits non-zero when something failed.
     let mut first_error: Option<RunError> = None;
 
-    for (pos, (idx, step)) in selected.iter().enumerate() {
+    for (pos, (_idx, step)) in selected.iter().enumerate() {
         if fail_fast_error.is_some() {
             break;
         }
@@ -328,7 +414,9 @@ pub(crate) async fn execute_plan(
         let elapsed = started.elapsed();
         let statuses = outcome_to_statuses(&outcome);
         crate::ui::step_outcome(elapsed, &statuses);
-        let step_stats = StepStats { index: idx + 1, elapsed, statuses };
+        // Number by the *selected* ordinal so `[STEP n/m]` headers and the
+        // final summary agree when `--only`/`--skip` filter the plan.
+        let step_stats = StepStats { index: step_no, elapsed, statuses };
         progress.lock().await.push(step_stats.clone());
         stats.push(step_stats);
 
@@ -451,7 +539,9 @@ async fn run_local_block(
     };
 
     if config.verbose >= 2 {
-        crate::ui::note(&format!("  ↳ local command: bash -c {:?}", body));
+        // Masked: `body` is user content and may embed a literal secret,
+        // exactly like the payload preview above it.
+        ui.lock().await.masked_note(&format!("  ↳ local command: bash -c {body:?}"));
     }
 
     // Stream output through the UI so secrets are masked and `--log-file`
@@ -495,26 +585,28 @@ async fn run_local_guard(guard: &str, timeout: Option<u64>) -> bool {
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(format!("set -e\n{guard}"));
     cmd.kill_on_drop(true);
+    isolate(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return false,
     };
+    let mut guard = GroupGuard::new(&child);
     let status = match timeout {
-        Some(secs) => {
-            let timed = tokio::time::timeout(Duration::from_secs(secs), child.wait()).await;
-            if let Ok(Ok(status)) = timed {
-                status
-            } else {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) => return false,
+            Err(_) => {
+                terminate(&mut child).await;
+                guard.disarm();
                 return false;
             }
-        }
+        },
         None => match child.wait().await {
             Ok(status) => status,
             Err(_) => return false,
         },
     };
+    guard.disarm();
     status.success()
 }
 
@@ -525,15 +617,26 @@ async fn run_command_status(
     timeout: Option<u64>,
     label: &str,
 ) -> Result<std::process::ExitStatus> {
+    isolate(&mut cmd);
+    cmd.kill_on_drop(true);
     let status = match timeout {
-        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), cmd.status()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(err)) => return Err(err).wrap_err(format!("failed to run {label}")),
-            Err(_) => {
-                crate::ui::warn(&format!("{label} timed out — killed"));
-                bail!("{label} timed out after {secs}s");
+        Some(secs) => {
+            let mut child = cmd.spawn().wrap_err(format!("failed to run {label}"))?;
+            let mut guard = GroupGuard::new(&child);
+            match tokio::time::timeout(Duration::from_secs(secs), child.wait()).await {
+                Ok(Ok(status)) => {
+                    guard.disarm();
+                    status
+                }
+                Ok(Err(err)) => return Err(err).wrap_err(format!("failed to run {label}")),
+                Err(_) => {
+                    crate::ui::warn(&format!("{label} timed out — killed"));
+                    terminate(&mut child).await;
+                    guard.disarm();
+                    bail!("{label} timed out after {secs}s");
+                }
             }
-        },
+        }
         None => cmd.status().await.wrap_err(format!("failed to run {label}"))?,
     };
     Ok(status)
@@ -549,7 +652,9 @@ async fn run_bash_streamed(
 ) -> Result<std::process::ExitStatus> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    isolate(&mut cmd);
     let mut child = cmd.spawn().wrap_err("failed to spawn bash")?;
+    let mut guard = GroupGuard::new(&child);
 
     let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("stdout not piped"))?;
     let stderr = child.stderr.take().ok_or_else(|| eyre::eyre!("stderr not piped"))?;
@@ -575,14 +680,15 @@ async fn run_bash_streamed(
                 Ok(Err(err)) => return Err(eyre::Report::new(err)),
                 Err(_) => {
                     read_task.abort();
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    terminate(&mut child).await;
+                    guard.disarm();
                     bail!("local step timed out after {secs}s");
                 }
             }
         }
         None => child.wait().await?,
     };
+    guard.disarm();
 
     let _ = out_task.await;
     let _ = err_task.await;
@@ -824,7 +930,11 @@ async fn run_remote_host(
     let payload_env = with_login_path(parts.env.clone(), remote_env.path.as_deref());
     if let Some(guard) = &parts.guard {
         match run_remote_guard(host, remote_env.shell, guard, &payload_env, config.timeout).await {
-            GuardResult::Pass => {}
+            GuardResult::Pass => {
+                if config.verbose >= 2 {
+                    crate::ui::note(&format!("  [{}] guard passed: {guard}", host.alias));
+                }
+            }
             GuardResult::Fail => {
                 crate::ui::note(&format!("[{}] SKIPPED (guard)", host.alias));
                 return (host.alias.clone(), HostOutcome::Skipped);
@@ -881,6 +991,7 @@ fn build_ssh_cmd(
     cmd.arg(shell.invoke(syntax_only));
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    isolate(&mut cmd);
     cmd
 }
 
@@ -938,6 +1049,7 @@ async fn probe_remote_env(host: &ResolvedHost) -> RemoteEnv {
     cmd.arg(script);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     cmd.kill_on_drop(true);
+    isolate(&mut cmd);
     let output = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
         Ok(Ok(output)) if output.status.success() => output,
         _ => return RemoteEnv::default(),
@@ -1002,10 +1114,12 @@ async fn run_remote_guard(
     cmd.arg(shell.invoke(false));
     cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
     cmd.kill_on_drop(true);
+    isolate(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return GuardResult::Transport,
     };
+    let mut group = GroupGuard::new(&child);
     if let Some(mut stdin) = child.stdin.take() {
         let script = format!("set -e\n{}{guard}\n", render_env(env));
         let _ = stdin.write_all(script.as_bytes()).await;
@@ -1014,16 +1128,22 @@ async fn run_remote_guard(
         Some(secs) => tokio::time::timeout(Duration::from_secs(secs), child.wait()).await,
         None => Ok(child.wait().await),
     };
-    match wait {
+    let result = match wait {
         Ok(Ok(status)) if status.success() => GuardResult::Pass,
         Ok(Ok(status)) if status.code() == Some(255) => GuardResult::Transport,
         Ok(Ok(_)) => GuardResult::Fail,
         _ => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            terminate(&mut child).await;
             GuardResult::Transport
         }
+    };
+    if !matches!(result, GuardResult::Fail) {
+        // A guard that simply did not match is a normal outcome, so the
+        // process was reaped cleanly; only transport failures need the group
+        // cleaned up.
+        group.disarm();
     }
+    result
 }
 
 async fn run_ssh_child(
@@ -1034,11 +1154,12 @@ async fn run_ssh_child(
     timeout: Option<u64>,
 ) -> Result<(), SshOutcome> {
     let mut child = cmd.spawn().map_err(|_| SshOutcome::Transport)?;
+    let mut guard = GroupGuard::new(&child);
 
     if let Some(mut stdin) = child.stdin.take() {
         if stdin.write_all(payload.as_bytes()).await.is_err() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            terminate(&mut child).await;
+            guard.disarm();
             return Err(SshOutcome::Transport);
         }
         drop(stdin);
@@ -1074,8 +1195,8 @@ async fn run_ssh_child(
                 }
                 Err(_) => {
                     read_task.abort();
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    terminate(&mut child).await;
+                    guard.disarm();
                     let _ = out_task.await;
                     let _ = err_task.await;
                     return Err(SshOutcome::TimedOut);
@@ -1093,6 +1214,7 @@ async fn run_ssh_child(
             }
         }
     };
+    guard.disarm();
 
     // Drain remaining buffered output.
     let _ = out_task.await;
@@ -1258,6 +1380,14 @@ async fn run_rsync_host(
             if has_rsync { "present" } else { "missing — using scp fallback" }
         ));
     }
+    // `scp` has no mirror mode, so `--delete` cannot be honored here. Say so
+    // rather than let a "mirror" step quietly keep stale remote files.
+    if delete && !has_rsync {
+        crate::ui::warn(&format!(
+            "[{}] `--delete` ignored: remote has no rsync, so the scp fallback cannot mirror deletions",
+            host.alias
+        ));
+    }
 
     let outcome = if has_rsync {
         run_rsync_transfer(ui.clone(), host, src, dst, delete, &remote_shell, config).await
@@ -1357,6 +1487,7 @@ async fn run_scp_transfer(
     mkdir.arg(format!("mkdir -p '{quoted_dir}'"));
     mkdir.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     mkdir.kill_on_drop(true);
+    isolate(&mut mkdir);
     let status = mkdir.status().await.wrap_err("failed to create remote dir")?;
     if !status.success() {
         bail!("remote mkdir for {dir} failed");
@@ -1374,12 +1505,14 @@ async fn run_scp_transfer(
     scp.arg(src).arg(&dest);
     scp.stdout(Stdio::piped()).stderr(Stdio::piped());
     scp.kill_on_drop(true);
+    isolate(&mut scp);
 
     if config.verbose >= 2 {
         crate::ui::note(&format!("  [{}] scp {}", host.alias, display_args(&scp)));
     }
 
     let mut child = scp.spawn().wrap_err("failed to spawn scp")?;
+    let mut guard = GroupGuard::new(&child);
     let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("stdout not piped"))?;
     let stderr = child.stderr.take().ok_or_else(|| eyre::eyre!("stderr not piped"))?;
 
@@ -1403,14 +1536,15 @@ async fn run_scp_transfer(
                 Ok(Err(err)) => return Err(eyre::Report::new(err)),
                 Err(_) => {
                     read_task.abort();
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    terminate(&mut child).await;
+                    guard.disarm();
                     bail!("copy step timed out after {secs}s");
                 }
             }
         }
         None => child.wait().await?,
     };
+    guard.disarm();
 
     let _ = out_task.await;
     let _ = err_task.await;
@@ -1429,7 +1563,10 @@ async fn run_rsync_child(
     timeout: Option<u64>,
     diff: bool,
 ) -> Result<()> {
+    cmd.kill_on_drop(true);
+    isolate(&mut cmd);
     let mut child = cmd.spawn().wrap_err("failed to spawn rsync")?;
+    let mut guard = GroupGuard::new(&child);
     let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("stdout not piped"))?;
     let stderr = child.stderr.take().ok_or_else(|| eyre::eyre!("stderr not piped"))?;
 
@@ -1458,14 +1595,15 @@ async fn run_rsync_child(
                 Ok(Err(err)) => return Err(eyre::Report::new(err)),
                 Err(_) => {
                     read_task.abort();
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    terminate(&mut child).await;
+                    guard.disarm();
                     bail!("copy step timed out after {secs}s");
                 }
             }
         }
         None => child.wait().await?,
     };
+    guard.disarm();
 
     let _ = out_task.await;
     let _ = err_task.await;

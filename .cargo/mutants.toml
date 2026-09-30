@@ -1,6 +1,8 @@
 # Mutation testing configuration for cargo-mutants.
 #
-# Binary crate entry points (e.g. `fn main`) cannot be exercised by unit
-# tests, so their injected mutants would always survive. Keep mutation
-# focused on library crates where the domain logic lives.
-exclude_globs = ["bin/cli-app/src/**"]
+# The binary crates are exercised by `bin/shellflow/tests/integration.rs`,
+# which cargo-mutants does not run (it builds each crate's own test target
+# only). Their orchestration mutants therefore survive by construction, so
+# they are excluded and mutation stays focused on the library crates, where
+# the domain logic lives and is unit- and property-tested.
+exclude_globs = ["bin/shellflow/src/**", "bin/demo-secret-app/src/**"]
