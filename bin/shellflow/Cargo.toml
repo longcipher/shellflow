@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "A shell-native, agentless automation tool that runs commands over SSH concurrently and idempotently."
 authors.workspace = true
 keywords.workspace = true
@@ -18,8 +17,8 @@ clap = { workspace = true, features = ["derive"] }
 colored = { workspace = true }
 eyre = { workspace = true }
 nix = { workspace = true, features = ["process", "signal"] }
-shellflow-core = { path = "../../crates/shellflow-core", version = "0.1.0" }
-shellflow-secrets = { path = "../../crates/shellflow-secrets", version = "0.1.0" }
+shellflow-core = { path = "../../crates/shellflow-core", version = "0.4.10" }
+shellflow-secrets = { path = "../../crates/shellflow-secrets", version = "0.4.10" }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
