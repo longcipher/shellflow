@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     error::ParseError,
+    heredoc::HeredocTracker,
     plan::{CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, SecretEntry, Step, Target},
     ssh_spec::SshSpec,
 };
@@ -36,6 +37,8 @@ struct State {
     pending_export: Vec<String>,
     /// Line number of each group declaration (for validation errors).
     group_lines: BTreeMap<String, usize>,
+    /// Here-document bodies opened by earlier lines and not yet terminated.
+    heredocs: HeredocTracker,
 }
 
 impl State {
@@ -50,6 +53,7 @@ impl State {
             pending_timeout: None,
             pending_export: Vec::new(),
             group_lines: BTreeMap::new(),
+            heredocs: HeredocTracker::default(),
         }
     }
 
@@ -486,6 +490,10 @@ fn directive(line: &str) -> Option<(String, String)> {
 
 /// Parse a deploy script into an [`ExecutionPlan`].
 ///
+/// Lines inside a here-document body are always script content: a `# @…`
+/// line there belongs to the user's data (a unit file, a template), not to
+/// shellflow, so it is never interpreted as a directive.
+///
 /// # Errors
 ///
 /// Returns a [`ParseError`] for malformed directives, duplicate or unknown
@@ -496,9 +504,18 @@ pub fn parse_script(input: &str) -> Result<ExecutionPlan, ParseError> {
     for (idx, raw) in input.lines().enumerate() {
         let line_no = idx + 1;
         let line = raw.strip_suffix('\r').unwrap_or(raw);
+
+        // A here-document body wins over directive detection: its lines are
+        // data, and the body may not be split by a block boundary.
+        if state.heredocs.consume_body(line) {
+            state.pending.push(line.to_string());
+            continue;
+        }
+
         if let Some((keyword, payload)) = directive(line) {
             state.apply_directive(&keyword, &payload, line_no)?;
         } else {
+            state.heredocs.open_in(line);
             state.pending.push(line.to_string());
         }
     }
@@ -523,6 +540,8 @@ pub fn parse_script(input: &str) -> Result<ExecutionPlan, ParseError> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::sample::select;
+
     use super::{directive, parse_script};
     use crate::{
         error::ParseError,
@@ -860,6 +879,131 @@ mod tests {
         Ok(())
     }
 
+    // -----------------------------------------------------------------
+    // Here-document bodies are data, never directives
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn heredoc_body_directive_is_script_content() -> Result<(), String> {
+        // The reported failure: a `# @remote` line inside a here-document was
+        // interpreted as a real directive, so the block was redirected to a
+        // host the author never named.
+        let plan = parse(
+            "# @local\n\
+             cat <<'INNER'\n\
+             # @remote web\n\
+             echo pwned\n\
+             INNER\n\
+             echo after\n",
+        )?;
+        assert_eq!(plan.steps.len(), 1, "heredoc body must not split blocks");
+        let step = as_local(&plan.steps[0])?;
+        assert_eq!(step.script, "cat <<'INNER'\n# @remote web\necho pwned\nINNER\necho after\n");
+        Ok(())
+    }
+
+    #[test]
+    fn heredoc_body_cannot_shadow_a_later_directive() -> Result<(), String> {
+        // A directive *after* the terminator must still take effect.
+        let plan = parse(
+            "# @server web1 deploy@h1\n\
+             # @local\n\
+             cat <<'EOF'\n\
+             body\n\
+             EOF\n\
+             # @remote web1\n\
+             echo deployed\n",
+        )?;
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[1].target_text(), Some("web1"));
+        Ok(())
+    }
+
+    #[test]
+    fn heredoc_body_cannot_break_the_plan() -> Result<(), String> {
+        // An unknown directive inside a body is data, so parsing succeeds.
+        let plan = parse("# @local\ncat <<EOF\n# @frobnicate x\nEOF\n")?;
+        assert_eq!(plan.steps.len(), 1);
+        assert!(as_local(&plan.steps[0])?.script.contains("# @frobnicate x"));
+        Ok(())
+    }
+
+    #[test]
+    fn indented_heredoc_body_is_protected() -> Result<(), String> {
+        let plan = parse("# @local\ncat <<-EOF\n\t# @remote web\n\tEOF\necho done\n")?;
+        assert_eq!(plan.steps.len(), 1);
+        assert!(as_local(&plan.steps[0])?.script.contains("# @remote web"));
+        Ok(())
+    }
+
+    #[test]
+    fn space_indented_terminator_does_not_close_a_plain_heredoc() -> Result<(), String> {
+        // Only tabs close a `<<-` body; a space-indented `EOF` is body text,
+        // so the trailing directive stays inside the block.
+        let plan = parse("# @local\ncat <<-EOF\nbody\n  EOF\n# @remote web\n")?;
+        assert_eq!(plan.steps.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn two_heredocs_on_one_line_are_both_tracked() -> Result<(), String> {
+        let plan = parse(
+            "# @local\n\
+             diff <(cat <<A) <(cat <<B)\n\
+             # @remote web\n\
+             A\n\
+             # @remote web\n\
+             B\n\
+             echo done\n",
+        )?;
+        assert_eq!(plan.steps.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn here_string_is_not_a_heredoc() -> Result<(), String> {
+        // `<<<` has no body: the following directive is still a directive.
+        let plan = parse("# @local\ngrep x <<<\"$body\"\n# @remote web\necho hi\n")?;
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[1].target_text(), Some("web"));
+        Ok(())
+    }
+
+    #[test]
+    fn quoted_heredoc_opener_in_a_string_is_ignored() -> Result<(), String> {
+        let plan = parse("# @local\necho 'a << b'\n# @remote web\necho hi\n")?;
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[1].target_text(), Some("web"));
+        Ok(())
+    }
+
+    #[test]
+    fn heredoc_opener_in_a_comment_is_ignored() -> Result<(), String> {
+        let plan = parse("# @local\necho hi\n# see <<EOF for details\n# @remote web\necho hi\n")?;
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[1].target_text(), Some("web"));
+        Ok(())
+    }
+
+    #[test]
+    fn unterminated_heredoc_consumes_the_rest() -> Result<(), String> {
+        // Bash warns and treats EOF as the terminator; matching that keeps
+        // shellflow from inventing a directive the shell never saw.
+        let plan = parse("# @local\ncat <<EOF\n# @remote web\n")?;
+        assert_eq!(plan.steps.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn crlf_heredoc_terminator_is_recognized() -> Result<(), String> {
+        let plan = parse(
+            "# @local\r\ncat <<'EOF'\r\n# @remote web\r\nEOF\r\n# @remote web2\r\necho hi\r\n",
+        )?;
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[1].target_text(), Some("web2"));
+        Ok(())
+    }
+
     proptest::proptest! {
         #[test]
         fn non_directive_body_becomes_single_local_step(
@@ -874,6 +1018,40 @@ mod tests {
             proptest::prop_assert_eq!(&step.script, &format!("{script}\n"));
         }
 
+        /// A here-document body containing a directive line never splits the
+        /// plan, whatever the body holds.
+        #[test]
+        fn heredoc_body_never_creates_a_step(
+            // Every candidate is deliberately directive-looking or a
+            // near-miss terminator; none is exactly `EOF`.
+            body in proptest::collection::vec(
+                select(vec!["body line", "# @remote web", "# comment", "EOFX", "  EOF", "text"]),
+                1..6,
+            ),
+        ) {
+            let body = body.join("\n");
+            let block = format!("cat <<'EOF'\n{body}\nEOF\n");
+            let plan = parse_prop(&format!("# @local\n{block}"))?;
+            proptest::prop_assert_eq!(plan.steps.len(), 1);
+            let step = as_local(&plan.steps[0])
+                .map_err(proptest::prelude::TestCaseError::fail)?;
+            // The whole opener..terminator span survives verbatim, so no body
+            // line can have been promoted to a directive.
+            proptest::prop_assert_eq!(step.script.as_str(), block.as_str());
+        }
+
+        /// The terminator closes the body, so a directive on the next line is
+        /// honored exactly once.
+        #[test]
+        fn directive_after_terminator_applies(
+            body in proptest::collection::vec("[a-z]{1,20}", 1..5),
+        ) {
+            let body = body.join("\n");
+            let script = format!("# @local\ncat <<'EOF'\n{body}\nEOF\n# @remote web\necho hi\n");
+            let plan = parse_prop(&script)?;
+            proptest::prop_assert_eq!(plan.steps.len(), 2);
+            proptest::prop_assert_eq!(plan.steps[1].target_text(), Some("web"));
+        }
         #[test]
         fn whitespace_only_body_is_dropped(
             lines in proptest::collection::vec(" ", 1..8),

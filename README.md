@@ -51,7 +51,9 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
   defaults to all hosts).
 - **Detailed debugging** — `-v` / `-vv` / `-vvv`:
   - `-v`: plan preview + per-step timing.
-  - `-vv`: exact `ssh`/`rsync`/`scp` argv and full payload previews.
+  - `-vv`: exact `ssh`/`rsync`/`scp` argv, full payload previews, and
+    `@only_if` guard evaluations. Every preview is secret-masked, local
+    blocks included.
   - `-vvv`: injects `set -x` into every payload and `ssh -v` on the wire, so you
     watch Bash trace lines live (stderr shown yellow, per-host prefixed).
 - **Idempotent dry-run & diff** — `--dry-run` / `--diff` syntax-check payloads
@@ -64,13 +66,18 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
 - **Graceful file copies** — `@copy` uses rsync when the target has it (with a
   `mkdir -p` remote wrapper), and automatically falls back to
   `ssh mkdir -p` + `scp` on hosts without rsync. Destination directories are
-  always created.
+  always created. `scp` cannot mirror deletions, so `--delete` is reported as
+  ignored on the fallback path rather than silently leaving stale files.
 - **Guards & timeouts** — `@only_if <cmd>` skips a block where the
   precondition fails; `--timeout SECS` / `@timeout SECS` kills hung hosts
   (guards included).
 - **Lifecycle safety** — Ctrl-C/SIGTERM terminates in-flight children (no
   orphans), prints a summary of completed steps, and exits 130; a preflight
   check fails fast if `bash`/`ssh`/`rsync`/`scp` are missing.
+  Every child runs in its own process group and is torn down with
+  `SIGTERM` -> `SIGKILL` after a grace period, so a block's whole process
+  tree (`cargo` -> `rustc`, `sleep 300 &`) dies with the step instead of
+  lingering as an orphan holding the log pipes open.
 - **Output modes** — `--output grouped` prints each host's logs as one block;
   `--log-file PATH` appends every streamed line (tagged host+stream) for audit.
 - **Secrets** — literal `@env KEY=VALUE` values are masked (`***`) in previews,
@@ -81,7 +88,10 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
   `age`-encrypted env file on the controller, injects every key into the
   block environment, exports the space-separated key list as
   `LT_SECRET_KEYS`, and masks all values in previews/traces/logs. Targets
-  never see the decryption identity.
+  never see the decryption identity. Values shorter than the masking
+  threshold are left alone (a global substring replace would shred unrelated
+  output); the threshold is `--mask-min-len`, else `$SHELLFLOW_MASK_MIN_LEN`,
+  else `6`.
 - **Embedded age tooling** — `keys` (generate/public) and `secret`
   (encrypt/decrypt/edit/creds) subcommands manage identities and encrypted env
   files; no `age`/`rage` CLI required on the controller.
@@ -111,7 +121,7 @@ lines belong to the current block.
 | `@server` | `# @server <name> <ssh-spec>` | Alias a host. `<ssh-spec>` = `[user@]host[:port]`, or a `~/.ssh/config` host alias |
 | `@group` | `# @group <name> <member>[,<member>…]` | Alias a group of servers |
 | `@env` | `# @env <KEY>` / `# @env <KEY>=<value>` | Inject an env var into later blocks; no `=value` copies from shellflow's environment. Literal values are masked in output |
-| `@secrets` | `# @secrets <file.env.age> [--identity <PATH>]` | Decrypt an age-encrypted env file at run time; inject keys into later blocks, export the key list as `LT_SECRET_KEYS`, and mask all values. Resolution is a hard error without a usable identity |
+| `@secrets` | `# @secrets <file.env.age> [--identity <PATH>]` | Decrypt an age-encrypted env file at run time; inject keys into later blocks, export the key list as `LT_SECRET_KEYS`, and mask all values. Identity precedence is most-specific-wins: the directive's `--identity`, then the run-wide `-i`, then `$SHELLFLOW_AGE_IDENTITY`, then `~/.config/age/keys.txt`. Resolution is a hard error without a usable identity |
 | `@local` | `# @local` | Following lines run locally (default) |
 | `@remote` | `# @remote <target>` | Following lines stream to the target (alias, group, or raw spec) |
 | `@copy` | `# @copy <src> -> <dst> @<target> [--delete]` | Copy a local path to the target (rsync, or scp fallback); creates the destination directory; supports `$VAR` interpolation |
@@ -132,7 +142,13 @@ Key rules:
 - `@copy` paths must not contain the literal `->`; the target is the last
   whitespace-separated token; paths with spaces are unsupported.
 - `@only_if` guards run on each host with the same env as the block.
-- Lines inside heredocs are not interpreted as directives.
+- Lines inside a here-document body are **data, never directives**: a `# @…`
+  line inside `cat <<EOF … EOF` is passed through to the block verbatim, so
+  generating a unit file or a template can never redirect a block to another
+  host. Quoted (`<<'EOF'`, `<<"EOF"`) and backslash-escaped (`<<\EOF`)
+  delimiters are tracked exactly; a delimiter the shell expands (`<<$TAG`)
+  is not statically knowable and is not tracked. `<<<` is a here-string and
+  has no body, so the next line is a directive again.
 
 ## CLI
 
@@ -164,7 +180,7 @@ OPTIONS:
   -l, --log-file <PATH>       Append streamed lines (tagged host+stream)
       --no-color              Disable ANSI colors
   -i, --identity <PATH>       Age identity for @secrets decryption
-      --mask-min-len <N>      Minimum value length to mask for @secrets [default: 6]
+      --mask-min-len <N>      Minimum value length to mask for @secrets
       --local                 Run remote blocks/copies locally (debugging)
   -h, --help                  Print help
   -V, --version               Print version

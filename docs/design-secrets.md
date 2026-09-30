@@ -164,8 +164,14 @@ pub struct SecretEntry {
 
 The executor resolves all `SecretEntry` values once, before the first step:
 
-1. load the identity (fail fast with a clear message if missing);
-2. decrypt the file;
+1. resolve the identity — **most specific wins**: the `@secrets` line's own
+   `--identity`, then the run-wide `-i` flag, then `$SHELLFLOW_AGE_IDENTITY`,
+   then `~/.config/age/keys.txt`. Identities are loaded lazily and cached per
+   run, so a playbook whose files each pin their own identity never touches
+   the default path, and a repeated path is read once. A missing or invalid
+   identity is a hard error (never a silent skip);
+2. decrypt the file. Later files win on key conflicts (matching `source`
+   semantics) and the key list is deduplicated in first-seen order;
 3. parse `KEY=VALUE` lines (blank lines and `#` comments ignored; the first
    `=` splits the key);
 4. insert every key into run-state env (same layer as `@export`, so explicit
@@ -179,11 +185,16 @@ The executor resolves all `SecretEntry` values once, before the first step:
 secret. Short values (e.g. `1`, `on`) would corrupt output, so `@secrets`
 masking applies only to values of length ≥ a threshold. The threshold
 defaults to `6` and is configurable via `$SHELLFLOW_MASK_MIN_LEN` (or
-`--mask-min-len` on `run`). Explicit `@env KEY=value` literals keep
-their current unconditional masking.
+`--mask-min-len` on `run`, which takes precedence). An unparsable or negative
+`$SHELLFLOW_MASK_MIN_LEN` falls back to `6` rather than failing the run.
+Explicit `@env KEY=value` literals keep their current unconditional masking.
 
 Masking covers host lines, payload previews, and `--log-file` output through
-the existing `Ui` path; secrets never appear in any spawned argv.
+the existing `Ui` path; secrets never appear in any spawned argv. Every path
+that renders *user content* must route through the mask, not only the payload
+previews: the `-vv` local `bash -c` echo goes through `Ui::masked_note` for
+exactly this reason, since a literal secret embedded in a block body would
+otherwise be printed unmasked two lines below a preview showing `***`.
 
 ### 5.4 Precedence & errors
 
@@ -230,10 +241,17 @@ stays free of async, I/O, and crypto.
   round-trip stability), masking threshold behavior.
 - **Parser** — `@secrets` directive recognition, ordering, and
   `LT_SECRET_KEYS` export using the existing `shellflow-core` test style.
+- **Resolver** — a per-entry `--identity` beats the run-wide `-i`; a playbook
+  whose every entry pins an identity succeeds even when the default identity
+  path does not exist; a missing identity is a hard error naming the path;
+  later files win on key conflicts and `LT_SECRET_KEYS` is deduplicated; the
+  threshold gates which values are registered for masking.
 - **Integration** — extend `bin/shellflow/tests/` with mock `ssh`/`rsync`
   shims (existing pattern): a playbook with `@secrets` must (a) not leak the
   value into captured argv or payload previews, (b) run the remote block with
-  the env injected, (c) fail fast without an identity.
+  the env injected, (c) fail fast without an identity, (d) decrypt through a
+  per-entry `--identity` with no run-wide `-i`, and (e) honor
+  `SHELLFLOW_MASK_MIN_LEN` for short values.
 - **Mutation** — `just mutation` over the new crate and parser changes.
 - **Fuzz** — conditional: the env-file parser is the only parser-like surface;
   add `cargo-fuzz` only if it grows into a general config format.

@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Demo application that reads sensitive configuration from environment variables, used to show shellflow's secrets workflow end to end."
 publish = false
 
 [lints]

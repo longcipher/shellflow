@@ -4,8 +4,12 @@
 use std::process::Command;
 
 /// The tools required on the controller machine.
+///
+/// `scp` is included because `@copy` falls back to `ssh mkdir -p` + `scp` on
+/// targets that lack `rsync` (design §9), so a missing `scp` is a latent
+/// mid-run failure for every such target.
 const REQUIRED_TOOLS: &[(&str, &[&str])] =
-    &[("bash", &["--version"]), ("ssh", &["-V"]), ("rsync", &["--version"])];
+    &[("bash", &["--version"]), ("ssh", &["-V"]), ("rsync", &["--version"]), ("scp", &["-V"])];
 
 /// Verify every required tool is available and executable.
 ///
@@ -52,8 +56,11 @@ mod tests {
     use super::{REQUIRED_TOOLS, preflight_check, tool_works};
 
     #[test]
-    fn required_tools_are_non_empty() {
-        assert_eq!(REQUIRED_TOOLS.len(), 3);
+    fn required_tools_include_the_scp_fallback() {
+        // bash/ssh/rsync drive execution; scp is the copy fallback for hosts
+        // without rsync, so all four must be present before any step runs.
+        let names: Vec<&str> = REQUIRED_TOOLS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["bash", "ssh", "rsync", "scp"]);
     }
 
     #[test]

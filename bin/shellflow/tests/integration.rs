@@ -863,3 +863,384 @@ fn secrets_injected_and_masked_in_local_mode() -> TestResult<()> {
     assert!(stdout.contains("MY_SECRET"), "LT_SECRET_KEYS missing: {stdout}");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Here-document bodies are data, never directives
+// ---------------------------------------------------------------------------
+
+#[test]
+fn heredoc_body_is_not_interpreted_as_a_directive() -> TestResult<()> {
+    // Regression: a `# @remote` line inside a here-document used to become a
+    // real directive, so the block was split and `echo pwned` ran on a host
+    // the playbook never named.
+    let sb = Sandbox::new("heredoc")?;
+    let script = sb.script(
+        "# @local\n\
+         cat <<'INNER'\n\
+         # @remote web\n\
+         echo pwned\n\
+         INNER\n\
+         echo after\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(
+        status_code(&out),
+        0,
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // `cat` prints the body verbatim, so the literal line is visible as data.
+    assert!(stdout.contains("[localhost] # @remote web"), "heredoc body was lost: {stdout}");
+    assert!(stdout.contains("[localhost] echo pwned"), "heredoc body was lost: {stdout}");
+    assert!(stdout.contains("[localhost] after"), "block after the terminator must run: {stdout}");
+    // The critical assertion: ssh must never have been invoked.
+    assert!(!sb.dir.join(SSH_LOG).exists(), "heredoc body must not become a remote step");
+    Ok(())
+}
+
+#[test]
+fn heredoc_terminator_restores_directive_handling() -> TestResult<()> {
+    // The fix must not over-correct: a directive *after* the terminator is a
+    // directive again.
+    let sb = Sandbox::new("heredoc-after")?;
+    let script = sb.script(
+        "# @server echo1 echo@h1\n\
+         # @local\n\
+         cat <<'EOF'\n\
+         body\n\
+         EOF\n\
+         # @remote echo1\n\
+         echo deployed\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[echo1] echo deployed"),
+        "post-terminator directive was swallowed: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn here_string_is_not_treated_as_a_heredoc() -> TestResult<()> {
+    // `<<<` has no body, so the following directive must still be honored.
+    let sb = Sandbox::new("herestring")?;
+    let script = sb.script(
+        "# @server echo1 echo@h1\n\
+         # @local\n\
+         cat <<<\"literal\"\n\
+         # @remote echo1\n\
+         echo hi\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[echo1] echo hi"),
+        "directive after a here-string was swallowed: {stdout}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Secrets: per-entry identity and the masking threshold
+// ---------------------------------------------------------------------------
+
+#[test]
+fn secrets_per_entry_identity_is_honored() -> TestResult<()> {
+    // `# @secrets FILE --identity PATH` used to be parsed and then ignored, so
+    // the run aborted on the default identity path. Here the file is sealed
+    // to a *second* key and no run-wide `-i` is given.
+    let sb = Sandbox::new("secrets-identity")?;
+    let pinned = sb.dir.join("pinned.txt");
+    sb.run_args(&["keys", "generate", "-o", &pinned.display().to_string()])?;
+    let pinned_pub = String::from_utf8_lossy(
+        &sb.run_args(&["keys", "public", "-i", &pinned.display().to_string()])?.stdout,
+    )
+    .trim()
+    .to_string();
+
+    let plain = sb.dir.join("p.env");
+    fs::write(&plain, "PINNED_VALUE=verysecretvalue\n").map_err(|e| e.to_string())?;
+    let age = sb.dir.join("p.env.age");
+    sb.run_args(&[
+        "secret",
+        "encrypt",
+        "-r",
+        &pinned_pub,
+        "-o",
+        &age.display().to_string(),
+        &plain.display().to_string(),
+    ])?;
+
+    let script = sb.script(&format!(
+        "# @secrets {} --identity {}\n# @local\necho \"got=$PINNED_VALUE keys=$LT_SECRET_KEYS\"\n",
+        age.display(),
+        pinned.display()
+    ))?;
+    let out = sb.run(&script, &["--local"])?;
+    assert_eq!(status_code(&out), 0, "per-entry identity was ignored: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("got=***"), "secret not injected/masked: {stdout}");
+    assert!(stdout.contains("keys=PINNED_VALUE"), "LT_SECRET_KEYS missing: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn mask_min_len_env_var_controls_secrets_masking() -> TestResult<()> {
+    // `SHELLFLOW_MASK_MIN_LEN` is the documented way to mask short values from
+    // CI without editing every playbook.
+    let sb = Sandbox::new("maskenv")?;
+    let key = sb.dir.join("keys.txt");
+    sb.run_args(&["keys", "generate", "-o", &key.display().to_string()])?;
+    let pubkey = String::from_utf8_lossy(
+        &sb.run_args(&["keys", "public", "-i", &key.display().to_string()])?.stdout,
+    )
+    .trim()
+    .to_string();
+
+    let plain = sb.dir.join("s.env");
+    fs::write(&plain, "S=abc\n").map_err(|e| e.to_string())?;
+    let age = sb.dir.join("s.env.age");
+    sb.run_args(&[
+        "secret",
+        "encrypt",
+        "-r",
+        &pubkey,
+        "-o",
+        &age.display().to_string(),
+        &plain.display().to_string(),
+    ])?;
+    let script = sb.script(&format!("# @secrets {}\n# @local\necho \"v=$S\"\n", age.display()))?;
+
+    // Default threshold (6): a 3-char value is left alone.
+    let out =
+        run_with_env(&script, &["--local", "-i", &key.display().to_string()], &sb.mock_dir(), &[])?;
+    assert_eq!(status_code(&out), 0, "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("v=abc"), "short value must not be masked by default: {stdout}");
+
+    // `SHELLFLOW_MASK_MIN_LEN=3`: now it is masked.
+    let out = run_with_env(
+        &script,
+        &["--local", "-i", &key.display().to_string()],
+        &sb.mock_dir(),
+        &[("SHELLFLOW_MASK_MIN_LEN", "3")],
+    )?;
+    assert_eq!(status_code(&out), 0, "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("v=***"), "SHELLFLOW_MASK_MIN_LEN was ignored: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn local_verbose_preview_masks_secrets() -> TestResult<()> {
+    // The `-vv` "local command" echo used to print the raw `bash -c` body,
+    // leaking a literal secret that the payload preview right above it masked.
+    let sb = Sandbox::new("localmask")?;
+    let script = sb.script(
+        "# @env TOKEN=LEAKCANARY123\n\
+         # @local\n\
+         echo \"$TOKEN\"\n",
+    )?;
+    let out = sb.run(&script, &["-vvv"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("LEAKCANARY123"), "secret leaked into -vvv output: {stdout}");
+    assert!(stdout.contains("***"), "mask not applied: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn step_without_hosts_renders_an_em_dash() -> TestResult<()> {
+    // A `@copy` under `--check` performs no transfer, so the step has no host
+    // statuses. The old rendering was an empty `()`.
+    let sb = Sandbox::new("emdash")?;
+    let script = sb.script("# @server ok1 ok@h1\n# @copy ./out -> /srv/app @ok1\n")?;
+    let out = sb.run(&script, &["--check"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("()"), "empty status list rendered as `()`: {stdout}");
+    assert!(stdout.contains("(—)"), "expected an em dash placeholder: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn step_numbers_agree_between_header_and_summary() -> TestResult<()> {
+    // With `--only`, the header counts the selected steps; the summary must
+    // use the same numbering or the two disagree.
+    let sb = Sandbox::new("stepnum")?;
+    let script = sb.script(
+        "# @name build\n# @local\necho AAA\n\
+         # @name deploy\n# @local\necho BBB\n\
+         # @name verify\n# @local\necho CCC\n",
+    )?;
+    let out = sb.run(&script, &["--only", "deploy"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[STEP 1/1] deploy"), "unexpected header: {stdout}");
+    assert!(stdout.contains("step  1  "), "summary must number the selected step 1: {stdout}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Preflight and copy-fallback honesty
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preflight_reports_missing_scp() -> TestResult<()> {
+    // `scp` is the copy fallback for hosts without rsync, so a missing scp is
+    // a latent mid-run failure and must fail fast instead.
+    let sb = Sandbox::new("preflight-scp")?;
+    let script = sb.script("# @local\n\necho hi\n")?;
+    let path_dir = sb.dir.join("partial-path");
+    fs::create_dir_all(&path_dir).map_err(|e| e.to_string())?;
+    for tool in ["/usr/bin/bash", "/usr/bin/ssh", "/usr/bin/rsync"] {
+        if Path::new(tool).exists() {
+            let name = tool.rsplit('/').next().unwrap_or_default();
+            std::os::unix::fs::symlink(tool, path_dir.join(name)).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shellflow"));
+    cmd.arg(&script).arg("--no-color");
+    cmd.env("MOCK_DIR", sb.mock_dir());
+    cmd.env("PATH", &path_dir);
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if status_code(&out) == 0 {
+        // The host machine has no scp in that dir only if the symlink loop
+        // above worked; treat an unexpected success as a skip.
+        eprintln!("skipping: this machine exposes scp at the probed path");
+        return Ok(());
+    }
+    assert_eq!(status_code(&out), 3, "preflight should exit 3: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("scp"), "preflight must name scp: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn scp_fallback_warns_that_delete_is_ignored() -> TestResult<()> {
+    // `scp` cannot mirror deletions. Silently ignoring `--delete` would leave
+    // stale files on the target while reporting a successful "mirror".
+    let sb = Sandbox::new("scpdelete")?;
+    let script = sb.script(
+        "# @server norsync1 norsync@h1\n\
+         # @copy ./out -> /srv/app @norsync1 --delete\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--delete"), "must warn that --delete is dropped: {stdout}");
+    assert!(stdout.contains("ignored"), "must warn that --delete is dropped: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn guard_is_visible_at_verbose_two() -> TestResult<()> {
+    // Design §8.1: `-vv` shows guard (`@only_if`) evaluations.
+    let sb = Sandbox::new("guardverbose")?;
+    let script = sb.script(
+        "# @server ok1 ok@h1\n\
+         # @remote ok1\n\
+         # @only_if test -f /etc/app.conf\n\
+         echo hi\n",
+    )?;
+    let out = sb.run(&script, &["-vv"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("guard passed"), "guard evaluation not shown: {stdout}");
+    assert!(stdout.contains("test -f /etc/app.conf"), "guard command not shown: {stdout}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Process-group teardown: no orphaned grandchildren
+// ---------------------------------------------------------------------------
+
+/// Whether `pid` is still executing, as opposed to having exited.
+///
+/// `kill(pid, 0)` also succeeds for a zombie that has exited but has not been
+/// reaped by init yet, which would make a correctly-killed child look like an
+/// orphan. On Linux the process state is authoritative; elsewhere fall back to
+/// the signal probe.
+fn pid_running(pid: i32) -> bool {
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) &&
+        let Some((_, rest)) = stat.rsplit_once(") ") &&
+        let Some(state) = rest.chars().next()
+    {
+        return state != 'Z';
+    }
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+#[test]
+fn timeout_kills_the_whole_process_group() -> TestResult<()> {
+    // A block's descendants must die with the step. `kill_on_drop` alone only
+    // reaps the direct child, which used to leave the background job running.
+    let sb = Sandbox::new("pgroup")?;
+    let pid_file = sb.dir.join("grandchild.pid");
+    let script = sb.script(&format!(
+        "# @local\n\
+         sleep 300 &\n\
+         echo $! > {}\n\
+         wait\n",
+        pid_file.display()
+    ))?;
+    let out = sb.run(&script, &["--timeout", "1"])?;
+    assert_eq!(status_code(&out), 4, "timeout is a failure: {out:?}");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pid_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .map_err(|e| format!("grandchild pid not recorded: {e}"))?
+        .trim()
+        .parse()
+        .map_err(|e| format!("unparsable pid: {e}"))?;
+
+    // The group kill is asynchronous with respect to the child's exit, so
+    // allow a brief settle before declaring the process an orphan.
+    let settle = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pid_running(pid) && std::time::Instant::now() < settle {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!pid_running(pid), "grandchild {pid} survived the timeout — orphaned process");
+    Ok(())
+}
+
+#[test]
+fn stubborn_child_is_escalated_to_sigkill() -> TestResult<()> {
+    // SIGTERM-trapping children must not be able to outlive the step: after
+    // the grace period the whole group is SIGKILLed.
+    let sb = Sandbox::new("sigkill")?;
+    let pid_file = sb.dir.join("stubborn.pid");
+    let script = sb.script(&format!(
+        "# @local\n\
+         sh -c 'trap \"\" TERM; echo $$ > {}; sleep 300' &\n\
+         wait\n",
+        pid_file.display()
+    ))?;
+    let out = sb.run(&script, &["--timeout", "1"])?;
+    assert_eq!(status_code(&out), 4, "timeout is a failure: {out:?}");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pid_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .map_err(|e| format!("stubborn pid not recorded: {e}"))?
+        .trim()
+        .parse()
+        .map_err(|e| format!("unparsable pid: {e}"))?;
+
+    let settle = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pid_running(pid) && std::time::Instant::now() < settle {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!pid_running(pid), "SIGTERM-trapping child {pid} survived; SIGKILL escalation failed");
+    Ok(())
+}

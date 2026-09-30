@@ -66,7 +66,7 @@ lines belong to the current block.
 | `@server` | `# @server <name> <ssh-spec>` | Alias a host; `<ssh-spec>` = `[user@]host[:port]` or a `~/.ssh/config` host alias |
 | `@group` | `# @group <name> <member>[,<member>…]` | Alias a group of servers |
 | `@env` | `# @env <KEY>` / `# @env <KEY>=<value>` | Inject env into later blocks; literal values are masked in output |
-| `@secrets` | `# @secrets <file.env.age> [--identity <PATH>]` | Decrypt an age-encrypted env file at run time; inject every key into the block environment, export the space-separated key list as `LT_SECRET_KEYS`, and mask all values. Resolution is a hard error without a usable identity |
+| `@secrets` | `# @secrets <file.env.age> [--identity <PATH>]` | Decrypt an age-encrypted env file at run time; inject every key into the block environment, export the space-separated key list as `LT_SECRET_KEYS`, and mask all values. Identity precedence: the directive's `--identity`, then run-wide `-i`, then `$SHELLFLOW_AGE_IDENTITY`, then `~/.config/age/keys.txt`. Resolution is a hard error without a usable identity |
 | `@local` | `# @local` | Following lines run locally (default) |
 | `@remote` | `# @remote <target>` | Following lines stream to the target (alias, group, raw spec) |
 | `@copy` | `# @copy <src> -> <dst> @<target> [--delete]` | Copy a local path (rsync, or scp fallback); creates the destination dir; `$VAR` interpolated |
@@ -88,7 +88,10 @@ Behavioral rules to remember:
   guard reports `SKIPPED`.
 - `@copy` `src`/`dst` must not contain `->`; the target is the last
   whitespace-separated token; spaces in paths are unsupported.
-- Lines inside heredocs are not interpreted as directives.
+- Lines inside a here-document body are data, never directives: a `# @…`
+  line inside `cat <<EOF … EOF` is passed through verbatim. Quoted/escaped
+  delimiters are tracked exactly; an expanded delimiter (`<<$TAG`) is not.
+  `<<<` is a here-string with no body, so the next line is a directive.
 
 ## Authoring a playbook
 
@@ -136,7 +139,8 @@ cat "${WORKDIR}/marker.txt"
   the environment.
 - A hanging host is bounded by `--timeout SECS` / `@timeout SECS` (guards
   included). Ctrl-C/SIGTERM kills in-flight children (no orphans) and exits
-  130.
+  130. Each child runs in its own process group, torn down `SIGTERM` ->
+  `SIGKILL`, so background jobs a block spawned die with the step.
 
 ## Troubleshooting
 
@@ -146,7 +150,8 @@ cat "${WORKDIR}/marker.txt"
 - `SKIPPED` → `@only_if` guard failed on that host (check the guard command
   and whether `@export`ed variables are referenced).
 - A copy step on a minimal host silently uses the `scp` fallback; `-vv` shows
-  which path was taken (`remote rsync: present|missing`).
+  which path was taken (`remote rsync: present|missing`) and the fallback
+  warns that `--delete` cannot be mirrored.
 - Payload previews are masked with `***` where secrets appear — that is
   expected.
 
@@ -180,7 +185,7 @@ OPTIONS:
   -l, --log-file <PATH>       Append streamed lines (tagged host+stream)
       --no-color              Disable ANSI colors
   -i, --identity <PATH>       Age identity for @secrets decryption
-      --mask-min-len <N>      Minimum value length to mask for @secrets [default: 6]
+      --mask-min-len <N>      Minimum value length to mask for @secrets
       --local                 Run remote blocks/copies locally (debugging)
   -h, --help                  Print help
   -V, --version               Print version

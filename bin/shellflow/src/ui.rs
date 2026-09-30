@@ -156,6 +156,16 @@ impl Ui {
         print_line("  |------------------".dimmed().to_string());
     }
 
+    /// Print a note line with every known secret masked.
+    ///
+    /// Notes that echo user content (a local `bash -c` body, an rsync
+    /// argv) must go through here: `note` renders raw text, so a literal
+    /// secret in a playbook would otherwise leak at `-vv` even though the
+    /// payload preview two lines above shows `***`.
+    pub(crate) fn masked_note(&self, text: &str) {
+        print_line(self.mask(text).dimmed().to_string());
+    }
+
     /// Print the plan preview shown at `-v` and above.
     pub(crate) fn plan_preview(&self, plan: &ExecutionPlan) {
         if !self.verbose.info() {
@@ -281,12 +291,26 @@ pub(crate) fn dry_run_banner() {
     print_line(">>> [DRY RUN] no changes will be made <<<".magenta().bold().to_string());
 }
 
+/// Render per-host outcomes as `alias OUTCOME` pairs.
+///
+/// A step with no hosts (a `@copy` under `--check`, or a copy skipped because
+/// a `$VAR` is unresolved in dry-run) renders as an em dash rather than an
+/// empty pair of parentheses.
+fn host_parts(statuses: &[HostStatus]) -> String {
+    if statuses.is_empty() {
+        return "—".to_string();
+    }
+    statuses
+        .iter()
+        .map(|s| format!("{} {}", s.alias.cyan(), s.outcome.colored()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Print the per-step host outcome line.
 pub(crate) fn step_outcome(elapsed: std::time::Duration, statuses: &[HostStatus]) {
     let time = format!("{:.2}s", elapsed.as_secs_f64());
-    let parts: Vec<String> =
-        statuses.iter().map(|s| format!("{} {}", s.alias.cyan(), s.outcome.colored())).collect();
-    print_line(format!("{} done in {time} ({})", "✔".bold(), parts.join(", ")));
+    print_line(format!("{} done in {time} ({})", "✔".bold(), host_parts(statuses)));
 }
 
 /// Print the final run summary with per-step timing and host statuses.
@@ -295,18 +319,40 @@ pub(crate) fn final_summary(steps: &[(usize, std::time::Duration, Vec<HostStatus
     print_line("Summary:".bold().to_string());
     for (idx, elapsed, statuses) in steps {
         let time = format!("{:.2}s", elapsed.as_secs_f64());
-        let parts: Vec<String> = statuses
-            .iter()
-            .map(|s| format!("{} {}", s.alias.cyan(), s.outcome.colored()))
-            .collect();
-        print_line(format!(
-            "  step {idx:>2}  {time:>8}  {}",
-            if parts.is_empty() { "—".to_string() } else { parts.join(", ") }
-        ));
+        print_line(format!("  step {idx:>2}  {time:>8}  {}", host_parts(statuses)));
     }
 }
 
 /// Print a failure note for a step in continue-on-error mode.
 pub(crate) fn step_failed(index: usize, message: &str) {
     print_line(format!("Step {index} failed: {message}").red().to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostStatus, Outcome, host_parts};
+
+    fn status(alias: &str, outcome: Outcome) -> HostStatus {
+        HostStatus { alias: alias.to_string(), outcome }
+    }
+
+    #[test]
+    fn empty_statuses_render_an_em_dash() {
+        // A `@copy` under `--check`, or one skipped in dry-run, has no hosts;
+        // the old rendering produced an empty `()`.
+        assert_eq!(host_parts(&[]), "—");
+    }
+
+    #[test]
+    fn statuses_render_alias_and_outcome() {
+        colored::control::set_override(false);
+        let rendered = host_parts(&[status("web1", Outcome::Ok), status("web2", Outcome::Skipped)]);
+        assert_eq!(rendered, "web1 OK, web2 SKIPPED");
+    }
+
+    #[test]
+    fn single_status_renders_without_a_separator() {
+        colored::control::set_override(false);
+        assert_eq!(host_parts(&[status("web1", Outcome::Failed)]), "web1 FAILED");
+    }
 }
