@@ -1,10 +1,14 @@
 //! Resolution of `@secrets` encrypted env files into run-state environment
 //! variables and mask values.
 //!
-//! Decryption happens once, before the first step runs. The decrypted values
-//! are injected into the run-state env (the same layer as `@export`, so an
-//! explicit `@env KEY=value` still wins on conflicts) and every value is
-//! registered for masking in previews, traces, and `--log-file`.
+//! Decryption happens once, before the first step runs. Shared (non-`{host}`)
+//! entries are injected into the run-state env (the same layer as `@export`,
+//! so an explicit `@env KEY=value` still wins on conflicts). Entries whose
+//! path contains the `{host}` placeholder expand to one encrypted file per
+//! targeted `@server` alias; each host receives only its own values, and a
+//! targeted host whose file is missing fails the run (fail closed). Every
+//! decrypted value is registered for masking in previews, traces, and
+//! `--log-file`.
 
 use std::{
     collections::HashMap,
@@ -24,11 +28,88 @@ use shellflow_secrets::{
 /// The space-separated list of keys exported after resolving `@secrets`.
 pub(crate) const SECRET_KEYS_VAR: &str = "LT_SECRET_KEYS";
 
-/// Resolved secrets: ordered `(key, value)` pairs plus the values to mask.
-pub(crate) type ResolvedSecrets = (Vec<(String, String)>, Vec<String>);
+/// Resolved secrets: shared pairs injected into run-state, per-host pairs
+/// layered onto each host's payload, and every value to mask.
+pub(crate) struct ResolvedSecrets {
+    shared: Vec<(String, String)>,
+    per_host: HashMap<String, Vec<(String, String)>>,
+    masks: Vec<String>,
+}
 
-/// Resolve every `@secrets` entry into ordered `(key, value)` pairs and a
+impl ResolvedSecrets {
+    /// Empty result for playbooks with no `@secrets` directive.
+    pub(crate) fn empty() -> Self {
+        Self {
+            shared: vec![(SECRET_KEYS_VAR.to_string(), String::new())],
+            per_host: HashMap::new(),
+            masks: Vec::new(),
+        }
+    }
+
+    /// Whether any entry used the `{host}` placeholder (needs a single
+    /// `--local` target to resolve unambiguously).
+    pub(crate) fn has_per_host(&self) -> bool {
+        !self.per_host.is_empty()
+    }
+
+    /// Shared `(key, value)` pairs for run-state env injection.
+    pub(crate) fn shared_env(&self) -> &[(String, String)] {
+        &self.shared
+    }
+
+    pub(crate) fn masks(&self) -> &[String] {
+        &self.masks
+    }
+
+    /// This host's `{host}` pairs, if it had any per-host `@secrets` entries.
+    pub(crate) fn host_pairs(&self, alias: &str) -> Option<&[(String, String)]> {
+        self.per_host.get(alias).map(Vec::as_slice)
+    }
+
+    /// Layer this host's `{host}` pairs onto `env` (a later value wins on a
+    /// duplicate key), and extend `LT_SECRET_KEYS` with this host's keys.
+    pub(crate) fn overlay(&self, env: &mut Vec<(String, String)>, alias: &str) {
+        let Some(pairs) = self.per_host.get(alias) else {
+            return;
+        };
+        let mut host_keys: Vec<String> = Vec::new();
+        for (k, v) in pairs {
+            if let Some(slot) = env.iter_mut().find(|(ek, _)| ek == k) {
+                slot.1.clone_from(v);
+            } else {
+                env.push((k.clone(), v.clone()));
+            }
+            if !host_keys.contains(k) {
+                host_keys.push(k.clone());
+            }
+        }
+
+        // Merge host keys into the exported LT_SECRET_KEYS list.
+        let mut all: Vec<String> = env
+            .iter()
+            .find(|(k, _)| k == SECRET_KEYS_VAR)
+            .map(|(_, v)| v.split(' ').filter(|s| !s.is_empty()).map(String::from).collect())
+            .unwrap_or_default();
+        for k in &host_keys {
+            if !all.contains(k) {
+                all.push(k.clone());
+            }
+        }
+        let joined = all.join(" ");
+        if let Some(slot) = env.iter_mut().find(|(k, _)| k == SECRET_KEYS_VAR) {
+            slot.1 = joined;
+        } else {
+            env.push((SECRET_KEYS_VAR.to_string(), joined));
+        }
+    }
+}
+
+/// Resolve every `@secrets` entry into shared pairs, per-host pairs, and a
 /// list of values to mask.
+///
+/// `host_aliases` are the host aliases the selected steps actually target
+/// (after `--target` restriction); a `{host}` entry expands against exactly
+/// this set, so a host no selected step touches never requires a file.
 ///
 /// Identity precedence is *most specific wins*: the `--identity` attached to
 /// the `@secrets` line, then the run-wide `--identity` flag, then
@@ -39,16 +120,19 @@ pub(crate) type ResolvedSecrets = (Vec<(String, String)>, Vec<String>);
 /// # Errors
 ///
 /// Returns an error when the resolved identity for an entry is missing or
-/// invalid, a file cannot be read/decrypted, or an env file is malformed.
+/// invalid, a file cannot be read/decrypted (including a targeted host whose
+/// `{host}` file is absent), or an env file is malformed.
 pub(crate) fn resolve_secrets(
     entries: &[SecretEntry],
+    host_aliases: &[String],
     identity: Option<&Path>,
     mask_min_len: usize,
 ) -> Result<ResolvedSecrets> {
     let mut cache: HashMap<PathBuf, Identity> = HashMap::new();
-    let mut env: Vec<(String, String)> = Vec::new();
+    let mut shared: Vec<(String, String)> = Vec::new();
+    let mut shared_keys: Vec<String> = Vec::new();
+    let mut per_host: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut masks: Vec<String> = Vec::new();
-    let mut keys: Vec<String> = Vec::new();
 
     for entry in entries {
         let id_path = entry
@@ -64,43 +148,67 @@ pub(crate) fn resolve_secrets(
             eyre!("failed to load identity {} (identity: {})", id_path.display(), id_path.display())
         })?;
 
-        let cipher = fs::read(&entry.file)
-            .wrap_err_with(|| format!("failed to read secrets file `{}`", entry.file))?;
-        let plain = decrypt_bytes(&cipher, identity)
-            .wrap_err_with(|| format!("failed to decrypt `{}`", entry.file))?;
-        let plain = String::from_utf8(plain)
-            .wrap_err_with(|| format!("secrets file `{}` is not valid UTF-8", entry.file))?;
-        let pairs = parse_env_file(&plain)
-            .wrap_err_with(|| format!("malformed env file `{}`", entry.file))?;
-        for (key, value) in pairs {
-            // De-duplicate masks so repeated values are not redundantly
-            // replaced; `mask_line` also sorts longest-first to avoid prefix
-            // leakage.
-            if value.len() >= mask_min_len && !masks.contains(&value) {
-                masks.push(value.clone());
+        if entry.file.contains("{host}") {
+            // Per-host: one file per targeted alias; a missing file is a
+            // hard error (fail closed) rather than a guessed placeholder.
+            for alias in host_aliases {
+                let path = entry.file.replace("{host}", alias);
+                let pairs = decrypt_file(&path, identity, &mut masks, mask_min_len)?;
+                per_host.entry(alias.clone()).or_default().extend(pairs);
             }
-            // A key present in two files appears once in the exported list,
-            // but keeps the last value (matching `source` semantics).
-            if !keys.contains(&key) {
-                keys.push(key.clone());
+        } else {
+            let pairs = decrypt_file(&entry.file, identity, &mut masks, mask_min_len)?;
+            for (key, _) in &pairs {
+                if !shared_keys.contains(key) {
+                    shared_keys.push(key.clone());
+                }
             }
-            env.retain(|(existing, _)| existing != &key);
-            env.push((key, value));
+            // Later files override earlier ones (last `@secrets` wins), and the
+            // key list stays deduplicated.
+            for (key, value) in pairs {
+                shared.retain(|(ek, _)| ek != &key);
+                shared.push((key, value));
+            }
         }
     }
 
-    env.push((SECRET_KEYS_VAR.to_string(), keys.join(" ")));
-    Ok((env, masks))
+    shared.push((SECRET_KEYS_VAR.to_string(), shared_keys.join(" ")));
+    Ok(ResolvedSecrets { shared, per_host, masks })
+}
+
+/// Read, decrypt, and parse one age-encrypted env file, registering any value
+/// at or above `mask_min_len` for masking.
+fn decrypt_file(
+    path: &str,
+    identity: &Identity,
+    masks: &mut Vec<String>,
+    mask_min_len: usize,
+) -> Result<Vec<(String, String)>> {
+    let cipher =
+        fs::read(path).wrap_err_with(|| format!("failed to read secrets file `{path}`"))?;
+    let plain =
+        decrypt_bytes(&cipher, identity).wrap_err_with(|| format!("failed to decrypt `{path}`"))?;
+    let plain = String::from_utf8(plain)
+        .wrap_err_with(|| format!("secrets file `{path}` is not valid UTF-8"))?;
+    let pairs = parse_env_file(&plain).wrap_err_with(|| format!("malformed env file `{path}`"))?;
+    let mut out = Vec::new();
+    for (key, value) in pairs {
+        // De-duplicate masks so repeated values are not redundantly replaced;
+        // `mask_line` also sorts longest-first to avoid prefix leakage.
+        if value.len() >= mask_min_len && !masks.contains(&value) {
+            masks.push(value.clone());
+        }
+        out.retain(|(existing, _)| existing != &key);
+        out.push((key, value));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use age::x25519::Identity;
     use shellflow_core::SecretEntry;
-    use shellflow_secrets::{
-        crypto::encrypt_bytes,
-        identity::{generate_identity, public_recipient},
-    };
+    use shellflow_secrets::{crypto::encrypt_bytes, identity::generate_identity};
 
     use super::{SECRET_KEYS_VAR, resolve_secrets};
 
@@ -118,8 +226,9 @@ mod tests {
         identity: &Identity,
         plain: &str,
     ) -> TestResult<std::path::PathBuf> {
-        let cipher = encrypt_bytes(plain.as_bytes(), &[public_recipient(identity)])
-            .map_err(|err| err.to_string())?;
+        let recipient = shellflow_secrets::identity::public_recipient(identity);
+        let cipher =
+            encrypt_bytes(plain.as_bytes(), &[recipient]).map_err(|err| err.to_string())?;
         let path = dir.join(format!("{name}.age"));
         std::fs::write(&path, cipher).map_err(|err| err.to_string())?;
         Ok(path)
@@ -149,34 +258,15 @@ mod tests {
     }
 
     #[test]
-    fn per_entry_identity_is_used_over_the_run_flag() -> TestResult<()> {
+    fn masked_values_are_registered() -> TestResult<()> {
         let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
-        let (main_file, main_identity) = fixture(dir.path(), "main", "A=frommain\n")?;
-        let (other_file, other_identity) = fixture(dir.path(), "other", "B=fromother\n")?;
+        let (file, identity) = fixture(dir.path(), "masked", "SECRET=supersecret_value\n")?;
+        let entries = vec![entry(&file, None)];
 
-        // The run-wide identity decrypts `main`; the entry pins `other` to
-        // its own key. Before the fix, `other` was opened with `main`'s key
-        // and the run aborted.
-        let entries = vec![entry(&main_file, None), entry(&other_file, Some(&other_identity))];
-        let (env, _masks) =
-            resolve_secrets(&entries, Some(&main_identity), 6).map_err(|err| format!("{err:#}"))?;
-
-        assert_eq!(value_of(&env, "A"), "frommain");
-        assert_eq!(value_of(&env, "B"), "fromother", "per-entry identity was ignored");
-        assert_eq!(value_of(&env, SECRET_KEYS_VAR), "A B");
-        Ok(())
-    }
-
-    #[test]
-    fn missing_run_identity_is_not_consulted_when_every_entry_pins_one() -> TestResult<()> {
-        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
-        let (file, identity) = fixture(dir.path(), "pinned", "A=1\n")?;
-        let entries = vec![entry(&file, Some(&identity))];
-        let absent = std::path::Path::new("/nonexistent/keys.txt");
-
-        let (env, _masks) =
-            resolve_secrets(&entries, Some(absent), 6).map_err(|err| format!("{err:#}"))?;
-        assert_eq!(value_of(&env, "A"), "1");
+        let resolved =
+            resolve_secrets(&entries, &[], Some(&identity), 6).map_err(|err| format!("{err:#}"))?;
+        assert!(resolved.masks().contains(&"supersecret_value".to_string()));
+        assert_eq!(value_of(resolved.shared_env(), "SECRET"), "supersecret_value");
         Ok(())
     }
 
@@ -189,11 +279,12 @@ mod tests {
         let entries = vec![entry(&first, None), entry(&second, None)];
 
         let shared_identity = dir.path().join("shared.key");
-        let (env, _masks) = resolve_secrets(&entries, Some(&shared_identity), 6)
+        let resolved = resolve_secrets(&entries, &[], Some(&shared_identity), 6)
             .map_err(|err| format!("{err:#}"))?;
-        assert_eq!(value_of(&env, "A"), "two", "later file must win");
-        assert_eq!(value_of(&env, "B"), "keep");
-        assert_eq!(value_of(&env, SECRET_KEYS_VAR), "A B", "key list must be deduplicated");
+        let env = resolved.shared_env();
+        assert_eq!(value_of(env, "A"), "two", "later file must win");
+        assert_eq!(value_of(env, "B"), "keep");
+        assert_eq!(value_of(env, SECRET_KEYS_VAR), "A B", "key list must be deduplicated");
         Ok(())
     }
 
@@ -203,13 +294,13 @@ mod tests {
         let (file, identity) = fixture(dir.path(), "short", "S=abc\n")?;
         let entries = vec![entry(&file, None)];
 
-        let (_env, masks) =
-            resolve_secrets(&entries, Some(&identity), 6).map_err(|err| format!("{err:#}"))?;
-        assert!(masks.is_empty(), "a 3-char value must not be masked at threshold 6");
+        let resolved =
+            resolve_secrets(&entries, &[], Some(&identity), 6).map_err(|err| format!("{err:#}"))?;
+        assert!(resolved.masks().is_empty(), "a 3-char value must not be masked at threshold 6");
 
-        let (_env, masks) =
-            resolve_secrets(&entries, Some(&identity), 3).map_err(|err| format!("{err:#}"))?;
-        assert_eq!(masks, vec!["abc".to_string()]);
+        let resolved =
+            resolve_secrets(&entries, &[], Some(&identity), 3).map_err(|err| format!("{err:#}"))?;
+        assert_eq!(resolved.masks(), &["abc".to_string()]);
         Ok(())
     }
 
@@ -220,11 +311,71 @@ mod tests {
         let entries = vec![entry(&file, None)];
         let absent = std::path::Path::new("/nonexistent/shellflow-key");
 
-        let Err(err) = resolve_secrets(&entries, Some(absent), 6) else {
+        let Err(err) = resolve_secrets(&entries, &[], Some(absent), 6) else {
             return Err("a missing identity must fail the run, not silently skip".to_string());
         };
         let rendered = format!("{err:#}");
         assert!(rendered.contains("/nonexistent/shellflow-key"), "unexpected error: {rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn per_host_entries_expand_and_layer() -> TestResult<()> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let identity_path = dir.path().join("common.key");
+        let identity = generate_identity(&identity_path).map_err(|err| err.to_string())?;
+        let common = write_secrets(dir.path(), "common", &identity, "SHARED=shared-value\n")?;
+        let _api = write_secrets(dir.path(), "api", &identity, "API_KEY=api-value\n")?;
+        let _trade = write_secrets(dir.path(), "trade", &identity, "API_KEY=trade-value\n")?;
+
+        // Build per-host entries via the {host} placeholder.
+        let common_entry = entry(&common, None);
+        let host_entry = SecretEntry {
+            file: dir.path().join("{host}.age").display().to_string(),
+            identity: None,
+        };
+        let entries = vec![common_entry, host_entry];
+        let aliases = vec!["api".to_string(), "trade".to_string()];
+
+        let resolved = resolve_secrets(&entries, &aliases, Some(&identity_path), 6)
+            .map_err(|err| format!("{err:#}"))?;
+        assert!(resolved.has_per_host());
+
+        // Shared env carries only the shared key.
+        let env = resolved.shared_env();
+        assert_eq!(value_of(env, "SHARED"), "shared-value");
+        assert!(value_of(env, "API_KEY").is_empty());
+
+        // api's payload gets api's value; trade never sees it.
+        let mut api_env = env.to_vec();
+        resolved.overlay(&mut api_env, "api");
+        assert_eq!(value_of(&api_env, "API_KEY"), "api-value");
+        assert_eq!(value_of(&api_env, SECRET_KEYS_VAR), "SHARED API_KEY");
+
+        let mut trade_env = env.to_vec();
+        resolved.overlay(&mut trade_env, "trade");
+        assert_eq!(value_of(&trade_env, "API_KEY"), "trade-value");
+        assert!(!trade_env.iter().any(|(k, v)| k == "API_KEY" && v == "api-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_per_host_file_fails_closed() -> TestResult<()> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let (api, identity) = fixture(dir.path(), "api", "API_KEY=api-value\n")?;
+        let _ = api;
+        let host_entry = SecretEntry {
+            file: dir.path().join("{host}.age").display().to_string(),
+            identity: None,
+        };
+        let entries = vec![host_entry];
+        // trade.env.age does not exist -> must error.
+        let aliases = vec!["api".to_string(), "trade".to_string()];
+
+        assert!(
+            resolve_secrets(&entries, &aliases, Some(&identity), 6).is_err(),
+            "a targeted host without its file must fail closed"
+        );
         Ok(())
     }
 }

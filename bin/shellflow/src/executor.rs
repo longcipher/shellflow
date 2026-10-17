@@ -11,7 +11,7 @@
 //! last-resort net for paths that drop a child without awaiting `terminate`.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::Stdio,
@@ -37,7 +37,7 @@ use tokio::{
 
 use crate::{
     cli::RunArgs,
-    secrets::resolve_secrets,
+    secrets::{ResolvedSecrets, resolve_secrets},
     ui::{HostStatus, Outcome, Stream, Ui},
 };
 
@@ -322,30 +322,62 @@ pub(crate) async fn execute_plan(
     // run (see `RemoteShell` / `resolve_remote_shell`).
     let shell_cache: ShellCache = Arc::new(Mutex::new(HashMap::new()));
 
-    // Resolve `@secrets` before the first step: decrypt, inject into run-state
-    // env, and register every value for masking.
-    if !plan.secrets.is_empty() {
-        match resolve_secrets(&plan.secrets, flags.identity.as_deref(), run.mask_min_len()) {
-            Ok((env_pairs, masks)) => {
-                secrets.extend(masks);
-                let mut state = run_state.lock().await;
-                for (key, value) in env_pairs {
-                    state.vars.insert(key, value);
-                }
-            }
+    // Apply --only / --skip filtering first so we know which hosts the
+    // selected steps actually target, before resolving per-host secrets.
+    let restrict = run.target_restrict();
+    let selected: Vec<(usize, &Step)> =
+        plan.steps.iter().enumerate().filter(|(idx, step)| is_selected(run, *idx, step)).collect();
+
+    // Host aliases the selected steps target (after restriction). `{host}` in
+    // `@secrets` paths expands against exactly this set, so a host no selected
+    // step touches never requires a secrets file.
+    let host_aliases = target_host_aliases(&plan, &restrict, &selected);
+
+    // Resolve `@secrets` before the first step: decrypt, inject shared pairs
+    // into run-state env, and register every value for masking.
+    let resolved = if plan.secrets.is_empty() {
+        ResolvedSecrets::empty()
+    } else {
+        match resolve_secrets(
+            &plan.secrets,
+            &host_aliases,
+            flags.identity.as_deref(),
+            run.mask_min_len(),
+        ) {
+            Ok(resolved) => resolved,
             Err(err) => {
                 eprintln!("error: {err:#}");
                 return RunOutcome::Failed(RunError::Config);
             }
         }
+    };
+
+    secrets.extend(resolved.masks().iter().cloned());
+    {
+        let mut state = run_state.lock().await;
+        for (key, value) in resolved.shared_env() {
+            state.vars.insert(key.clone(), value.clone());
+        }
     }
     ui.lock().await.set_secrets(secrets);
+
+    // `--local` runs each block once, so per-host `@secrets` (`{host}`) need a
+    // single unambiguous target.
+    if flags.local && resolved.has_per_host() && host_aliases.len() > 1 {
+        eprintln!(
+            "error: `--local` cannot resolve per-host `@secrets` ({{host}}) across {} hosts; \
+             re-run with `-t <host>`",
+            host_aliases.len()
+        );
+        return RunOutcome::Failed(RunError::Config);
+    }
+
+    let resolved = Arc::new(resolved);
 
     if flags.dry_run {
         crate::ui::dry_run_banner();
     }
 
-    let restrict = run.target_restrict();
     // `--parallel 0` (default) means unbounded, per the documented "all".
     // An `Option` avoids `Semaphore::new(usize::MAX)`, which would exceed
     // tokio's MAX_PERMITS and panic.
@@ -380,16 +412,14 @@ pub(crate) async fn execute_plan(
             Step::Local(local) => run_local_step(&ui, &run_state, local, config).await,
             Step::Remote(remote) => match resolve_hosts(&plan, &remote.target, &restrict) {
                 Ok(hosts) => {
-                    run_remote_step(
-                        &ui,
-                        &semaphore,
-                        &run_state,
-                        remote,
-                        hosts,
-                        config,
-                        &shell_cache,
-                    )
-                    .await
+                    let ctx = RemoteStepCtx {
+                        ui: &ui,
+                        semaphore: &semaphore,
+                        run_state: &run_state,
+                        shell_cache: &shell_cache,
+                        secrets: &resolved,
+                    };
+                    run_remote_step(&ctx, remote, hosts, config).await
                 }
                 Err(err) => {
                     crate::ui::step_failed(step_no, &err.to_string());
@@ -469,6 +499,33 @@ fn is_selected(run: &RunArgs, idx: usize, step: &Step) -> bool {
     true
 }
 
+/// Host aliases the selected steps actually target (after `--target`
+/// restriction). `{host}` in `@secrets` paths expands against exactly this
+/// set, so a server no selected step touches never requires a secrets file.
+fn target_host_aliases(
+    plan: &ExecutionPlan,
+    restrict: &[String],
+    selected: &[(usize, &Step)],
+) -> Vec<String> {
+    let mut aliases = BTreeSet::new();
+    for (_, step) in selected {
+        let target = match step {
+            Step::Remote(remote) => &remote.target,
+            Step::Copy(copy) => &copy.target,
+            Step::Local(_) => continue,
+        };
+        if let Ok(hosts) = resolve_hosts(plan, target, restrict) {
+            aliases.extend(
+                hosts
+                    .into_iter()
+                    .map(|host| host.alias)
+                    .filter(|alias| plan.servers.contains_key(alias)),
+            );
+        }
+    }
+    aliases.into_iter().collect()
+}
+
 /// Convert a step outcome into per-host statuses for the UI.
 fn outcome_to_statuses(outcome: &Result<Vec<(String, HostOutcome)>>) -> Vec<HostStatus> {
     match outcome {
@@ -506,6 +563,7 @@ async fn run_local_block(
     env: &[EnvEntry],
     config: StepConfig,
     capture: &[String],
+    extra: &[(String, String)],
 ) -> Result<()> {
     if config.check || config.dry_run {
         run_bash_n(script).await?;
@@ -513,7 +571,13 @@ async fn run_local_block(
         return Ok(());
     }
 
-    let resolved = build_env(run_state, env).await;
+    let mut resolved = build_env(run_state, env).await;
+    // Per-host `@secrets` pairs (from `--local` `{host}` expansion): last wins
+    // on a duplicate key, layered on top of the shared run-state env.
+    for (k, v) in extra {
+        resolved.retain(|(ek, _)| ek != k);
+        resolved.push((k.clone(), v.clone()));
+    }
     let mut cmd = Command::new("bash");
     cmd.arg("-c");
     cmd.envs(resolved);
@@ -575,7 +639,9 @@ async fn run_local_step(
         ui.lock().await.payload_preview("Local Payload", &local.script);
     }
 
-    match run_local_block(ui, run_state, &local.script, &local.env, config, &local.export).await {
+    match run_local_block(ui, run_state, &local.script, &local.env, config, &local.export, &[])
+        .await
+    {
         Ok(()) => Ok(vec![("localhost".to_string(), HostOutcome::Ok)]),
         Err(err) => Err(err),
     }
@@ -794,30 +860,49 @@ async fn capture_exports(
 // Remote steps
 // ---------------------------------------------------------------------------
 
+/// Shared handles threaded through a remote step's host fan-out. Bundled so
+/// `run_remote_step` stays under clippy's argument limit while still passing
+/// the per-run `secrets` resolution to each host.
+struct RemoteStepCtx<'a> {
+    ui: &'a ArcUi,
+    semaphore: &'a Option<Arc<Semaphore>>,
+    run_state: &'a Arc<Mutex<RunState>>,
+    shell_cache: &'a ShellCache,
+    secrets: &'a Arc<ResolvedSecrets>,
+}
+
 async fn run_remote_step(
-    ui: &ArcUi,
-    semaphore: &Option<Arc<Semaphore>>,
-    run_state: &Arc<Mutex<RunState>>,
+    ctx: &RemoteStepCtx<'_>,
     remote: &RemoteStep,
     hosts: Vec<ResolvedHost>,
     config: StepConfig,
-    shell_cache: &ShellCache,
 ) -> Result<Vec<(String, HostOutcome)>> {
     if config.local {
-        return run_remote_step_local(ui, run_state, remote, config).await;
+        let alias = hosts.first().map(|host| host.alias.clone());
+        return run_remote_step_local(
+            ctx.ui,
+            ctx.run_state,
+            remote,
+            config,
+            ctx.secrets,
+            alias.as_deref(),
+        )
+        .await;
     }
 
     if config.dry_run || config.verbose >= 2 {
-        ui.lock()
+        ctx.ui
+            .lock()
             .await
             .payload_preview(&format!("Remote Payload ({})", remote.target.text), &remote.script);
     }
 
-    let env = build_env(run_state, &remote.env).await;
+    let env = build_env(ctx.run_state, &remote.env).await;
     let trace_line = if config.verbose >= 3 { "set -x\n" } else { "" };
-    // The payload is assembled per host: each host's probed login PATH is
-    // injected into its env block, so the rc file never needs sourcing inside
-    // the payload (interactive configs break `set -eu` in scripts).
+    // The payload is assembled per host: each host's probed login PATH and its
+    // own `@secrets` values are injected into its env block (see
+    // [`run_remote_host`]), so the rc file never needs sourcing inside the
+    // payload (interactive configs break `set -eu` in scripts).
     let parts = PayloadParts {
         script: remote.script.clone(),
         guard: remote.guard.clone(),
@@ -826,15 +911,20 @@ async fn run_remote_step(
     };
     let mut tasks = JoinSet::new();
     for host in hosts {
-        let ui = Arc::clone(ui);
-        let semaphore = semaphore.clone();
+        let ui = Arc::clone(ctx.ui);
+        let semaphore = ctx.semaphore.clone();
         let parts = parts.clone();
-        let shell_cache = Arc::clone(shell_cache);
+        let shell_cache = Arc::clone(ctx.shell_cache);
+        let secrets = Arc::clone(ctx.secrets);
         tasks.spawn(async move {
-            if let Some(semaphore) = &semaphore {
-                let _permit = Arc::clone(semaphore).acquire_owned().await;
-            }
-            run_remote_host(ui, &host, &parts, config, shell_cache).await
+            // Hold the permit for the whole host task: an `if let` block would
+            // drop it before the task runs, so `--parallel N` never actually
+            // serialized anything.
+            let _permit = match &semaphore {
+                Some(semaphore) => Arc::clone(semaphore).acquire_owned().await.ok(),
+                None => None,
+            };
+            run_remote_host(ui, &host, &parts, config, shell_cache, &secrets).await
         });
     }
 
@@ -850,6 +940,8 @@ async fn run_remote_step_local(
     run_state: &Arc<Mutex<RunState>>,
     remote: &RemoteStep,
     config: StepConfig,
+    secrets: &Arc<ResolvedSecrets>,
+    host_alias: Option<&str>,
 ) -> Result<Vec<(String, HostOutcome)>> {
     if config.dry_run || config.verbose >= 2 {
         ui.lock().await.payload_preview(
@@ -865,8 +957,13 @@ async fn run_remote_step_local(
         return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
     }
 
-    // Reuse the local execution primitive; remote blocks have no `@export`.
-    match run_local_block(ui, run_state, &remote.script, &remote.env, config, &[]).await {
+    // Per-host `@secrets` pairs for this `--local` target (shared pairs are
+    // already in run-state env). Remote blocks have no `@export`.
+    let extra: Vec<(String, String)> = host_alias
+        .and_then(|alias| secrets.host_pairs(alias))
+        .map(|pairs| pairs.to_vec())
+        .unwrap_or_default();
+    match run_local_block(ui, run_state, &remote.script, &remote.env, config, &[], &extra).await {
         Ok(()) => Ok(vec![("localhost".to_string(), HostOutcome::Ok)]),
         Err(err) => Err(err),
     }
@@ -894,6 +991,7 @@ async fn run_remote_host(
     parts: &PayloadParts,
     config: StepConfig,
     shell_cache: ShellCache,
+    secrets: &Arc<ResolvedSecrets>,
 ) -> (String, HostOutcome) {
     // Dry-run/check: syntax-check the payload on each host, never execute.
     // No env probe: plain `bash -n -s` needs no login environment.
@@ -927,7 +1025,10 @@ async fn run_remote_host(
     // Real run: probe (and cache) the login environment once, evaluate the
     // guard, then stream the payload — all with the probed PATH injected.
     let remote_env = resolve_remote_env(host, &shell_cache).await;
-    let payload_env = with_login_path(parts.env.clone(), remote_env.path.as_deref());
+    let mut payload_env = with_login_path(parts.env.clone(), remote_env.path.as_deref());
+    // Layer this host's per-host `@secrets` values on top of the shared
+    // run-state env (already present in `parts.env`); extend `LT_SECRET_KEYS`.
+    secrets.overlay(&mut payload_env, &host.alias);
     if let Some(guard) = &parts.guard {
         match run_remote_guard(host, remote_env.shell, guard, &payload_env, config.timeout).await {
             GuardResult::Pass => {
@@ -1302,9 +1403,12 @@ async fn run_copy_step(
         let delete = copy.delete;
         let shell_cache = Arc::clone(shell_cache);
         tasks.spawn(async move {
-            if let Some(semaphore) = &semaphore {
-                let _permit = Arc::clone(semaphore).acquire_owned().await;
-            }
+            // Hold the permit for the whole host task (see [`run_remote_step`]
+            // for why the binding must outlive the work below).
+            let _permit = match &semaphore {
+                Some(semaphore) => Arc::clone(semaphore).acquire_owned().await.ok(),
+                None => None,
+            };
             // Reuse the per-run login-env cache, which now also carries the
             // rsync probe — no extra ssh round trip per copy step (design §7.4).
             let has_rsync = resolve_remote_env(&host, &shell_cache).await.has_rsync;
