@@ -2,15 +2,19 @@
 
 # shellflow playbook: deploy demo-secret-app to trade and api servers.
 #
-# Uses the cred-wrap approach: systemd host-key-bound credentials are exported
-# as environment variables by the cred-wrap wrapper before exec'ing the app.
-# No application code changes needed — works with any third-party or
-# closed-source project that reads env vars.
+# Uses the per-service starter approach: systemd host-key-bound credentials are
+# exported as environment variables by the service's own `bin/` wrapper before
+# exec'ing the app. No application code changes needed — works with any
+# third-party or closed-source project that reads env vars.
+#
+# Service files (services/demo-secret-app/):
+#   bin/demo-secret-app-start   cred→env wrapper (installed to /opt/.../bin/)
+#   demo-secret-app.service     systemd unit
 #
 # Workflow:
 #   1. Build the release binary locally.
-#   2. Copy binary + unit file to a temp dir on each host.
-#   3. Remote: install binary, unit, cred-wrap helper, and systemd credentials.
+#   2. Copy binary + unit + starter to a temp dir on each host.
+#   3. Remote: install binary, starter, unit, and systemd credentials.
 #   4. Enable + start the service.
 #   5. Verify the service ran successfully.
 #
@@ -41,49 +45,32 @@ echo "==> Building demo-secret-app (release, x86_64-linux)..."
 cargo zigbuild --release -p demo-secret-app --target x86_64-unknown-linux-gnu 2>&1
 cp target/x86_64-unknown-linux-gnu/release/demo-secret-app "${WORKDIR}/"
 cp services/demo-secret-app/demo-secret-app.service "${WORKDIR}/"
+cp services/demo-secret-app/bin/demo-secret-app-start "${WORKDIR}/"
 echo "==> Build complete: $(ls -lh "${WORKDIR}/demo-secret-app" | awk '{print $5}')"
 # @export STAMP,WORKDIR
 
-# === 2. Copy: ship binary + unit to remote temp dir ===
+# === 2. Copy: ship binary + unit + starter to remote temp dir ===
 # @name ship-artifacts
 # @copy $WORKDIR/demo-secret-app -> $WORKDIR/demo-secret-app @all
 # @copy $WORKDIR/demo-secret-app.service -> $WORKDIR/demo-secret-app.service @all
+# @copy $WORKDIR/demo-secret-app-start -> $WORKDIR/demo-secret-app-start @all
 
-# === 3. Remote: install binary, unit, cred-wrap, and systemd credentials ===
+# === 3. Remote: install binary, starter, unit, and systemd credentials ===
 # @name install
 # @remote all
 # @timeout 120
 set -eu
 echo "==> Installing on $(hostname)..."
 
-# Install binary
-sudo install -m 0755 "${WORKDIR}/demo-secret-app" /usr/local/bin/demo-secret-app
-echo "==> binary installed"
+# Install binary + per-service starter under /opt/<svc>/bin/
+sudo install -d -m 0755 /opt/demo-secret-app/bin
+sudo install -m 0755 "${WORKDIR}/demo-secret-app" /opt/demo-secret-app/bin/demo-secret-app
+sudo install -m 0755 "${WORKDIR}/demo-secret-app-start" /opt/demo-secret-app/bin/demo-secret-app-start
+echo "==> binary + starter installed"
 
 # Install systemd unit
 sudo install -m 0644 "${WORKDIR}/demo-secret-app.service" /etc/systemd/system/demo-secret-app.service
 echo "==> unit installed"
-
-# Install cred-wrap helper (exports systemd credentials as env vars, then exec)
-sudo install -d -m 0755 /usr/local/libexec/shellflow
-cat > /tmp/cred-wrap <<'CRED_WRAP_EOF'
-#!/usr/bin/env bash
-set -eu
-if [ -n "${CREDENTIALS_DIRECTORY:-}" ]; then
-  for f in "$CREDENTIALS_DIRECTORY"/*; do
-    [ -f "$f" ] || continue
-    key="$(basename "$f")"
-    case "$key" in
-      [A-Za-z_][A-Za-z0-9_]*) ;;
-      *) continue ;;
-    esac
-    export "$key=$(cat "$f")"
-  done
-fi
-exec "$@"
-CRED_WRAP_EOF
-sudo install -m 0755 /tmp/cred-wrap /usr/local/libexec/shellflow/cred-wrap
-echo "==> cred-wrap installed"
 
 # Create systemd credential store and encrypt each secret as a host-key-bound credential
 sudo install -d -m 0700 /etc/credstore.encrypted
@@ -98,7 +85,7 @@ done
 echo "==> credential store ready"
 
 # Clean up temp files
-rm -f "${WORKDIR}/demo-secret-app" "${WORKDIR}/demo-secret-app.service"
+rm -f "${WORKDIR}/demo-secret-app" "${WORKDIR}/demo-secret-app.service" "${WORKDIR}/demo-secret-app-start"
 echo "==> temp files cleaned"
 
 # === 4. Remote: enable and start the service ===

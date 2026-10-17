@@ -2,7 +2,8 @@
 //!
 //! This is a typical third-party / closed-source application pattern: it reads
 //! all configuration from environment variables, expecting them to be injected
-//! by the runtime environment (systemd with `ImportCredential=` + `cred-wrap`).
+//! by the runtime environment (systemd with `ImportCredential=` plus the
+//! per-service starter in `services/demo-secret-app/bin/`).
 //!
 //! Required environment variables:
 //!   - `API_KEY`       — API authentication key
