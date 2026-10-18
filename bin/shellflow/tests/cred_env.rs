@@ -659,7 +659,7 @@ exit 0
     }
 
     fn log(&self) -> String {
-        fs::read_to_string(&self.log).map(|s| s.to_string()).unwrap_or_default()
+        fs::read_to_string(&self.log).map_or_default(|s| s.to_string())
     }
 }
 
