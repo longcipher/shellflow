@@ -306,6 +306,96 @@ fn scp_fallback_when_remote_rsync_missing() -> TestResult<()> {
 }
 
 #[test]
+fn copy_directory_source_uses_content_semantics() -> TestResult<()> {
+    // A directory source must transfer as its *contents* (`src/ -> dst/`):
+    // GNU rsync would also flatten a bare `src` into a missing `dst`, but
+    // macOS's openrsync nests it as `dst/<basename>/…` — the trailing slashes
+    // pin the portable form (regression guard for the real-deploy failure
+    // where `zenoh/` arrived as `zenoh/zenoh/`).
+    let sb = Sandbox::new("copydir")?;
+    let src = sb.dir.join("svcdir");
+    fs::create_dir_all(&src).map_err(|e| e.to_string())?;
+    fs::write(src.join("binary"), "data").map_err(|e| e.to_string())?;
+    let script_txt =
+        format!("# @server web1 web@h1\n# @copy {} -> /srv/app @web1\n", src.display());
+    let script = sb.script(&script_txt)?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = sb.rsync_log();
+    assert!(
+        log.contains(&format!("{}/", src.display())),
+        "directory source must carry a trailing slash: {log}"
+    );
+    assert!(
+        log.contains("web@h1:/srv/app/"),
+        "directory destination must carry a trailing slash: {log}"
+    );
+    Ok(())
+}
+
+#[test]
+fn copy_directory_source_scp_fallback_also_flattens() -> TestResult<()> {
+    // On hosts without rsync, a directory source must still land as contents
+    // in the destination (`scp -r src/. host:dst/`), not nested under the
+    // source basename.
+    let sb = Sandbox::new("copydirscp")?;
+    let src = sb.dir.join("svcdir");
+    fs::create_dir_all(&src).map_err(|e| e.to_string())?;
+    fs::write(src.join("binary"), "data").map_err(|e| e.to_string())?;
+    let script_txt =
+        format!("# @server norsync1 norsync@h1\n# @copy {} -> /srv/app @norsync1\n", src.display());
+    let script = sb.script(&script_txt)?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = sb.scp_log();
+    assert!(
+        log.contains(&format!("{}/.", src.display())),
+        "scp fallback must flatten a directory source via `src/.`: {log}"
+    );
+    assert!(
+        log.contains("norsync@h1:/srv/app/"),
+        "scp fallback must target the destination dir: {log}"
+    );
+    Ok(())
+}
+
+#[test]
+fn copy_exclude_passes_globs_to_rsync() -> TestResult<()> {
+    let sb = Sandbox::new("exclude")?;
+    let script = sb.script(
+        "# @server web1 web@h1\n\
+         # @copy ./out -> /srv/app @web1 --exclude *.env.age --exclude '*.key'\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = sb.rsync_log();
+    assert!(log.contains("--exclude *.env.age"), "first glob missing: {log}");
+    assert!(log.contains("--exclude *.key"), "second glob missing: {log}");
+    // The source and destination must still be transferred after the flags.
+    assert!(log.contains("./out"), "source missing: {log}");
+    assert!(log.contains("web@h1:/srv/app"), "destination missing: {log}");
+    Ok(())
+}
+
+#[test]
+fn copy_exclude_warns_on_scp_fallback() -> TestResult<()> {
+    // The scp fallback cannot filter files; the warning must be visible
+    // instead of silently shipping excluded files.
+    let sb = Sandbox::new("exclude-scp")?;
+    let script = sb.script(
+        "# @server norsync1 norsync@h1\n\
+         # @copy ./out -> /srv/app @norsync1 --exclude *.env.age\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let combined =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(combined.contains("`--exclude` ignored"), "warning missing: {combined}");
+    assert!(!sb.scp_log().is_empty(), "scp fallback should have run");
+    Ok(())
+}
+
+#[test]
 fn rsync_copy_creates_parent_dir_via_rsync_path() -> TestResult<()> {
     // With a file-style dst, `--rsync-path` must mkdir the *parent*, not the
     // file path itself.
@@ -822,6 +912,58 @@ fn keys_and_secret_round_trip() -> TestResult<()> {
     assert_eq!(status_code(&out), 0);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("ImportCredential=DB_PASSWORD"), "creds mismatch: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn creds_store_dir_prints_load_credential_lines() -> TestResult<()> {
+    let sb = Sandbox::new("credsstore")?;
+    let key = sb.dir.join("keys.txt");
+    let out = sb.run_args(&["keys", "generate", "-o", &key.display().to_string()])?;
+    assert_eq!(status_code(&out), 0);
+
+    let out = sb.run_args(&["keys", "public", "-i", &key.display().to_string()])?;
+    let pubkey = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let plain = sb.dir.join("plain.env");
+    fs::write(&plain, "DB_PASSWORD=topsecret\nRUST_LOG=info\n").map_err(|e| e.to_string())?;
+    let age = sb.dir.join("plain.env.age");
+    let out = sb.run_args(&[
+        "secret",
+        "encrypt",
+        "-r",
+        &pubkey,
+        "-o",
+        &age.display().to_string(),
+        &plain.display().to_string(),
+    ])?;
+    assert_eq!(status_code(&out), 0, "encrypt failed: {out:?}");
+
+    let store = sb.dir.join("credstore.encrypted").join("zenoh");
+    fs::create_dir_all(&store).map_err(|e| e.to_string())?;
+    let out = sb.run_args(&[
+        "secret",
+        "creds",
+        "-i",
+        &key.display().to_string(),
+        "--store-dir",
+        &store.display().to_string(),
+        &age.display().to_string(),
+    ])?;
+    assert_eq!(status_code(&out), 0, "creds failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected =
+        format!("LoadCredentialEncrypted=DB_PASSWORD:{}", store.join("DB_PASSWORD").display());
+    assert!(stdout.contains(&expected), "missing `{expected}` in: {stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "LoadCredentialEncrypted=RUST_LOG:{}",
+            store.join("RUST_LOG").display()
+        )),
+        "missing RUST_LOG line in: {stdout}"
+    );
+    // The default (ImportCredential=) form must not appear when --store-dir is given.
+    assert!(!stdout.contains("ImportCredential"), "flat form leaked: {stdout}");
     Ok(())
 }
 
