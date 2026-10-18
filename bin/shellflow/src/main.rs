@@ -9,11 +9,15 @@
 #![allow(clippy::print_stderr)]
 
 mod cli;
+mod cred_env;
+mod emit;
 mod executor;
 mod keys;
 mod preflight;
 mod secret;
 mod secrets;
+mod service;
+mod template;
 mod ui;
 
 use std::{sync::Arc, time::Duration};
@@ -48,6 +52,34 @@ async fn main() -> Result<()> {
             }
         },
         Some(Command::Secret(cmd)) => match secret::run(&cmd.command) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                1
+            }
+        },
+        Some(Command::Template(cmd)) => match template::run(&cmd.command) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                1
+            }
+        },
+        Some(Command::Emit(cmd)) => match emit::run(&cmd.command) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                1
+            }
+        },
+        Some(Command::CredEnv(cmd)) => match cred_env::run(&cmd.command) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                1
+            }
+        },
+        Some(Command::Service(cmd)) => match service::run(&cmd.command) {
             Ok(()) => 0,
             Err(err) => {
                 eprintln!("error: {err:#}");
