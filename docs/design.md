@@ -1,8 +1,8 @@
 # shellflow — Design Document
 
-> Related design: [`design-secrets.md`](design-secrets.md) covers the embedded
-> `age` integration (`keys`/`secret`), the `@secrets` directive, and `--local`
-> mode.
+> Part I covers the DSL and execution engine; **Part II** (sections `S1`–`S12`)
+> covers the embedded `age` integration (`keys`/`secret`), the `@secrets`
+> directive, `--local` mode, and the target-side `cred-env` helpers.
 
 ## 1. Executive Summary
 
@@ -216,6 +216,9 @@ pub struct CopyStep {
     pub dst: String,
     pub target: Target,
     pub delete: bool,
+    /// `--exclude <glob>` patterns (repeatable); honored by the rsync path,
+    /// warned as ignored on the scp fallback and in `--local` mode.
+    pub excludes: Vec<String>,
     /// `@only_if` is **not supported on `@copy`** — the parser rejects it and
     /// this field stays `None` in valid plans (retained for struct symmetry).
     pub guard: Option<String>,
@@ -297,8 +300,8 @@ shellflow/
 ├── Cargo.toml                 # workspace deps & lints (already configured)
 ├── Justfile                   # format/lint/test/mutation/build (already configured)
 ├── docs/
-│   ├── design.md              # this document
-│   └── design-secrets.md      # age integration, @secrets, --local mode
+│   ├── design.md              # this document (Part I: engine, Part II: secrets)
+│   └── example-app.md         # worked examples: secret-app + env-app
 ├── bin/
 │   └── shellflow/             # CLI + execution engine (I/O boundary)
 │       ├── Cargo.toml
@@ -941,3 +944,406 @@ proceeding.
 
 ✔ Dry run complete — no changes made. Run without --dry-run to capture VERSION.
 ```
+
+---
+
+## Part II — Secrets & Credentials
+
+> Formerly `docs/design-secrets.md` (kept as a separate design until the
+> docs consolidation). Sections are numbered `S1`–`S12` to stay distinct from
+> Part I; in-text references use the `§S<n>` form.
+
+### S1. Motivation & Goals
+
+Today `shellflow` is a deployment engine, but it has no first-class story for
+**encrypted configuration**. Projects that need it end up with ad-hoc glue:
+
+- an external `age`/`rage` CLI to generate identities and encrypt/decrypt files;
+- a render script that decrypts secrets, base64-encodes them, and injects them
+  as literal `# @env KEY=<value>` lines so they are masked by shellflow;
+- a template renderer (`sed`) to substitute paths into `@copy` directives;
+- hand-maintained systemd unit `ImportCredential=` lists that must stay in
+  sync with the encrypted env files.
+
+All of this knowledge lives in per-project scripts and READMEs instead of in
+the tool. The result is a fragmented, hard-to-audit workflow where the
+controller needs several external binaries and every project reinvents the
+same pipeline.
+
+#### Goals
+
+1. **Single controller tool.** After this change the controller needs only
+   `shellflow` (plus the `ssh`/`rsync`/`bash` it already wraps). No `age`,
+   `rage`, `base64`, or render scripts.
+2. **Static playbooks.** Playbooks reference encrypted files directly
+   (`# @secrets conf/prod.env.age`) instead of generated ones containing
+   base64 literals.
+3. **Uniform secret hygiene.** Secrets are masked in previews, traces, and
+   audit logs; never appear in any argv; never touch disk on the controller or
+   the targets.
+4. **Zero target-side crypto.** Targets only need `bash` and systemd ≥ 254.
+
+#### Non-goals
+
+- **Not a replacement for systemd.** Credential storage on targets stays
+  systemd-native (`systemd-creds`, `LoadCredentialEncrypted=` /
+  `ImportCredential=`). `shellflow` decrypts on the controller and lets the
+  target's systemd re-seal per host.
+- **Not a Vault/KMS.** Single-operator asymmetric encryption of whole files,
+  consistent with the existing shell-native, minimal-toolchain philosophy.
+- **No new deployment language.** `@secrets` builds on the existing
+  directive DSL and `ExecutionPlan`; playbooks remain 100% valid Bash.
+
+### S2. Design Overview
+
+```text
+controller (only shellflow + ssh/rsync/bash)              targets (bash + systemd >= 254)
+┌───────────────────────────────────────────────┐        ┌──────────────────────────────────┐
+│ keys generate / public          identity      │        │                                  │
+│ secret encrypt / decrypt / edit               │        │                                  │
+│ @secrets file.env.age  ──decrypt──> env vars │  ssh   │   remote bash blocks receive the  │
+│   (masked everywhere, never in argv)         │───────>│   decrypted env (masked) over the  │
+│                                              │        │   encrypted channel; targets need │
+│                                              │        │   only bash (+ systemd-creds)     │
+└───────────────────────────────────────────────┘        └──────────────────────────────────┘
+```
+
+Key pieces:
+
+1. **`crates/shellflow-secrets`** — a new library crate wrapping the Rust
+   `age` crate (the reference Rust implementation that `rage` itself wraps).
+   Handles identity loading, file encrypt/decrypt, recipient read-back, and
+   `KEY=VALUE` env parsing. No I/O leaks into `shellflow-core`.
+2. **CLI subcommands** — `keys`, `secret`; the bare positional form
+   (`shellflow deploy.sh`) keeps working as `run`.
+3. **`@secrets` directive** — decrypts an age file at execution time, injects
+   the keys as environment variables into subsequent blocks, exports a
+   `LT_SECRET_KEYS` list, and registers every value for masking.
+
+### S3. `age` Integration
+
+`shellflow` embeds the Rust `age` crate. `rage` is itself a thin CLI over
+this crate, so encrypted files are interoperable: files created by
+`shellflow secret encrypt` decrypt with `rage`, and vice versa.
+
+#### S3.1 Identity resolution
+
+Identity (private key) is resolved in this order:
+
+1. `-i` / `--identity` flag (any subcommand that needs it);
+2. `$SHELLFLOW_AGE_IDENTITY`;
+3. `~/.config/age/keys.txt` (the age convention).
+
+Identity files are the standard age format (X25519 private key). Existing
+`rage`/`age` identities work unchanged.
+
+#### S3.2 Recipients
+
+Recipients (public keys) are passed as repeatable `-r age1…` arguments or
+read from a directory of `*.pub` files via `--recipients-dir` (one key per
+file). This mirrors how projects conventionally store operator public keys.
+
+> The age format is **anonymous**: the header stores the ephemeral share, not
+> the recipients, so recipients cannot be recovered from an encrypted file.
+> `secret edit` therefore **requires** `-r`/`--recipients-dir` and fails
+> fast if none are given — re-encrypting without them would silently drop
+> operators.
+
+### S4. CLI Surface
+
+```text
+shellflow run [SCRIPT] [flags]        # current behavior; also the default
+shellflow keys generate [-o PATH]     # write a new identity
+shellflow keys public [-i PATH]       # print the public key
+shellflow secret encrypt [-r age1…]... [-o OUT] FILE
+shellflow secret decrypt [-i KEY] [FILE]
+shellflow secret edit [-i KEY] FILE   # decrypt -> $EDITOR -> re-encrypt
+shellflow secret creds FILE           # print ImportCredential=KEY lines
+```
+
+`run` keeps accepting the positional script so `shellflow deploy.sh` remains
+backward compatible; all existing flags (`-v/-n/-d/-t/-o/-s/-p/-c/-k`, etc.)
+apply to `run`.
+
+### S5. `@secrets` Directive
+
+#### S5.1 Syntax & semantics
+
+```bash
+#!/usr/bin/env shellflow
+
+# @server web-1 deploy@10.0.0.11
+# @server web-2 deploy@10.0.0.12
+# @group  web  web-1,web-2
+
+# @secrets services/myapp/env/prod.env.age
+# @remote web
+set -eu
+# LT_SECRET_KEYS is exported automatically. Per-service store: one
+# sub-directory per service keeps deploys from wiping another service's
+# credentials (ImportCredential= only reads the flat store).
+sudo install -d -m 0700 /etc/credstore.encrypted/myapp
+# Use `tr + read + printenv`, NOT `for key in $LT_SECRET_KEYS` + `${!key}`:
+# word splitting and indirect expansion are bash-only, and the remote login
+# shell may be zsh (both silently misbehave there).
+printf '%s\n' "$LT_SECRET_KEYS" | tr ' ' '\n' | while read -r key; do
+  [ -n "$key" ] || continue
+  printf '%s' "$(printenv "$key")" | sudo systemd-creds encrypt \
+    --with-key=host --name="$key" - "/etc/credstore.encrypted/myapp/${key}"
+done
+```
+
+> Credential filenames equal the key names (no `.cred` suffix):
+> `systemd-creds` embeds the output filename into the ciphertext, and
+> `ImportCredential=KEY` looks up the store by exact name — mismatches are
+> refused. With `--local`, this block runs on the controller instead of over
+> SSH, which is useful for debugging.
+
+- `@secrets <file.age>` behaves like a batch of `@env KEY=VALUE` entries
+  applied to all **subsequent** blocks, but the values are resolved at
+  execution time from the encrypted file.
+- The directive is a comment, so the playbook remains 100% valid Bash.
+- Repeatable: multiple `@secrets` lines merge in order; later files win on
+  key conflicts (matching shell `source` semantics).
+- The decrypted keys are **also** exported as the space-separated list
+  variable `LT_SECRET_KEYS`, so remote blocks can iterate them without
+  knowing the key names ahead of time.
+
+#### S5.2 Execution-time resolution
+
+The parser records only the file path (keeping `shellflow-core` pure and
+I/O-free):
+
+```rust
+pub struct SecretEntry {
+    pub file: String,
+    pub identity: Option<String>,
+}
+// ExecutionPlan gains: pub secrets: Vec<SecretEntry>
+```
+
+The executor resolves all `SecretEntry` values once, before the first step:
+
+1. resolve the identity — **most specific wins**: the `@secrets` line's own
+   `--identity`, then the run-wide `-i` flag, then `$SHELLFLOW_AGE_IDENTITY`,
+   then `~/.config/age/keys.txt`. Identities are loaded lazily and cached per
+   run, so a playbook whose files each pin their own identity never touches
+   the default path, and a repeated path is read once. A missing or invalid
+   identity is a hard error (never a silent skip);
+2. decrypt the file. Later files win on key conflicts (matching `source`
+   semantics) and the key list is deduplicated in first-seen order;
+3. parse `KEY=VALUE` lines (blank lines and `#` comments ignored; the first
+   `=` splits the key);
+4. insert every key into run-state env (same layer as `@export`, so explicit
+   `@env` still wins on conflicts);
+5. register every value in the `Ui` mask set (see §S5.3);
+6. export `LT_SECRET_KEYS` into run-state env.
+
+#### S5.3 Masking
+
+`Ui::mask_line` currently performs a global `str::replace` for every known
+secret. Short values (e.g. `1`, `on`) would corrupt output, so `@secrets`
+masking applies only to values of length ≥ a threshold. The threshold
+defaults to `6` and is configurable via `$SHELLFLOW_MASK_MIN_LEN` (or
+`--mask-min-len` on `run`, which takes precedence). An unparsable or negative
+`$SHELLFLOW_MASK_MIN_LEN` falls back to `6` rather than failing the run.
+Explicit `@env KEY=value` literals keep their current unconditional masking.
+
+Masking covers host lines, payload previews, and `--log-file` output through
+the existing `Ui` path; secrets never appear in any spawned argv. Every path
+that renders *user content* must route through the mask, not only the payload
+previews: the `-vv` local `bash -c` echo goes through `Ui::masked_note` for
+exactly this reason, since a literal secret embedded in a block body would
+otherwise be printed unmasked two lines below a preview showing `***`.
+
+#### S5.4 Precedence & errors
+
+- Precedence for a key present in several sources:
+  `@env KEY=value` (step) > `@secrets`/`@export` (run state) > passthrough.
+- Missing identity, undecryptable file, or malformed env content is a hard
+  error before any step runs (never a silent skip).
+
+### S7. Crate & Module Impact
+
+| Area | Change |
+|---|---|
+| `crates/shellflow-secrets` (new) | `age` wrapper: identity load, encrypt/decrypt, recipient read-back, env-file parser. Library-only; unit + proptest. |
+| `crates/shellflow-core` | `ExecutionPlan.secrets: Vec<SecretEntry>`; parser recognizes `@secrets` (path only, no I/O). |
+| `bin/shellflow` | clap subcommands (`run` default); executor resolves secrets into run-state env + mask list; `Ui` gains a min-length mask threshold. |
+| `bin/shellflow/src/preflight.rs` | unchanged (`age` is embedded; `bash`/`ssh`/`rsync` remain the only required tools). |
+
+Dependency additions (via `cargo add`, workspace-managed): `age`,
+`age-core`, `clap` (already present), `tempfile` (dev). `shellflow-core`
+stays free of async, I/O, and crypto.
+
+### S8. Security Properties
+
+- **Controller-only secrets**: encrypted files travel to the controller,
+  decrypted in memory, injected into remote payloads over the (already
+  encrypted) SSH channel. Targets never hold the age identity.
+- **No argv / no disk**: secret values never appear in process argv; the
+  temporary plaintext lives only in shellflow's memory and is dropped after
+  the run.
+- **Masked everywhere**: previews, `-vv/-vvv` traces, and `--log-file` redact
+  every `@secrets` value (subject to the min-length guard).
+- **Fail fast**: missing identity, decrypt failure, or malformed env aborts
+  before any step executes.
+- **Recipient safety**: `secret edit` requires explicit `-r`/`--recipients-dir`
+  and fails fast otherwise — age is anonymous, so re-encrypting without the
+  full recipient list would silently drop operators.
+
+### S9. Testing Strategy
+
+- **Unit (TDD)** — `shellflow-secrets`: identity load/paths, encrypt→decrypt
+  round-trip with an ephemeral generated identity, recipient read-back,
+  env-file parsing (blank/comment/`=`-in-value edge cases).
+- **Property** — env-file parser invariants via `proptest` (e.g. parse
+  round-trip stability), masking threshold behavior.
+- **Parser** — `@secrets` directive recognition, ordering, and
+  `LT_SECRET_KEYS` export using the existing `shellflow-core` test style.
+- **Resolver** — a per-entry `--identity` beats the run-wide `-i`; a playbook
+  whose every entry pins an identity succeeds even when the default identity
+  path does not exist; a missing identity is a hard error naming the path;
+  later files win on key conflicts and `LT_SECRET_KEYS` is deduplicated; the
+  threshold gates which values are registered for masking.
+- **Integration** — extend `bin/shellflow/tests/` with mock `ssh`/`rsync`
+  shims (existing pattern): a playbook with `@secrets` must (a) not leak the
+  value into captured argv or payload previews, (b) run the remote block with
+  the env injected, (c) fail fast without an identity, (d) decrypt through a
+  per-entry `--identity` with no run-wide `-i`, and (e) honor
+  `SHELLFLOW_MASK_MIN_LEN` for short values.
+- **Mutation** — `just mutation` over the new crate and parser changes.
+- **Fuzz** — conditional: the env-file parser is the only parser-like surface;
+  add `cargo-fuzz` only if it grows into a general config format.
+
+### S10. Milestones
+
+1. **M1 — `shellflow-secrets` crate.** `age` wrapper + env parser + tests.
+2. **M2 — `keys` / `secret` subcommands.** `generate`, `public`, `encrypt`,
+   `decrypt`, `edit`, `creds`.
+3. **M3 — `@secrets` directive.** Parser entry, executor resolution, masking
+   threshold, `LT_SECRET_KEYS`.
+4. **M4 — Docs & examples.** Update `README.md`, `docs/design.md`, add an
+   end-to-end example playbook.
+
+Each milestone ends with `just format && just lint && just test &&
+just mutation` green.
+
+### S11. Decision Records
+
+#### D-1. Embed the Rust `age` crate instead of shelling out to `rage`
+
+`rage` is a CLI wrapper over the same crate; embedding it removes a PATH
+dependency, keeps behavior identical, and matches the tool's zero-runtime
+philosophy. The Go `age` implementation is not used.
+
+#### D-2. `@secrets` directive instead of generated base64 `@env` glue
+
+The directive keeps playbooks static and valid Bash, moves decryption into
+the tool (where masking already lives), and eliminates render scripts and
+temporary files.
+
+#### D-4. Masking with a min-length threshold
+
+`mask_line` does global replacement; protecting short values from being
+over-masked requires a threshold, which is exposed as configuration rather
+than hard-coded.
+
+### S12. Target-side helpers: `cred-env`, templates, `emit`, `template check`
+
+#### S12.1 Motivation
+
+Every third-party service used to ship its own `bin/<svc>-start` launcher: a
+credential→env export loop plus, when the app only reads a config file, a
+heredoc that renders the config into tmpfs. Both parts were copied verbatim
+into every service and were bash/zsh-fragile in different ways.
+
+#### S12.2 Design
+
+The helpers are **subcommands of the shellflow binary itself**; the playbook
+installs that binary once per target host (static musl cross-build via
+`cargo zigbuild`, ~3 MB, idempotent, version upgrades ship with each deploy)
+and every unit references it:
+
+- **`shellflow cred-env exec <cmd> [args…]`** — exports every
+  `$CREDENTIALS_DIRECTORY/*` as an env var (filename = variable name, exact
+  `[A-Za-z_][A-Za-z0-9_]*` check matching the Rust env parser) and execs the
+  command (`CommandExt::exec`, so systemd's main PID and signals apply to the
+  real program). Unset `$CREDENTIALS_DIRECTORY` fails closed — a unit that
+  declares no credentials should not run through `cred-env`. Replaces the
+  per-service export loop.
+- **`shellflow cred-env render <tmpl> <out>`** — substitutes `${KEY}`
+  placeholders from the credentials into a template and writes `<out>` (0600,
+  same-directory temp file + atomic rename). Substitution is literal;
+  `shellflow_core::render_template` fails with the sorted list of missing keys
+  before anything is written. Replaces the per-service heredoc.
+- **`shellflow cred-env credstore-install <svc> [--store-dir PATH]`** —
+  clears `/etc/credstore.encrypted/<svc>/` and re-seals every key listed in
+  `$LT_SECRET_KEYS` (exported by `@secrets`) via
+  `sudo systemd-creds encrypt --with-key=host --name=<KEY>`, value on stdin.
+  Unset `$LT_SECRET_KEYS` aborts (the store must not be wiped for nothing);
+  set-but-empty is an explicit "no credentials" and clears the store. Replaces
+  the hand-written install loop (and its zsh/bash portability class).
+- **Templates** are plaintext files with `${KEY}` placeholders, committed next
+  to the service. They contain no secrets, so they may live on persistent
+  disk; only the rendered output (tmpfs) ever holds values.
+- **`shellflow template check <tmpl> <file.env.age>`** extracts the
+  template's `${KEY}` references (`shellflow_core::template_keys`) and
+  cross-checks them against the encrypted env file on the controller: missing
+  keys are fatal (they would abort the unit at start), unreferenced keys are
+  reported as notes.
+- **Controller-side replacements for the infra repo's bash scripts**:
+  `shellflow secret keys-check <dir>` verifies all `<host>.env.age` files in a
+  service directory share one key set (was `scripts/check-env-keys.sh`);
+  `shellflow service init <svc> [--host …]` scaffolds the flat layout + unit +
+  playbook skeleton (was `scripts/new-service.sh`).
+- **Fallback**: `shellflow emit cred-env [-o PATH]` still prints a pure-bash
+  asset (`bin/shellflow/assets/cred-env.sh`, embedded with `include_str!`)
+  implementing `exec`/`render` with the same semantics, for targets that
+  cannot host the binary. Both implementations are exercised by parallel
+  integration suites over one shared fixture set.
+
+#### S12.3 Correctness constraints discovered while testing
+
+- **Literal substitution cannot use `${line//needle/val}`**: in the
+  replacement string, `&` expands to the matched text on some bash versions
+  (sed-like semantics), so a password containing `&` would corrupt the render.
+  The bash fallback builds the result with `${text%%"$needle"*}` /
+  `${text#*"$needle"}` instead, which is literal on every bash; the Rust
+  `render_template` splices spans from the original text (also making
+  self-referential values safe).
+- **Variable-name validation cannot use a `case` glob**: in
+  `case $key in [A-Za-z_][A-Za-z0-9_]*)`, the trailing `*` matches *any*
+  string, so `BAD-NAME` passes and the subsequent `export` fails. Both
+  implementations use the exact regex equivalent
+  (`[[ =~ ]]` in bash, a char-based check in Rust), matching the Rust env
+  parser.
+- **`ExecStart=` performs no command substitution**: `$(cat …)` is passed
+  literally, and the `sh -c` workaround would expose the secret in argv
+  (`ps`). Apps must read `$CREDENTIALS_DIRECTORY/<KEY>` themselves, use
+  `cred-env exec`, or consume a `cred-env render`-produced config file.
+- **The encrypted path form needs `LoadCredentialEncrypted=ID:PATH`**:
+  `LoadCredential=` expects a plaintext source and `ImportCredential=` only
+  searches the flat credential-store directories (systemd.io/CREDENTIALS,
+  systemd.exec(5)).
+
+#### S12.4 Testing
+
+- `crates/shellflow-core/src/template.rs`: unit + proptest coverage of the
+  placeholder scanner and `render_template` (boundaries, malformed forms,
+  multi-byte, adjacent placeholders, literal values, missing-key fail-closed).
+  30 of 31 mutants caught (1 unviable).
+- `bin/shellflow/tests/cred_env.rs`: two parallel suites over shared fixtures —
+  (a) the bash fallback asset under `bash`, (b) the real `shellflow cred-env`
+  binary (`CARGO_BIN_EXE_shellflow`) with a fake `$CREDENTIALS_DIRECTORY` and
+  a stub `sudo`/`systemd-creds` on `PATH`: `exec` export semantics (including
+  invalid names and fail-closed without the directory), flag passthrough, exit
+  code propagation, `render` literal substitution (values with `&|$\\'"`),
+  non-UTF-8 rejection, 0600 output, no temp-file leftovers, and
+  `credstore-install` happy path (argv hygiene: values never in argv), stale
+  key clearing, and fail-closed on empty/missing/invalid keys and unsafe
+  service names.
+- `bin/shellflow/tests/service_init.rs`: `service init` scaffolding (file
+  set, executable bit, overwrite refusal, name validation, generated playbook
+  passes `-k` end-to-end with a real encrypted env) and `secret keys-check`
+  (match/mismatch/no-files cases).
