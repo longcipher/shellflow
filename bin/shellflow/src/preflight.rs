@@ -1,7 +1,7 @@
 //! Preflight validation: verify that the tools shellflow shells out to are
 //! present on `PATH` before any step runs.
 
-use std::process::Command;
+use std::{env, path::PathBuf, process::Command};
 
 /// The tools required on the controller machine.
 ///
@@ -9,7 +9,7 @@ use std::process::Command;
 /// targets that lack `rsync` (design §9), so a missing `scp` is a latent
 /// mid-run failure for every such target.
 const REQUIRED_TOOLS: &[(&str, &[&str])] =
-    &[("bash", &["--version"]), ("ssh", &["-V"]), ("rsync", &["--version"]), ("scp", &["-V"])];
+    &[("bash", &["--version"]), ("ssh", &["-V"]), ("rsync", &["--version"]), ("scp", &[])];
 
 /// Verify every required tool is available and executable.
 ///
@@ -42,13 +42,28 @@ fn check_tools(tools: &[(&str, &[&str])]) -> Result<(), String> {
 }
 
 /// Run a probe command and report whether it succeeded.
+///
+/// An empty probe means "no self-reporting flag exists": the tool is only
+/// checked for existence on `PATH`. This is the case for `scp`, which — unlike
+/// `ssh -V` / `rsync --version` — has no version flag at all (OpenSSH's
+/// `scp` rejects `-V` as an illegal option).
 fn tool_works(name: &str, args: &[&str]) -> bool {
+    if args.is_empty() {
+        return which(name).is_some();
+    }
     Command::new(name)
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Minimal `which`: the first directory in `PATH` holding an executable file
+/// with this name.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
@@ -73,6 +88,10 @@ mod tests {
         }
         // We only assert on bash, which must exist.
         assert!(tool_works("bash", &["--version"]));
+        // `scp` has no version flag (OpenSSH rejects `-V`), so its probe is a
+        // plain PATH lookup — this is the regression guard for that path.
+        assert!(tool_works("scp", &[]));
+        assert!(!tool_works("definitely-not-a-tool-xyz", &[]));
     }
 
     #[test]
