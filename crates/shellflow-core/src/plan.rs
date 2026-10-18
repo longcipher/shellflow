@@ -273,7 +273,7 @@ fn allowed_aliases(plan: &ExecutionPlan, restrict: &[String]) -> HashSet<String>
 }
 
 /// True for `[A-Za-z_][A-Za-z0-9_]*`.
-fn is_valid_var_name(name: &str) -> bool {
+pub(crate) fn is_valid_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) if first.is_ascii_alphabetic() || first == '_' => {}

@@ -1,0 +1,86 @@
+#!/usr/bin/env shellflow
+
+# ============================================================
+# shellflow playbook: deploy/upgrade __SVC__
+# ============================================================
+# Layout: services/__SVC__/ flat; credentials->env and template rendering
+#   via the shared cred-env helper (same shellflow binary, installed to
+#   /usr/local/bin/shellflow by the playbook).
+#
+# Usage:
+#   shellflow -k playbooks/deploy-__SVC__.sh
+#   shellflow --dry-run --diff playbooks/deploy-__SVC__.sh
+#   shellflow playbooks/deploy-__SVC__.sh
+
+# === Servers (declare the hosts this service deploys to; a missing
+#     host's secrets file will fail-closed) ===
+__SERVER_LINES__
+# === Secrets: age-encrypted env, {host} expands per target alias ===
+# @secrets services/__SVC__/{host}.env.age
+
+# === 1. Local: obtain artifacts (download release + verify sha256 / build locally) ===
+# @name fetch
+# @local
+set -eu
+SVC=__SVC__
+# Target helper: same shellflow binary provides cred-env exec/render/credstore-install.
+# musl static (zigbuild), no glibc coupling; the target only needs this one binary.
+TARGET_ARCH="${TARGET_ARCH:-x86_64-unknown-linux-musl}"
+SHELLFLOW_SRC="${SHELLFLOW_SRC:-$HOME/src/github.com/longcipher/shellflow}"
+[ -d "${SHELLFLOW_SRC}" ] || { echo "!! SHELLFLOW_SRC not found: ${SHELLFLOW_SRC}" >&2; exit 1; }
+STAMP="${SVC}-$(date +%s)"
+WORKDIR="/tmp/${STAMP}"
+mkdir -p "${WORKDIR}"
+# TODO: download/build artifacts into ${WORKDIR} (see infra repo playbooks/deploy-zenoh.sh)
+( cd "${SHELLFLOW_SRC}" && cargo zigbuild --release -p shellflow --target "${TARGET_ARCH}" )
+cp "${SHELLFLOW_SRC}/target/${TARGET_ARCH}/release/shellflow" "${WORKDIR}/shellflow"
+# @export STAMP,WORKDIR,SVC
+
+# === 2. Copy: whole-directory distribution (age ciphertext not sent — @secrets goes via payload injection) ===
+# @name ship-artifacts
+# @copy $WORKDIR/<artifact-dir> -> $WORKDIR/<artifact-dir> @__HOST__
+# @copy services/$SVC -> $WORKDIR/svc @__HOST__ --exclude *.age
+# @copy services/_common/10-hardening.conf -> $WORKDIR/10-hardening.conf @__HOST__
+# @copy $WORKDIR/shellflow -> $WORKDIR/shellflow @__HOST__
+
+# === 3. Remote: install + host-key-bound credentials ===
+# @name install
+# @remote __HOST__
+# @timeout 180
+set -eu
+echo "==> installing ${SVC} on $(hostname)"
+sudo id "${SVC}" >/dev/null 2>&1 || sudo useradd --system --home-dir "/etc/${SVC}" --shell /usr/sbin/nologin "${SVC}"
+sudo install -d -m 0755 /usr/local/lib/"${SVC}"
+sudo install -d -m 0755 "/opt/${SVC}/bin"
+sudo install -d -m 0755 "/etc/${SVC}"
+sudo install -d -m 0755 /usr/local/bin
+# TODO: install artifacts (binary/plugins); see infra repo playbooks/deploy-zenoh.sh
+# Plaintext config template (no secret values; render output goes to tmpfs at unit start)
+sudo install -m 0644 "${WORKDIR}/svc/${SVC}.json5.tmpl" "/etc/${SVC}/${SVC}.json5.tmpl"
+# Shared cred-env helper (same shellflow binary; idempotent upgrade)
+sudo install -m 0755 "${WORKDIR}/shellflow" /usr/local/bin/shellflow
+sudo install -m 0644 "${WORKDIR}/svc/${SVC}.service" "/etc/systemd/system/${SVC}.service"
+sudo install -d -m 0755 "/etc/systemd/system/${SVC}.service.d"
+sudo install -m 0644 "${WORKDIR}/10-hardening.conf" "/etc/systemd/system/${SVC}.service.d/10-hardening.conf"
+# Credentials: per-service subdir + per-key host-key binding (Rust subcommand;
+# values go via stdin, never argv; works regardless of bash vs zsh login shell)
+/usr/local/bin/shellflow cred-env credstore-install "${SVC}"
+rm -rf "${WORKDIR}/svc" "${WORKDIR}/10-hardening.conf" "${WORKDIR}/shellflow"
+
+# === 4. Remote: enable + restart ===
+# @name enable-start
+# @remote __HOST__
+set -eu
+sudo systemctl daemon-reload
+sudo systemctl enable "${SVC}.service"
+sudo systemctl restart "${SVC}.service"
+sudo systemctl is-active "${SVC}.service"
+
+# === 5. Remote: verify ===
+# @name verify
+# @remote __HOST__
+set -eu
+echo "==> ${SVC} status: $(sudo systemctl is-active "${SVC}.service")"
+sudo ls -l "/etc/credstore.encrypted/${SVC}/"
+sudo ls -l "/run/credentials/${SVC}.service/" 2>/dev/null || true
+sudo journalctl -u "${SVC}.service" --no-pager -n 15

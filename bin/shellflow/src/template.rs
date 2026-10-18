@@ -16,7 +16,10 @@ use shellflow_secrets::{
     identity::{effective_identity_path, load_x25519_identity},
 };
 
-use crate::cli::{TemplateCheckArgs, TemplateCmd};
+use crate::{
+    cli::{TemplateCheckArgs, TemplateCmd},
+    ui::Ui,
+};
 
 /// Run a `template` subcommand.
 ///
@@ -24,13 +27,13 @@ use crate::cli::{TemplateCheckArgs, TemplateCmd};
 ///
 /// Propagates I/O, identity, and decryption errors; `check` fails when the
 /// template references a key that the env file does not provide.
-pub(crate) fn run(cmd: &TemplateCmd) -> Result<()> {
+pub(crate) fn run(cmd: &TemplateCmd, ui: &Ui) -> Result<()> {
     match cmd {
-        TemplateCmd::Check(args) => check(args),
+        TemplateCmd::Check(args) => check(args, ui),
     }
 }
 
-fn check(args: &TemplateCheckArgs) -> Result<()> {
+fn check(args: &TemplateCheckArgs, ui: &Ui) -> Result<()> {
     let content = fs::read_to_string(&args.template)
         .wrap_err_with(|| format!("failed to read template `{}`", args.template.display()))?;
     let used = template_keys(&content);
@@ -56,19 +59,19 @@ fn check(args: &TemplateCheckArgs) -> Result<()> {
             "template `{}` references keys missing from `{}`: {}",
             args.template.display(),
             args.file.display(),
-            missing.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", "),
+            missing.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
         ));
     }
 
     // Unused keys are a warning: the credential is imported but never
     // substituted, which usually means a stale key or a stale template.
     for key in env_keys.iter().filter(|k| !used.contains(k)) {
-        println!("note: {key} is in the env file but not referenced by the template");
+        ui.note(&format!("note: {key} is in the env file but not referenced by the template"));
     }
-    println!(
+    ui.note(&format!(
         "OK: {} key(s) referenced by the template, all present in {}",
         used.len(),
         args.file.display()
-    );
+    ));
     Ok(())
 }

@@ -6,7 +6,10 @@ use std::collections::BTreeMap;
 use crate::{
     error::ParseError,
     heredoc::HeredocTracker,
-    plan::{CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, SecretEntry, Step, Target},
+    plan::{
+        CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, SecretEntry, Step, Target,
+        is_valid_var_name,
+    },
     ssh_spec::SshSpec,
 };
 
@@ -502,16 +505,6 @@ fn strip_surrounding_quotes(raw: &str) -> String {
         }
     }
     trimmed.to_string()
-}
-
-/// True for `[A-Za-z_][A-Za-z0-9_]*`.
-fn is_valid_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Extract `(keyword, payload)` from a possible directive line.

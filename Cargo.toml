@@ -4,7 +4,7 @@ members = ["bin/*", "crates/*", "examples/*"]
 exclude = [".github/"]
 resolver = "3"
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/longcipher/shellflow"
@@ -20,8 +20,8 @@ colored = "3.1.1"
 eyre = "0.6.14"
 nix = "0.31.3"
 proptest = "1.11.0"
-shellflow-core = { path = "crates/shellflow-core", version = "0.2.0" }
-shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.2.0" }
+shellflow-core = { path = "crates/shellflow-core", version = "0.2.1" }
+shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.2.1" }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = "1.53.1"

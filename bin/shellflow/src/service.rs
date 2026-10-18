@@ -22,6 +22,15 @@ use eyre::{Context, Result, bail};
 
 use crate::cli::{ServiceCmd, ServiceInitArgs};
 
+/// The config template (token `__SVC__`).
+const CONFIG_TEMPLATE: &str = include_str!("../assets/service-config.tmpl");
+
+/// The systemd unit (token `__SVC__`).
+const UNIT_TEMPLATE: &str = include_str!("../assets/service-unit.tmpl");
+
+/// The deploy playbook (tokens `__SVC__`, `__SERVER_LINES__`, `__HOST__`).
+const PLAYBOOK_TEMPLATE: &str = include_str!("../assets/service-playbook.tmpl");
+
 /// Scaffold a service.
 ///
 /// # Errors
@@ -35,159 +44,6 @@ pub(crate) fn run(cmd: &ServiceCmd) -> Result<()> {
 }
 
 /// Scaffold a service (`service init`).
-///
-/// # Errors
-///
-/// Returns when the service name is unusable, when any target path already
-/// exists (never overwrites), or on I/O failures.
-/// The config template (token `__SVC__`).
-const CONFIG_TEMPLATE: &str = r#"{
-  // __SVC__ 配置模板 — `shellflow cred-env render` 在 unit 启动时把加密 env
-  // 中的键值注入下方占位符 (占位符形如: 美元符号 + 花括号 + 键名 + 右花括号):
-  //   /usr/local/bin/shellflow cred-env render \
-  //     /etc/__SVC__/__SVC__.json5.tmpl /run/__SVC__/__SVC__.json5
-  // 值来自加密 env (逐主机), 渲染产物 0600, unit 退出即毁。
-  // 自检: shellflow template check services/__SVC__/__SVC__.json5.tmpl \
-  //         services/__SVC__/<host>.env.age
-  // 注意: 注释里不要写占位符文本, 会被当作真实占位符校验。
-  //
-  // TODO: 按应用配置格式改写下面内容; 不需要配置文件的应用删掉本模板与
-  //       unit 里的 ExecStartPre= 行。
-  mode: "default",
-  listen: { endpoints: ["${LISTEN_ENDPOINT}"] },
-}
-"#;
-
-/// The systemd unit (token `__SVC__`).
-const UNIT_TEMPLATE: &str = r"[Unit]
-Description=__SVC__ (encrypted credentials via systemd-creds)
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=simple
-# 专用运行用户 (playbook 自动创建, 最小权限)
-User=__SVC__
-Group=__SVC__
-
-# tmpfs 目录: 渲染产物落这里 (0700, unit 退出即毁)
-RuntimeDirectory=__SVC__
-RuntimeDirectoryMode=0700
-
-# 需要配置文件的第三方应用: 渲染明文模板 (无密值) 进 tmpfs; 不需要则删掉本行
-ExecStartPre=/usr/local/bin/shellflow cred-env render /etc/__SVC__/__SVC__.json5.tmpl /run/__SVC__/__SVC__.json5
-
-# 共享助手 (playbook 安装到 /usr/local/bin/shellflow, 全服务共用, 无每服务
-# 启动器): 导出 systemd 凭据为环境变量后 exec 真实二进制。
-# 自研应用可改为 ExecStart 直接指二进制, 启动早期读 $CREDENTIALS_DIRECTORY。
-ExecStart=/usr/local/bin/shellflow cred-env exec /opt/__SVC__/bin/__SVC__
-
-# ★ 逐键从按服务 credstore 导入 (重新生成本段):
-#   shellflow secret creds --store-dir /etc/credstore.encrypted/__SVC__ \
-#     services/__SVC__/<host>.env.age
-# 粘贴输出的 LoadCredentialEncrypted= 行到下面 (各主机键集合必须一致):
-# LoadCredentialEncrypted=API_KEY:/etc/credstore.encrypted/__SVC__/API_KEY
-
-# --- 安全加固见 services/_common/10-hardening.conf ---
-# playbook 安装为 /etc/systemd/system/__SVC__.service.d/10-hardening.conf
-
-[Install]
-WantedBy=multi-user.target
-";
-
-/// The deploy playbook (tokens `__SVC__`, `__SERVER_LINES__`, `__HOST__`).
-const PLAYBOOK_TEMPLATE: &str = r#"#!/usr/bin/env shellflow
-
-# ============================================================
-# shellflow playbook: 部署/升级 __SVC__
-# ============================================================
-# 布局: services/__SVC__/ 扁平化; 凭据->env 与模板渲染走共享 cred-env 助手
-#   (同一 shellflow 二进制, playbook 安装到 /usr/local/bin/shellflow)。
-#
-# 用法:
-#   shellflow -k playbooks/deploy-__SVC__.sh
-#   shellflow --dry-run --diff playbooks/deploy-__SVC__.sh
-#   shellflow playbooks/deploy-__SVC__.sh
-
-# === 服务器 (声明本服务实际部署的主机; 缺文件的 host 会 fail-closed) ===
-__SERVER_LINES__
-# === 敏感信息: age 加密 env, {host} 按目标机别名解析 ===
-# @secrets services/__SVC__/{host}.env.age
-
-# === 1. Local: 获取产物 (下载 release 并校验 sha256 / 本地构建) ===
-# @name fetch
-# @local
-set -eu
-SVC=__SVC__
-# 目标机助手: 同一 shellflow 二进制提供 cred-env exec/render/credstore-install。
-# musl 静态 (zigbuild), 无 glibc 耦合; 目标机只需这一个二进制。
-TARGET_ARCH="${TARGET_ARCH:-x86_64-unknown-linux-musl}"
-SHELLFLOW_SRC="${SHELLFLOW_SRC:-$HOME/src/github.com/longcipher/shellflow}"
-[ -d "${SHELLFLOW_SRC}" ] || { echo "!! SHELLFLOW_SRC not found: ${SHELLFLOW_SRC}" >&2; exit 1; }
-STAMP="${SVC}-$(date +%s)"
-WORKDIR="/tmp/${STAMP}"
-mkdir -p "${WORKDIR}"
-# TODO: 下载/构建产物到 ${WORKDIR} (示例见 infra 仓库 playbooks/deploy-zenoh.sh)
-( cd "${SHELLFLOW_SRC}" && cargo zigbuild --release -p shellflow --target "${TARGET_ARCH}" )
-cp "${SHELLFLOW_SRC}/target/${TARGET_ARCH}/release/shellflow" "${WORKDIR}/shellflow"
-# @export STAMP,WORKDIR,SVC
-
-# === 2. Copy: 整目录下发 (age 密文不下发 — @secrets 走 payload 注入) ===
-# @name ship-artifacts
-# @copy $WORKDIR/<artifact-dir> -> $WORKDIR/<artifact-dir> @__HOST__
-# @copy services/$SVC -> $WORKDIR/svc @__HOST__ --exclude *.age
-# @copy services/_common/10-hardening.conf -> $WORKDIR/10-hardening.conf @__HOST__
-# @copy $WORKDIR/shellflow -> $WORKDIR/shellflow @__HOST__
-
-# === 3. Remote: 安装 + host-key 绑定凭据 ===
-# @name install
-# @remote __HOST__
-# @timeout 180
-set -eu
-echo "==> installing ${SVC} on $(hostname)"
-sudo id "${SVC}" >/dev/null 2>&1 || sudo useradd --system --home-dir "/etc/${SVC}" --shell /usr/sbin/nologin "${SVC}"
-sudo install -d -m 0755 /usr/local/lib/"${SVC}"
-sudo install -d -m 0755 "/opt/${SVC}/bin"
-sudo install -d -m 0755 "/etc/${SVC}"
-sudo install -d -m 0755 /usr/local/bin
-# TODO: 安装产物 (二进制/插件), 示例见 infra 仓库 playbooks/deploy-zenoh.sh
-# 明文配置模板 (无密值; 渲染产物在 unit 启动时进 tmpfs)
-sudo install -m 0644 "${WORKDIR}/svc/${SVC}.json5.tmpl" "/etc/${SVC}/${SVC}.json5.tmpl"
-# 共享 cred-env 助手 (同一 shellflow 二进制; 幂等升级)
-sudo install -m 0755 "${WORKDIR}/shellflow" /usr/local/bin/shellflow
-sudo install -m 0644 "${WORKDIR}/svc/${SVC}.service" "/etc/systemd/system/${SVC}.service"
-sudo install -d -m 0755 "/etc/systemd/system/${SVC}.service.d"
-sudo install -m 0644 "${WORKDIR}/10-hardening.conf" "/etc/systemd/system/${SVC}.service.d/10-hardening.conf"
-# 凭据: 每服务子目录 + 逐键 host-key 绑定 (Rust 子命令; 值走 stdin 不进 argv;
-# 与目标机登录 shell 是 bash 还是 zsh 无关)
-/usr/local/bin/shellflow cred-env credstore-install "${SVC}"
-rm -rf "${WORKDIR}/svc" "${WORKDIR}/10-hardening.conf" "${WORKDIR}/shellflow"
-
-# === 4. Remote: enable + restart ===
-# @name enable-start
-# @remote __HOST__
-set -eu
-sudo systemctl daemon-reload
-sudo systemctl enable "${SVC}.service"
-sudo systemctl restart "${SVC}.service"
-sudo systemctl is-active "${SVC}.service"
-
-# === 5. Remote: 验证 ===
-# @name verify
-# @remote __HOST__
-set -eu
-echo "==> ${SVC} status: $(sudo systemctl is-active "${SVC}.service")"
-sudo ls -l "/etc/credstore.encrypted/${SVC}/"
-sudo ls -l "/run/credentials/${SVC}.service/" 2>/dev/null || true
-sudo journalctl -u "${SVC}.service" --no-pager -n 15
-"#;
-
-/// Scaffold a service (`service init`).
-///
-/// # Errors
-///
-/// Returns when the service name is unusable, when any target path already
-/// exists (never overwrites), or on I/O failures.
 fn init(cmd: &ServiceInitArgs) -> Result<()> {
     let service = cmd.service.trim();
     let hosts: Vec<String> = if cmd.hosts.is_empty() {
@@ -310,8 +166,6 @@ mod tests {
     fn generated_template_uses_real_placeholders() {
         let config = render(CONFIG_TEMPLATE, "myapp");
         assert!(!config.contains("__SVC__"));
-        // The scaffold must ship a resolvable `${KEY}` placeholder, not a
-        // leftover token (which `template check` would silently ignore).
         assert!(!config.contains("__LISTEN_ENDPOINT__"));
         assert_eq!(
             shellflow_core::template_keys(&config),
@@ -332,8 +186,6 @@ mod tests {
         assert!(body.contains("# @secrets services/myapp/{host}.env.age"));
         assert!(body.contains("cred-env credstore-install"));
         assert!(body.contains("cargo zigbuild"));
-        // No line may open with a bare directive token: comment lines that
-        // start (after `#` + whitespace) with `@` are parsed as directives.
         for line in body.lines() {
             let trimmed = line.trim_start();
             if let Some(rest) = trimmed.strip_prefix('#') {
