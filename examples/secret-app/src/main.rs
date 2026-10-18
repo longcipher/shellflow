@@ -1,9 +1,9 @@
-//! Demo Secret App — reads sensitive configuration from environment variables.
+//! Secret App example — reads sensitive configuration from environment variables.
 //!
 //! This is a typical third-party / closed-source application pattern: it reads
 //! all configuration from environment variables, expecting them to be injected
-//! by the runtime environment (systemd with `ImportCredential=` plus the
-//! per-service starter in `services/demo-secret-app/bin/`).
+//! by systemd from host-key-bound credentials (`LoadCredentialEncrypted=` plus
+//! `shellflow cred-env exec`, deployed by `deploy.sh` in this directory).
 //!
 //! Required environment variables:
 //!   - `API_KEY`       — API authentication key
@@ -46,7 +46,7 @@ fn main() {
     let secrets = ["API_KEY", "API_SECRET", "DB_PASSWORD"];
     let log_level = env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
 
-    println!("--- demo-secret-app ---");
+    println!("--- secret-app ---");
     println!("LOG_LEVEL={log_level}");
     println!();
 

@@ -1,0 +1,39 @@
+[Unit]
+Description=Env App example — plain environment-variable configuration (no encryption)
+After=network-online.target
+Wants=network-online.target
+
+# === The plain-env pattern (the baseline secret-app replaces) ===
+#
+# Configuration is a plaintext env file on the target disk, written 0600 by
+# the deploy playbook and read by PID 1 before the DynamicUser drops
+# privileges. Values are readable by root on the target — that is exactly the
+# trade-off this example demonstrates. See examples/secret-app for the
+# encrypted equivalent.
+
+[Service]
+Type=oneshot
+# Stay "active" after a successful run so `systemctl is-active` reflects the
+# last run's outcome (exit 0 -> active, exit 1 -> failed).
+RemainAfterExit=yes
+# Ephemeral uid/gid per start: no static `nobody` account (which systemd
+# flags as unsafe), no state left behind between runs.
+DynamicUser=yes
+
+# Plain env file written by the deploy playbook (0600 root:root).
+EnvironmentFile=/etc/env-app/env-app.env
+
+ExecStart=/opt/env-app/bin/env-app
+
+# Security hardening (does not protect against root reading the env file —
+# that is inherent to the plaintext pattern)
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateDevices=yes
+ProtectProc=invisible
+
+[Install]
+WantedBy=multi-user.target

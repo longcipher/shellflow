@@ -66,8 +66,9 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
 - **Graceful file copies** — `@copy` uses rsync when the target has it (with a
   `mkdir -p` remote wrapper), and automatically falls back to
   `ssh mkdir -p` + `scp` on hosts without rsync. Destination directories are
-  always created. `scp` cannot mirror deletions, so `--delete` is reported as
-  ignored on the fallback path rather than silently leaving stale files.
+  always created. `scp` cannot mirror deletions or filter files, so `--delete`
+  and `--exclude` are reported as ignored on the fallback path rather than
+  silently leaving stale files (or shipping excluded files).
 - **Guards & timeouts** — `@only_if <cmd>` skips a block where the
   precondition fails; `--timeout SECS` / `@timeout SECS` kills hung hosts
   (guards included).
@@ -124,7 +125,7 @@ lines belong to the current block.
 | `@secrets` | `# @secrets <file.env.age> [--identity <PATH>]` | Decrypt an age-encrypted env file at run time; inject keys into later blocks, export the key list as `LT_SECRET_KEYS`, and mask all values. Identity precedence is most-specific-wins: the directive's `--identity`, then the run-wide `-i`, then `$SHELLFLOW_AGE_IDENTITY`, then `~/.config/age/keys.txt`. Resolution is a hard error without a usable identity |
 | `@local` | `# @local` | Following lines run locally (default) |
 | `@remote` | `# @remote <target>` | Following lines stream to the target (alias, group, or raw spec) |
-| `@copy` | `# @copy <src> -> <dst> @<target> [--delete]` | Copy a local path to the target (rsync, or scp fallback); creates the destination directory; supports `$VAR` interpolation |
+| `@copy` | `# @copy <src> -> <dst> @<target> [--delete] [--exclude <glob>]` | Copy a local path to the target (rsync, or scp fallback); a directory source is flattened into `dst` (contents semantics, identical on GNU rsync and macOS openrsync); supports `$VAR` interpolation; `--exclude` is repeatable and honored by rsync (warned as ignored on the scp fallback and in `--local` mode) |
 | `@export` | `# @export <VAR>[,<VAR>…]` | Capture variables from the preceding local block into run state |
 | `@timeout` | `# @timeout <seconds>` | Per-step timeout for the next block |
 | `@name` | `# @name <label>` | Name the next block (for `--only`/`--skip` and reporting) |
@@ -194,7 +195,26 @@ shellflow keys public [-i PATH]           print the age1... public key
 shellflow secret encrypt -r age1... [-o OUT] [FILE]
 shellflow secret decrypt [-i PATH] [-o OUT] [FILE]
 shellflow secret edit [-i PATH] -r age1... FILE    decrypt -> $EDITOR -> re-encrypt
-shellflow secret creds [-i PATH] FILE              print ImportCredential=KEY lines
+shellflow secret creds [-i PATH] [--store-dir PATH] FILE   print ImportCredential=KEY lines
+                                             (--store-dir prints per-service
+                                              LoadCredentialEncrypted=KEY:PATH lines)
+shellflow template check [-i PATH] <tmpl> <file.env.age>   every ${KEY} in the
+                                             template must exist in the env file
+shellflow emit cred-env [-o PATH]          print the target-side `cred-env`
+                                             bash fallback (export creds /
+                                             render templates)
+shellflow cred-env exec <cmd> [args…]      [target] export credentials as env
+                                             vars, then exec the command
+shellflow cred-env render <tmpl> <out>     [target] substitute ${KEY} credential
+                                             values into a template (0600)
+shellflow cred-env credstore-install <svc> [--store-dir PATH]
+                                           [target] clear + re-seal the
+                                             per-service credential store
+shellflow secret keys-check [-i PATH] <dir>  all <host>.env.age in <dir> must
+                                             share the same key set
+shellflow service init <svc> [--host H]…   scaffold services/<svc>/ +
+                                             playbooks/deploy-<svc>.sh (flat
+                                             layout, shared-helper unit)
 ```
 
 Exit codes: `0` success · `1` plan/parse/config error · `2` CLI usage · `3`
@@ -261,6 +281,15 @@ shellflow secret creds services/myapp/env/prod.env.age
 # -> ImportCredential=API_SECRET
 # -> ImportCredential=DB_PASSWORD
 
+# Per-service credential store (one sub-directory per service, so deploying
+# one service never wipes another service's host-key-bound credentials):
+# prints LoadCredentialEncrypted=KEY:/etc/credstore.encrypted/<svc>/KEY lines
+shellflow secret creds --store-dir /etc/credstore.encrypted/myapp \
+  services/myapp/env/prod.env.age
+# -> LoadCredentialEncrypted=API_KEY:/etc/credstore.encrypted/myapp/API_KEY
+# -> LoadCredentialEncrypted=API_SECRET:/etc/credstore.encrypted/myapp/API_SECRET
+# -> LoadCredentialEncrypted=DB_PASSWORD:/etc/credstore.encrypted/myapp/DB_PASSWORD
+
 # Decrypt to stdout for a quick peek
 shellflow secret decrypt services/myapp/env/prod.env.age
 # -> API_KEY=sk-prod-abcdef1234567890
@@ -293,10 +322,17 @@ and masks all values in output.
 # @remote all
 # @timeout 120
 set -eu
-# LT_SECRET_KEYS is automatically exported by @secrets
-for key in $LT_SECRET_KEYS; do
-  printf '%s' "${!key}" | sudo systemd-creds encrypt \
-    --with-key=host --name="$key" - "/etc/credstore.encrypted/${key}"
+# LT_SECRET_KEYS is automatically exported by @secrets.
+# Per-service store: one sub-directory per service keeps deploys from wiping
+# another service's credentials (ImportCredential= only reads the flat store).
+sudo install -d -m 0700 /etc/credstore.encrypted/myapp
+# NOTE: use `tr + read + printenv`, not `for key in $LT_SECRET_KEYS` +
+# `${!key}` — the latter are bash-only features and the remote login shell
+# may be zsh (word splitting and indirect expansion silently misbehave).
+printf '%s\n' "$LT_SECRET_KEYS" | tr ' ' '\n' | while read -r key; do
+  [ -n "$key" ] || continue
+  printf '%s' "$(printenv "$key")" | sudo systemd-creds encrypt \
+    --with-key=host --name="$key" - "/etc/credstore.encrypted/myapp/${key}"
 done
 sudo systemctl daemon-reload
 sudo systemctl restart myapp
@@ -315,33 +351,34 @@ shellflow -i ~/.config/age/keys.txt playbook.sh
 shellflow -t trade -i ~/.config/age/keys.txt playbook.sh
 ```
 
-### 5. End-to-end: deploy demo-secret-app
+### 5. End-to-end: deploy the secret-app example
 
 The repository includes a complete working example:
-[`playbooks/deploy-demo.sh`](playbooks/deploy-demo.sh) deploys the
-`demo-secret-app` binary to `trade` and `api` servers (configured in
+[`examples/secret-app/deploy.sh`](examples/secret-app/deploy.sh) deploys the
+`secret-app` binary to `api` and `trade` servers (configured in
 `~/.ssh/config`).
 
-The demo uses the **cred-wrap** approach: systemd host-key-bound credentials
-are exported as environment variables by the `cred-wrap` wrapper before
-exec'ing the app. No application code changes needed — works with any
-third-party or closed-source project that reads env vars.
+The demo uses the **cred-env** approach: the shellflow binary installed on the
+target (`shellflow cred-env exec`) exports systemd host-key-bound credentials
+as environment variables before exec'ing the app. No application code changes
+and no per-service starter script — works with any third-party or closed-source
+project that reads env vars.
 
 ```bash
 # 1. Preview the deployment
-shellflow --dry-run --diff playbooks/deploy-demo.sh
+shellflow --dry-run --diff examples/secret-app/deploy.sh
 
 # 2. Real deployment
-shellflow playbooks/deploy-demo.sh
+shellflow examples/secret-app/deploy.sh
 
 # 3. Verify on a remote host
-ssh trade "sudo journalctl -u demo-secret-app.service --no-pager -n 20"
+ssh trade "sudo journalctl -u secret-app.service --no-pager -n 20"
 ```
 
 Expected output on the target:
 
 ```
---- demo-secret-app ---
+--- secret-app ---
 LOG_LEVEL=info
 
   API_KEY=sk-p...7890 (len=24)
@@ -351,7 +388,7 @@ LOG_LEVEL=info
 All secrets present. App is ready.
 ```
 
-See [`docs/workflow-demo-secret-app.md`](docs/workflow-demo-secret-app.md) for
+See [`docs/example-app.md`](docs/example-app.md) for
 the full detailed walkthrough.
 
 ## Examples
@@ -372,10 +409,12 @@ shellflow keys generate -o ~/.config/age/keys.txt
 shellflow secret encrypt -r "$(shellflow keys public)" -o prod.env.age < prod.env
 shellflow secret edit -r "$(shellflow keys public)" prod.env.age
 shellflow secret creds prod.env.age
+shellflow secret creds --store-dir /etc/credstore.encrypted/myapp prod.env.age
+shellflow template check -i ~/.config/age/keys.txt svc.json5.tmpl prod.env.age
 shellflow -i ~/.config/age/keys.txt --local playbook-with-secrets.sh
 
 # Full deployment
-shellflow playbooks/deploy-demo.sh
+shellflow examples/secret-app/deploy.sh
 ```
 
 [`playbooks/deploy.sh`](playbooks/deploy.sh) is a runnable playbook that
