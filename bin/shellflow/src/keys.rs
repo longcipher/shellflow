@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use eyre::{Result, bail, eyre};
 use shellflow_secrets::identity::{
-    effective_identity_path, generate_identity, load_x25519_identity,
+    effective_identity_path, expand_home, generate_identity, load_x25519_identity,
 };
 
 use crate::cli::KeysCmd;
@@ -13,15 +13,12 @@ use crate::cli::KeysCmd;
 ///
 /// Returns an error (rather than silently writing to a relative path) when
 /// `$HOME` is unset, e.g. in a minimal container.
-fn expand_home(path: &Path) -> Result<PathBuf> {
-    let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| eyre!("cannot expand `~` in `{}`: $HOME is not set", path.display()))?;
-        Ok(PathBuf::from(home).join(rest))
-    } else {
-        Ok(path.to_path_buf())
+fn expand_home_strict(path: &Path) -> Result<PathBuf> {
+    let expanded = expand_home(path);
+    if expanded.to_string_lossy().starts_with("~/") {
+        return Err(eyre!("cannot expand `~` in `{}`: $HOME is not set", path.display()));
     }
+    Ok(expanded)
 }
 
 /// Run a `keys` subcommand.
@@ -37,7 +34,7 @@ pub(crate) fn run(cmd: &KeysCmd) -> Result<()> {
 }
 
 fn generate(output: &Path) -> Result<()> {
-    let path = expand_home(output)?;
+    let path = expand_home_strict(output)?;
     if path.exists() {
         bail!("refusing to overwrite existing identity file {}", path.display());
     }

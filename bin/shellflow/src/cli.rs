@@ -176,8 +176,24 @@ pub(crate) enum SecretCmd {
     Decrypt(SecretDecryptArgs),
     /// Decrypt, open `$EDITOR`, and re-encrypt to the given recipients.
     Edit(SecretEditArgs),
-    /// Print the `ImportCredential=KEY` lines for an env file.
+    /// Print the `ImportCredential=KEY` lines for an env file (`--store-dir`
+    /// switches to the per-service `LoadCredentialEncrypted=KEY:PATH` form).
     Creds(SecretCredsArgs),
+    /// Check that every `<host>.env.age` in a service directory shares the
+    /// same key set (units are shared across hosts, so drift breaks deploys).
+    KeysCheck(SecretKeysCheckArgs),
+}
+
+/// Arguments for `secret keys-check`.
+#[derive(Debug, Args)]
+pub(crate) struct SecretKeysCheckArgs {
+    /// Identity file to decrypt with.
+    #[arg(short = 'i', long, value_name = "PATH")]
+    pub identity: Option<PathBuf>,
+
+    /// Service directory containing `<host>.env.age` files.
+    #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
 }
 
 /// Arguments for `secret encrypt`.
@@ -244,13 +260,166 @@ pub(crate) struct SecretCredsArgs {
     #[arg(short = 'i', long, value_name = "PATH")]
     pub identity: Option<PathBuf>,
 
+    /// Print `LoadCredentialEncrypted=KEY:<dir>/<KEY>` lines instead of the default
+    /// flat `ImportCredential=KEY` form, for per-service credential stores
+    /// (e.g. `/etc/credstore.encrypted/<svc>`).
+    #[arg(long, value_name = "PATH")]
+    pub store_dir: Option<PathBuf>,
+
     /// The encrypted env file to read.
     #[arg(value_name = "FILE")]
     pub file: PathBuf,
 }
 
+/// Arguments for `shellflow template`.
+#[derive(Debug, Args)]
+pub(crate) struct TemplateArgs {
+    #[command(subcommand)]
+    pub command: TemplateCmd,
+}
+
+/// The `template` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum TemplateCmd {
+    /// Check that every `${KEY}` placeholder in a template exists in an
+    /// encrypted env file (the manifest `cred-env render` needs at runtime).
+    Check(TemplateCheckArgs),
+}
+
+/// Arguments for `template check`.
+#[derive(Debug, Args)]
+pub(crate) struct TemplateCheckArgs {
+    /// Identity file to decrypt the env file with.
+    #[arg(short = 'i', long, value_name = "PATH")]
+    pub identity: Option<PathBuf>,
+
+    /// Template file with `${KEY}` placeholders.
+    #[arg(value_name = "TEMPLATE")]
+    pub template: PathBuf,
+
+    /// Encrypted env file providing the credential keys.
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+}
+
+/// Arguments for `shellflow emit`.
+#[derive(Debug, Args)]
+pub(crate) struct EmitArgs {
+    #[command(subcommand)]
+    pub command: EmitCmd,
+}
+
+/// The `emit` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum EmitCmd {
+    /// Print (or write) the embedded `cred-env` bash helper.
+    ///
+    /// Fallback for targets that cannot host the `shellflow` binary; the
+    /// primary path is `shellflow cred-env` (same semantics, no shell).
+    CredEnv(EmitCredEnvArgs),
+}
+
+/// Arguments for `emit cred-env`.
+#[derive(Debug, Args)]
+pub(crate) struct EmitCredEnvArgs {
+    /// Output path (written mode 0755); defaults to stdout.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+}
+
+/// Arguments for `shellflow cred-env` — the target-side credential helpers.
+///
+/// These subcommands run **on the target host** (the binary is installed once
+/// per host by a deploy playbook). They never touch age identities, never
+/// open the network, and read only `$CREDENTIALS_DIRECTORY` plus the
+/// environment a playbook block already injected.
+#[derive(Debug, Args)]
+pub(crate) struct CredEnvArgs {
+    #[command(subcommand)]
+    pub command: CredEnvCmd,
+}
+
+/// The `cred-env` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum CredEnvCmd {
+    /// Export every credential in `$CREDENTIALS_DIRECTORY` as an environment
+    /// variable (filename = variable name) and exec the command.
+    Exec(CredEnvExecArgs),
+    /// Substitute `${KEY}` placeholders in a template with credential values
+    /// and write the result (0600, atomic rename).
+    Render(CredEnvRenderArgs),
+    /// Install credentials into a per-service host-key-bound store via
+    /// `systemd-creds` (runs on the target; values come from the environment).
+    CredstoreInstall(CredstoreInstallArgs),
+}
+
+/// Arguments for `cred-env exec`.
+#[derive(Debug, Args)]
+pub(crate) struct CredEnvExecArgs {
+    /// The command to run, with its arguments. Everything after `exec` is
+    /// passed through verbatim (flags included).
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        required = true,
+        value_name = "CMD"
+    )]
+    pub command: Vec<String>,
+}
+
+/// Arguments for `cred-env render`.
+#[derive(Debug, Args)]
+pub(crate) struct CredEnvRenderArgs {
+    /// Template file with `${KEY}` placeholders (plaintext, no secrets).
+    #[arg(value_name = "TMPL")]
+    pub template: PathBuf,
+
+    /// Output path; its parent directory must exist (created 0600).
+    #[arg(value_name = "OUT")]
+    pub output: PathBuf,
+}
+
+/// Arguments for `cred-env credstore-install`.
+#[derive(Debug, Args)]
+pub(crate) struct CredstoreInstallArgs {
+    /// Service name; the default store is `/etc/credstore.encrypted/<SVC>`.
+    #[arg(value_name = "SVC")]
+    pub service: String,
+
+    /// Override the store directory (default `/etc/credstore.encrypted/<SVC>`).
+    #[arg(long, value_name = "PATH")]
+    pub store_dir: Option<PathBuf>,
+}
+
+/// Arguments for `shellflow service` — repository scaffolding.
+#[derive(Debug, Args)]
+pub(crate) struct ServiceArgs {
+    #[command(subcommand)]
+    pub command: ServiceCmd,
+}
+
+/// The `service` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ServiceCmd {
+    /// Scaffold a new service in the flat layout (config template, systemd
+    /// unit, deploy playbook skeleton) in the current repository.
+    Init(ServiceInitArgs),
+}
+
+/// Arguments for `service init`.
+#[derive(Debug, Args)]
+pub(crate) struct ServiceInitArgs {
+    /// Service name (`[a-z][a-z0-9-]*`).
+    #[arg(value_name = "SVC")]
+    pub service: String,
+
+    /// Host alias this service deploys to (repeatable; default `api`).
+    #[arg(long = "host", value_name = "HOST")]
+    pub hosts: Vec<String>,
+}
+
 /// The top-level CLI: a `run` subcommand (also the default via the bare
-/// positional `SCRIPT`), plus `keys` and `secret`.
+/// positional `SCRIPT`), plus `keys`, `secret`, `template`, and `emit`.
 #[derive(Debug, Parser)]
 #[command(name = "shellflow", version, about, long_about)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -273,6 +442,14 @@ pub(crate) enum Command {
     Keys(KeysArgs),
     /// Encrypt, decrypt, and edit age-encrypted env files.
     Secret(SecretArgs),
+    /// Cross-check `${KEY}` templates against encrypted env files.
+    Template(TemplateArgs),
+    /// Print embedded target-side helper assets (bash fallback).
+    Emit(EmitArgs),
+    /// Target-side credential helpers (run on the target host).
+    CredEnv(CredEnvArgs),
+    /// Scaffold new services in the flat repository layout.
+    Service(ServiceArgs),
 }
 
 impl RunArgs {
@@ -364,6 +541,206 @@ mod tests {
         let cli = Cli::parse_from(["shellflow", "--local", "deploy.sh"]);
         assert!(cli.command.is_none());
         assert!(cli.run.flags.local);
+    }
+
+    #[test]
+    fn creds_store_dir_parses() {
+        let cli = Cli::parse_from([
+            "shellflow",
+            "secret",
+            "creds",
+            "--store-dir",
+            "/etc/credstore.encrypted/zenoh",
+            "services/zenoh/api.env.age",
+        ]);
+        match cli.command {
+            Some(Command::Secret(secret)) => match secret.command {
+                super::SecretCmd::Creds(c) => {
+                    assert_eq!(
+                        c.store_dir.map(|p| p.to_string_lossy().into_owned()),
+                        Some("/etc/credstore.encrypted/zenoh".to_string())
+                    );
+                    assert_eq!(c.file.to_string_lossy(), "services/zenoh/api.env.age");
+                }
+                other => panic!("expected creds subcommand, got {other:?}"),
+            },
+            other => panic!("expected secret subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cred_env_exec_passes_through_flags() {
+        // Everything after `exec` belongs to the wrapped command, flags
+        // included — `ExecStart=` relies on this.
+        let cli = Cli::parse_from([
+            "shellflow",
+            "cred-env",
+            "exec",
+            "/usr/local/bin/zenohd",
+            "-c",
+            "/run/zenoh/zenoh.json5",
+            "--listen",
+            "tcp/0.0.0.0:7447",
+        ]);
+        match cli.command {
+            Some(Command::CredEnv(cred_env)) => match cred_env.command {
+                super::CredEnvCmd::Exec(e) => {
+                    assert_eq!(
+                        e.command,
+                        vec![
+                            "/usr/local/bin/zenohd".to_string(),
+                            "-c".to_string(),
+                            "/run/zenoh/zenoh.json5".to_string(),
+                            "--listen".to_string(),
+                            "tcp/0.0.0.0:7447".to_string(),
+                        ]
+                    );
+                }
+                other => panic!("expected exec subcommand, got {other:?}"),
+            },
+            other => panic!("expected cred-env subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cred_env_exec_requires_a_command() {
+        assert!(Cli::try_parse_from(["shellflow", "cred-env", "exec"]).is_err());
+    }
+
+    #[test]
+    fn cred_env_render_parses() {
+        let cli = Cli::parse_from([
+            "shellflow",
+            "cred-env",
+            "render",
+            "/etc/zenoh/zenoh.json5.tmpl",
+            "/run/zenoh/zenoh.json5",
+        ]);
+        match cli.command {
+            Some(Command::CredEnv(cred_env)) => match cred_env.command {
+                super::CredEnvCmd::Render(r) => {
+                    assert_eq!(r.template.to_string_lossy(), "/etc/zenoh/zenoh.json5.tmpl");
+                    assert_eq!(r.output.to_string_lossy(), "/run/zenoh/zenoh.json5");
+                }
+                other => panic!("expected render subcommand, got {other:?}"),
+            },
+            other => panic!("expected cred-env subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cred_env_credstore_install_parses() {
+        let cli = Cli::parse_from([
+            "shellflow",
+            "cred-env",
+            "credstore-install",
+            "zenoh",
+            "--store-dir",
+            "/tmp/store/zenoh",
+        ]);
+        match cli.command {
+            Some(Command::CredEnv(cred_env)) => match cred_env.command {
+                super::CredEnvCmd::CredstoreInstall(c) => {
+                    assert_eq!(c.service, "zenoh");
+                    assert_eq!(
+                        c.store_dir.map(|p| p.to_string_lossy().into_owned()),
+                        Some("/tmp/store/zenoh".to_string())
+                    );
+                }
+                other => panic!("expected credstore-install subcommand, got {other:?}"),
+            },
+            other => panic!("expected cred-env subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_keys_check_parses() {
+        let cli = Cli::parse_from([
+            "shellflow",
+            "secret",
+            "keys-check",
+            "-i",
+            "/k.txt",
+            "services/zenoh",
+        ]);
+        match cli.command {
+            Some(Command::Secret(secret)) => match secret.command {
+                super::SecretCmd::KeysCheck(c) => {
+                    assert_eq!(c.dir.to_string_lossy(), "services/zenoh");
+                    assert_eq!(
+                        c.identity.map(|p| p.to_string_lossy().into_owned()),
+                        Some("/k.txt".to_string())
+                    );
+                }
+                other => panic!("expected keys-check subcommand, got {other:?}"),
+            },
+            other => panic!("expected secret subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_init_parses_hosts() {
+        let cli = Cli::parse_from([
+            "shellflow",
+            "service",
+            "init",
+            "myapp",
+            "--host",
+            "api",
+            "--host",
+            "trade",
+        ]);
+        match cli.command {
+            Some(Command::Service(service)) => match service.command {
+                super::ServiceCmd::Init(i) => {
+                    assert_eq!(i.service, "myapp");
+                    assert_eq!(i.hosts, vec!["api".to_string(), "trade".to_string()]);
+                }
+            },
+            other => panic!("expected service subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_cred_env_parses() {
+        let cli = Cli::parse_from(["shellflow", "emit", "cred-env", "-o", "/opt/cred-env"]);
+        match cli.command {
+            Some(Command::Emit(emit)) => match emit.command {
+                super::EmitCmd::CredEnv(a) => {
+                    assert_eq!(
+                        a.output.map(|p| p.to_string_lossy().into_owned()),
+                        Some("/opt/cred-env".to_string())
+                    );
+                }
+            },
+            other => panic!("expected emit subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_check_parses() {
+        let cli = Cli::parse_from([
+            "shellflow",
+            "template",
+            "check",
+            "-i",
+            "/keys.txt",
+            "services/zenoh/zenoh.json5.tmpl",
+            "services/zenoh/api.env.age",
+        ]);
+        match cli.command {
+            Some(Command::Template(template)) => match template.command {
+                super::TemplateCmd::Check(a) => {
+                    assert_eq!(
+                        a.identity.map(|p| p.to_string_lossy().into_owned()),
+                        Some("/keys.txt".to_string())
+                    );
+                    assert_eq!(a.template.to_string_lossy(), "services/zenoh/zenoh.json5.tmpl");
+                    assert_eq!(a.file.to_string_lossy(), "services/zenoh/api.env.age");
+                }
+            },
+            other => panic!("expected template subcommand, got {other:?}"),
+        }
     }
 
     /// The env var is process-global, so every test that mutates it takes
