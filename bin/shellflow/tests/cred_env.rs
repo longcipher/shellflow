@@ -462,12 +462,16 @@ fn rust_exec_exports_credentials_and_execs() -> TestResult<()> {
 
 #[test]
 fn rust_exec_passes_flags_through() -> TestResult<()> {
-    // `ExecStart=` relies on `-c`-style flags reaching the wrapped command.
+    // `ExecStart=` relies on flags and extra positional args reaching the
+    // wrapped program, and on the exported env var being visible to it.
+    // `printenv NAME EXTRA` is rejected by both GNU and BSD printenv ("extra
+    // operand"), so use `sh -c` with a positional arg to prove passthrough.
     let creds = Creds::new("rust-exec-flags")?;
     creds.set("GREETING", "hello")?;
-    let out = run_cred_env(&["exec", "printenv", "GREETING", "extra-arg"], Some(&creds))?;
+    let out =
+        run_cred_env(&["exec", "sh", "-c", "echo $GREETING:$1", "sh", "extra"], Some(&creds))?;
     assert_eq!(status(&out), 0, "exec failed: {}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello:extra");
     Ok(())
 }
 
