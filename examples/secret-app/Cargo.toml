@@ -8,7 +8,6 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
-rust-version.workspace = true
 description = "Example application that reads sensitive configuration from environment variables, showing shellflow's encrypted-secrets workflow end to end."
 publish = false
 

@@ -89,8 +89,7 @@ impl ResolvedSecrets {
         let mut all: Vec<String> = env
             .iter()
             .find(|(k, _)| k == SECRET_KEYS_VAR)
-            .map(|(_, v)| v.split_whitespace().map(String::from).collect())
-            .unwrap_or_default();
+            .map_or_default(|(_, v)| v.split_whitespace().map(String::from).collect());
         for k in &host_keys {
             if !all.contains(k) {
                 all.push(k.clone());

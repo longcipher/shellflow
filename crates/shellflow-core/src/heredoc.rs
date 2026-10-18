@@ -56,7 +56,7 @@ pub struct HeredocTracker {
 impl HeredocTracker {
     /// Whether a here-document body is currently open.
     #[must_use]
-    pub fn is_open(&self) -> bool {
+    pub const fn is_open(&self) -> bool {
         !self.open.is_empty()
     }
 

@@ -456,17 +456,9 @@ impl RunArgs {
     /// The parsed `--target` restriction list.
     #[must_use]
     pub(crate) fn target_restrict(&self) -> Vec<String> {
-        self.flags
-            .target
-            .as_deref()
-            .map(|t| {
-                t.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.flags.target.as_deref().map_or_default(|t| {
+            t.split(',').map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned).collect()
+        })
     }
 
     /// The effective `@secrets` masking threshold: an explicit

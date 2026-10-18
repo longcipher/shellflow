@@ -240,8 +240,7 @@ fn keys_check(args: &SecretKeysCheckArgs) -> Result<()> {
     for file in &files {
         let host = file
             .file_name()
-            .map(|n| n.to_string_lossy().trim_end_matches(".env.age").to_string())
-            .unwrap_or_default();
+            .map_or_default(|n| n.to_string_lossy().trim_end_matches(".env.age").to_string());
         let cipher =
             fs::read(file).wrap_err_with(|| format!("failed to read `{}`", file.display()))?;
         let plain = decrypt_bytes(&cipher, &identity)
