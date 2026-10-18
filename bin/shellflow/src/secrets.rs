@@ -22,7 +22,7 @@ use shellflow_core::SecretEntry;
 use shellflow_secrets::{
     crypto::decrypt_bytes,
     env::parse_env_file,
-    identity::{effective_identity_path, load_x25519_identity},
+    identity::{effective_identity_path, expand_home, load_x25519_identity},
 };
 
 /// The space-separated list of keys exported after resolving `@secrets`.
@@ -38,12 +38,13 @@ pub(crate) struct ResolvedSecrets {
 
 impl ResolvedSecrets {
     /// Empty result for playbooks with no `@secrets` directive.
+    ///
+    /// No `LT_SECRET_KEYS` var is injected: `credstore-install` treats
+    /// set-but-empty as "explicit no credentials, clear the store", so
+    /// exporting an empty list here would let a secrets-less playbook wipe a
+    /// service store. Absent var fails closed instead (no wipe).
     pub(crate) fn empty() -> Self {
-        Self {
-            shared: vec![(SECRET_KEYS_VAR.to_string(), String::new())],
-            per_host: HashMap::new(),
-            masks: Vec::new(),
-        }
+        Self { shared: Vec::new(), per_host: HashMap::new(), masks: Vec::new() }
     }
 
     /// Whether any entry used the `{host}` placeholder (needs a single
@@ -88,7 +89,7 @@ impl ResolvedSecrets {
         let mut all: Vec<String> = env
             .iter()
             .find(|(k, _)| k == SECRET_KEYS_VAR)
-            .map(|(_, v)| v.split(' ').filter(|s| !s.is_empty()).map(String::from).collect())
+            .map(|(_, v)| v.split_whitespace().map(String::from).collect())
             .unwrap_or_default();
         for k in &host_keys {
             if !all.contains(k) {
@@ -135,10 +136,13 @@ pub(crate) fn resolve_secrets(
     let mut masks: Vec<String> = Vec::new();
 
     for entry in entries {
+        // Per-entry `--identity` also expands `~/` (same as the run-wide
+        // flag); previously it used `PathBuf::from` directly, so
+        // `@secrets x.age --identity ~/keys.txt` read a literal `~` path.
         let id_path = entry
             .identity
             .as_deref()
-            .map_or_else(|| effective_identity_path(identity), PathBuf::from);
+            .map_or_else(|| effective_identity_path(identity), |s| expand_home(Path::new(s)));
         if !cache.contains_key(&id_path) {
             let loaded = load_x25519_identity(&id_path)
                 .map_err(|err| eyre!("{err} (identity: {})", id_path.display()))?;

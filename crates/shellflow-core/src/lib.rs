@@ -11,6 +11,7 @@ pub mod heredoc;
 pub mod parser;
 pub mod plan;
 pub mod ssh_spec;
+pub mod template;
 
 pub use env::{MASK, mask_line, render_env, shell_quote_single};
 pub use error::{InterpolateError, ParseError};
@@ -21,3 +22,4 @@ pub use plan::{
     Step, Target, interpolate, resolve_hosts,
 };
 pub use ssh_spec::SshSpec;
+pub use template::{render_template, template_keys};
