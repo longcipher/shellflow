@@ -1,0 +1,37 @@
+[Unit]
+Description=__SVC__ (encrypted credentials via systemd-creds)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Dedicated runtime user (created by playbook, least privilege)
+User=__SVC__
+Group=__SVC__
+
+# tmpfs directory: render output lands here (0700, wiped on unit exit)
+RuntimeDirectory=__SVC__
+RuntimeDirectoryMode=0700
+
+# For third-party apps needing a config file: render the plaintext template
+# (no secret values) into tmpfs; delete this line if not needed
+ExecStartPre=/usr/local/bin/shellflow cred-env render /etc/__SVC__/__SVC__.json5.tmpl /run/__SVC__/__SVC__.json5
+
+# Shared helper (installed to /usr/local/bin/shellflow by playbook, shared
+# across all services, no per-service starter script): exports systemd
+# credentials as environment variables then execs the real binary.
+# For first-party apps, change ExecStart to point directly at the binary and
+# read $CREDENTIALS_DIRECTORY early in startup.
+ExecStart=/usr/local/bin/shellflow cred-env exec /opt/__SVC__/bin/__SVC__
+
+# == Per-key import from per-service credstore (regenerate this section):
+#   shellflow secret creds --store-dir /etc/credstore.encrypted/__SVC__ \
+#     services/__SVC__/<host>.env.age
+# Paste the LoadCredentialEncrypted= lines below (all hosts must share keys):
+# LoadCredentialEncrypted=API_KEY:/etc/credstore.encrypted/__SVC__/API_KEY
+
+# --- Security hardening: see services/_common/10-hardening.conf ---
+# Playbook installs it as /etc/systemd/system/__SVC__.service.d/10-hardening.conf
+
+[Install]
+WantedBy=multi-user.target

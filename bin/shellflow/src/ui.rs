@@ -142,6 +142,12 @@ impl Ui {
         self.verbose
     }
 
+    /// Clone the audit-file handle so executor sub-modules can route
+    /// `print_line` output to the same file without holding the Ui lock.
+    pub(crate) fn log_file(&self) -> Option<Arc<std::sync::Mutex<std::fs::File>>> {
+        self.log_file.clone()
+    }
+
     /// Register secret values to be masked in all output.
     pub(crate) fn set_secrets(&mut self, secrets: Vec<String>) {
         self.secrets = secrets;
@@ -149,11 +155,11 @@ impl Ui {
 
     /// Print a masked payload preview (used at `-vv`, dry-run, and diff).
     pub(crate) fn payload_preview(&self, title: &str, script: &str) {
-        print_line(format!("  |--- {title} ---").dimmed().to_string());
+        self.log_line(format!("  |--- {title} ---").dimmed().to_string());
         for line in script.lines() {
-            print_line(format!("  | {}", self.mask(line)).dimmed().to_string());
+            self.log_line(format!("  | {}", self.mask(line)).dimmed().to_string());
         }
-        print_line("  |------------------".dimmed().to_string());
+        self.log_line("  |------------------".dimmed().to_string());
     }
 
     /// Print a note line with every known secret masked.
@@ -163,7 +169,7 @@ impl Ui {
     /// secret in a playbook would otherwise leak at `-vv` even though the
     /// payload preview two lines above shows `***`.
     pub(crate) fn masked_note(&self, text: &str) {
-        print_line(self.mask(text).dimmed().to_string());
+        self.log_line(self.mask(text).dimmed().to_string());
     }
 
     /// Print the plan preview shown at `-v` and above.
@@ -171,19 +177,19 @@ impl Ui {
         if !self.verbose.info() {
             return;
         }
-        print_line("Plan:".dimmed().to_string());
+        self.log_line("Plan:".dimmed().to_string());
         for (name, spec) in &plan.servers {
-            print_line(format!("  server  {name:>12} -> {spec:?}").dimmed().to_string());
+            self.log_line(format!("  server  {name:>12} -> {spec:?}").dimmed().to_string());
         }
         for (name, members) in &plan.groups {
-            print_line(
+            self.log_line(
                 format!("  group   {name:>12} -> {}", members.join(",")).dimmed().to_string(),
             );
         }
         for (idx, step) in plan.steps.iter().enumerate() {
             let target = step.target_text().map_or_default(|t| format!(" -> {t}"));
             let name = step.name().map_or_default(|n| format!(" ({n})"));
-            print_line(
+            self.log_line(
                 format!("  step    {:>2}: {}{}{}", idx + 1, step.kind(), name, target)
                     .dimmed()
                     .to_string(),
@@ -253,16 +259,42 @@ impl Ui {
     fn mask(&self, line: &str) -> String {
         mask_line(line, &self.secrets)
     }
+
+    /// Print a note line (dimmed), routed through the log file if configured.
+    pub(crate) fn note(&self, text: &str) {
+        print_line(text.dimmed().to_string(), &self.log_file);
+    }
+
+    /// Write one line to stdout and the audit log (if configured), using the
+    /// Ui's own log_file handle — for methods like `plan_preview` that need to
+    /// emit multiple lines without threading the handle through each call.
+    pub(crate) fn log_line(&self, text: String) {
+        print_line(text, &self.log_file);
+    }
 }
 
 /// Write one line to stdout, flushing the lock immediately.
-fn print_line(text: String) {
+///
+/// When a `--log-file` is configured, the line is also appended to the audit
+/// log so that step headers, notes, warnings, and summaries are captured
+/// alongside host output.
+fn print_line(text: String, log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>) {
     let mut out = stdout().lock();
     let _ = writeln!(out, "{text}");
+    if let Some(file) = log_file {
+        let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = file.write_all(text.as_bytes());
+        let _ = file.write_all(b"\n");
+    }
 }
 
 /// Print a step header.
-pub(crate) fn step_header(index: usize, total: usize, step: &Step) {
+pub(crate) fn step_header(
+    index: usize,
+    total: usize,
+    step: &Step,
+    log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>,
+) {
     let kind_colored = match step.kind() {
         "local" => "local".green(),
         "remote" => "remote".yellow(),
@@ -273,22 +305,22 @@ pub(crate) fn step_header(index: usize, total: usize, step: &Step) {
     let target = step.target_text().map_or_default(|t| format!(" -> {t}"));
     let name = step.name().map_or_default(|n| format!(" {n}"));
     let label = format!("[STEP {index}/{total}]{name} {kind_colored}{target}").bold();
-    print_line(format!("\n{label}"));
+    print_line(format!("\n{label}"), log_file);
 }
 
 /// Print a note line (dimmed).
-pub(crate) fn note(text: &str) {
-    print_line(text.dimmed().to_string());
+pub(crate) fn note(text: &str, log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>) {
+    print_line(text.dimmed().to_string(), log_file);
 }
 
 /// Print a warning line (yellow, prefixed with `!`).
-pub(crate) fn warn(text: &str) {
-    print_line(format!("  ! {text}").yellow().to_string());
+pub(crate) fn warn(text: &str, log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>) {
+    print_line(format!("  ! {text}").yellow().to_string(), log_file);
 }
 
 /// Print a dry-run banner (magenta, bold).
-pub(crate) fn dry_run_banner() {
-    print_line(">>> [DRY RUN] no changes will be made <<<".magenta().bold().to_string());
+pub(crate) fn dry_run_banner(log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>) {
+    print_line(">>> [DRY RUN] no changes will be made <<<".magenta().bold().to_string(), log_file);
 }
 
 /// Render per-host outcomes as `alias OUTCOME` pairs.
@@ -308,24 +340,35 @@ fn host_parts(statuses: &[HostStatus]) -> String {
 }
 
 /// Print the per-step host outcome line.
-pub(crate) fn step_outcome(elapsed: std::time::Duration, statuses: &[HostStatus]) {
+pub(crate) fn step_outcome(
+    elapsed: std::time::Duration,
+    statuses: &[HostStatus],
+    log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>,
+) {
     let time = format!("{:.2}s", elapsed.as_secs_f64());
-    print_line(format!("{} done in {time} ({})", "✔".bold(), host_parts(statuses)));
+    print_line(format!("{} done in {time} ({})", "✔".bold(), host_parts(statuses)), log_file);
 }
 
 /// Print the final run summary with per-step timing and host statuses.
-pub(crate) fn final_summary(steps: &[(usize, std::time::Duration, Vec<HostStatus>)]) {
-    print_line(String::new());
-    print_line("Summary:".bold().to_string());
+pub(crate) fn final_summary(
+    steps: &[(usize, std::time::Duration, Vec<HostStatus>)],
+    log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>,
+) {
+    print_line(String::new(), log_file);
+    print_line("Summary:".bold().to_string(), log_file);
     for (idx, elapsed, statuses) in steps {
         let time = format!("{:.2}s", elapsed.as_secs_f64());
-        print_line(format!("  step {idx:>2}  {time:>8}  {}", host_parts(statuses)));
+        print_line(format!("  step {idx:>2}  {time:>8}  {}", host_parts(statuses)), log_file);
     }
 }
 
 /// Print a failure note for a step in continue-on-error mode.
-pub(crate) fn step_failed(index: usize, message: &str) {
-    print_line(format!("Step {index} failed: {message}").red().to_string());
+pub(crate) fn step_failed(
+    index: usize,
+    message: &str,
+    log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>,
+) {
+    print_line(format!("Step {index} failed: {message}").red().to_string(), log_file);
 }
 
 #[cfg(test)]
@@ -354,5 +397,40 @@ mod tests {
     fn single_status_renders_without_a_separator() {
         colored::control::set_override(false);
         assert_eq!(host_parts(&[status("web1", Outcome::Failed)]), "web1 FAILED");
+    }
+
+    #[test]
+    fn log_line_writes_to_stdout_and_log_file() {
+        use std::sync::Arc;
+        colored::control::set_override(false);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("test.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open log file");
+        let ui = super::Ui {
+            verbose: super::Verbosity(0),
+            secrets: Vec::new(),
+            output: super::OutputModeState::Stream,
+            log_file: Some(Arc::new(std::sync::Mutex::new(file))),
+        };
+        ui.log_line("test line".to_string());
+        drop(ui);
+        let content = std::fs::read_to_string(&log_path).expect("read log file");
+        assert!(content.contains("test line"), "log file should contain the line, got: {content}");
+    }
+
+    #[test]
+    fn log_line_without_log_file_writes_to_stdout_only() {
+        colored::control::set_override(false);
+        let ui = super::Ui {
+            verbose: super::Verbosity(0),
+            secrets: Vec::new(),
+            output: super::OutputModeState::Stream,
+            log_file: None,
+        };
+        ui.log_line("stdout only".to_string());
     }
 }
