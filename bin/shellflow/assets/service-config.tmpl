@@ -1,0 +1,18 @@
+{
+  // __SVC__ configuration template — `shellflow cred-env render` injects encrypted env
+  // values into the placeholders below at unit startup:
+  //   /usr/local/bin/shellflow cred-env render \
+  //     /etc/__SVC__/__SVC__.json5.tmpl /run/__SVC__/__SVC__.json5
+  // Values come from the per-host encrypted env; the render output is 0600 and
+  // lives in tmpfs (wiped on unit stop).
+  // Self-check: shellflow template check services/__SVC__/__SVC__.json5.tmpl \
+  //             services/__SVC__/<host>.env.age
+  // NOTE: do not write placeholder-looking text inside comments — they are
+  //       validated as real placeholders.
+  //
+  // TODO: adapt the following to your application's config format; delete
+  //       this template and the ExecStartPre= line in the unit if no config
+  //       file is needed.
+  mode: "default",
+  listen: { endpoints: ["${LISTEN_ENDPOINT}"] },
+}

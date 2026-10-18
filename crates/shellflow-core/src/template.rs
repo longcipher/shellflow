@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn handles_multibyte_content() {
         // Non-ASCII bytes must not panic or split a char boundary.
-        let keys = template_keys("密码=${PASSWORD} 令牌=${TOKEN}\n");
+        let keys = template_keys("🔑päss=${PASSWORD} tökén=${TOKEN}\n");
         assert_eq!(keys, vec!["PASSWORD", "TOKEN"]);
     }
 
@@ -286,8 +286,9 @@ mod tests {
 
     #[test]
     fn render_multibyte_values_and_template() {
-        let rendered = render_template("密码=${P}", &values(&[("P", "值&$|")])).expect("render");
-        assert_eq!(rendered, "密码=值&$|");
+        let rendered =
+            render_template("🔑päss=${P}", &values(&[("P", "väl🔒&$|")])).expect("render");
+        assert_eq!(rendered, "🔑päss=väl🔒&$|");
     }
 
     proptest::proptest! {

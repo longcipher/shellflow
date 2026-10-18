@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     cli::{Cli, Command, RunArgs},
-    executor::{RunError, RunOutcome, StepStats, execute_plan},
+    executor::{RunOutcome, StepStats, execute_plan},
     preflight::{preflight_check, preflight_check_local},
     ui::HostStatus,
 };
@@ -58,13 +58,16 @@ async fn main() -> Result<()> {
                 1
             }
         },
-        Some(Command::Template(cmd)) => match template::run(&cmd.command) {
-            Ok(()) => 0,
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                1
+        Some(Command::Template(cmd)) => {
+            let ui = ui::Ui::new(0, false, cli::OutputMode::Stream, None);
+            match template::run(&cmd.command, &ui) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    1
+                }
             }
-        },
+        }
         Some(Command::Emit(cmd)) => match emit::run(&cmd.command) {
             Ok(()) => 0,
             Err(err) => {
@@ -130,15 +133,10 @@ fn run_preflight_flags(flags: &cli::RunFlags) -> Result<(), String> {
 
 /// Execute a plan and map the outcome to an exit code.
 async fn run_plan(run: &RunArgs, plan: shellflow_core::ExecutionPlan) -> i32 {
-    // Total step count for the interrupt summary.
     let total_steps = plan.steps.len();
 
-    // Completed-step statistics shared with the executor so an interrupt can
-    // still report what finished before the signal.
     let progress: Arc<Mutex<Vec<StepStats>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // Run the plan; on SIGINT/SIGTERM abort it (kill_on_drop reaps children)
-    // and exit 130.
     let outcome = tokio::select! {
         outcome = execute_plan(run, plan, Arc::clone(&progress)) => outcome,
         _ = wait_for_signal() => {
@@ -149,17 +147,16 @@ async fn run_plan(run: &RunArgs, plan: shellflow_core::ExecutionPlan) -> i32 {
 
     match outcome {
         RunOutcome::Success => 0,
-        RunOutcome::Failed(RunError::Config) => 1,
-        RunOutcome::Failed(RunError::Transport) => 3,
-        RunOutcome::Failed(RunError::Script) => 4,
+        RunOutcome::Failed(executor::RunError::Config) => 1,
+        RunOutcome::Failed(executor::RunError::Transport) => 3,
+        RunOutcome::Failed(executor::RunError::Script) => 4,
         RunOutcome::Interrupted { total } => {
             eprintln!("interrupted — {total} total steps; in-flight processes were terminated");
-            // Report what completed before the interrupt (design §7.5).
             let done = progress.lock().await;
             if !done.is_empty() {
                 let summary: Vec<(usize, Duration, Vec<HostStatus>)> =
                     done.iter().map(|s| (s.index, s.elapsed, s.statuses.clone())).collect();
-                crate::ui::final_summary(&summary);
+                crate::ui::final_summary(&summary, &None);
             }
             EXIT_INTERRUPTED
         }
@@ -175,9 +172,6 @@ fn init_tracing() {
 }
 
 /// Resolve when SIGINT or SIGTERM is received.
-///
-/// Returns `io::Result<()>` (not a bare `()`) so callers can bind the future
-/// with a `_` pattern without triggering `ignored_unit_patterns`.
 async fn wait_for_signal() -> std::io::Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
