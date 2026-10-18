@@ -399,7 +399,7 @@ impl State {
         let (src, rest) = payload.split_once("->").ok_or_else(|| ParseError::InvalidDirective {
             line,
             directive: "copy".to_string(),
-            reason: "expected `src -> dst @target [--delete]`".to_string(),
+            reason: "expected `src -> dst @target [--delete] [--exclude <glob>]`".to_string(),
         })?;
         let src = src.trim();
         if src.is_empty() {
@@ -410,12 +410,46 @@ impl State {
             });
         }
 
+        // Grammar: `src -> dst @target [--delete] [--exclude <glob>]…`.
+        // The target is the last token once the trailing flags are peeled off.
         let mut tokens: Vec<&str> = rest.split_whitespace().collect();
         let mut delete = false;
-        if tokens.last() == Some(&"--delete") {
-            delete = true;
-            tokens.pop();
+        let mut excludes: Vec<String> = Vec::new();
+        loop {
+            match tokens.last().copied() {
+                Some("--delete") => {
+                    delete = true;
+                    tokens.pop();
+                }
+                Some("--exclude") => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "copy".to_string(),
+                        reason: "`--exclude` requires a glob pattern".to_string(),
+                    });
+                }
+                _ if tokens.len() >= 2 && tokens[tokens.len() - 2] == "--exclude" => {
+                    let glob = tokens.pop().ok_or_else(|| ParseError::InvalidDirective {
+                        line,
+                        directive: "copy".to_string(),
+                        reason: "`--exclude` requires a glob pattern".to_string(),
+                    })?;
+                    tokens.pop(); // the `--exclude` flag itself
+                    let glob = strip_surrounding_quotes(glob).trim().to_string();
+                    if glob.is_empty() {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "copy".to_string(),
+                            reason: "`--exclude` glob must not be empty".to_string(),
+                        });
+                    }
+                    excludes.push(glob);
+                }
+                _ => break,
+            }
         }
+        // Flags are peeled from the right, so restore the written order.
+        excludes.reverse();
         let target = tokens.pop().ok_or_else(|| ParseError::InvalidDirective {
             line,
             directive: "copy".to_string(),
@@ -429,6 +463,7 @@ impl State {
                 reason: "missing target".to_string(),
             });
         }
+
         let dst = tokens.join(" ");
         if dst.is_empty() {
             return Err(ParseError::InvalidDirective {
@@ -444,12 +479,29 @@ impl State {
             dst,
             target: Target::new(target),
             delete,
+            excludes,
             guard: None,
             timeout,
             env,
         }));
         Ok(())
     }
+}
+
+/// Strip one layer of surrounding `"` or `'` quotes.
+///
+/// A directive is a comment line, so no shell quoting applies and quotes are
+/// literal characters; stripping them lets `--exclude '*.key'` read naturally.
+fn strip_surrounding_quotes(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if first == last && (first == b'"' || first == b'\'') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// True for `[A-Za-z_][A-Za-z0-9_]*`.
@@ -633,6 +685,73 @@ mod tests {
         assert_eq!(copy.dst, "/tmp/@deploy/app");
         assert_eq!(copy.target.text, "web");
         assert!(!copy.delete);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_step_parses_exclude_globs() -> Result<(), String> {
+        let plan = parse("# @copy services/app -> /opt/app @web --exclude *.env.age\n")?;
+        let copy = as_copy(&plan.steps[0])?;
+        assert_eq!(copy.src, "services/app");
+        assert_eq!(copy.dst, "/opt/app");
+        assert_eq!(copy.excludes, vec!["*.env.age"]);
+        assert!(!copy.delete);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_excludes_are_repeatable_and_combine_with_delete() -> Result<(), String> {
+        let plan = parse("# @copy a -> /srv/b @web --delete --exclude *.env --exclude '*.key'\n")?;
+        let copy = as_copy(&plan.steps[0])?;
+        assert!(copy.delete);
+        assert_eq!(copy.excludes, vec!["*.env", "*.key"]);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_exclude_keeps_destination_with_spaces() -> Result<(), String> {
+        let plan = parse("# @copy a -> /srv/my app @web --exclude *.tmp\n")?;
+        let copy = as_copy(&plan.steps[0])?;
+        assert_eq!(copy.dst, "/srv/my app");
+        assert_eq!(copy.excludes, vec!["*.tmp"]);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_exclude_without_value_is_error() {
+        assert!(matches!(
+            parse_script("# @copy a -> b @web --exclude\n"),
+            Err(ParseError::InvalidDirective { directive, .. }) if directive == "copy"
+        ));
+    }
+
+    #[test]
+    fn copy_exclude_rejects_empty_glob() {
+        // A glob is a whitespace-delimited token, so only the empty quoted
+        // forms can express "no pattern" — both must be rejected (an empty
+        // rsync `--exclude` pattern is a hard rsync error).
+        for empty in ["--exclude ''", "--exclude \"\""] {
+            let script = format!("# @copy a -> b @web {empty}\n");
+            assert!(
+                matches!(
+                    parse_script(&script),
+                    Err(ParseError::InvalidDirective { directive, .. }) if directive == "copy"
+                ),
+                "expected rejection for `{empty}`"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_exclude_quotes_are_stripped_only_when_matched() -> Result<(), String> {
+        // Matching quotes are stripped; a single-sided quote is a literal
+        // character of the glob (rsync patterns legitimately contain neither).
+        let plan = parse(
+            "# @copy a -> /srv/b @web --exclude \"*.log\" --exclude '*.tmp' \
+             --exclude 'oops --exclude oops'\n",
+        )?;
+        let copy = as_copy(&plan.steps[0])?;
+        assert_eq!(copy.excludes, vec!["*.log", "*.tmp", "'oops", "oops'"]);
         Ok(())
     }
 

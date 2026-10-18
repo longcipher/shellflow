@@ -103,6 +103,11 @@ pub struct CopyStep {
     pub target: Target,
     /// Mirror deletions on the remote side (`--delete`).
     pub delete: bool,
+    /// Glob patterns to exclude from the transfer (`--exclude`, repeatable).
+    ///
+    /// Honored by the `rsync` path; the `scp` fallback and `--local` copy
+    /// cannot filter files and warn instead.
+    pub excludes: Vec<String>,
     /// Optional precondition from `@only_if`.
     ///
     /// `@only_if` is **not supported on `@copy`** and the parser rejects it

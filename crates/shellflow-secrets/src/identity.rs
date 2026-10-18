@@ -16,25 +16,42 @@ use crate::error::SecretsError;
 /// Env var that overrides the identity file path.
 pub const IDENTITY_ENV: &str = "SHELLFLOW_AGE_IDENTITY";
 
+/// Expand a leading `~/` to `$HOME`.
+///
+/// Returns the path unchanged when it does not start with `~/` or when
+/// `$HOME` is unset (the caller then fails with a missing-file error rather
+/// than silently writing to a literal `~` directory).
+#[must_use]
+pub fn expand_home(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 /// The default identity file: `~/.config/age/keys.txt` (age convention).
 ///
 /// Overridden by `$SHELLFLOW_AGE_IDENTITY` or an explicit `--identity`.
+/// A leading `~/` in the env var is expanded against `$HOME`.
 #[must_use]
 pub fn default_identity_path() -> PathBuf {
-    std::env::var_os(IDENTITY_ENV).map_or_else(
-        || {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".config/age/keys.txt")
-        },
-        PathBuf::from,
-    )
+    if let Some(env) = std::env::var_os(IDENTITY_ENV) {
+        return expand_home(&PathBuf::from(env));
+    }
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".config/age/keys.txt")
 }
 
 /// Resolve the effective identity path: explicit `--identity` wins, then
 /// `$SHELLFLOW_AGE_IDENTITY`, then the default location.
+///
+/// A leading `~/` in any of these is expanded against `$HOME`.
 #[must_use]
 pub fn effective_identity_path(explicit: Option<&Path>) -> PathBuf {
-    explicit.map_or_else(default_identity_path, Path::to_path_buf)
+    explicit.map_or_else(default_identity_path, expand_home)
 }
 
 /// Load an X25519 identity from an age identity file.
@@ -173,6 +190,46 @@ mod tests {
             std::env::set_var("HOME", "/home/test-user");
         }
         assert_eq!(default_identity_path(), PathBuf::from("/home/test-user/.config/age/keys.txt"));
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn expand_home_handles_tilde_and_plain_paths() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("HOME", "/home/test-user");
+        }
+        assert_eq!(expand_home(Path::new("~/keys.txt")), PathBuf::from("/home/test-user/keys.txt"));
+        assert_eq!(
+            expand_home(Path::new("~/.config/age/keys.txt")),
+            PathBuf::from("/home/test-user/.config/age/keys.txt")
+        );
+        assert_eq!(expand_home(Path::new("/abs/keys.txt")), PathBuf::from("/abs/keys.txt"));
+        assert_eq!(expand_home(Path::new("relative/keys.txt")), PathBuf::from("relative/keys.txt"));
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn effective_identity_expands_tilde() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("HOME", "/home/tilde-user");
+            std::env::remove_var(IDENTITY_ENV);
+        }
+        assert_eq!(
+            effective_identity_path(Some(Path::new("~/keys.txt"))),
+            PathBuf::from("/home/tilde-user/keys.txt")
+        );
+        // SAFETY: serialized by ENV_LOCK.
         unsafe {
             std::env::remove_var("HOME");
         }
