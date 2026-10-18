@@ -12,6 +12,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    fs,
     os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::Stdio,
@@ -384,9 +385,8 @@ pub(crate) async fn execute_plan(
     let semaphore: Option<Arc<Semaphore>> =
         (flags.parallel != 0).then(|| Arc::new(Semaphore::new(flags.parallel)));
 
-    // Apply --only / --skip filtering.
-    let selected: Vec<(usize, &Step)> =
-        plan.steps.iter().enumerate().filter(|(idx, step)| is_selected(run, *idx, step)).collect();
+    // Reuse the `--only` / `--skip` filtered selection from above (also used
+    // for `{host}` expansion), so filtering cannot drift between phases.
     let total = selected.len();
 
     if ui.lock().await.verbosity().info() {
@@ -1382,7 +1382,7 @@ async fn run_copy_step(
     };
 
     if config.local {
-        return run_copy_step_local(ui, &src, &dst, copy.delete, config).await;
+        return run_copy_step_local(ui, &src, &dst, copy.delete, &copy.excludes, config).await;
     }
 
     if config.check {
@@ -1401,6 +1401,7 @@ async fn run_copy_step(
         let src = src.clone();
         let dst = dst.clone();
         let delete = copy.delete;
+        let excludes = copy.excludes.clone();
         let shell_cache = Arc::clone(shell_cache);
         tasks.spawn(async move {
             // Hold the permit for the whole host task (see [`run_remote_step`]
@@ -1412,7 +1413,8 @@ async fn run_copy_step(
             // Reuse the per-run login-env cache, which now also carries the
             // rsync probe — no extra ssh round trip per copy step (design §7.4).
             let has_rsync = resolve_remote_env(&host, &shell_cache).await.has_rsync;
-            run_rsync_host(ui, &host, &src, &dst, delete, config, has_rsync).await
+            let opts = CopyOpts { delete, excludes: &excludes };
+            run_rsync_host(ui, &host, &src, &dst, opts, config, has_rsync).await
         });
     }
 
@@ -1421,12 +1423,13 @@ async fn run_copy_step(
 
 /// `--local` mode: mirror a copy step with a local `cp -a` (once). `--delete`
 /// clears the destination first. Debugging only; remote delta semantics do
-/// not apply.
+/// not apply, and `--exclude` globs cannot be honored by `cp` (warned).
 async fn run_copy_step_local(
     _ui: &ArcUi,
     src: &str,
     dst: &str,
     delete: bool,
+    excludes: &[String],
     config: StepConfig,
 ) -> Result<Vec<(String, HostOutcome)>> {
     if config.check {
@@ -1438,6 +1441,13 @@ async fn run_copy_step_local(
     }
     if config.dry_run {
         return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
+    }
+
+    if !excludes.is_empty() {
+        crate::ui::warn(
+            "`--exclude` ignored in --local copy mode (local copies use `cp -a`; \
+             re-run without `--local` for rsync filtering)",
+        );
     }
 
     if delete {
@@ -1462,12 +1472,22 @@ async fn run_copy_step_local(
     Ok(vec![("localhost".to_string(), HostOutcome::Ok)])
 }
 
+/// Transfer options shared by the rsync and scp copy paths, grouped to keep
+/// the transfer helpers within the argument budget.
+#[derive(Clone, Copy)]
+struct CopyOpts<'a> {
+    /// Mirror deletions on the remote side (`--delete`).
+    delete: bool,
+    /// Glob patterns excluded from the transfer (`--exclude`).
+    excludes: &'a [String],
+}
+
 async fn run_rsync_host(
     ui: ArcUi,
     host: &ResolvedHost,
     src: &str,
     dst: &str,
-    delete: bool,
+    opts: CopyOpts<'_>,
     config: StepConfig,
     has_rsync: bool,
 ) -> (String, HostOutcome) {
@@ -1484,17 +1504,23 @@ async fn run_rsync_host(
             if has_rsync { "present" } else { "missing — using scp fallback" }
         ));
     }
-    // `scp` has no mirror mode, so `--delete` cannot be honored here. Say so
+    // `scp` has no filter mode, so `--delete` cannot be honored here. Say so
     // rather than let a "mirror" step quietly keep stale remote files.
-    if delete && !has_rsync {
+    if opts.delete && !has_rsync {
         crate::ui::warn(&format!(
             "[{}] `--delete` ignored: remote has no rsync, so the scp fallback cannot mirror deletions",
             host.alias
         ));
     }
+    if !opts.excludes.is_empty() && !has_rsync {
+        crate::ui::warn(&format!(
+            "[{}] `--exclude` ignored: remote has no rsync, so the scp fallback cannot filter files",
+            host.alias
+        ));
+    }
 
     let outcome = if has_rsync {
-        run_rsync_transfer(ui.clone(), host, src, dst, delete, &remote_shell, config).await
+        run_rsync_transfer(ui.clone(), host, src, dst, opts, &remote_shell, config).await
     } else {
         run_scp_transfer(ui.clone(), host, src, dst, config).await
     };
@@ -1513,42 +1539,60 @@ async fn run_rsync_host(
     }
 }
 
+/// Normalize `@copy` paths for directory sources: the source is transferred
+/// as its *contents* (`src/` → `dst/`), so `dst` becomes the copy of the
+/// source. GNU rsync also flattens a bare `src` into a missing `dst`, but
+/// macOS ships openrsync, which nests it instead (`dst/<basename>/…`) — the
+/// trailing slashes pin the portable, flavor-independent form. File sources
+/// pass through unchanged (`src` → `dst`, parent of `dst` pre-created).
+fn normalize_copy_paths(src: &str, dst: &str) -> (String, String) {
+    if fs::metadata(src).is_ok_and(|meta| meta.is_dir()) {
+        (format!("{}/", src.trim_end_matches('/')), format!("{}/", dst.trim_end_matches('/')))
+    } else {
+        (src.to_string(), dst.to_string())
+    }
+}
+
 /// Copy via rsync with a remote `mkdir -p` wrapper.
 async fn run_rsync_transfer(
     ui: ArcUi,
     host: &ResolvedHost,
     src: &str,
     dst: &str,
-    delete: bool,
+    opts: CopyOpts<'_>,
     remote_shell: &str,
     config: StepConfig,
 ) -> Result<()> {
     let mut cmd = Command::new("rsync");
     cmd.args(["-a", "-z"]);
-    if delete {
+    if opts.delete {
         cmd.arg("--delete");
+    }
+    for glob in opts.excludes {
+        cmd.arg("--exclude").arg(glob);
     }
     if config.dry_run {
         cmd.args(["--dry-run", "-i"]);
     }
+    let (src, dst) = normalize_copy_paths(src, dst);
     // The remote `rsync` runs under a `mkdir -p` wrapper so the destination
-    // directory is created automatically. `dst` may name a file (e.g.
-    // `/srv/app.tar.gz`); in that case only its parent needs to exist — rsync
-    // itself creates the final component. When `dst` ends with `/` it is a
-    // directory and is created in full.
+    // directory is created automatically. For a normalized directory copy
+    // (`dst` ends with `/`) the whole path is the destination directory; for
+    // a file destination only its parent needs to exist — rsync itself
+    // creates the final component.
     let dir = if dst.ends_with('/') {
-        dst
+        dst.as_str()
     } else {
         match dst.rsplit_once('/') {
             Some((dir, file)) if !file.is_empty() && !dir.is_empty() => dir,
-            _ => dst,
+            _ => dst.as_str(),
         }
     };
     let quoted = dir.replace('\'', "'\\''");
     let mkdir_rsync = format!("mkdir -p '{quoted}' && rsync");
     cmd.args(["--rsync-path", &mkdir_rsync, "-e", remote_shell]);
     let dest = format!("{}:{dst}", host.spec.dest());
-    cmd.arg(src).arg(&dest);
+    cmd.arg(&src).arg(&dest);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
@@ -1578,10 +1622,22 @@ async fn run_scp_transfer(
 
     // Split `dst` into its parent directory and final component. For a plain
     // file target like `/tmp/x/app.tar.gz`, `dir` is `/tmp/x` and the file
-    // lands at `/tmp/x/app.tar.gz` (matching the rsync semantics).
-    let (dir, _file) = match dst.rsplit_once('/') {
-        Some((dir, file)) if !file.is_empty() && !dir.is_empty() => (dir, file),
-        _ => (dst, ""), // dst is already a directory (trailing `/` or bare dir)
+    // lands at `/tmp/x/app.tar.gz` (matching the rsync semantics). A
+    // directory source is normalized to *contents* semantics via the `/.`
+    // suffix (scp has no rsync-style trailing-slash distinction): the
+    // destination directory itself receives the source's contents, matching
+    // the rsync path — see [`normalize_copy_paths`].
+    let is_dir_src = fs::metadata(src).is_ok_and(|meta| meta.is_dir());
+    let (dir, scp_src) = if is_dir_src {
+        (dst.trim_end_matches('/').to_string(), format!("{src}/."))
+    } else {
+        match dst.rsplit_once('/') {
+            Some((dir, file)) if !file.is_empty() && !dir.is_empty() => {
+                (dir.to_string(), src.to_string())
+            }
+            _ => (dst.to_string(), src.to_string()), /* dst is already a directory (trailing `/`
+                                                      * or bare dir) */
+        }
     };
 
     // 1. Create the destination directory remotely.
@@ -1598,15 +1654,18 @@ async fn run_scp_transfer(
     }
 
     // 2. Transfer the source into the (now existing) remote directory. The
-    // trailing `/` makes scp copy `src` *into* `dir`, preserving the source
-    // basename — identical to what rsync does for `src -> dir/`.
+    // trailing `/` makes scp copy into `dir`; for a directory source the
+    // `/.` suffix flattens its contents (no `dir/<basename>/` nesting).
     let dest = format!("{}:{dir}/", host.spec.dest());
     let mut scp = Command::new("scp");
     scp.args(["-q", "-o", "BatchMode=yes"]);
     if let Some(port) = host.spec.port {
         scp.args(["-P", &port.to_string()]);
     }
-    scp.arg(src).arg(&dest);
+    if is_dir_src {
+        scp.arg("-r");
+    }
+    scp.arg(&scp_src).arg(&dest);
     scp.stdout(Stdio::piped()).stderr(Stdio::piped());
     scp.kill_on_drop(true);
     isolate(&mut scp);
