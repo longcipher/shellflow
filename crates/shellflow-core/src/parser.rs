@@ -1097,6 +1097,124 @@ mod tests {
         Ok(())
     }
 
+    /// Every malformed directive is rejected at parse time with an error that
+    /// names the directive and the 1-based line. One row per validation branch,
+    /// so a new rejection path cannot ship without a case.
+    #[test]
+    fn malformed_directives_name_the_directive_and_reason() {
+        // (script, directive the error must name, reason fragment)
+        let cases: &[(&str, &str, &str)] = &[
+            ("# @remote\n", "remote", "missing target"),
+            ("# @timeout soon\n", "timeout", "invalid seconds"),
+            ("# @timeout 0\n", "timeout", "greater than zero"),
+            ("# @name\n", "name", "missing label"),
+            ("# @only_if\n", "only_if", "missing command"),
+            ("# @server\n", "server", "missing name"),
+            ("# @server web1\n", "server", "missing ssh spec"),
+            ("# @server web1 host extra\n", "server", "too many arguments"),
+            ("# @group\n", "group", "missing name"),
+            ("# @group web\n", "group", "missing members"),
+            ("# @group web web1 extra\n", "group", "too many arguments"),
+            ("# @group web ,\n", "group", "no members"),
+            ("# @env\n", "env", "missing variable"),
+            ("# @env 1BAD=value\n", "env", "invalid variable name"),
+            ("# @env 1BAD\n", "env", "invalid variable name"),
+            ("# @secrets\n", "secrets", "missing encrypted file path"),
+            ("# @secrets f.env.age --identity\n", "secrets", "`--identity` requires a path"),
+            ("# @secrets f.env.age --bogus\n", "secrets", "unexpected token"),
+            ("# @export\n", "export", "missing variable name"),
+            ("# @export 1BAD\n", "export", "invalid variable name"),
+            ("# @copy a b @web\n", "copy", "expected `src -> dst"),
+            ("# @copy  -> /dst @web\n", "copy", "missing source path"),
+            ("# @copy a -> @web\n", "copy", "missing destination path"),
+            ("# @copy a ->\n", "copy", "missing target"),
+            ("# @copy a -> /dst @\n", "copy", "missing target"),
+            ("# @copy a -> /dst @web --exclude\n", "copy", "`--exclude` requires a glob"),
+            ("# @copy a -> /dst @web --exclude ''\n", "copy", "glob must not be empty"),
+        ];
+        for (script, directive, reason) in cases {
+            let err = match parse_script(script) {
+                Err(err) => err,
+                Ok(_) => panic!("`{script}` must not parse"),
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("invalid `@{directive}` directive")),
+                "`{script}`: error should name `@{directive}`, got `{message}`"
+            );
+            assert!(
+                message.contains(reason),
+                "`{script}`: error should say `{reason}`, got `{message}`"
+            );
+            assert!(
+                message.starts_with("line 1:"),
+                "`{script}`: error should report line 1, got `{message}`"
+            );
+        }
+    }
+
+    #[test]
+    fn error_reports_the_offending_line_number() {
+        // The line number is what an operator acts on, so it must be the
+        // directive's own line, not the first or last line of the script.
+        let err = parse_script("# @local\necho hi\n# @timeout 0\n").expect_err("must fail");
+        assert!(err.to_string().starts_with("line 3:"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn copy_rejects_a_guard_at_parse_time() {
+        let err = parse_script("# @only_if test -f /etc/app.conf\n# @copy a -> b @web\n")
+            .expect_err("a guard on a copy step must be rejected");
+        let message = err.to_string();
+        assert!(message.contains("invalid `@copy` directive"), "unexpected error: {message}");
+        assert!(message.contains("only_if"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn copy_parses_quoted_and_bare_exclude_globs() -> Result<(), String> {
+        // Quotes around a glob are literal characters in a comment line and are
+        // stripped; a bare glob is taken as written.
+        let plan =
+            parse("# @copy ./out -> /srv/app @web --delete --exclude '*.key' --exclude *.log\n")?;
+        let step = as_copy(&plan.steps[0])?;
+        assert!(step.delete, "--delete should be recorded");
+        assert_eq!(step.excludes, vec!["*.key".to_string(), "*.log".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_keeps_excludes_in_written_order() -> Result<(), String> {
+        // Flags are peeled from the right, then restored, so the recorded order
+        // matches what the playbook says.
+        let plan = parse("# @copy ./out -> /srv/app @web --exclude a --exclude b --exclude c\n")?;
+        let step = as_copy(&plan.steps[0])?;
+        assert_eq!(step.excludes, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn group_colliding_with_a_server_name_is_rejected() {
+        let err = parse_script("# @server web1 deploy@10.0.0.1\n# @group web1 web1\n")
+            .expect_err("a group may not shadow a server alias");
+        assert!(err.to_string().contains("collides"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn duplicate_group_is_rejected() {
+        let err = parse_script("# @group web web1\n# @group web web2\n")
+            .expect_err("a group may not be defined twice");
+        assert!(err.to_string().contains("already defined"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn secrets_directive_parses_an_explicit_identity() -> Result<(), String> {
+        let plan = parse("# @secrets services/app/api.env.age --identity /keys/app.txt\n")?;
+        assert_eq!(plan.secrets.len(), 1);
+        assert_eq!(plan.secrets[0].file, "services/app/api.env.age");
+        assert_eq!(plan.secrets[0].identity.as_deref(), Some("/keys/app.txt"));
+        Ok(())
+    }
+
     #[test]
     fn unterminated_heredoc_consumes_the_rest() -> Result<(), String> {
         // Bash warns and treats EOF as the terminator; matching that keeps
