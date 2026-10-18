@@ -1,6 +1,6 @@
 
 [workspace]
-members = ["bin/*", "crates/*"]
+members = ["bin/*", "crates/*", "examples/*"]
 exclude = [".github/"]
 resolver = "3"
 [workspace.package]
