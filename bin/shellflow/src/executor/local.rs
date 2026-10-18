@@ -150,11 +150,19 @@ pub(crate) async fn run_local_step(
 ) -> Result<Vec<(String, HostOutcome)>> {
     let log_file = ui.lock().await.log_file();
 
-    if let Some(guard) = &local.guard &&
-        !run_local_guard(guard, config.timeout).await
-    {
-        crate::ui::note("  local guard failed — skipping block", &log_file);
-        return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
+    // The guard must observe the same environment as the block (run-state
+    // `@export` variables plus `@env` entries), exactly like the remote path.
+    let env = build_env(run_state, &local.env).await;
+
+    if let Some(guard) = &local.guard {
+        if run_local_guard(guard, &env, config.timeout).await {
+            if config.verbose >= 2 {
+                ui.lock().await.masked_note(&format!("  guard passed: {guard}"));
+            }
+        } else {
+            crate::ui::note("  local guard failed — skipping block", &log_file);
+            return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
+        }
     }
 
     if config.dry_run || config.verbose >= 2 {
@@ -177,9 +185,16 @@ pub(crate) async fn run_local_step(
     }
 }
 
-pub(super) async fn run_local_guard(guard: &str, timeout: Option<u64>) -> bool {
+pub(super) async fn run_local_guard(
+    guard: &str,
+    env: &[(String, String)],
+    timeout: Option<u64>,
+) -> bool {
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(format!("set -e\n{guard}"));
+    // Same env layer as the block: run-state/`@env` pairs overlay the process
+    // environment `Command` inherits by default.
+    cmd.envs(env.iter().cloned());
     cmd.kill_on_drop(true);
     isolate(&mut cmd);
     let mut child = match cmd.spawn() {

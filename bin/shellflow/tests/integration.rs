@@ -865,6 +865,57 @@ fn local_copy_creates_parent_dir() -> TestResult<()> {
 }
 
 #[test]
+fn local_mode_guard_sees_exported_state() -> TestResult<()> {
+    // Regression: the `--local` guard path ran `bash -c` with no environment,
+    // so an `@only_if` guard referencing an `@export`ed variable expanded it to
+    // empty and the block was wrongly skipped. Guards must see the same env as
+    // the block (design: "@only_if guards run with the same env as the block").
+    let sb = Sandbox::new("local-guard-state")?;
+    let workdir = sb.dir.join("workdir");
+    fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
+    fs::write(workdir.join("marker.txt"), "v1").map_err(|e| e.to_string())?;
+    let script = sb.script(&format!(
+        "# @local\n\
+         WORKDIR={wd}\n\
+         # @export WORKDIR\n\
+         # @remote web\n\
+         # @only_if test -f \"$WORKDIR/marker.txt\"\n\
+         echo GUARD_BODY_RAN\n",
+        wd = workdir.display()
+    ))?;
+    let out = sb.run(&script, &["--local"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("GUARD_BODY_RAN"),
+        "guard must see @exported WORKDIR and let the block run: {stdout}"
+    );
+    assert!(!stdout.contains("SKIPPED"), "block was wrongly skipped: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn local_mode_guard_sees_env_entries() -> TestResult<()> {
+    // The same regression for `@env`: a guard testing an `@env`-injected
+    // variable must observe it in local mode.
+    let sb = Sandbox::new("local-guard-env")?;
+    let script = sb.script(
+        "# @env GUARD_FLAG=on\n\
+         # @remote web\n\
+         # @only_if test \"$GUARD_FLAG\" = on\n\
+         echo GUARD_ENV_BODY_RAN\n",
+    )?;
+    let out = sb.run(&script, &["--local"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("GUARD_ENV_BODY_RAN"),
+        "guard must see @env entries in local mode: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn keys_and_secret_round_trip() -> TestResult<()> {
     let sb = Sandbox::new("keys")?;
     let key = sb.dir.join("keys.txt");
@@ -1386,3 +1437,4 @@ fn stubborn_child_is_escalated_to_sigkill() -> TestResult<()> {
     assert!(!pid_running(pid), "SIGTERM-trapping child {pid} survived; SIGKILL escalation failed");
     Ok(())
 }
+

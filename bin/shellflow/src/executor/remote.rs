@@ -475,16 +475,28 @@ async fn run_remote_step_local(
         );
     }
 
-    if let Some(guard) = &remote.guard &&
-        !run_local_guard(guard, config.timeout).await
-    {
-        crate::ui::note("  local guard failed — skipping block", log_file);
-        return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
-    }
-
     let extra: Vec<(String, String)> = host_alias
         .and_then(|alias| secrets.host_pairs(alias))
         .map_or_default(|pairs| pairs.to_vec());
+
+    // The guard must observe the same environment as the block: run-state
+    // `@export` variables, `@env` entries, and this host's `{host}` secrets —
+    // exactly what the remote path renders into the guard script.
+    if let Some(guard) = &remote.guard {
+        let mut guard_env = build_env(run_state, &remote.env).await;
+        for (k, v) in &extra {
+            guard_env.retain(|(gk, _)| gk != k);
+            guard_env.push((k.clone(), v.clone()));
+        }
+        if run_local_guard(guard, &guard_env, config.timeout).await {
+            if config.verbose >= 2 {
+                ui.lock().await.masked_note(&format!("  guard passed: {guard}"));
+            }
+        } else {
+            crate::ui::note("  local guard failed — skipping block", log_file);
+            return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
+        }
+    }
     let args = super::LocalBlockArgs {
         ui,
         run_state,
