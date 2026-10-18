@@ -5,4 +5,4 @@
 # only). Their orchestration mutants therefore survive by construction, so
 # they are excluded and mutation stays focused on the library crates, where
 # the domain logic lives and is unit- and property-tested.
-exclude_globs = ["bin/shellflow/src/**", "bin/demo-secret-app/src/**"]
+exclude_globs = ["bin/shellflow/src/**", "examples/*/src/**"]

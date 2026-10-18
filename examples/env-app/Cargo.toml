@@ -1,0 +1,20 @@
+[package]
+name = "env-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Example application configured with plain environment variables (no encryption) — the simple baseline that shellflow's encrypted workflow replaces."
+publish = false
+
+[[bin]]
+name = "env-app"
+path = "src/main.rs"
+
+[lints]
+workspace = true
