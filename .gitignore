@@ -35,3 +35,6 @@ bun.lockb
 .rumdl_cache/
 .hypothesis/
 .benchmarks/
+
+# ===== 本地助手状态 =====
+.codebuddy/
