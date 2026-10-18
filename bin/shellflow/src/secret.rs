@@ -320,9 +320,88 @@ fn validate_plaintext_env(bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+        path::{Path, PathBuf},
+    };
 
-    use super::{temp_plaintext_path, validate_plaintext_env, write_temp_plaintext};
+    use shellflow_secrets::identity::{generate_identity, public_recipient};
+
+    use super::{
+        SecretCredsArgs, SecretDecryptArgs, SecretEditArgs, SecretEncryptArgs, SecretKeysCheckArgs,
+        collect_recipients, creds, decrypt, edit, encrypt, keys_check, run_editor,
+        temp_plaintext_path, validate_plaintext_env, write_temp_plaintext,
+    };
+
+    /// Serializes tests that mutate process-global env vars (`VISUAL`,
+    /// `EDITOR`). Rust 2024 makes `set_var` `unsafe`, so every mutation is
+    /// guarded by this lock and scoped to the closure.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A throwaway identity plus its `age1…` recipient string.
+    struct TestIdentity {
+        dir: tempfile::TempDir,
+        path: PathBuf,
+        recipient: String,
+    }
+
+    impl TestIdentity {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("keys.txt");
+            let identity = generate_identity(&path).expect("generate identity");
+            Self { dir, path, recipient: public_recipient(&identity).to_string() }
+        }
+    }
+
+    /// Encrypt `plain` to `out` for `recipients`.
+    fn encrypt_to(plain: &Path, out: &Path, recipients: Vec<String>) -> Result<(), String> {
+        encrypt(&SecretEncryptArgs {
+            recipients,
+            recipients_dir: None,
+            output: Some(out.to_path_buf()),
+            file: Some(plain.to_path_buf()),
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// Decrypt `cipher` to `out` with `identity`.
+    fn decrypt_to(cipher: &Path, out: &Path, identity: &Path) -> Result<(), String> {
+        decrypt(&SecretDecryptArgs {
+            identity: Some(identity.to_path_buf()),
+            output: Some(out.to_path_buf()),
+            file: Some(cipher.to_path_buf()),
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// Write `content` to `path`.
+    fn write(path: &Path, content: &str) {
+        fs::write(path, content).expect("write fixture");
+    }
+
+    /// Run `body` with `$VISUAL`/`$EDITOR` set to `value` (or both unset).
+    fn with_editor<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: serialized by `ENV_LOCK`; no other test reads these vars
+        // concurrently and the values are non-secret test fixtures.
+        unsafe {
+            for key in ["VISUAL", "EDITOR"] {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        let out = body();
+        // SAFETY: serialized by `ENV_LOCK`, as above.
+        unsafe {
+            std::env::remove_var("VISUAL");
+            std::env::remove_var("EDITOR");
+        }
+        out
+    }
 
     #[test]
     fn temp_plaintext_is_owner_only() {
@@ -354,5 +433,469 @@ mod tests {
     #[test]
     fn temp_plaintext_path_is_unique_per_call() {
         assert_ne!(temp_plaintext_path(), temp_plaintext_path());
+    }
+
+    // -----------------------------------------------------------------------
+    // encrypt / decrypt round trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn encrypt_then_decrypt_preserves_bytes_exactly() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        // Includes a trailing-newline-free payload and a non-ASCII value: the
+        // round trip must be byte-exact, not text-normalized.
+        write(&plain, "A=1\nB=héllo\n");
+
+        let cipher = id.dir.path().join("out.env.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+        assert!(cipher.exists(), "encrypted file was not written");
+        assert_ne!(
+            fs::read(&cipher).expect("read cipher"),
+            fs::read(&plain).expect("read plain"),
+            "output must be ciphertext"
+        );
+
+        let back = id.dir.path().join("back.env");
+        decrypt_to(&cipher, &back, &id.path).expect("decrypt");
+        assert_eq!(
+            fs::read(&back).expect("read decrypted"),
+            fs::read(&plain).expect("read plain"),
+            "decrypted bytes must match the plaintext exactly"
+        );
+    }
+
+    #[test]
+    fn encrypt_rejects_an_invalid_recipient() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        write(&plain, "A=1\n");
+        let err = encrypt_to(&plain, &id.dir.path().join("x.age"), vec!["nope".to_string()])
+            .expect_err("invalid recipient must fail");
+        assert!(err.contains("nope"), "error should name the bad recipient: {err}");
+    }
+
+    #[test]
+    fn decrypt_rejects_ciphertext_for_another_identity() {
+        let id = TestIdentity::new();
+        let other = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        write(&plain, "A=1\n");
+        let cipher = id.dir.path().join("x.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+
+        let err = decrypt_to(&cipher, &id.dir.path().join("out.env"), &other.path)
+            .expect_err("a foreign identity must not decrypt");
+        assert!(!err.is_empty(), "decryption failure must report a reason");
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_recipients
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collect_recipients_reads_pub_files_and_skips_comments() {
+        let id = TestIdentity::new();
+        let dir = id.dir.path().join("recipients");
+        fs::create_dir_all(&dir).expect("mkdir");
+        // A `*.pub` file with a comment, a blank line, and the real key.
+        write(&dir.join("alice.pub"), &format!("# alice\n\n{}\n", id.recipient));
+        // Non-`.pub` files are ignored, even when they hold a valid key.
+        write(&dir.join("notes.txt"), &id.recipient);
+
+        let recipients =
+            collect_recipients(&[], Some(&dir)).expect("collect recipients from directory");
+        assert_eq!(recipients.len(), 1, "only the .pub entry counts: {recipients:?}");
+    }
+
+    #[test]
+    fn collect_recipients_combines_explicit_and_directory_entries() {
+        let id = TestIdentity::new();
+        let extra = TestIdentity::new();
+        let dir = id.dir.path().join("recipients");
+        fs::create_dir_all(&dir).expect("mkdir");
+        write(&dir.join("alice.pub"), &format!("{}\n", id.recipient));
+
+        let recipients = collect_recipients(&[extra.recipient.clone()], Some(&dir))
+            .expect("collect combined recipients");
+        assert_eq!(recipients.len(), 2, "explicit + directory entries: {recipients:?}");
+    }
+
+    #[test]
+    fn collect_recipients_without_sources_is_empty() {
+        assert!(collect_recipients(&[], None).expect("no sources").is_empty());
+    }
+
+    #[test]
+    fn collect_recipients_rejects_a_malformed_pub_entry() {
+        let id = TestIdentity::new();
+        let dir = id.dir.path().join("recipients");
+        fs::create_dir_all(&dir).expect("mkdir");
+        write(&dir.join("broken.pub"), "age1notavalidkey\n");
+        let err = collect_recipients(&[], Some(&dir)).expect_err("malformed key must fail");
+        assert!(err.to_string().contains("age1notavalidkey"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn collect_recipients_reports_a_missing_directory() {
+        let id = TestIdentity::new();
+        let missing = id.dir.path().join("nope");
+        assert!(
+            collect_recipients(&[], Some(&missing)).is_err(),
+            "a missing --recipients-dir must be reported, not silently skipped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // output writing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn written_output_is_byte_exact_with_no_trailing_newline() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        // Binary payload: an added `\n` would corrupt it.
+        let payload = b"\x00\x01binary\xff";
+        fs::write(&plain, payload).expect("write binary fixture");
+
+        let cipher = id.dir.path().join("bin.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+
+        let back = id.dir.path().join("bin.out");
+        decrypt_to(&cipher, &back, &id.path).expect("decrypt");
+        assert_eq!(fs::read(&back).expect("read back"), payload.to_vec(), "bytes must round-trip");
+    }
+
+    // -----------------------------------------------------------------------
+    // run_editor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn editor_fails_clearly_when_no_editor_is_set() {
+        let err = with_editor(None, || run_editor(Path::new("/tmp/x")))
+            .expect_err("missing $EDITOR must be an error");
+        assert!(err.to_string().contains("$EDITOR"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn editor_rejects_a_blank_editor_value() {
+        let err = with_editor(Some("   "), || run_editor(Path::new("/tmp/x")))
+            .expect_err("a blank $EDITOR must be an error");
+        assert!(err.to_string().contains("$EDITOR"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn editor_runs_the_program_and_accepts_success() {
+        with_editor(Some("true"), || run_editor(Path::new("/tmp/x")).expect("`true` exits 0"));
+    }
+
+    #[test]
+    fn editor_reports_a_non_zero_exit() {
+        let err = with_editor(Some("false"), || run_editor(Path::new("/tmp/x")))
+            .expect_err("a failing editor must be reported");
+        assert!(err.to_string().contains("editor exited with status"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn editor_reports_a_missing_program() {
+        let err =
+            with_editor(Some("shellflow-no-such-editor-xyz"), || run_editor(Path::new("/tmp/x")))
+                .expect_err("a missing editor program must be reported");
+        assert!(
+            err.to_string().contains("shellflow-no-such-editor-xyz"),
+            "error should name the program: {err}"
+        );
+    }
+
+    #[test]
+    fn editor_passes_flags_and_path_as_argv_without_a_shell() {
+        // `$EDITOR` is split on whitespace and passed as argv, so `code --wait`
+        // works and metacharacters are never executed. The script records its
+        // own argv, which is what we assert on.
+        let id = TestIdentity::new();
+        let script = id.dir.path().join("fake-editor.sh");
+        let marker = id.dir.path().join("argv.txt");
+        write(&script, &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", marker.display()));
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let target = id.dir.path().join("edited.env");
+        write(&target, "A=1\n");
+        with_editor(Some(&format!("{} --wait", script.display())), || {
+            run_editor(&target).expect("editor exits 0");
+        });
+
+        let recorded = fs::read_to_string(&marker).expect("editor argv marker");
+        assert!(recorded.contains("--wait"), "flags must be forwarded: {recorded}");
+        assert!(
+            recorded.contains(target.display().to_string().as_str()),
+            "path must be forwarded: {recorded}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // secret edit
+    // -----------------------------------------------------------------------
+
+    /// Run `secret edit` with `editor` as `$EDITOR` on `file`.
+    fn run_edit(
+        file: &Path,
+        identity: &Path,
+        recipients: Vec<String>,
+        editor: &str,
+    ) -> Result<(), String> {
+        let args = SecretEditArgs {
+            identity: Some(identity.to_path_buf()),
+            recipients,
+            recipients_dir: None,
+            file: file.to_path_buf(),
+        };
+        with_editor(Some(editor), || edit(&args)).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn edit_decrypts_edits_and_re_encrypts() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        write(&plain, "A=1\n");
+        let cipher = id.dir.path().join("secret.env.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+
+        // The editor appends a new key to the plaintext buffer.
+        let script = id.dir.path().join("append.sh");
+        write(&script, "#!/bin/sh\nprintf 'B=2\\n' >> \"$1\"\n");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        run_edit(&cipher, &id.path, vec![id.recipient.clone()], &script.display().to_string())
+            .expect("edit round trip");
+
+        let back = id.dir.path().join("after.env");
+        decrypt_to(&cipher, &back, &id.path).expect("decrypt after edit");
+        let content = fs::read_to_string(&back).expect("read edited plaintext");
+        assert!(content.contains("A=1"), "original key must survive: {content}");
+        assert!(content.contains("B=2"), "the edit must be applied: {content}");
+    }
+
+    #[test]
+    fn edit_rejects_a_malformed_edit_and_keeps_the_ciphertext() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        write(&plain, "A=1\n");
+        let cipher = id.dir.path().join("secret.env.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+        let before = fs::read(&cipher).expect("read cipher before");
+
+        // The editor writes a line that is not `KEY=VALUE`.
+        let script = id.dir.path().join("break.sh");
+        write(&script, "#!/bin/sh\nprintf 'NO_EQUALS_HERE\\n' >> \"$1\"\n");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let err =
+            run_edit(&cipher, &id.path, vec![id.recipient.clone()], &script.display().to_string())
+                .expect_err("a malformed edit must fail");
+        assert!(err.contains("malformed"), "error should explain the problem: {err}");
+        assert_eq!(
+            fs::read(&cipher).expect("read cipher after"),
+            before,
+            "a rejected edit must leave the encrypted file untouched"
+        );
+    }
+
+    #[test]
+    fn edit_requires_recipients_before_re_encrypting() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        write(&plain, "A=1\n");
+        let cipher = id.dir.path().join("secret.env.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+
+        let err = run_edit(&cipher, &id.path, vec![], "true")
+            .expect_err("re-encrypting with no recipient must fail");
+        assert!(err.contains("no recipients"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn edit_removes_the_temporary_plaintext() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        write(&plain, "A=1\n");
+        let cipher = id.dir.path().join("secret.env.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+
+        // The editor records its own path; the temp buffer must be gone by the
+        // time `edit` returns, so no decrypted bytes are left behind.
+        let script = id.dir.path().join("record.sh");
+        let marker = id.dir.path().join("tmp-path.txt");
+        write(&script, &format!("#!/bin/sh\nprintf '%s' \"$1\" > {}\n", marker.display()));
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        run_edit(&cipher, &id.path, vec![id.recipient.clone()], &script.display().to_string())
+            .expect("edit round trip");
+
+        let tmp = fs::read_to_string(&marker).expect("editor path marker");
+        assert!(!Path::new(tmp.trim()).exists(), "temporary plaintext was not cleaned up: {tmp}");
+    }
+
+    // -----------------------------------------------------------------------
+    // secret creds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn creds_prints_import_credential_lines() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        write(&plain, "API_KEY=secret\nDB_PASSWORD=pw\n");
+        let cipher = id.dir.path().join("secret.env.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+
+        creds(&SecretCredsArgs { identity: Some(id.path.clone()), store_dir: None, file: cipher })
+            .expect("creds");
+    }
+
+    #[test]
+    fn creds_prints_load_credential_encrypted_lines_with_store_dir() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        write(&plain, "API_KEY=secret\n");
+        let cipher = id.dir.path().join("secret.env.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+
+        creds(&SecretCredsArgs {
+            identity: Some(id.path.clone()),
+            store_dir: Some(PathBuf::from("/etc/credstore.encrypted/myapp")),
+            file: cipher,
+        })
+        .expect("creds with --store-dir");
+    }
+
+    #[test]
+    fn creds_prints_nothing_for_an_empty_env_file() {
+        let id = TestIdentity::new();
+        let plain = id.dir.path().join("plain.env");
+        write(&plain, "");
+        let cipher = id.dir.path().join("empty.env.age");
+        encrypt_to(&plain, &cipher, vec![id.recipient.clone()]).expect("encrypt");
+
+        // An env file with no keys is legal for `creds` (it just prints no
+        // lines); `keys_check` is the tool that rejects that shape.
+        creds(&SecretCredsArgs { identity: Some(id.path.clone()), store_dir: None, file: cipher })
+            .expect("creds on an empty env file");
+    }
+
+    // -----------------------------------------------------------------------
+    // secret keys-check
+    // -----------------------------------------------------------------------
+
+    /// Build `<dir>/<host>.env.age` encrypted to `recipient` with `content`.
+    fn host_env(dir: &Path, host: &str, content: &str, recipient: &str) -> PathBuf {
+        let plain = dir.join(format!("{host}.plain"));
+        write(&plain, content);
+        let cipher = dir.join(format!("{host}.env.age"));
+        encrypt_to(&plain, &cipher, vec![recipient.to_string()]).expect("encrypt host env");
+        cipher
+    }
+
+    #[test]
+    fn keys_check_accepts_identical_key_sets() {
+        let id = TestIdentity::new();
+        let dir = id.dir.path().join("svc");
+        fs::create_dir_all(&dir).expect("mkdir");
+        // Different values, same keys — that is the intended invariant (units
+        // are shared across hosts).
+        host_env(&dir, "api", "K=v1\nJ=w1\n", &id.recipient);
+        host_env(&dir, "trade", "K=v2\nJ=w2\n", &id.recipient);
+
+        keys_check(&SecretKeysCheckArgs { identity: Some(id.path.clone()), dir })
+            .expect("identical key sets must pass");
+    }
+
+    #[test]
+    fn keys_check_detects_a_missing_key() {
+        let id = TestIdentity::new();
+        let dir = id.dir.path().join("svc");
+        fs::create_dir_all(&dir).expect("mkdir");
+        host_env(&dir, "api", "K=1\nJ=2\n", &id.recipient);
+        host_env(&dir, "trade", "K=1\n", &id.recipient);
+
+        let err = keys_check(&SecretKeysCheckArgs { identity: Some(id.path.clone()), dir })
+            .expect_err("drift must be detected");
+        let msg = err.to_string();
+        assert!(msg.contains("key set mismatch"), "unexpected error: {msg}");
+        assert!(msg.contains("trade"), "error should name the drifting host: {msg}");
+        assert!(msg.contains("J"), "error should name the missing key: {msg}");
+    }
+
+    #[test]
+    fn keys_check_detects_an_extra_key() {
+        let id = TestIdentity::new();
+        let dir = id.dir.path().join("svc");
+        fs::create_dir_all(&dir).expect("mkdir");
+        host_env(&dir, "api", "K=1\n", &id.recipient);
+        host_env(&dir, "trade", "K=1\nEXTRA=2\n", &id.recipient);
+
+        let err = keys_check(&SecretKeysCheckArgs { identity: Some(id.path.clone()), dir })
+            .expect_err("an extra key is drift too");
+        assert!(err.to_string().contains("EXTRA"), "error should name the extra key: {err}");
+    }
+
+    #[test]
+    fn keys_check_rejects_an_empty_directory() {
+        let id = TestIdentity::new();
+        let dir = id.dir.path().join("empty");
+        fs::create_dir_all(&dir).expect("mkdir");
+        let err = keys_check(&SecretKeysCheckArgs { identity: Some(id.path.clone()), dir })
+            .expect_err("an empty directory must fail");
+        assert!(err.to_string().contains("no *.env.age files"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn keys_check_ignores_files_that_are_not_host_envs() {
+        let id = TestIdentity::new();
+        let dir = id.dir.path().join("svc");
+        fs::create_dir_all(&dir).expect("mkdir");
+        let plain = dir.join("legacy.plain");
+        write(&plain, "K=1\n");
+        let other = dir.join("legacy.age");
+        encrypt_to(&plain, &other, vec![id.recipient.clone()]).expect("encrypt");
+
+        let err = keys_check(&SecretKeysCheckArgs { identity: Some(id.path.clone()), dir })
+            .expect_err("a non-`*.env.age` file must not count");
+        assert!(err.to_string().contains("no *.env.age files"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn keys_check_rejects_a_file_with_no_keys() {
+        let id = TestIdentity::new();
+        let dir = id.dir.path().join("svc");
+        fs::create_dir_all(&dir).expect("mkdir");
+        host_env(&dir, "api", "", &id.recipient);
+
+        let err = keys_check(&SecretKeysCheckArgs { identity: Some(id.path.clone()), dir })
+            .expect_err("an env file with no keys must fail");
+        assert!(err.to_string().contains("no keys"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn keys_check_rejects_an_undecryptable_file() {
+        let id = TestIdentity::new();
+        let foreign = TestIdentity::new();
+        let dir = id.dir.path().join("svc");
+        fs::create_dir_all(&dir).expect("mkdir");
+        host_env(&dir, "api", "K=1\n", &id.recipient);
+        host_env(&dir, "trade", "K=1\n", &foreign.recipient);
+
+        let err = keys_check(&SecretKeysCheckArgs { identity: Some(id.path.clone()), dir })
+            .expect_err("a foreign ciphertext must fail the check");
+        assert!(err.to_string().contains("trade"), "error should name the file: {err}");
+    }
+
+    #[test]
+    fn keys_check_reports_a_missing_directory_before_touching_identity() {
+        let id = TestIdentity::new();
+        let dir = id.dir.path().join("does-not-exist");
+        let err = keys_check(&SecretKeysCheckArgs { identity: Some(id.path.clone()), dir })
+            .expect_err(
+                "a missing directory must be reported structurally, before identity resolution",
+            );
+        assert!(err.to_string().contains("failed to read service directory"), "unexpected: {err}");
     }
 }
