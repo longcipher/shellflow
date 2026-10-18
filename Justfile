@@ -7,6 +7,9 @@ format:
   rumdl fmt .
   cargo sort -w -g
   cargo +nightly fmt --all
+  # The fuzz crates are detached workspaces, so `cargo fmt --all` skips them.
+  rustfmt --edition 2024 crates/shellflow-core/fuzz/fuzz_targets/*.rs
+  rustfmt --edition 2024 crates/shellflow-secrets/fuzz/fuzz_targets/*.rs
 
 # Auto-fix linting issues
 fix:
@@ -29,6 +32,17 @@ test:
 # Run mutation tests with cargo-mutants
 mutation:
   cargo mutants
+
+# Type-check every fuzz target (no execution)
+fuzz-check:
+  cd crates/shellflow-core && cargo +nightly fuzz check
+  cd crates/shellflow-secrets && cargo +nightly fuzz check
+
+# Run every fuzz target for SECS seconds (hostile-input parsers)
+fuzz SECS="20":
+  cd crates/shellflow-core && cargo +nightly fuzz run fuzz_parse_script -- -max_total_time={{SECS}}
+  cd crates/shellflow-core && cargo +nightly fuzz run fuzz_interpolate -- -max_total_time={{SECS}}
+  cd crates/shellflow-secrets && cargo +nightly fuzz run fuzz_parse_env_file -- -max_total_time={{SECS}}
 
 # Run tests with coverage
 test-coverage:

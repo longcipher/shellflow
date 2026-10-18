@@ -1,0 +1,26 @@
+[package]
+name = "shellflow-secrets-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the shellflow workspace: the fuzz crate pins its own
+# (sanitizer-instrumented) build profile and must never be picked up by
+# `cargo build`/`cargo test` at the workspace root.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.shellflow-secrets]
+path = ".."
+
+[[bin]]
+name = "fuzz_parse_env_file"
+path = "fuzz_targets/fuzz_parse_env_file.rs"
+test = false
+doc = false
+bench = false
