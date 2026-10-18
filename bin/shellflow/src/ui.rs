@@ -181,8 +181,8 @@ impl Ui {
             );
         }
         for (idx, step) in plan.steps.iter().enumerate() {
-            let target = step.target_text().map(|t| format!(" -> {t}")).unwrap_or_default();
-            let name = step.name().map(|n| format!(" ({n})")).unwrap_or_default();
+            let target = step.target_text().map_or_default(|t| format!(" -> {t}"));
+            let name = step.name().map_or_default(|n| format!(" ({n})"));
             print_line(
                 format!("  step    {:>2}: {}{}{}", idx + 1, step.kind(), name, target)
                     .dimmed()
@@ -270,8 +270,8 @@ pub(crate) fn step_header(index: usize, total: usize, step: &Step) {
         other => other.normal(),
     }
     .to_string();
-    let target = step.target_text().map(|t| format!(" -> {t}")).unwrap_or_default();
-    let name = step.name().map(|n| format!(" {n}")).unwrap_or_default();
+    let target = step.target_text().map_or_default(|t| format!(" -> {t}"));
+    let name = step.name().map_or_default(|n| format!(" {n}"));
     let label = format!("[STEP {index}/{total}]{name} {kind_colored}{target}").bold();
     print_line(format!("\n{label}"));
 }

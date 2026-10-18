@@ -24,10 +24,10 @@ pub const IDENTITY_ENV: &str = "SHELLFLOW_AGE_IDENTITY";
 #[must_use]
 pub fn expand_home(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = s.strip_prefix("~/") &&
+        let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     path.to_path_buf()
 }
@@ -123,6 +123,45 @@ pub fn public_recipient(identity: &age::x25519::Identity) -> age::x25519::Recipi
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate process-global env vars (`HOME`,
+    /// `SHELLFLOW_AGE_IDENTITY`). A single shared lock — not one per test —
+    /// is required, otherwise the tests race on the global environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that restores an env var to its original state on drop.
+    struct EnvRestore {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        /// Set `key` to `value`, capturing its previous value for restore.
+        ///
+        /// # Safety
+        /// Callers must hold `ENV_LOCK` so no other thread reads or writes the
+        /// same env var concurrently (env access is process-global).
+        unsafe fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: guarded by ENV_LOCK; values are non-secret test fixtures.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            // SAFETY: guard lifetime is bounded by ENV_LOCK held by the test.
+            unsafe {
+                match &self.original {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn generate_and_reload_round_trips() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -175,34 +214,24 @@ mod tests {
 
     #[test]
     fn default_identity_resolves_env_then_home() {
-        // Env access is process-global; serialize with other tests.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // SAFETY: serialized by ENV_LOCK; no concurrent env readers in these
-        // tests; values are non-secret test fixtures.
-        unsafe {
-            std::env::set_var(IDENTITY_ENV, "/custom/key.txt");
+        // Env access is process-global and guarded by ENV_LOCK; values are
+        // non-secret test fixtures.
+        {
+            // SAFETY: guarded by ENV_LOCK.
+            let _identity_env = unsafe { EnvRestore::set(IDENTITY_ENV, "/custom/key.txt") };
+            assert_eq!(default_identity_path(), PathBuf::from("/custom/key.txt"));
         }
-        assert_eq!(default_identity_path(), PathBuf::from("/custom/key.txt"));
-        unsafe {
-            std::env::remove_var(IDENTITY_ENV);
-            std::env::set_var("HOME", "/home/test-user");
-        }
+        // SAFETY: guarded by ENV_LOCK.
+        let _home = unsafe { EnvRestore::set("HOME", "/home/test-user") };
         assert_eq!(default_identity_path(), PathBuf::from("/home/test-user/.config/age/keys.txt"));
-        unsafe {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[test]
     fn expand_home_handles_tilde_and_plain_paths() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: serialized by ENV_LOCK.
-        unsafe {
-            std::env::set_var("HOME", "/home/test-user");
-        }
+        // SAFETY: guarded by ENV_LOCK.
+        let _home = unsafe { EnvRestore::set("HOME", "/home/test-user") };
         assert_eq!(expand_home(Path::new("~/keys.txt")), PathBuf::from("/home/test-user/keys.txt"));
         assert_eq!(
             expand_home(Path::new("~/.config/age/keys.txt")),
@@ -210,28 +239,16 @@ mod tests {
         );
         assert_eq!(expand_home(Path::new("/abs/keys.txt")), PathBuf::from("/abs/keys.txt"));
         assert_eq!(expand_home(Path::new("relative/keys.txt")), PathBuf::from("relative/keys.txt"));
-        // SAFETY: serialized by ENV_LOCK.
-        unsafe {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[test]
     fn effective_identity_expands_tilde() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: serialized by ENV_LOCK.
-        unsafe {
-            std::env::set_var("HOME", "/home/tilde-user");
-            std::env::remove_var(IDENTITY_ENV);
-        }
+        // SAFETY: guarded by ENV_LOCK.
+        let _home = unsafe { EnvRestore::set("HOME", "/home/tilde-user") };
         assert_eq!(
             effective_identity_path(Some(Path::new("~/keys.txt"))),
             PathBuf::from("/home/tilde-user/keys.txt")
         );
-        // SAFETY: serialized by ENV_LOCK.
-        unsafe {
-            std::env::remove_var("HOME");
-        }
     }
 }

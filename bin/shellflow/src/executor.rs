@@ -961,8 +961,7 @@ async fn run_remote_step_local(
     // already in run-state env). Remote blocks have no `@export`.
     let extra: Vec<(String, String)> = host_alias
         .and_then(|alias| secrets.host_pairs(alias))
-        .map(|pairs| pairs.to_vec())
-        .unwrap_or_default();
+        .map_or_default(|pairs| pairs.to_vec());
     match run_local_block(ui, run_state, &remote.script, &remote.env, config, &[], &extra).await {
         Ok(()) => Ok(vec![("localhost".to_string(), HostOutcome::Ok)]),
         Err(err) => Err(err),
