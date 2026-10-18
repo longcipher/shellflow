@@ -1438,3 +1438,237 @@ fn stubborn_child_is_escalated_to_sigkill() -> TestResult<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// End-to-end scenarios: whole pipelines, idempotence, and failure classes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_full_deploy_pipeline() -> TestResult<()> {
+    // The scenario the tool exists for, in one run: capture a version locally,
+    // ship the artifact to every host with `$VERSION` interpolated, then
+    // restart behind a guard.
+    let sb = Sandbox::new("e2e-pipeline")?;
+    let script = sb.script(
+        "# @server web1 ok1@h1\n\
+         # @server web2 ok2@h1\n\
+         # @group  web web1,web2\n\
+         # @local\n\
+         VERSION=v1.2.3\n\
+         # @export VERSION\n\
+         # @copy ./dist -> /srv/app-$VERSION @web\n\
+         # @remote web\n\
+         # @only_if test -d /srv\n\
+         echo deployed $VERSION\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    // `@export` -> `@copy`: the version reaches the rsync destination.
+    let rsync = sb.rsync_log();
+    assert!(rsync.contains("/srv/app-v1.2.3"), "copy dst not interpolated: {rsync}");
+
+    // `@export` -> `@remote`: the version is exported into every payload.
+    for host in ["ok1@h1", "ok2@h1"] {
+        let stdin = sb.read(&format!("ssh-stdin-{host}.txt"));
+        assert!(
+            stdin.contains("export VERSION='v1.2.3';"),
+            "version missing from {host} payload: {stdin:?}"
+        );
+        assert!(stdin.contains("deployed $VERSION"), "script missing from payload: {stdin:?}");
+    }
+
+    // Both declared hosts took part in the remote step.
+    let ssh = sb.ssh_log();
+    assert!(ssh.contains("ok1@h1") && ssh.contains("ok2@h1"), "not every host ran: {ssh}");
+    Ok(())
+}
+
+#[test]
+fn parallel_one_serializes_hosts() -> TestResult<()> {
+    // Mirror of `parallel_default_fans_out_concurrently`: with `-p 1` the mock
+    // barrier must interleave as READY,DONE,READY,DONE.
+    let sb = Sandbox::new("parallel-one")?;
+    let script = sb.script(
+        "# @server e1 echo1@h1\n\
+         # @server e2 echo2@h1\n\
+         # @group g e1,e2\n\
+         # @remote g\n\
+         echo hi\n",
+    )?;
+    let out = sb.run(&script, &["-p", "1"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let order = sb.read("order.log");
+    let events: Vec<&str> = order.lines().collect();
+    assert_eq!(events.len(), 4, "expected 4 barrier events:\n{order}");
+    assert!(events[0].starts_with("READY"), "first event must be READY:\n{order}");
+    assert!(events[1].starts_with("DONE"), "`-p 1` must serialize:\n{order}");
+    Ok(())
+}
+
+#[test]
+fn rerunning_a_playbook_is_idempotent() -> TestResult<()> {
+    // A deploy tool's core promise: a second run issues the same transfers and
+    // finishes green again, not a divergent plan.
+    let sb = Sandbox::new("idempotent")?;
+    let src = sb.dir.join("dist.txt");
+    fs::write(&src, "payload").map_err(|e| e.to_string())?;
+    let script = sb.script(&format!(
+        "# @server web1 ok1@h1\n\
+         # @local\n\
+         echo build\n\
+         # @copy {} -> /srv/app @web1\n\
+         # @remote web1\n\
+         echo restart\n",
+        src.display()
+    ))?;
+    let transfers = |log: &str| log.lines().filter(|l| l.contains("dist.txt")).count();
+
+    let first = sb.run(&script, &[])?;
+    assert_eq!(status_code(&first), 0, "stderr: {}", String::from_utf8_lossy(&first.stderr));
+    let one = transfers(&sb.rsync_log());
+
+    let second = sb.run(&script, &[])?;
+    assert_eq!(status_code(&second), 0, "stderr: {}", String::from_utf8_lossy(&second.stderr));
+    let two = transfers(&sb.rsync_log());
+
+    assert_eq!(two, one * 2, "a re-run must repeat exactly the same transfers");
+    Ok(())
+}
+
+#[test]
+fn a_failing_remote_script_exits_four() -> TestResult<()> {
+    // Exit-code contract: a script failure is 4, distinct from a transport
+    // failure (3) or a plan error (1).
+    let sb = Sandbox::new("exit-four")?;
+    let script = sb.script("# @server f1 fail@h1\n# @remote f1\necho hi\n")?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 4, "a failing remote script must be exit 4: {out:?}");
+    Ok(())
+}
+
+#[test]
+fn one_failing_host_does_not_cancel_the_others() -> TestResult<()> {
+    // Hosts inside one step are independent: a transport failure on a dead
+    // host must not cancel the healthy host's work, and both outcomes are
+    // reported.
+    let sb = Sandbox::new("mixed-hosts")?;
+    let script = sb.script(
+        "# @server d1 dead@h1\n\
+         # @server e1 echo@h1\n\
+         # @group g d1,e1\n\
+         # @remote g\n\
+         echo MIXED_OK\n",
+    )?;
+    let out = sb.run(&script, &["-c"])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MIXED_OK"), "the healthy host must still run: {stdout}");
+    assert!(stdout.contains("FAILED"), "the failing host must be reported: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn secrets_without_a_usable_identity_is_a_hard_error() -> TestResult<()> {
+    // Fail closed: a playbook whose `@secrets` cannot be decrypted must not
+    // run at all (a half-populated environment is worse than a refusal).
+    let sb = Sandbox::new("no-identity")?;
+    let script = sb.script("# @secrets services/app/api.env.age\n# @local\necho hi\n")?;
+    let out = run_with_env(
+        &script,
+        &["--local"],
+        &sb.mock_dir(),
+        &[("SHELLFLOW_AGE_IDENTITY", "/nonexistent/identity.txt")],
+    )?;
+    assert_eq!(status_code(&out), 1, "an unresolvable identity must be exit 1: {out:?}");
+    Ok(())
+}
+
+#[test]
+fn missing_secrets_file_fails_closed() -> TestResult<()> {
+    let sb = Sandbox::new("missing-secret-file")?;
+    let key = sb.dir.join("keys.txt");
+    sb.run_args(&["keys", "generate", "-o", &key.display().to_string()])?;
+    let script = sb.script("# @secrets services/app/nope.env.age\n# @local\necho hi\n")?;
+    let out = sb.run(&script, &["--local", "-i", &key.display().to_string()])?;
+    assert_eq!(status_code(&out), 1, "a missing @secrets file must be exit 1: {out:?}");
+    Ok(())
+}
+
+#[test]
+fn per_host_secrets_need_a_single_local_target() -> TestResult<()> {
+    // `{host}` entries expand per targeted alias, so `--local` (which collapses
+    // every host onto localhost) cannot disambiguate more than one. The files
+    // must exist for the run to reach that check.
+    let sb = Sandbox::new("per-host-local")?;
+    let key = sb.dir.join("keys.txt");
+    sb.run_args(&["keys", "generate", "-o", &key.display().to_string()])?;
+    let pubkey = String::from_utf8_lossy(
+        &sb.run_args(&["keys", "public", "-i", &key.display().to_string()])?.stdout,
+    )
+    .trim()
+    .to_string();
+    let plain = sb.dir.join("plain.env");
+    fs::write(&plain, "TOKEN=abc123\n").map_err(|e| e.to_string())?;
+    for host in ["web1", "web2"] {
+        let out = sb.run_args(&[
+            "secret",
+            "encrypt",
+            "-r",
+            &pubkey,
+            "-o",
+            &sb.dir.join(format!("app-{host}.env.age")).to_string_lossy(),
+            &plain.to_string_lossy(),
+        ])?;
+        assert_eq!(status_code(&out), 0, "encrypt failed: {out:?}");
+    }
+
+    // `@secrets` paths resolve against the working directory, so the test uses
+    // an absolute path (the `{host}` placeholder stays literal here).
+    let secrets = sb.dir.join("app-{host}.env.age");
+    let script = sb.script(&format!(
+        "# @server web1 ok1@h1\n\
+         # @server web2 ok2@h1\n\
+         # @group web web1,web2\n\
+         # @secrets {}\n\
+         # @remote web\n\
+         echo hi\n",
+        secrets.display()
+    ))?;
+    let out = sb.run(&script, &["--local", "-i", &key.display().to_string()])?;
+    assert_eq!(status_code(&out), 1, "ambiguous per-host secrets must be exit 1: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--local"), "error should explain the conflict: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn copy_delete_flag_reaches_rsync() -> TestResult<()> {
+    let sb = Sandbox::new("copy-delete")?;
+    let script = sb.script("# @server web1 ok1@h1\n# @copy ./dist -> /srv/app @web1 --delete\n")?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(sb.rsync_log().contains("--delete"), "--delete missing: {}", sb.rsync_log());
+    Ok(())
+}
+
+#[test]
+fn a_playbook_without_steps_succeeds() -> TestResult<()> {
+    // Declarations only: nothing to run is a success, not an error.
+    let sb = Sandbox::new("empty-plan")?;
+    let script = sb.script("# just a comment\n# @server web1 ok1@h1\n")?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "a plan with no steps must succeed: {out:?}");
+    Ok(())
+}
+
+#[test]
+fn only_by_index_selects_that_step() -> TestResult<()> {
+    // `--only` accepts a 1-based index as well as a name.
+    let sb = Sandbox::new("only-index")?;
+    let script = sb.script("# @local\necho FIRST_STEP\n# @local\necho SECOND_STEP\n")?;
+    let out = sb.run(&script, &["--only", "2"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("SECOND_STEP"), "the selected step must run: {stdout}");
+    assert!(!stdout.contains("FIRST_STEP"), "the other step must not run: {stdout}");
+    Ok(())
+}
