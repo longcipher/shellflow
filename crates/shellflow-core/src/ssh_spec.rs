@@ -167,4 +167,60 @@ mod tests {
         assert_eq!(spec.rsync_remote_shell().as_deref(), Some("ssh -p 2222"));
         Ok(())
     }
+
+    proptest::proptest! {
+        /// A rendered spec parses back to exactly the same fields, so a
+        /// `~/.ssh/config`-free destination survives the plan -> argv path
+        /// unchanged.
+        #[test]
+        fn spec_round_trips_through_parse_and_render(
+            user in "[a-z][a-z0-9_-]{0,12}",
+            host in "[a-z0-9]([a-z0-9.-]{0,28}[a-z0-9])?",
+            port in 1_u16..65535,
+        ) {
+            let rendered = format!("{user}@{host}:{port}");
+            let spec = SshSpec::parse(&rendered).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(spec.user.as_deref(), Some(user.as_str()));
+            prop_assert_eq!(&spec.host, &host);
+            prop_assert_eq!(spec.port, Some(port));
+            let dest = spec.dest();
+            let shell = spec.rsync_remote_shell();
+            let want_dest = format!("{user}@{host}");
+            let want_shell = format!("ssh -p {port}");
+            prop_assert_eq!(&dest, &want_dest);
+            prop_assert_eq!(shell.as_deref(), Some(want_shell.as_str()));
+        }
+
+        /// `to_ssh_args` is always 1 or 3 elements and ends with the
+        /// destination: a host string can never grow the argv, which is what
+        /// keeps `ssh` injection impossible even for exotic specs.
+        #[test]
+        fn ssh_argv_shape_is_fixed(
+            spec in prop_oneof![
+                "[a-z0-9]([a-z0-9.-]{0,28}[a-z0-9])?".prop_map(|host| format!("{host}")),
+                ("[a-z0-9.-]{1,20}", 1_u16..65535)
+                    .prop_map(|(host, port)| format!("{host}:{port}")),
+            ],
+        ) {
+            let parsed = SshSpec::parse(&spec).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let dest = parsed.dest();
+            let args = parsed.to_ssh_args();
+            let expected_len = if parsed.port.is_some() { 3 } else { 1 };
+            prop_assert_eq!(args.len(), expected_len);
+            prop_assert_eq!(args.last().map(String::as_str), Some(dest.as_str()));
+            for arg in &args {
+                prop_assert!(!arg.is_empty(), "empty ssh argument");
+                prop_assert!(
+                    !arg.contains(char::is_whitespace),
+                    "argv element contains whitespace: {}",
+                    arg
+                );
+            }
+        }
+    }
+
+    use proptest::{
+        prelude::{Strategy, TestCaseError, prop_assert, prop_assert_eq},
+        prop_oneof,
+    };
 }

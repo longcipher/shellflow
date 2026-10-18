@@ -540,6 +540,32 @@ mod tests {
     }
 
     #[test]
+    fn a_value_containing_a_reference_is_not_re_expanded() -> Result<(), String> {
+        // Single-pass by design: a captured value may legitimately contain a
+        // `$` (a password like `p$w`), and re-scanning it would corrupt the
+        // path it was substituted into.
+        let mut state = RunState::default();
+        state.vars.insert("X".to_string(), "$Y".to_string());
+        state.vars.insert("Y".to_string(), "1".to_string());
+        let out = interpolate("$X", &state).map_err(|e| e.to_string())?;
+        assert_eq!(out, "$Y");
+        Ok(())
+    }
+
+    #[test]
+    fn a_stray_dollar_next_to_a_value_is_not_a_reference() -> Result<(), String> {
+        // `$$` is a literal `$` followed by the expansion of `X`. Only a second
+        // pass would read `$abc` as a reference to `abc`, which is why
+        // interpolation is single-pass and non-idempotent by design.
+        let mut state = RunState::default();
+        state.vars.insert("X".to_string(), "abc".to_string());
+        state.vars.insert("abc".to_string(), "zzz".to_string());
+        let out = interpolate("$${X}", &state).map_err(|e| e.to_string())?;
+        assert_eq!(out, "$abc");
+        Ok(())
+    }
+
+    #[test]
     fn interpolate_underscore_and_braced_names() -> Result<(), String> {
         let mut state = RunState::default();
         state.vars.insert("_REV".to_string(), "abc123".to_string());
@@ -562,4 +588,198 @@ mod tests {
             })
             .collect()
     }
+
+    proptest::proptest! {
+        /// A template without `$` is returned byte-for-byte, whatever the run
+        /// state holds: interpolation may only ever touch `$` references.
+        #[test]
+        fn interpolate_is_identity_without_dollar(
+            text in "[^$]{0,40}",
+            (key, value) in ("[A-Za-z_][A-Za-z0-9_]{0,8}", "[^$]{0,20}"),
+        ) {
+            let mut state = RunState::default();
+            state.vars.insert(key, value);
+            let out = interpolate(&text, &state).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(&out, &text);
+        }
+
+        /// `$NAME` and `${NAME}` agree, and only the valid `[A-Za-z_]\w*` name
+        /// is consumed — the following separator must survive.
+        #[test]
+        fn braced_and_unbraced_forms_agree(
+            name in "[A-Za-z_][A-Za-z0-9_]{0,10}",
+            value in "[a-z0-9]{1,12}",
+            suffix in prop_oneof![
+                Just(String::new()),
+                Just("/".to_string()),
+                Just("-x".to_string()),
+            ],
+        ) {
+            let mut state = RunState::default();
+            state.vars.insert(name.clone(), value.clone());
+            let unbraced =
+                interpolate(&format!("${name}{suffix}"), &state).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let braced =
+                interpolate(&format!("${{{name}}}{suffix}"), &state).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(&unbraced, &format!("{value}{suffix}"));
+            prop_assert_eq!(braced, unbraced);
+        }
+
+        /// A fully-resolved template leaves no `$` behind.
+        #[test]
+        fn every_reference_is_expanded(
+            prefix in "[a-z/]{0,10}",
+            name in "[A-Za-z_][A-Za-z0-9_]{0,10}",
+            value in "[a-z0-9]{1,12}",
+        ) {
+            let mut state = RunState::default();
+            state.vars.insert(name.clone(), value);
+            let out = interpolate(&format!("{prefix}${{{name}}}"), &state)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert!(!out.contains('$'), "unexpanded reference left in {out:?}");
+        }
+
+        /// Every stray `$` shape is copied literally and never errors — an
+        /// unresolvable-looking `$` must not abort a deploy.
+        #[test]
+        fn stray_dollar_is_literal_never_an_error(
+            stray in prop_oneof![
+                Just("$".to_string()),
+                Just("$ ".to_string()),
+                Just("$1".to_string()),
+                Just("$9x".to_string()),
+                Just("${".to_string()),
+                Just("${}".to_string()),
+                Just("${1}".to_string()),
+                Just("${bad-name}".to_string()),
+                Just("${ x }".to_string()),
+                Just("$$".to_string()),
+            ],
+            // The trailing separator is non-name so it can never glue onto the
+            // stray `$` and form a real (unresolved) variable reference.
+            around in (
+                "[a-z]{0,8}",
+                prop_oneof![
+                    Just(String::new()),
+                    Just("/".to_string()),
+                    Just("-".to_string()),
+                    Just(".".to_string()),
+                ],
+            ),
+        ) {
+            let state = RunState::default();
+            let template = format!("{}{}{}", around.0, stray, around.1);
+            let out = interpolate(&template, &state).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert!(out.contains('$'), "the literal `$` must survive: {out:?}");
+        }
+
+        /// An unresolved reference is a hard error that names the variable
+        /// (never a silent empty expansion).
+        #[test]
+        fn unresolved_reference_names_the_variable(name in "[A-Za-z_][A-Za-z0-9_]{0,10}") {
+            let state = RunState::default();
+            match interpolate(&format!("x/${{{name}}}"), &state) {
+                Err(InterpolateError::Unresolved { var, .. }) => prop_assert_eq!(var, name),
+                other => return Err(TestCaseError::fail(format!("expected Unresolved, got {other:?}"))),
+            }
+        }
+
+        /// Interpolating an already-interpolated path is a no-op, so a path
+        /// that round-trips through run state twice cannot double-expand.
+        #[test]
+        fn interpolation_is_idempotent(
+            name in "[A-Za-z_][A-Za-z0-9_]{0,10}",
+            value in "[a-z0-9/_-]{1,12}",
+        ) {
+            let mut state = RunState::default();
+            state.vars.insert(name.clone(), value);
+            let once = interpolate(&format!("/opt/${{{name}}}/${name}"), &state)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let twice = interpolate(&once, &state).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(once, twice);
+        }
+
+        /// Interpolation agrees with a hand-built expectation for an arbitrary
+        /// sequence of literal and `${VAR}` segments.
+        #[test]
+        fn interpolation_matches_manual_construction(
+            parts in proptest::collection::vec(
+                ("[a-z]{1,6}", "[A-Z][A-Z0-9_]{0,5}", "[a-z0-9]{1,8}"),
+                1..6,
+            ),
+        ) {
+            let mut state = RunState::default();
+            let mut template = String::new();
+            let mut expected = String::new();
+            for (lit, name, value) in parts {
+                // First definition wins, so `expected` and the render agree
+                // even when a name repeats across segments.
+                let stored = state.vars.entry(name.clone()).or_insert(value);
+                template.push_str(&lit);
+                template.push_str(&format!("${{{name}}}"));
+                expected.push_str(&lit);
+                expected.push_str(stored.as_str());
+            }
+            let out = interpolate(&template, &state).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(out, expected);
+        }
+
+        /// Non-ASCII text is preserved byte-for-byte, and a `$` that is not
+        /// followed by a valid name stays literal.
+        #[test]
+        fn non_ascii_survives_interpolation(
+            text in "[\\p{L}\\p{N} ]{0,20}",
+            // Latin-1 supplement letters: valid UTF-8, never an ASCII name
+            // character, so `$` + these stays a literal `$`.
+            tail in "[\u{00C0}-\u{017F}]{1,4}",
+        ) {
+            let state = RunState::default();
+            let plain = interpolate(&text, &state).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(&plain, &text);
+            let template = format!("${tail}");
+            let out = interpolate(&template, &state).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(&out, &template);
+        }
+
+        /// A group resolves to exactly its member count, in declaration order,
+        /// and a `--target` restriction never expands that set.
+        #[test]
+        fn group_resolution_is_exact(
+            count in 1_usize..6,
+            keep in 1_usize..6,
+        ) {
+            let keep = keep.min(count);
+            let mut script = String::new();
+            let mut members = String::new();
+            for i in 0..count {
+                script.push_str(&format!("# @server web{i} deploy@10.0.0.{i}\n"));
+                if i > 0 {
+                    members.push(',');
+                }
+                members.push_str(&format!("web{i}"));
+            }
+            script.push_str(&format!("# @group web {members}\n"));
+            let plan = parse_script(&script).map_err(|e| TestCaseError::fail(e.to_string()))?;
+
+            let all = resolve_hosts(&plan, &Target::new("web"), &[]).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(all.len(), count);
+            for (i, host) in all.iter().enumerate() {
+                prop_assert_eq!(&host.alias, &format!("web{i}"));
+            }
+
+            let restricted = resolve_hosts(
+                &plan,
+                &Target::new("web"),
+                &["web0".to_string()],
+            )
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(restricted.len(), 1);
+            prop_assert!(keep >= 1, "sanity: keep is at least 1");
+        }
+    }
+
+    use proptest::{
+        prelude::{Just, TestCaseError, prop_assert, prop_assert_eq},
+        prop_oneof,
+    };
 }
