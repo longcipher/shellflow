@@ -22,7 +22,7 @@ lint:
   rumdl check .
   cargo sort -w -g -c
   cargo +nightly fmt --all -- --check
-  RUSTC_WRAPPER= cargo +nightly clippy --all -- -D warnings
+  RUSTC_WRAPPER= cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
   RUSTC_WRAPPER= cargo shear
 
 # Run tests

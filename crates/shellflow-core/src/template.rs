@@ -149,13 +149,13 @@ mod tests {
 
     #[test]
     fn ignores_dollar_without_braces() {
-        assert!(template_keys("cost is $5 and $A\n").is_empty());
+        assert!(template_keys("cost is $5 and $A\n").is_empty(), "an unbraced `$` names nothing");
     }
 
     #[test]
     fn ignores_malformed_placeholders() {
         // No closing brace, invalid name, empty name, stray brace.
-        assert!(template_keys("${A ${1BAD} ${} ${A{B}\n").is_empty());
+        assert!(template_keys("${A ${1BAD} ${} ${A{B}\n").is_empty(), "each form is malformed");
     }
 
     #[test]
@@ -195,8 +195,8 @@ mod tests {
 
     #[test]
     fn boundary_inputs_never_panic() {
-        assert!(template_keys("").is_empty());
-        assert!(template_keys("no placeholders here").is_empty());
+        assert!(template_keys("").is_empty(), "an empty template has no keys");
+        assert!(template_keys("no placeholders here").is_empty(), "plain text has no keys");
         assert!(template_keys("$").is_empty(), "a trailing lone dollar");
         assert!(template_keys("${").is_empty(), "unterminated opener");
         assert!(template_keys("${A").is_empty(), "missing closing brace");
@@ -216,7 +216,10 @@ mod tests {
         // A multi-byte char terminates the name scan without splitting it;
         // because the closing brace no longer immediately follows the name,
         // this is not a placeholder.
-        assert!(template_keys("${KEYé}=x").is_empty());
+        assert!(
+            template_keys("${KEYé}=x").is_empty(),
+            "the multi-byte char breaks the placeholder"
+        );
         // With the brace directly after the name, the multi-byte text that
         // follows is irrelevant.
         assert_eq!(template_keys("${KEY}é"), vec!["KEY"]);
@@ -334,11 +337,16 @@ mod tests {
                 .enumerate()
                 .map(|(i, k)| (k.clone(), vals[i % vals.len()].clone()))
                 .collect();
-            let template: String = keys.iter().map(|k| format!("<${{{k}}}>")).collect();
+            let mut template = String::new();
+            for k in &keys {
+                template.push_str(&format!("<${{{k}}}>"));
+            }
             let rendered = render_template(&template, &map).expect("all keys present");
-            let expected: String =
-                keys.iter().map(|k| format!("<{}>", map[k.as_str()])).collect();
-            proptest::prop_assert_eq!(rendered.clone(), expected);
+            let mut expected = String::new();
+            for k in &keys {
+                expected.push_str(&format!("<{}>", map[k.as_str()]));
+            }
+            proptest::prop_assert_eq!(rendered.as_str(), expected.as_str());
             // Values are plain words, so no placeholder survives rendering.
             proptest::prop_assert!(template_keys(&rendered).is_empty());
         }
@@ -351,7 +359,10 @@ mod tests {
             for n in &names {
                 if !keys.contains(n) { keys.push(n.clone()); }
             }
-            let template: String = keys.iter().map(|k| format!("${{{k}}}")).collect();
+            let mut template = String::new();
+            for k in &keys {
+                template.push_str(&format!("${{{k}}}"));
+            }
             let err = render_template(&template, &HashMap::new()).expect_err("no values");
             let mut expected = keys.clone();
             expected.sort();

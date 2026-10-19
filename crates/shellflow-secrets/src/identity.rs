@@ -24,8 +24,11 @@ pub const IDENTITY_ENV: &str = "SHELLFLOW_AGE_IDENTITY";
 #[must_use]
 pub fn expand_home(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
+    // An empty `$HOME` is treated as absent: `PathBuf::from("")` would make a
+    // `~/x` expansion fall back to the relative path `x`, which resolves
+    // against whatever directory happens to be current.
     if let Some(rest) = s.strip_prefix("~/") &&
-        let Some(home) = std::env::var_os("HOME")
+        let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
     {
         return PathBuf::from(home).join(rest);
     }
@@ -38,11 +41,17 @@ pub fn expand_home(path: &Path) -> PathBuf {
 /// A leading `~/` in the env var is expanded against `$HOME`.
 #[must_use]
 pub fn default_identity_path() -> PathBuf {
-    if let Some(env) = std::env::var_os(IDENTITY_ENV) {
+    if let Some(env) = std::env::var_os(IDENTITY_ENV).filter(|v| !v.is_empty()) {
         return expand_home(&PathBuf::from(env));
     }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".config/age/keys.txt")
+    // Without a usable `$HOME` there is no honest default: returning a
+    // relative `.config/age/keys.txt` would silently adopt whatever identity
+    // happens to sit in the current directory. Report the missing path
+    // instead, which surfaces as a clear "identity not found".
+    match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        Some(home) => PathBuf::from(home).join(".config/age/keys.txt"),
+        None => PathBuf::from(".config/age/keys.txt"),
+    }
 }
 
 /// Resolve the effective identity path: explicit `--identity` wins, then

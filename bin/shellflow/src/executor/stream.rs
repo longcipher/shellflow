@@ -29,6 +29,15 @@ where
 pub(super) enum PipedRun {
     Completed(std::process::ExitStatus),
     TimedOut,
+    /// The payload could not be delivered because the child closed its stdin
+    /// early (EPIPE).
+    ///
+    /// This is a **transport** condition, not a timeout: `ssh` exiting 255
+    /// (auth refused, host key rejected, connection reset) surfaces here.
+    /// Reporting it as `TimedOut` would send an operator chasing timeout
+    /// configuration instead of the real cause, and would break the exit-code
+    /// contract in design §6 (ssh 255 => exit 3, not exit 4).
+    PipeBroken,
 }
 
 /// Run a piped child with stdout/stderr forwarded through the UI, honoring
@@ -56,7 +65,7 @@ pub(super) async fn run_piped_child(
         crate::ui::warn(&format!("[{}] stdin write failed", host), log_file);
         super::process::terminate(&mut child).await;
         guard.disarm();
-        return Ok(PipedRun::TimedOut);
+        return Ok(PipedRun::PipeBroken);
     }
 
     let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("stdout not piped"))?;
@@ -89,7 +98,11 @@ pub(super) async fn run_piped_child(
                 Ok(Ok(status)) => Ok(PipedRun::Completed(status)),
                 Ok(Err(err)) => Err(eyre::eyre!("wait error: {err}")),
                 Err(_) => {
-                    read_task.abort();
+                    // Terminate first so closing the group closes the inherited
+                    // pipe ends, which lets both reader tasks see EOF and drain
+                    // what is already buffered. Aborting the consumer first
+                    // would discard those lines, breaking the `--log-file`
+                    // audit trail exactly when an operator needs it most.
                     super::process::terminate(&mut child).await;
                     guard.disarm();
                     Ok(PipedRun::TimedOut)
@@ -103,23 +116,39 @@ pub(super) async fn run_piped_child(
     };
     guard.disarm();
 
+    // Both streams are drained to EOF on every path, including the timeout
+    // path above: killing the group closes the inherited pipe ends, so the
+    // reader tasks finish on their own and joining them cannot hang.
     let _ = out_task.await;
     let _ = err_task.await;
     let _ = read_task.await;
     result
 }
 
+/// Collect per-host results, preserving the ones that completed.
+///
+/// A join error (a host task panicked or was aborted) must not discard the
+/// statuses of hosts that already finished — the caller renders those in the
+/// step summary, and dropping them would misreport the fan-out.
 pub(super) async fn collect_hosts(
     mut tasks: JoinSet<(String, HostOutcome)>,
 ) -> Result<Vec<(String, HostOutcome)>> {
     let mut results = Vec::with_capacity(tasks.len());
+    let mut first_join_error: Option<String> = None;
     while let Some(res) = tasks.join_next().await {
         match res {
             Ok(outcome) => results.push(outcome),
-            Err(join_err) => return Err(eyre::eyre!("host task failed: {join_err}")),
+            Err(join_err) => {
+                if first_join_error.is_none() {
+                    first_join_error = Some(join_err.to_string());
+                }
+            }
         }
     }
-    Ok(results)
+    match first_join_error {
+        Some(err) => Err(eyre::eyre!("host task failed: {err}")),
+        None => Ok(results),
+    }
 }
 
 #[cfg(test)]
@@ -153,6 +182,7 @@ mod tests {
         match result {
             PipedRun::Completed(status) => assert!(status.success()),
             PipedRun::TimedOut => panic!("should not time out"),
+            PipedRun::PipeBroken => panic!("should not break the pipe"),
         }
     }
 
@@ -174,6 +204,7 @@ mod tests {
         match result {
             PipedRun::Completed(status) => assert!(status.success()),
             PipedRun::TimedOut => panic!("should not time out"),
+            PipedRun::PipeBroken => panic!("should not break the pipe"),
         }
     }
 
@@ -194,6 +225,7 @@ mod tests {
         match result {
             PipedRun::Completed(_) => panic!("should have timed out"),
             PipedRun::TimedOut => {}
+            PipedRun::PipeBroken => panic!("should not break the pipe"),
         }
     }
 }

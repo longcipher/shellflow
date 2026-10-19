@@ -197,7 +197,7 @@ mod tests {
         #[test]
         fn ssh_argv_shape_is_fixed(
             spec in prop_oneof![
-                "[a-z0-9]([a-z0-9.-]{0,28}[a-z0-9])?".prop_map(|host| format!("{host}")),
+                "[a-z0-9]([a-z0-9.-]{0,28}[a-z0-9])?".prop_map(|host| host.to_owned()),
                 ("[a-z0-9.-]{1,20}", 1_u16..65535)
                     .prop_map(|(host, port)| format!("{host}:{port}")),
             ],
