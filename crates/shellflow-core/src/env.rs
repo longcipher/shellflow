@@ -1,7 +1,53 @@
-//! Shell-safe environment rendering and secret redaction helpers.
+//! Shell-safe environment rendering, `@export` capture parsing, and secret
+//! redaction helpers.
+//!
+//! [`render_env`] and [`parse_capture_records`] are the two halves of one
+//! protocol: the first renders the env header that precedes every payload, the
+//! second parses the `NAME=VALUE\0` records a local block writes back so that
+//! `@export` state survives a step boundary (design §7.6).
+
+use std::collections::BTreeMap;
+
+use crate::error::CaptureError;
 
 /// The placeholder used when redacting known secret values.
 pub const MASK: &str = "***";
+
+/// The record separator used by the `@export` capture file.
+///
+/// NUL — not `\n` — is deliberate. A shell variable may legally contain a
+/// newline, so a newline-delimited format lets one exported value forge
+/// another (and silently truncates a legitimately multi-line value). NUL
+/// cannot occur inside a shell value, which makes it an unambiguous record
+/// boundary that needs no escaping (design §7.6).
+pub const CAPTURE_SEPARATOR: u8 = 0;
+
+/// Parse the NUL-delimited `@export` capture records written by the runner.
+///
+/// Records have the form `NAME=VALUE\0`; empty records (including the trailing
+/// one after the final separator) are skipped. When a name repeats, the last
+/// record wins, matching bash `source` semantics.
+///
+/// # Errors
+///
+/// Returns [`CaptureError::MissingSeparator`] for a record without `=`, and
+/// [`CaptureError::NotUtf8`] when a name or value is not valid UTF-8.
+pub fn parse_capture_records(bytes: &[u8]) -> Result<BTreeMap<String, String>, CaptureError> {
+    let mut out = BTreeMap::new();
+    for record in bytes.split(|&b| b == CAPTURE_SEPARATOR) {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(eq) = record.iter().position(|&b| b == b'=') else {
+            return Err(CaptureError::MissingSeparator);
+        };
+        let (name, value) = record.split_at(eq);
+        let name = std::str::from_utf8(name).map_err(|_| CaptureError::NotUtf8)?;
+        let value = std::str::from_utf8(&value[1..]).map_err(|_| CaptureError::NotUtf8)?;
+        out.insert(name.to_string(), value.to_string());
+    }
+    Ok(out)
+}
 
 /// Single-quote a value for safe inclusion in a `bash` export line.
 ///
@@ -38,25 +84,35 @@ pub fn render_env(entries: &[(String, String)]) -> String {
     out
 }
 
-/// Redact a value by replacing every occurrence of known secrets with
-/// [`MASK`].
+/// Order and de-duplicate a mask set for [`mask_line`].
 ///
-/// Secrets are masked longest-first (and de-duplicated) so a value that is a
-/// prefix of another (e.g. `KEY=abc` vs `KEY_LONG=abcdef`) cannot leave the
-/// longer secret's tail exposed after the shorter one is replaced.
+/// Sorting longest-first is what stops a value that is a prefix of another
+/// (e.g. `abc` vs `abcdef`) from leaving the longer secret's tail exposed. It
+/// is done **once per run**, not once per output line: this function is on the
+/// hot path for every streamed line, and a playbook can register hundreds of
+/// `@secrets` values. The result is returned owned so the caller can store it
+/// directly and reuse it for the whole run.
 #[must_use]
-pub fn mask_line(line: &str, secrets: &[String]) -> String {
-    if secrets.is_empty() {
-        return line.to_string();
-    }
-    // Longest-first, de-duplicated, non-empty. Sorting a small list per line is
-    // cheap and keeps the masking order-independent of caller insertion order.
-    let mut ordered: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
+pub fn prepare_masks(secrets: &[String]) -> Vec<String> {
+    let mut ordered: Vec<&str> =
+        secrets.iter().filter(|s| !s.is_empty()).map(String::as_str).collect();
     ordered.sort_unstable_by_key(|a| std::cmp::Reverse(a.len()));
     ordered.dedup();
+    ordered.into_iter().map(ToOwned::to_owned).collect()
+}
+
+/// Redact every occurrence of the known secrets in `line` with [`MASK`].
+///
+/// `masks` **must** come from [`prepare_masks`] (longest-first, de-duplicated);
+/// an arbitrary slice does not satisfy that ordering.
+#[must_use]
+pub fn mask_line<S: AsRef<str>>(line: &str, masks: &[S]) -> String {
+    if masks.is_empty() {
+        return line.to_string();
+    }
     let mut out = line.to_string();
-    for secret in ordered {
-        out = out.replace(secret, MASK);
+    for secret in masks {
+        out = out.replace(secret.as_ref(), MASK);
     }
     out
 }
@@ -65,7 +121,66 @@ pub fn mask_line(line: &str, secrets: &[String]) -> String {
 mod tests {
     use proptest::prelude::{prop_assert, prop_assert_eq};
 
-    use super::{MASK, mask_line, render_env, shell_quote_single};
+    use super::{
+        CAPTURE_SEPARATOR, MASK, mask_line, parse_capture_records, prepare_masks, render_env,
+        shell_quote_single,
+    };
+
+    #[test]
+    fn parses_basic_capture_records() {
+        let records = b"VERSION=abc123\0SVC=myapp\0";
+        let parsed = parse_capture_records(records).expect("records parse");
+        assert_eq!(parsed.get("VERSION").map(String::as_str), Some("abc123"));
+        assert_eq!(parsed.get("SVC").map(String::as_str), Some("myapp"));
+    }
+
+    #[test]
+    fn capture_value_may_contain_newline_and_equals() {
+        // The reason the format is NUL-delimited: a newline inside one value
+        // must not truncate it, and must not look like a second record.
+        let records = b"A=first\nsecond=third\0B=x=y=z\0";
+        let parsed = parse_capture_records(records).expect("records parse");
+        assert_eq!(parsed.get("A").map(String::as_str), Some("first\nsecond=third"));
+        assert_eq!(parsed.get("B").map(String::as_str), Some("x=y=z"));
+        assert!(!parsed.contains_key("second"), "an embedded line must not become a record");
+    }
+
+    #[test]
+    fn capture_value_may_be_empty() {
+        let records = b"A=\0B=v\0";
+        let parsed = parse_capture_records(records).expect("records parse");
+        assert_eq!(parsed.get("A").map(String::as_str), Some(""));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn capture_empty_input_yields_empty_map() {
+        let parsed = parse_capture_records(b"").expect("empty input parses");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn capture_last_record_wins() {
+        let records = b"A=first\0A=second\0";
+        let parsed = parse_capture_records(records).expect("records parse");
+        assert_eq!(parsed.get("A").map(String::as_str), Some("second"));
+    }
+
+    #[test]
+    fn capture_missing_separator_is_an_error() {
+        assert!(matches!(
+            parse_capture_records(b"A=v\0NOSEP\0"),
+            Err(crate::error::CaptureError::MissingSeparator)
+        ));
+    }
+
+    #[test]
+    fn capture_invalid_utf8_is_an_error() {
+        let mut bytes = b"A=".to_vec();
+        bytes.push(0xff);
+        bytes.push(CAPTURE_SEPARATOR);
+        assert!(matches!(parse_capture_records(&bytes), Err(crate::error::CaptureError::NotUtf8)));
+    }
 
     #[test]
     fn quotes_plain_value() {
@@ -95,7 +210,8 @@ mod tests {
     #[test]
     fn masks_secret_occurrences() {
         let line = "export DB_PASSWORD='s3cr3t';";
-        let redacted = mask_line(line, &["s3cr3t".to_string()]);
+        let secrets = vec!["s3cr3t".to_string()];
+        let redacted = mask_line(line, &prepare_masks(&secrets));
         assert_eq!(redacted, "export DB_PASSWORD='***';");
     }
 
@@ -104,7 +220,8 @@ mod tests {
         // The shorter secret is a prefix of the longer one. Masking longest
         // first must not leave the longer secret's tail exposed.
         let line = "KEY=abcdef KEY_LONG=abcdefXYZ";
-        let redacted = mask_line(line, &["abcdef".to_string(), "abcdefXYZ".to_string()]);
+        let secrets = vec!["abcdef".to_string(), "abcdefXYZ".to_string()];
+        let redacted = mask_line(line, &prepare_masks(&secrets));
         assert_eq!(redacted, "KEY=*** KEY_LONG=***");
         assert!(!redacted.contains("XYZ"));
     }
@@ -112,13 +229,24 @@ mod tests {
     #[test]
     fn mask_dedups_repeated_values() {
         let line = "A=secret B=secret";
-        let redacted = mask_line(line, &["secret".to_string(), "secret".to_string()]);
+        let secrets = vec!["secret".to_string(), "secret".to_string()];
+        let redacted = mask_line(line, &prepare_masks(&secrets));
         assert_eq!(redacted, "A=*** B=***");
+        assert_eq!(prepare_masks(&secrets).len(), 1, "duplicate secrets must be collapsed once");
     }
 
     #[test]
     fn mask_ignores_empty_secret() {
-        assert_eq!(mask_line("hello", &[String::new()]), "hello");
+        let secrets = vec![String::new()];
+        assert_eq!(mask_line("hello", &prepare_masks(&secrets)), "hello");
+    }
+
+    #[test]
+    fn prepare_masks_is_order_independent() {
+        let forward = vec!["bbb".to_string(), "a".to_string(), "cc".to_string()];
+        let backward = vec!["cc".to_string(), "a".to_string(), "bbb".to_string()];
+        assert_eq!(prepare_masks(&forward), prepare_masks(&backward));
+        assert_eq!(prepare_masks(&forward), vec!["bbb", "cc", "a"], "longest first");
     }
 
     #[test]
@@ -149,6 +277,25 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// The capture protocol round-trips values containing the characters
+        /// that would break a newline- or `=`-delimited format: an exported
+        /// value can never forge a sibling record, and never truncates.
+        #[test]
+        fn capture_round_trips_delimiter_bearing_values(
+            (name, value) in ("[A-Za-z_][A-Za-z0-9_]{0,8}", "[^\0]{0,24}"),
+        ) {
+            let mut records = Vec::new();
+            records.extend_from_slice(name.as_bytes());
+            records.push(b'=');
+            records.extend_from_slice(value.as_bytes());
+            records.push(CAPTURE_SEPARATOR);
+
+            let parsed = parse_capture_records(&records)
+                .map_err(|e| proptest::prelude::TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(parsed.get(name.as_str()).map(String::as_str), Some(value.as_str()));
+            prop_assert_eq!(parsed.len(), 1, "exactly one record must be produced");
+        }
+
         /// Quoting is lossless: any value survives a shell round-trip, so a
         /// value containing `'`, spaces, or metacharacters reaches the remote
         /// byte-for-byte.
@@ -174,7 +321,7 @@ mod tests {
             let values: Vec<String> =
                 secrets.iter().map(|(marker, tail)| format!("s{marker}{tail}")).collect();
             let line = values.join(&filler);
-            let masked = mask_line(&line, &values);
+            let masked = mask_line(&line, &prepare_masks(&values));
             for secret in &values {
                 prop_assert!(
                     !masked.contains(secret.as_str()),
@@ -183,7 +330,8 @@ mod tests {
             }
             let mut reversed = values.clone();
             reversed.reverse();
-            prop_assert_eq!(&masked, &mask_line(&line, &reversed));
+            // `prepare_masks` must normalise order away, so both give the same line.
+            prop_assert_eq!(&masked, &mask_line(&line, &prepare_masks(&reversed)));
         }
 
         /// Masking twice is the same as masking once: an operator cannot
@@ -196,8 +344,9 @@ mod tests {
             let values: Vec<String> =
                 secrets.iter().map(|(marker, tail)| format!("s{marker}{tail}")).collect();
             let line = values.join(&filler);
-            let once = mask_line(&line, &values);
-            prop_assert_eq!(mask_line(&once, &values), once);
+            let masks = prepare_masks(&values);
+            let once = mask_line(&line, &masks);
+            prop_assert_eq!(mask_line(&once, &masks), once);
         }
 
         /// `render_env` emits exactly one `export` line per pair, keys are
@@ -218,7 +367,7 @@ mod tests {
                 prop_assert!(rendered.contains(&quoted));
             }
             let values: Vec<String> = entries.iter().map(|(_, v)| v.clone()).collect();
-            let masked = mask_line(&rendered, &values);
+            let masked = mask_line(&rendered, &prepare_masks(&values));
             for value in values.iter().filter(|v| !v.is_empty() && **v != MASK) {
                 prop_assert!(
                     !masked.contains(value.as_str()),

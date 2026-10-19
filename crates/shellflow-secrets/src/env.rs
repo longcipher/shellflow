@@ -33,12 +33,17 @@ fn strip_quotes(value: &str) -> String {
 /// are accepted). The first `=` splits the key from the value; a surrounding
 /// pair of matching quotes is stripped from the value.
 ///
+/// A repeated key keeps the **last** value and appears once, in the position
+/// of its first occurrence — matching bash `source` semantics and keeping the
+/// key list (`LT_SECRET_KEYS`, `secret creds`, `secret keys-check`) free of
+/// phantom duplicates.
+///
 /// # Errors
 ///
 /// Returns [`SecretsError::MalformedEnv`] when a line has no `=`, has an
 /// invalid variable name, or an `export` line has no assignment.
 pub fn parse_env_file(content: &str) -> Result<Vec<(String, String)>, SecretsError> {
-    let mut out = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
     for (idx, raw) in content.lines().enumerate() {
         let raw = raw.strip_suffix('\r').unwrap_or(raw);
         let line = raw.trim();
@@ -61,7 +66,12 @@ pub fn parse_env_file(content: &str) -> Result<Vec<(String, String)>, SecretsErr
                 reason: format!("invalid variable name `{key}`"),
             });
         }
-        out.push((key.to_string(), strip_quotes(value)));
+        let value = strip_quotes(value);
+        match out.iter_mut().find(|(k, _)| k == key) {
+            // Later assignment wins; the key keeps its original position.
+            Some(slot) => slot.1 = value,
+            None => out.push((key.to_string(), value)),
+        }
     }
     Ok(out)
 }
@@ -69,6 +79,17 @@ pub fn parse_env_file(content: &str) -> Result<Vec<(String, String)>, SecretsErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_key_keeps_the_last_value_once() {
+        // `source` semantics: the last assignment wins and the key appears
+        // once, so `secret creds` / `keys-check` see no phantom duplicates.
+        let parsed = parse_env_file("A=1\nB=2\nA=3\n").expect("parse");
+        assert_eq!(
+            parsed,
+            vec![("A".to_string(), "3".to_string()), ("B".to_string(), "2".to_string())]
+        );
+    }
 
     #[test]
     fn parses_basic_pairs() {

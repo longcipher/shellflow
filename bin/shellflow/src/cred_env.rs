@@ -22,18 +22,14 @@ use std::{
     ffi::OsStr,
     fs,
     io::Write as _,
-    os::unix::{
-        ffi::OsStrExt as _,
-        fs::{OpenOptionsExt as _, PermissionsExt as _},
-        process::CommandExt as _,
-    },
+    os::unix::{ffi::OsStrExt as _, process::CommandExt as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use eyre::{Context, Result, bail, eyre};
 
-use crate::cli::CredEnvCmd;
+use crate::{cli::CredEnvCmd, fsx::write_secret_file};
 
 /// `systemd` sets this for units that declare credentials.
 const CREDENTIALS_DIRECTORY: &str = "CREDENTIALS_DIRECTORY";
@@ -41,8 +37,6 @@ const CREDENTIALS_DIRECTORY: &str = "CREDENTIALS_DIRECTORY";
 const SECRET_KEYS_VAR: &str = "LT_SECRET_KEYS";
 /// Default root of the per-service host-key-bound credential store.
 const DEFAULT_STORE_ROOT: &str = "/etc/credstore.encrypted";
-/// Permission bits for rendered config files and the credential store.
-const SECRET_FILE_MODE: u32 = 0o600;
 
 /// Run a `cred-env` subcommand.
 ///
@@ -178,58 +172,6 @@ pub(crate) fn exec(command: &[String]) -> Result<()> {
     Err(eyre!("cred-env exec {program}: {error}"))
 }
 
-/// Write `bytes` to `path` with mode 0600 via a same-directory temp file and
-/// an atomic rename, so a reader never observes a partial render and the
-/// plaintext never exists under any other name.
-///
-/// The temp name carries pid + time-nanos + attempt counter and is created
-/// with `create_new` (no symlink following, no pre-plant race).
-fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent =
-        path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let base = path.file_name().map_or_else(|| "out".into(), |n| n.to_string_lossy().into_owned());
-    let pid = std::process::id();
-    // Try a few unpredictable names; `create_new` fails when the name (or a
-    // planted symlink at that name) already exists.
-    let mut last_err: Option<eyre::Report> = None;
-    for attempt in 0..10u128 {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(attempt, |d| d.as_nanos() ^ attempt);
-        let temp = parent.join(format!(".{base}.tmp.{pid}.{nonce}"));
-        let result = (|| -> Result<()> {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(SECRET_FILE_MODE)
-                .open(&temp)
-                .wrap_err_with(|| format!("cred-env: cannot create `{}`", temp.display()))?;
-            file.write_all(bytes).wrap_err("cred-env: cannot write render output")?;
-            file.flush().wrap_err("cred-env: cannot flush render output")?;
-            drop(file);
-            fs::set_permissions(&temp, fs::Permissions::from_mode(SECRET_FILE_MODE)).ok();
-            fs::rename(&temp, path).wrap_err_with(|| {
-                format!("cred-env: cannot move render into `{}`", path.display())
-            })?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                let _ = fs::remove_file(&temp);
-                // Retry only on collision; other I/O errors fail immediately.
-                let msg = format!("{err:#}");
-                if msg.contains("already exists") || msg.contains("File exists") {
-                    last_err = Some(err);
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| eyre!("cred-env: cannot create temp file")))
-}
-
 /// Render `${KEY}` placeholders from `$CREDENTIALS_DIRECTORY` into `output`.
 ///
 /// Fails closed: if any referenced credential is missing (or not valid
@@ -290,10 +232,60 @@ pub(crate) fn credstore_install(service: &str, store_dir: Option<&Path>) -> Resu
     let keys: Vec<String> =
         raw_keys.to_string_lossy().split_whitespace().map(ToOwned::to_owned).collect();
 
-    sudo(&["install", "-d", "-m", "0700", &store])?;
-    sudo(&["find", &store, "-mindepth", "1", "-delete"])?;
+    // Build the whole new store beside the live one, then swap it in. The
+    // previous behaviour cleared `/etc/credstore.encrypted/<svc>/` first, so a
+    // failure part-way through (full disk, missing `systemd-creds`, expired
+    // sudo) left the service with an empty or half-written credential store
+    // and every unit depending on it broken.
+    let store = PathBuf::from(&store);
+    let staging = store.with_file_name(format!(
+        "{}.new",
+        store.file_name().map_or_else(|| "store".into(), |n| n.to_string_lossy().into_owned())
+    ));
 
-    for key in &keys {
+    sudo(&["install", "-d", "-m", "0700", &store.to_string_lossy()])?;
+    let _ = fs::remove_dir_all(&staging);
+    sudo(&["install", "-d", "-m", "0700", &staging.to_string_lossy()])?;
+
+    let seal_result = seal_all(&keys, &staging);
+    if let Err(err) = seal_result {
+        // The live store was never touched; drop the partial staging tree.
+        let _ = fs::remove_dir_all(&staging);
+        return Err(err);
+    }
+
+    // Every credential is sealed: swap atomically by renaming the old store
+    // aside, moving staging into place, then deleting the old tree.
+    let retired = store.with_extension("old");
+    let _ = fs::remove_dir_all(&retired);
+    let had_previous = store.exists();
+    if had_previous && fs::rename(&store, &retired).is_err() {
+        let _ = fs::remove_dir_all(&staging);
+        bail!(
+            "cred-env credstore-install: cannot retire the previous store at `{}`",
+            store.display()
+        );
+    }
+    if let Err(err) = fs::rename(&staging, &store) {
+        // Put the previous store back so the service is never left without one.
+        if had_previous {
+            let _ = fs::rename(&retired, &store);
+        }
+        let _ = fs::remove_dir_all(&staging);
+        bail!(
+            "cred-env credstore-install: cannot install the new store at `{}`: {err}",
+            store.display()
+        );
+    }
+    let _ = fs::remove_dir_all(&retired);
+    Ok(())
+}
+
+/// Seal every key in `keys` into `store`, one `systemd-creds encrypt` per key.
+///
+/// Values travel on stdin — never argv, never a temporary file.
+fn seal_all(keys: &[String], store: &Path) -> Result<()> {
+    for key in keys {
         if !is_valid_var_name(key) {
             bail!("cred-env credstore-install: invalid credential key `{key}`");
         }
@@ -305,14 +297,14 @@ pub(crate) fn credstore_install(service: &str, store_dir: Option<&Path>) -> Resu
         if value.is_empty() {
             bail!("cred-env credstore-install: credential `{key}` is empty");
         }
-        let path = format!("{store}/{key}");
+        let store_arg = store.to_string_lossy().into_owned();
+        let path = format!("{store_arg}/{key}");
         let mut child = Command::new("sudo")
             .args(["systemd-creds", "encrypt", "--with-key=host", "--name", key, "-", &path])
             .stdin(Stdio::piped())
             .spawn()
             .wrap_err("cred-env credstore-install: cannot run `sudo systemd-creds encrypt`")?;
-        if let Some(stdin) = child.stdin.take() {
-            let mut stdin = stdin;
+        if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(value.as_bytes())
                 .wrap_err("cred-env: cannot write to systemd-creds stdin")?;

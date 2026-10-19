@@ -8,7 +8,7 @@ use shellflow_core::{EnvEntry, LocalStep, RunState};
 use tokio::{fs, process::Command, sync::Mutex};
 
 use super::{
-    ArcUi, HostOutcome, LocalBlockArgs, LogFile, StepConfig,
+    ArcUi, CaptureFile, HostOutcome, LocalBlockArgs, LogFile, StepConfig,
     process::{GroupGuard, isolate},
 };
 
@@ -37,6 +37,13 @@ pub(super) async fn build_env(
     env
 }
 
+/// Append the `@export` capture statements to a local block.
+///
+/// Records are NUL-delimited (`NAME=VALUE\0`), matching design §7.6. NUL is
+/// the only delimiter a shell value cannot contain, so a value carrying a
+/// newline cannot forge a sibling record or be silently truncated; no
+/// escaping is needed. A NUL-separated record also matches the `parse_capture_records`
+/// pure parser in `shellflow-core`, which is where the reading side is tested.
 fn append_capture(script: &str, vars: &[String]) -> String {
     let mut out = String::with_capacity(script.len() + 64 * vars.len());
     out.push_str(script);
@@ -44,33 +51,37 @@ fn append_capture(script: &str, vars: &[String]) -> String {
         out.push('\n');
     }
     for var in vars {
+        // `printf` interprets `\0` as NUL in the format string; the values are
+        // passed as arguments, so `%`/backslash in them are never re-scanned.
         out.push_str(&format!(
-            "printf '%s=%s\\n' \"{var}\" \"${{{var}}}\" >> \"$SHELLFLOW_CAPTURE\"\n"
+            "printf '%s=%s\\0' \"{var}\" \"${{{var}}}\" >> \"$SHELLFLOW_CAPTURE\"\n"
         ));
     }
     out
 }
 
+/// Read the NUL-delimited capture file into the run state, then let the
+/// [`CaptureFile`] guard delete it.
+///
+/// Deletion is the guard's job (see [`CaptureFile`]), so every early return
+/// here — including the "variable was not exported" error — still cleans up.
 pub(crate) async fn capture_exports(
     run_state: &Arc<Mutex<RunState>>,
     vars: &[String],
-    path: &Path,
+    capture: &super::CaptureFile,
 ) -> Result<()> {
-    let content = fs::read_to_string(path)
+    let content = fs::read(capture.path())
         .await
-        .wrap_err_with(|| format!("failed to read capture file {}", path.display()))?;
-    let _ = fs::remove_file(path).await;
+        .wrap_err_with(|| format!("failed to read capture file {}", capture.path().display()))?;
+    let table = shellflow_core::parse_capture_records(&content)
+        .wrap_err("failed to parse `@export` capture records")?;
+
     let mut state = run_state.lock().await;
     for var in vars {
-        let value = content
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{var}=")).map(ToOwned::to_owned));
-        match value {
-            Some(value) => {
-                state.vars.insert(var.clone(), value);
-            }
-            None => return Err(eyre::eyre!("variable `{var}` was not exported by the local step")),
-        }
+        let Some(value) = table.get(var.as_str()) else {
+            return Err(eyre::eyre!("variable `{var}` was not exported by the local step"));
+        };
+        state.vars.insert(var.clone(), value.clone());
     }
     Ok(())
 }
@@ -116,13 +127,15 @@ pub(super) async fn run_local_block(args: &LocalBlockArgs<'_>) -> Result<()> {
     };
     cmd.arg(format!("{header}{body}"));
 
-    let capture_path = if args.capture.is_empty() {
+    // The guard owns the capture file's lifetime: whether the step succeeds,
+    // fails, or the capture cannot be parsed, the plaintext file is removed.
+    let capture = if args.capture.is_empty() {
         None
     } else {
         let path = super::capture_file_path();
         create_capture_file(&path)?;
         cmd.env("SHELLFLOW_CAPTURE", &path);
-        Some(path)
+        Some(CaptureFile::new(path))
     };
 
     if args.config.verbose >= 2 {
@@ -136,8 +149,8 @@ pub(super) async fn run_local_block(args: &LocalBlockArgs<'_>) -> Result<()> {
         bail!("local script exited with status {status}");
     }
 
-    if let Some(path) = capture_path {
-        capture_exports(args.run_state, args.capture, &path).await?;
+    if let Some(capture) = &capture {
+        capture_exports(args.run_state, args.capture, capture).await?;
     }
     Ok(())
 }
@@ -236,6 +249,11 @@ async fn run_bash_streamed(
         super::stream::PipedRun::Completed(status) => Ok(status),
         super::stream::PipedRun::TimedOut => {
             bail!("local step timed out");
+        }
+        // The local child died before reading its script: a spawn-level or
+        // script-delivery failure, not a timeout.
+        super::stream::PipedRun::PipeBroken => {
+            bail!("local script could not be delivered to bash");
         }
     }
 }

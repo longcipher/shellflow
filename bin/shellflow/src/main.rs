@@ -7,11 +7,18 @@
 
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
+// The workspace denies `panic`/`unwrap`/`expect` in production code; the unit
+// test modules use them pervasively and opt out explicitly rather than
+// relying on the lint gate skipping test targets. `pedantic` is scoped the
+// same way — see `shellflow-core` for the rationale.
+#![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(test, allow(clippy::pedantic, clippy::nursery))]
 
 mod cli;
 mod cred_env;
 mod emit;
 mod executor;
+mod fsx;
 mod keys;
 mod preflight;
 mod secret;
@@ -59,7 +66,7 @@ async fn main() -> Result<()> {
             }
         },
         Some(Command::Template(cmd)) => {
-            let ui = ui::Ui::new(0, false, cli::OutputMode::Stream, None);
+            let ui = ui::Ui::new(0, cli.run.flags.no_color, cli::OutputMode::Stream, None);
             match template::run(&cmd.command, &ui) {
                 Ok(()) => 0,
                 Err(err) => {

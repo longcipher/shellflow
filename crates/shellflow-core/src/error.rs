@@ -84,3 +84,23 @@ pub enum InterpolateError {
         template: String,
     },
 }
+
+/// Errors produced while parsing the NUL-delimited `@export` capture file
+/// written by the runner (design §7.6).
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum CaptureError {
+    /// A record carried no `=` separator.
+    #[error("malformed `@export` capture record: missing `=` separator")]
+    MissingSeparator,
+
+    /// A record name or value was not valid UTF-8.
+    #[error("malformed `@export` capture record: not valid UTF-8")]
+    NotUtf8,
+
+    /// A record named a variable that was not listed in `@export`.
+    #[error("malformed `@export` capture record: unexpected variable `{name}`")]
+    UnexpectedVar {
+        /// The name found in the capture file.
+        name: String,
+    },
+}

@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use super::{
-    ArcUi, CopyStepArgs, HostOutcome, LogFile, ShellCache, StepConfig,
+    ArcUi, CopyStepArgs, HostOutcome, LogFile, ShellCache, StepConfig, fanout_slot,
     local::{build_env, run_local_block, run_local_guard},
     process::{GroupGuard, isolate},
     stream,
@@ -448,10 +448,8 @@ pub(super) async fn run_remote_step(
         let secrets = Arc::clone(ctx.secrets);
         let log_file = ctx.log_file.clone();
         tasks.spawn(async move {
-            let _permit = match &semaphore {
-                Some(semaphore) => Arc::clone(semaphore).acquire_owned().await.ok(),
-                None => None,
-            };
+            // Never run unthrottled when the semaphore is closed.
+            let _permit = fanout_slot!(&semaphore, &log_file, host);
             run_remote_host(ui, &host, &parts, config, shell_cache, &secrets, &log_file).await
         });
     }
@@ -707,9 +705,21 @@ async fn run_remote_guard(
         Err(_) => return GuardResult::Transport,
     };
     let mut group = GroupGuard::new(&child);
-    if let Some(mut stdin) = child.stdin.take() {
-        let script = format!("set -e\n{}{guard}\n", render_env(env));
-        let _ = stdin.write_all(script.as_bytes()).await;
+    // Fail closed: a guard that could not be delivered must never be reported
+    // as `Pass`. If the write fails, stdin drops, the remote shell reads an
+    // empty script and exits 0 — which would otherwise mark an *unevaluated*
+    // precondition as satisfied and release the block.
+    let delivered = match child.stdin.take() {
+        Some(mut stdin) => {
+            let script = format!("set -e\n{}{guard}\n", render_env(env));
+            stdin.write_all(script.as_bytes()).await.is_ok()
+        }
+        None => false,
+    };
+    if !delivered {
+        super::process::terminate(&mut child).await;
+        group.disarm();
+        return GuardResult::Transport;
     }
     let wait = match timeout {
         Some(secs) => tokio::time::timeout(Duration::from_secs(secs), child.wait()).await,
@@ -721,6 +731,10 @@ async fn run_remote_guard(
         Ok(Ok(_)) => GuardResult::Fail,
         _ => {
             super::process::terminate(&mut child).await;
+            // `terminate` reaps the child, so its pgid is released: disarm or
+            // the guard's drop would SIGKILL a pgid the OS may already have
+            // recycled onto an unrelated process group.
+            group.disarm();
             GuardResult::Transport
         }
     };
@@ -753,5 +767,8 @@ async fn run_ssh_child(
             Ok(())
         }
         stream::PipedRun::TimedOut => Err(SshOutcome::TimedOut),
+        // A broken stdin pipe means the transport died (auth refused, host
+        // key rejected, reset), not that the step ran out of time: exit 3.
+        stream::PipedRun::PipeBroken => Err(SshOutcome::Transport),
     }
 }

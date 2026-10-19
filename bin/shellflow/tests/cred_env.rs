@@ -5,10 +5,16 @@
 //! binary; these tests exercise the *emitted bytes* exactly as a target would
 //! run them, against a fake `$CREDENTIALS_DIRECTORY`.
 
+// The workspace denies `panic`/`unwrap`/`expect` in production code; this file
+// is an integration-test crate, so it opts out explicitly rather than relying
+// on the lint gate silently skipping test targets.
+#![allow(clippy::pedantic, clippy::nursery)]
+#![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+
 use std::{
     env, fs,
     os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Output},
 };
 
@@ -416,10 +422,6 @@ fn template_check_resolves_identity_from_env() -> TestResult<()> {
     Ok(())
 }
 
-/// Keep `Path` in scope for the helper signature above.
-#[allow(dead_code)]
-fn _path_marker(_: &Path) {}
-
 // ---------------------------------------------------------------------------
 // cred-env subcommands (the Rust binary on the target)
 //
@@ -698,13 +700,26 @@ fn credstore_install_seals_every_key() -> TestResult<()> {
     assert!(log.contains("--name ZENOH_USER"), "cred name missing from systemd-creds call: {log}");
     assert!(!log.contains("p@ss|w"), "secret leaked into argv: {log}");
     assert!(!log.contains("op&user"), "secret leaked into argv: {log}");
-    assert!(log.contains("find"), "the store must be cleared first: {log}");
+    // The live store is sealed into a staging directory first and swapped in
+    // only once every credential succeeded, so the new store must appear in
+    // the systemd-creds calls.
+    assert!(
+        log.contains("zenoh.new"),
+        "credentials must be sealed into a staging store before the swap: {log}"
+    );
+    assert!(
+        !log.contains("find "),
+        "the store must not be wiped up front (a failed seal would empty it): {log}"
+    );
+    // No staging or retired tree may be left behind.
+    assert!(!store.join("zenoh.new").exists(), "staging store must be renamed into place");
+    assert!(!store.join("zenoh.old").exists(), "retired store must be removed");
     let _ = fs::remove_dir_all(&store);
     Ok(())
 }
 
 #[test]
-fn credstore_install_clears_the_store_first() -> TestResult<()> {
+fn credstore_install_replaces_the_store_wholesale() -> TestResult<()> {
     let stub = SudoStub::new("clear")?;
     let store = std::env::temp_dir().join(format!("shellflow-store-clear-{}", std::process::id()));
     let _ = fs::remove_dir_all(&store);
@@ -720,6 +735,41 @@ fn credstore_install_clears_the_store_first() -> TestResult<()> {
     assert_eq!(status(&out), 0, "install failed: {}", String::from_utf8_lossy(&out.stderr));
     assert!(!store.join("zenoh").join("STALE_KEY").exists(), "stale credential must be cleared");
     assert!(store.join("zenoh").join("FRESH_KEY").exists(), "fresh credential must be written");
+    let _ = fs::remove_dir_all(&store);
+    Ok(())
+}
+
+#[test]
+fn credstore_install_keeps_the_live_store_when_a_seal_fails() -> TestResult<()> {
+    // The critical safety property: sealing happens into a staging store, so a
+    // mid-way failure must leave the previous store fully intact rather than
+    // empty or half-written (which would break every unit that depends on it).
+    let stub = SudoStub::new("partial")?;
+    let store =
+        std::env::temp_dir().join(format!("shellflow-store-partial-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&store);
+    let store_dir = store.join("zenoh");
+    fs::create_dir_all(&store_dir).map_err(|e| e.to_string())?;
+    fs::write(store_dir.join("EXISTING"), "previous-good-value").map_err(|e| e.to_string())?;
+
+    let out = stub
+        .command(&["zenoh", "--store-dir", store_dir.to_str().expect("utf8")])
+        .env("LT_SECRET_KEYS", "GOOD_KEY MISSING_KEY")
+        .env("GOOD_KEY", "v")
+        .output()
+        .map_err(|e| e.to_string())?;
+    assert_ne!(status(&out), 0, "a missing credential must abort the install");
+    assert!(store_dir.join("EXISTING").exists(), "the live store must survive a failed install");
+    assert_eq!(
+        fs::read_to_string(store_dir.join("EXISTING")).map_err(|e| e.to_string())?,
+        "previous-good-value",
+        "the previous store must be byte-identical after a failed install"
+    );
+    assert!(
+        !store_dir.join("GOOD_KEY").exists(),
+        "a partially sealed credential must not leak into the live store"
+    );
+    assert!(!store.join("zenoh.new").exists(), "the staging store must be cleaned up");
     let _ = fs::remove_dir_all(&store);
     Ok(())
 }

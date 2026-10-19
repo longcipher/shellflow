@@ -1,7 +1,7 @@
 //! Single-pass line scanner that turns a Bash deploy script into an
 //! [`ExecutionPlan`].
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     error::ParseError,
@@ -91,7 +91,7 @@ impl State {
         let guard = self.pending_guard.take();
         let timeout = self.pending_timeout.take();
         let export = std::mem::take(&mut self.pending_export);
-        let env = self.plan.env.clone();
+        let env = Arc::clone(&self.plan.env).as_ref().clone();
 
         let step = match self.mode {
             Mode::Local => Step::Local(LocalStep { name, script, guard, timeout, export, env }),
@@ -316,7 +316,7 @@ impl State {
             }
             EnvEntry::Passthrough { key: payload.to_string() }
         };
-        self.plan.env.push(entry);
+        Arc::make_mut(&mut self.plan.env).push(entry);
         Ok(())
     }
 
@@ -397,7 +397,7 @@ impl State {
         }
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
-        let env = self.plan.env.clone();
+        let env = self.plan.env.as_ref().clone();
 
         let (src, rest) = payload.split_once("->").ok_or_else(|| ParseError::InvalidDirective {
             line,

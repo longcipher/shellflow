@@ -3,7 +3,7 @@
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
@@ -17,10 +17,16 @@ use shellflow_secrets::{
     identity::{effective_identity_path, load_x25519_identity},
 };
 
-use crate::cli::{
-    SecretCmd, SecretCredsArgs, SecretDecryptArgs, SecretEditArgs, SecretEncryptArgs,
-    SecretKeysCheckArgs,
+use crate::{
+    cli::{
+        SecretCmd, SecretCredsArgs, SecretDecryptArgs, SecretEditArgs, SecretEncryptArgs,
+        SecretKeysCheckArgs,
+    },
+    fsx::write_secret_file,
 };
+
+/// Owner-only mode for the temporary plaintext buffer `secret edit` stages.
+const SECRET_FILE_MODE: u32 = 0o600;
 
 /// Run a `secret` subcommand.
 ///
@@ -89,37 +95,47 @@ fn read_input(file: Option<&Path>) -> Result<Vec<u8>, SecretsError> {
     }
 }
 
-fn write_output(output: Option<&Path>, data: &[u8]) -> Result<(), SecretsError> {
-    if let Some(path) = output {
-        fs::write(path, data).map_err(|source| SecretsError::WriteIdentity {
-            path: path.display().to_string(),
-            source,
-        })
-    } else {
+/// Write command output: a file when `-o` is given, stdout otherwise.
+///
+/// A file destination goes through [`write_secret_file`], which creates it
+/// `0600` and renames it into place. Plain `fs::write` would produce
+/// `0666 & ~umask` — typically world-readable `0644` — which is unacceptable
+/// for decrypted secrets, and would truncate an existing file before writing.
+fn write_output(output: Option<&Path>, data: &[u8]) -> Result<()> {
+    let Some(path) = output else {
         // Write exact bytes: no trailing newline. Appending `\n` would corrupt
         // binary age ciphertext on `encrypt > out.age` and change `decrypt`
         // output bytes.
         let mut out = std::io::stdout().lock();
-        out.write_all(data).map_err(|source| SecretsError::ReadInput { source })
-    }
+        return out.write_all(data).wrap_err("failed to write to stdout");
+    };
+    write_secret_file(path, data).wrap_err_with(|| format!("failed to write `{}`", path.display()))
 }
 
 fn encrypt(args: &SecretEncryptArgs) -> Result<()> {
     let plain = read_input(args.file.as_deref())?;
     let recipients = collect_recipients(&args.recipients, args.recipients_dir.as_deref())?;
     let cipher = encrypt_bytes(&plain, &recipients).map_err(eyre::Report::msg)?;
-    write_output(args.output.as_deref(), &cipher).map_err(eyre::Report::msg)?;
+    write_output(args.output.as_deref(), &cipher)?;
     Ok(())
 }
 
 fn decrypt(args: &SecretDecryptArgs) -> Result<()> {
     let cipher = read_input(args.file.as_deref())?;
-    let id_path = effective_identity_path(args.identity.as_deref());
-    let identity = load_x25519_identity(&id_path)
-        .map_err(|err| eyre!("{err} (identity: {})", id_path.display()))?;
+    let identity = load_identity(args.identity.as_deref())?;
     let plain = decrypt_bytes(&cipher, &identity).map_err(eyre::Report::msg)?;
-    write_output(args.output.as_deref(), &plain).map_err(eyre::Report::msg)?;
+    write_output(args.output.as_deref(), &plain)?;
     Ok(())
+}
+
+/// Load the X25519 identity for the effective `-i` / `$SHELLFLOW_AGE_IDENTITY` /
+/// `~/.config/age/keys.txt` path.
+///
+/// Shared by every subcommand that decrypts, so the identity path is resolved
+/// and reported the same way everywhere.
+pub(crate) fn load_identity(explicit: Option<&Path>) -> Result<age::x25519::Identity> {
+    let id_path = effective_identity_path(explicit);
+    load_x25519_identity(&id_path).map_err(|err| eyre!("{err} (identity: {})", id_path.display()))
 }
 
 /// Run the user's editor on a file without invoking a shell.
@@ -149,44 +165,93 @@ fn run_editor(path: &Path) -> Result<()> {
 }
 
 fn edit(args: &SecretEditArgs) -> Result<()> {
+    // Resolve and validate recipients FIRST (design §S3.2, §S8: `secret edit`
+    // "fails fast" when none are given). Doing it after decryption would write
+    // plaintext to disk, open the editor, and only then throw the user's work
+    // away.
+    let recipients = collect_recipients(&args.recipients, args.recipients_dir.as_deref())
+        .map_err(eyre::Report::msg)?;
+    if recipients.is_empty() {
+        bail!(
+            "no recipients given: re-encrypting without them would drop every operator \
+             (use `-r age1...` or `--recipients-dir`)"
+        );
+    }
+
     let cipher = read_input(Some(&args.file))?;
-    let id_path = effective_identity_path(args.identity.as_deref());
-    let identity = load_x25519_identity(&id_path)
-        .map_err(|err| eyre!("{err} (identity: {})", id_path.display()))?;
+    let identity = load_identity(args.identity.as_deref())?;
     let plain = decrypt_bytes(&cipher, &identity).map_err(eyre::Report::msg)?;
 
-    let temp = temp_plaintext_path();
-    write_temp_plaintext(&temp, &plain).wrap_err("failed to write temporary plaintext")?;
+    // The staging file holds plaintext, so its lifetime is bound to a guard
+    // rather than to the happy path: a failed editor or a failed re-encrypt
+    // must still remove it.
+    let temp = TempPlaintext(temp_plaintext_path());
+    temp.write(&plain).wrap_err("failed to write temporary plaintext")?;
 
+    let temp_path = temp.path().to_path_buf();
     let result = (|| -> Result<()> {
-        run_editor(&temp)?;
-        let edited = fs::read(&temp).wrap_err("failed to read edited plaintext")?;
+        run_editor(&temp_path)?;
+        let edited = fs::read(&temp_path).wrap_err("failed to read edited plaintext")?;
         // Validate before re-encrypting: a malformed edit must fail while the
         // editor just exited (pointing at the temp file), not at the next
         // deploy's `@secrets` parse step.
         validate_plaintext_env(&edited)?;
-        let recipients = collect_recipients(&args.recipients, args.recipients_dir.as_deref())
-            .map_err(eyre::Report::msg)?;
-        if recipients.is_empty() {
-            bail!(
-                "no recipients given: re-encrypting without them would drop every operator \
-                 (use `-r age1...` or `--recipients-dir`)"
-            );
-        }
         let cipher = encrypt_bytes(&edited, &recipients).map_err(eyre::Report::msg)?;
-        fs::write(&args.file, &cipher).wrap_err("failed to write encrypted file")?;
+        // Atomic rename: the original ciphertext stays intact and readable if
+        // anything below fails. A plain `fs::write` would truncate the only
+        // copy before the new bytes landed.
+        write_secret_file(&args.file, &cipher)
+            .wrap_err_with(|| format!("failed to write `{}`", args.file.display()))?;
         Ok(())
     })();
 
-    let _ = fs::remove_file(&temp);
+    // `TempPlaintext` removes the staging file on drop, so every early return
+    // above still leaves no plaintext behind.
+    drop(temp);
     result
+}
+
+/// Owns a temporary plaintext file for its whole lifetime.
+///
+/// Cleanup is attached to `Drop` rather than to the success path: the
+/// operation that uses this buffer can fail in several ways (editor missing,
+/// editor non-zero, malformed edit, encryption failure), and every one of them
+/// must leave no plaintext behind.
+struct TempPlaintext(PathBuf);
+
+impl TempPlaintext {
+    /// Create the staging file and write `plain` into it, owner-only.
+    fn write(&self, plain: &[u8]) -> Result<()> {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_FILE_MODE)
+            .open(&self.0)
+            .wrap_err_with(|| format!("cannot create `{}`", self.0.display()))?;
+        file.write_all(plain).wrap_err("cannot write temporary plaintext")?;
+        file.flush().wrap_err("cannot flush temporary plaintext")?;
+        Ok(())
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempPlaintext {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_file(&self.0) &&
+            err.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("warning: failed to remove temporary plaintext {}: {err}", self.0.display());
+        }
+    }
 }
 
 fn creds(args: &SecretCredsArgs) -> Result<()> {
     let cipher = read_input(Some(&args.file))?;
-    let id_path = effective_identity_path(args.identity.as_deref());
-    let identity = load_x25519_identity(&id_path)
-        .map_err(|err| eyre!("{err} (identity: {})", id_path.display()))?;
+    let identity = load_identity(args.identity.as_deref())?;
     let plain = decrypt_bytes(&cipher, &identity).map_err(eyre::Report::msg)?;
     let plain = String::from_utf8(plain).wrap_err("decrypted file is not valid UTF-8")?;
     for (key, _) in parse_env_file(&plain).map_err(eyre::Report::msg)? {
@@ -218,29 +283,36 @@ fn creds(args: &SecretCredsArgs) -> Result<()> {
 fn keys_check(args: &SecretKeysCheckArgs) -> Result<()> {
     // Structural validation first: a typo'd or empty directory should be
     // reported without touching identity resolution.
-    let mut files: Vec<PathBuf> = fs::read_dir(&args.dir)
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(&args.dir)
         .wrap_err_with(|| format!("failed to read service directory `{}`", args.dir.display()))?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension().is_some_and(|ext| ext == "age") &&
-                path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".env.age"))
-        })
-        .collect();
+    {
+        // An unreadable entry must not vanish: dropping it silently would let
+        // this command report "N host(s) share the same key set" while having
+        // checked fewer hosts than exist — the exact drift it exists to catch.
+        let entry = entry
+            .wrap_err_with(|| format!("failed to read an entry in `{}`", args.dir.display()))?;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "age") &&
+            path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".env.age"))
+        {
+            files.push(path);
+        }
+    }
     files.sort();
     if files.is_empty() {
         bail!("no *.env.age files under `{}`", args.dir.display());
     }
 
-    let id_path = effective_identity_path(args.identity.as_deref());
-    let identity = load_x25519_identity(&id_path)
-        .map_err(|err| eyre!("{err} (identity: {})", id_path.display()))?;
+    let identity = load_identity(args.identity.as_deref())?;
 
     let mut reference: Option<(String, Vec<String>)> = None;
     for file in &files {
         let host = file
             .file_name()
-            .map_or_default(|n| n.to_string_lossy().trim_end_matches(".env.age").to_string());
+            .map(|n| n.to_string_lossy())
+            .and_then(|n| n.strip_suffix(".env.age").map(ToOwned::to_owned))
+            .unwrap_or_else(|| file.display().to_string());
         let cipher =
             fs::read(file).wrap_err_with(|| format!("failed to read `{}`", file.display()))?;
         let plain = decrypt_bytes(&cipher, &identity)
@@ -248,11 +320,14 @@ fn keys_check(args: &SecretKeysCheckArgs) -> Result<()> {
         let plain = String::from_utf8(plain)
             .wrap_err_with(|| format!("`{}` is not valid UTF-8", file.display()))?;
         let mut keys: Vec<String> = parse_env_file(&plain)
-            .map_err(eyre::Report::msg)?
+            .map_err(|err| eyre!("`{}`: {err}", file.display()))?
             .into_iter()
             .map(|(key, _)| key)
             .collect();
+        // A repeated key in one file is one credential, not two: leaving the
+        // duplicate in would report drift against a host that has the key once.
         keys.sort();
+        keys.dedup();
         if keys.is_empty() {
             bail!("`{}` contains no keys", file.display());
         }
@@ -286,26 +361,6 @@ fn temp_plaintext_path() -> PathBuf {
     std::env::temp_dir().join(format!("shellflow-edit-{}-{nonce}.env", std::process::id()))
 }
 
-/// Write the plaintext edit buffer with owner-only permissions.
-///
-/// `fs::write` would create the file `0666 & ~umask` (typically world-readable
-/// `0644`), but the buffer holds decrypted secrets, so it is created `0600`
-/// with `create_new` (no symlink following, no pre-plant race).
-///
-/// # Errors
-///
-/// Returns an I/O error when the file cannot be created or written.
-fn write_temp_plaintext(path: &Path, plain: &[u8]) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .wrap_err_with(|| format!("failed to create {}", path.display()))?;
-    file.write_all(plain).wrap_err("failed to write temporary plaintext")?;
-    Ok(())
-}
-
 /// Validate edited plaintext as an env file before re-encrypting it.
 ///
 /// # Errors
@@ -322,7 +377,7 @@ fn validate_plaintext_env(bytes: &[u8]) -> Result<()> {
 mod tests {
     use std::{
         fs,
-        os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+        os::unix::fs::PermissionsExt as _,
         path::{Path, PathBuf},
     };
 
@@ -331,7 +386,7 @@ mod tests {
     use super::{
         SecretCredsArgs, SecretDecryptArgs, SecretEditArgs, SecretEncryptArgs, SecretKeysCheckArgs,
         collect_recipients, creds, decrypt, edit, encrypt, keys_check, run_editor,
-        temp_plaintext_path, validate_plaintext_env, write_temp_plaintext,
+        temp_plaintext_path, validate_plaintext_env,
     };
 
     /// Serializes tests that mutate process-global env vars (`VISUAL`,
@@ -407,9 +462,49 @@ mod tests {
     fn temp_plaintext_is_owner_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("edit.env");
-        write_temp_plaintext(&path, b"KEY=value\n").expect("write temp plaintext");
+        let temp = super::TempPlaintext(path.clone());
+        temp.write(b"KEY=value\n").expect("write temp plaintext");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "edit buffer must be 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn temp_plaintext_is_removed_when_dropped() {
+        // The guard owns cleanup: a failed edit must leave no plaintext behind.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("edit.env");
+        {
+            let temp = super::TempPlaintext(path.clone());
+            temp.write(b"SECRET=hunter2\n").expect("write temp plaintext");
+            assert!(path.exists(), "file must exist while the guard is alive");
+        }
+        assert!(!path.exists(), "dropping the guard must delete the plaintext");
+    }
+
+    #[test]
+    fn edit_validates_recipients_before_touching_any_file() {
+        // Design §S3.2/§S8: `secret edit` fails fast when no recipient is
+        // given. Pointing at a nonexistent ciphertext proves the ordering
+        // without inspecting global temp state: if `edit` read the input
+        // first, it would fail with a read error instead of the recipient
+        // error, and a plaintext buffer could have been staged.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.env.age");
+
+        let err = edit(&SecretEditArgs {
+            identity: Some(dir.path().join("id.key")),
+            recipients: Vec::new(),
+            recipients_dir: None,
+            file: missing.clone(),
+        })
+        .expect_err("missing recipients must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no recipients given"), "unexpected error: {msg}");
+        assert!(
+            !msg.contains("failed to read"),
+            "recipients must be validated before any file I/O: {msg}"
+        );
+        assert!(!missing.exists(), "the ciphertext must not be created");
     }
 
     #[test]
@@ -516,7 +611,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("mkdir");
         write(&dir.join("alice.pub"), &format!("{}\n", id.recipient));
 
-        let recipients = collect_recipients(&[extra.recipient.clone()], Some(&dir))
+        let recipients = collect_recipients(std::slice::from_ref(&extra.recipient), Some(&dir))
             .expect("collect combined recipients");
         assert_eq!(recipients.len(), 2, "explicit + directory entries: {recipients:?}");
     }
