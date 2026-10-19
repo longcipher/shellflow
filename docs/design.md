@@ -110,7 +110,8 @@ All other lines (including plain comments) belong to the current block.
 | `@env` | `# @env <KEY>` / `# @env <KEY>=<value>` | Inject an env var into subsequent blocks. No `=value` → copy from shellflow's own environment. Values never appear in argv and are masked in previews/traces (§7.2, §9) |
 | `@local` | `# @local` | Following lines run on the local machine (default at start) |
 | `@remote` | `# @remote <target>` | Following lines stream to `<target>` (alias, group, or raw ssh-spec; `@`-prefix optional) |
-| `@copy` | `# @copy <src> -> <dst> @<target> [--delete]` | Sync a local file/dir to `<dst>` on all hosts in `<target>`. `--delete` mirrors removal of remote extras. `src`/`dst` support `$VAR`/`${VAR}` interpolation from `@export`ed state (§4.4) |
+| `@copy` | `# @copy <src> -> <dst> @<target> [--delete] [--exclude <glob>]` | Sync a local file/dir to `<dst>` on all hosts in `<target>`. `--delete` mirrors removal of remote extras; in `--local` mode it swaps a staged copy into place so a failed copy cannot empty the destination. `--exclude` (repeatable) is honored by the rsync path and warned as ignored on the scp fallback and in `--local` mode. `src`/`dst` support `$VAR`/`${VAR}` interpolation from `@export`ed state (§4.4) |
+| `@secrets` | `# @secrets <file.env.age> [--identity <path>]` | Decrypt an age-encrypted `KEY=VALUE` file into the environment of all subsequent blocks (Part II §S5). `--identity` overrides the run-wide `-i` for this entry only. |
 | `@export` | `# @export <VAR>[,<VAR>…]` | After the preceding local block, capture the named variables into run state; later `@copy` paths interpolate them and later blocks receive them as env vars (§7.6) |
 | `@timeout` | `# @timeout <seconds>` | Cap the next block per host; on expiry the child is SIGTERM'd, then SIGKILL'd after a grace period (§7.5) |
 | `@name` | `# @name <label>` | Label the next block (for `--only`/`--skip` filtering and reporting) |
@@ -307,29 +308,49 @@ shellflow/
 │       ├── Cargo.toml
 │       ├── src/
 │       │   ├── main.rs        # clap entry, tracing init, orchestration
-│       │   ├── cli.rs         # Args (clap derive)
+│       │   ├── cli.rs         # Args (clap derive), all subcommands
 │       │   ├── ui.rs          # colored streaming output, plan summary, masking
-│       │   ├── executor.rs    # run_local / run_remote / run_copy, fan-out
+│       │   ├── fsx.rs         # atomic 0600/0755 writes (secret + helper assets)
+│       │   ├── executor/      # run_local / run_remote / run_copy, fan-out
+│       │   │   ├── mod.rs     # shared types, capture-file guard, fan-out slot
+│       │   │   ├── local.rs   # bash -c, guard, @export capture
+│       │   │   ├── remote.rs  # ssh streaming, login-shell probe, guards
+│       │   │   ├── copy.rs    # rsync + scp fallback, staged --delete swap
+│       │   │   ├── process.rs # process groups, terminate, GroupGuard
+│       │   │   └── stream.rs  # piped-output forwarding, timeout, drain
 │       │   ├── secrets.rs     # @secrets resolution -> run-state env + mask list
-│       │   ├── secret.rs      # `secret` subcommand (encrypt/decrypt/edit/creds)
+│       │   ├── secret.rs      # `secret` subcommand (encrypt/decrypt/edit/creds/keys-check)
 │       │   ├── keys.rs        # `keys` subcommand (generate/public)
+│       │   ├── cred_env.rs    # target-side `cred-env` helpers
+│       │   ├── service.rs     # `service init` repository scaffolding
+│       │   ├── template.rs    # `template check` against an encrypted env
+│       │   ├── emit.rs        # emit the embedded bash helper (fallback)
 │       │   └── preflight.rs   # required-tool preflight check
 │       └── tests/
 │           ├── integration.rs # end-to-end with mock ssh/rsync shims
+│           ├── cred_env.rs    # cred-env / emit / template check
+│           ├── service_init.rs# service init + secret keys-check
 │           └── mockbin/       # fake ssh/rsync/scp (Bash shims recording argv)
 └── crates/
     ├── shellflow-core/        # parser + plan types (pure, no I/O)
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs
-    │       ├── plan.rs        # data model (§4.3)
-    │       ├── env.rs         # env rendering + masking (pure string logic)
+    │       ├── plan.rs        # data model (§4.3), resolve_hosts, interpolate
+    │       ├── env.rs         # env rendering, @export capture parser, masking
     │       ├── parser.rs      # line scanner -> ExecutionPlan
-    │       └── ssh_spec.rs    # SshSpec parse / to_args / rsync dest
+    │       ├── heredoc.rs     # here-document body tracking (§4.1 rule 8)
+    │       ├── template.rs    # ${KEY} placeholder scanner + render_template (S12)
+    │       ├── ssh_spec.rs    # SshSpec parse / to_args / rsync dest
+    │       └── error.rs       # ParseError / InterpolateError / CaptureError
     └── shellflow-secrets/     # age wrapper (encrypt/decrypt, env parser)
         ├── Cargo.toml
         └── src/
-            └── lib.rs         # identity load, crypto, KEY=VALUE env parsing
+            ├── lib.rs         # identity load, crypto, KEY=VALUE env parsing
+            ├── identity.rs    # X25519 identity resolution and generation
+            ├── crypto.rs      # age encrypt/decrypt
+            ├── env.rs         # KEY=VALUE env file parser
+            └── error.rs
 ```
 
 ### 5.2 Crate responsibilities
@@ -340,19 +361,29 @@ shellflow/
 - Resolves targets to host lists (`resolve_hosts`).
 - Builds `ssh`/`rsync` argv strings from `SshSpec` (including `-p` for ports and
   `-e 'ssh -p N'` for rsync).
-- Renders the payload env header (escaping + `set -x` ordering) and masks known
-  secret values — pure string logic, unit-testable.
-- Exposes `ParseError` (with line numbers) via `thiserror`.
-- No tokio, no stdio, no network. Everything is unit- and proptest-able.
+- Renders the payload env header (escaping + `set -x` ordering), parses the
+  NUL-delimited `@export` capture records, and masks known secret values — all
+  pure string logic, unit- and proptest-able.
+- Exposes `ParseError` / `InterpolateError` / `CaptureError` (with line
+  numbers where applicable) via `thiserror`.
+- No tokio, no stdio, no network, **no filesystem access**. `ExecutionPlan.env`
+  is copy-on-write (`Arc<Vec<_>>`) so snapshotting the env into every step does
+  not make plan construction quadratic. Everything is unit- and proptest-able.
 
-**`shellflow-secrets`** — pure crypto/parsing wrapper, no I/O at the crate
-boundary beyond what `age` requires.
+**`shellflow-secrets`** — age wrapper.
 
-- Wraps the `age` crate (X25519 identities) for identity loading, file
-  encrypt/decrypt, and recipient read-back.
+- Wraps the `age` crate (X25519 identities) for identity loading and
+  generation, file encrypt/decrypt, and recipient read-back.
+- Resolves the identity path (`-i` / `$SHELLFLOW_AGE_IDENTITY` /
+  `~/.config/age/keys.txt`). An empty or unset `$HOME` is treated as *absent*
+  rather than as the current directory, so a planted `./.config/age/keys.txt`
+  can never be adopted as the operator's identity.
 - Parses `KEY=VALUE` env files (blank lines and `#` comments ignored; first
-  `=` splits the key) for `@secrets` resolution.
-- Library-only: no `tokio`, no `std::process`. Unit- and proptest-tested.
+  `=` splits the key; a repeated key keeps its last value and appears once,
+  matching `source` semantics).
+- Library-only: no `tokio`, no `std::process`. It does perform its own file
+  I/O (identity load, env-file read), which is exactly its stated job (§S7);
+  it has no network or subprocess surface.
 - `shellflow-core` stays free of async, I/O, and crypto.
 
 **`bin/shellflow`** — the I/O boundary.
@@ -436,14 +467,27 @@ OPTIONS:
   -l, --log-file <PATH>       Append every streamed line (tagged host+stream)
                               to a file for audit
       --no-color              Disable ANSI colors
+      --local                 Run remote blocks/copies on the controller
+                               (debugging; no network or sudo required)
+  -i, --identity <PATH>       age identity for `@secrets` decryption
   -h, --help                  Print help
   -V, --version               Print version
+
+SUBCOMMANDS (the bare positional `shellflow deploy.sh` == `shellflow run`):
+  run [SCRIPT] [flags]                   run a deploy script (the default)
+  keys generate | public                 manage age identities
+  secret encrypt|decrypt|edit|creds|keys-check
+  template check <tmpl> <file.env.age>   cross-check ${KEY} against a sealed env
+  emit cred-env [-o PATH]                print the bash helper (fallback targets)
+  cred-env exec|render|credstore-install target-side helpers (see §S12)
+  service init <svc> [--host <alias>]    repository scaffolding (see §S12.2)
 
 EXIT CODES:
   0   success (skipped blocks and dry-runs with no errors)
   1   plan/parse error (bad script, unresolved @export variable)
   2   CLI usage error (clap)
-  3   transport/setup failure (missing ssh/rsync/bash, ssh exit 255, rsync I/O error)
+  3   transport/setup failure (missing ssh/rsync/bash, ssh exit 255, a broken
+      payload pipe, rsync I/O error)
   4   script execution failure (a local/remote step exited non-zero)
   130 interrupted by SIGINT/SIGTERM (see §7.5)
 ```
@@ -590,8 +634,12 @@ degrades gracefully to a plain copy on minimal hosts.
 ### 7.5 Lifecycle: preflight, timeouts, signals
 
 - **Preflight.** Before running anything, shellflow verifies that `bash`,
-  `ssh`, and `rsync` exist on `PATH` and fails with a friendly message (exit 3)
-  if any is missing — no mid-run `Command::new` surprise.
+  `ssh`, `rsync`, and `scp` exist on `PATH` *and are executable*, and fails
+  with a friendly message (exit 3) if any is missing — no mid-run
+  `Command::new` surprise. (`scp` is required because `@copy` falls back to it
+  on rsync-less targets; see §7.3.) Each probe is bounded, so a PATH-shadowed
+  wrapper that never exits cannot hang the CLI before the timeout machinery
+  exists.
 - **Process groups.** Every child is spawned with `process_group(0)`, so it
   leads a fresh process group. Signalling only the *direct child* is not
   enough: a block runs `bash -c`, whose own descendants (`cargo` -> `rustc`, a
@@ -623,10 +671,17 @@ isolation and error semantics — state is passed *explicitly* (Decision Record
 D-7):
 
 1. When a local step declares `@export VAR`, shellflow appends a capture line
-   that writes the values to a private temp file as NUL-delimited records (the
-   temp path is passed via `Command::env`, so it never appears on stdout).
+   that writes the values to a private temp file as **NUL-delimited** records
+   (`NAME=VALUE\0`); the temp path is passed via `Command::env`, so it never
+   appears on stdout. NUL is used because a shell value may legally contain a
+   newline: a newline-delimited format would let one exported value forge
+   another and would silently truncate a legitimately multi-line value. The
+   reader is the pure `shellflow_core::parse_capture_records`.
 2. After the step, shellflow reads the file into `RunState`. Scripts that call
-   `exit` before the capture line cannot export — documented, acceptable.
+   `exit` before the capture line cannot export — documented, acceptable. The
+   capture file is owned by an RAII guard, so it is deleted on **every** exit
+   path, including a failed step: it holds plaintext and must not outlive the
+   step, least of all on a shared CI runner.
 3. Later `@copy` `src`/`dst` strings are interpolated from `RunState`
    (`$VAR`/`${VAR}`); unresolved names are a plan-build error.
 4. Later local steps receive the values via `Command::env()`; later remote
@@ -738,8 +793,11 @@ Example-based unit tests (colocated `#[cfg(test)]`):
 - `@export` attachment to the preceding local block; error after a remote block;
 - `@copy --delete` parsing and `$VAR`/`${VAR}` interpolation from `RunState`;
   unresolved variables are errors, not silent literals;
+- the NUL-delimited `@export` capture protocol: a value containing a newline
+  or `=` round-trips intact and can never be read as a second record;
 - env-block rendering: single-quote escaping, ordering before `set -x`,
-  masking of known values;
+  masking of known values; mask ordering is normalized once per run
+  (`prepare_masks`), not once per output line;
 - `resolve_hosts`: alias / group / raw spec / `--target` restriction;
 - `SshSpec`: `user@host:port` → `["-p", "2222", "user@host"]` and rsync dest;
 - here-documents: quoted/escaped/plain/`<<-` delimiters, `<<<` here-strings,
@@ -783,6 +841,11 @@ End-to-end tests with **mock `ssh`/`rsync` shims** placed earlier on `PATH`
   numbering in sync;
 - process-group teardown: a background grandchild of a timed-out local block
   is gone afterwards, and a child that traps `SIGTERM` is `SIGKILL`ed.
+- **failure-path hygiene**: a failed `@export` step leaves no capture file
+  behind; an exported value cannot forge a sibling variable; a broken ssh
+  payload pipe is classified as a transport error (exit 3), never a timeout;
+  a failed `--local --delete` copy leaves the previous destination intact and
+  cleans up its staging directory.
 
 These tests require local `bash`, `ssh`-less (mock shims), and no network.
 
@@ -795,6 +858,13 @@ just test        # cargo test --all-features (incl. proptest)
 just mutation    # cargo-mutants; fix survivors
 just check-cn    # no CJK in code/comments (docs/comments are English-only)
 ```
+
+`just lint` runs `clippy --workspace --all-targets --all-features`, so test
+code is linted too. The `deny` lints (`panic`, `unwrap_used`, `expect_used`)
+and the `pedantic`/`nursery` groups are scoped to production code with an
+explicit `cfg_attr(test, allow(...))` at each crate root: the constraint is
+stated where it holds instead of being satisfied by silently skipping test
+targets.
 
 Fuzz (`cargo-fuzz`) and Criterion benchmarks: **N/A** for v1 — the grammar is a
 fixed line scanner and the workload is I/O-bound. Revisit if the DSL grows
@@ -1163,6 +1233,39 @@ otherwise be printed unmasked two lines below a preview showing `***`.
 - Missing identity, undecryptable file, or malformed env content is a hard
   error before any step runs (never a silent skip).
 
+#### S5.5 Per-host secrets via the `{host}` placeholder
+
+A `@secrets` path may contain `{host}`, which expands to the **target alias**
+of each host the selected steps actually reach (after `--target` restriction):
+
+```bash
+# @server web-1 deploy@10.0.0.11
+# @server web-2 deploy@10.0.0.12
+# @group  web  web-1,web-2
+
+# @secrets services/myapp/{host}.env.age
+# @remote web
+echo "this is $API_KEY"        # different per host
+```
+
+Semantics:
+
+1. Expansion uses the set of aliases the **selected** steps target. A host no
+   selected step touches never requires a file, so `-t web-1` with
+   `--only fetch` does not need `web-2.env.age`.
+2. A targeted host whose file is missing is a **hard error** (fail closed).
+   Guessing a path or silently skipping a host would deploy a host with the
+   wrong credentials.
+3. Per-host pairs are layered onto that host's payload env only; one host
+   never sees another host's values. `LT_SECRET_KEYS` is extended with that
+   host's keys.
+4. Every value is registered for masking exactly like a shared value.
+5. `--local` resolves remote blocks on the controller, so a `{host}` playbook
+   is ambiguous there: it requires a single host (`-t <host>`) and errors
+   otherwise, rather than picking one arbitrarily.
+6. Remote syntax checks (`--check`/`--dry-run`) do not need per-host values:
+   they never execute the block.
+
 ### S7. Crate & Module Impact
 
 | Area | Change |
@@ -1181,16 +1284,21 @@ stays free of async, I/O, and crypto.
 - **Controller-only secrets**: encrypted files travel to the controller,
   decrypted in memory, injected into remote payloads over the (already
   encrypted) SSH channel. Targets never hold the age identity.
-- **No argv / no disk**: secret values never appear in process argv; the
-  temporary plaintext lives only in shellflow's memory and is dropped after
-  the run.
+- **No argv / no disk**: secret values never appear in process argv. Every
+  file that holds plaintext or ciphertext — `secret decrypt -o`, `secret
+  edit`, `cred-env render` — is written `0600` through a same-directory
+  temporary file and an atomic rename, so a partial or failed write never
+  truncates the previous contents and the mode is corrected even when
+  re-writing an existing file. The `@export` capture file is owned by an RAII
+  guard and deleted on every exit path, including a failed step.
 - **Masked everywhere**: previews, `-vv/-vvv` traces, and `--log-file` redact
   every `@secrets` value (subject to the min-length guard).
 - **Fail fast**: missing identity, decrypt failure, or malformed env aborts
   before any step executes.
 - **Recipient safety**: `secret edit` requires explicit `-r`/`--recipients-dir`
   and fails fast otherwise — age is anonymous, so re-encrypting without the
-  full recipient list would silently drop operators.
+  full recipient list would silently drop operators. The check runs *before*
+  the ciphertext is read, so a rejected invocation never stages plaintext.
 
 ### S9. Testing Strategy
 
@@ -1282,8 +1390,11 @@ and every unit references it:
   `$LT_SECRET_KEYS` (exported by `@secrets`) via
   `sudo systemd-creds encrypt --with-key=host --name=<KEY>`, value on stdin.
   Unset `$LT_SECRET_KEYS` aborts (the store must not be wiped for nothing);
-  set-but-empty is an explicit "no credentials" and clears the store. Replaces
-  the hand-written install loop (and its zsh/bash portability class).
+  set-but-empty is an explicit "no credentials" and clears the store. The new
+  store is built in a staging directory and swapped in only once every key
+  sealed successfully, so a mid-way failure leaves the previous store intact
+  rather than empty or half-written. Replaces the hand-written install loop
+  (and its zsh/bash portability class).
 - **Templates** are plaintext files with `${KEY}` placeholders, committed next
   to the service. They contain no secrets, so they may live on persistent
   disk; only the rendered output (tmpfs) ever holds values.
