@@ -286,20 +286,23 @@ mod tests {
 
     #[test]
     fn here_string_is_not_a_heredoc() {
-        assert!(scan_openers("grep foo <<<\"$bar\"").is_empty());
+        assert!(scan_openers("grep foo <<<\"$bar\"").is_empty(), "a here-string opens nothing");
     }
 
     #[test]
     fn quoted_region_is_not_scanned() {
-        assert!(scan_openers("echo 'a << b'").is_empty());
-        assert!(scan_openers("echo \"a << b\"").is_empty());
+        assert!(scan_openers("echo 'a << b'").is_empty(), "a quoted `<<` opens nothing");
+        assert!(scan_openers("echo \"a << b\"").is_empty(), "a quoted `<<` opens nothing");
         // The quoted `<<` opens nothing; the real opener after it still does.
         assert_eq!(tags("echo '<<' <<EOF"), vec!["EOF"]);
     }
 
     #[test]
     fn comment_does_not_open_a_heredoc() {
-        assert!(scan_openers("# see <<EOF for details").is_empty());
+        assert!(
+            scan_openers("# see <<EOF for details").is_empty(),
+            "a comment never opens a heredoc"
+        );
         assert_eq!(tags("cat <<EOF # and <<OTHER"), vec!["EOF"]);
     }
 
@@ -327,7 +330,10 @@ mod tests {
     #[test]
     fn double_quotes_honor_backslash_escapes() {
         // `\"` does not close the string, so the `<<` after it stays inside it.
-        assert!(scan_openers("echo \"x\\\" <<EOF\"").is_empty());
+        assert!(
+            scan_openers("echo \"x\\\" <<EOF\"").is_empty(),
+            "the escaped quote closes the region"
+        );
     }
 
     #[test]
@@ -352,9 +358,12 @@ mod tests {
     #[test]
     fn expanded_delimiter_is_not_tracked() {
         // `<<$TAG` cannot be resolved statically: no body is tracked.
-        assert!(scan_openers("cat <<$TAG").is_empty());
-        assert!(scan_openers("cat <<\"$TAG\"").is_empty());
-        assert!(scan_openers("cat <<`gen_tag`").is_empty());
+        assert!(scan_openers("cat <<$TAG").is_empty(), "an expanded delimiter is untrackable");
+        assert!(
+            scan_openers("cat <<\"$TAG\"").is_empty(),
+            "a quoted delimiter opens no tracked body"
+        );
+        assert!(scan_openers("cat <<`gen_tag`").is_empty(), "a backtick delimiter is untrackable");
     }
 
     #[test]
@@ -362,8 +371,14 @@ mod tests {
         // Bash continues a quoted word onto the next line, so the scanner must
         // treat the rest of the line as the quoted region instead of indexing
         // past the end.
-        assert!(scan_openers("echo \"unterminated").is_empty());
-        assert!(scan_openers("echo 'unterminated").is_empty());
+        assert!(
+            scan_openers("echo \"unterminated").is_empty(),
+            "an unterminated quote opens nothing"
+        );
+        assert!(
+            scan_openers("echo 'unterminated").is_empty(),
+            "an unterminated quote opens nothing"
+        );
     }
 
     #[test]
@@ -378,15 +393,15 @@ mod tests {
         // `cat <<<EOF` is a here-string whose word is `EOF`; `cat <<EOF` opens
         // a body. Conflating the two would invent a here-document that Bash
         // never has.
-        assert!(scan_openers("cat <<<EOF").is_empty());
-        assert!(scan_openers("cat <<<'EOF'").is_empty());
+        assert!(scan_openers("cat <<<EOF").is_empty(), "`<<<` is a here-string, not a heredoc");
+        assert!(scan_openers("cat <<<'EOF'").is_empty(), "`<<<` is a here-string, not a heredoc");
     }
 
     #[test]
     fn four_angle_brackets_do_not_open_a_heredoc() {
         // `<<<<` is a shell syntax error, but the scanner must stay total: it
         // may not mistake the third `<` for a delimiter and must not loop.
-        assert!(scan_openers("cat <<<<EOF").is_empty());
+        assert!(scan_openers("cat <<<<EOF").is_empty(), "a quoted `<<<` opens nothing");
     }
 
     #[test]
@@ -414,9 +429,9 @@ mod tests {
 
     #[test]
     fn empty_delimiter_opens_nothing() {
-        assert!(scan_openers("echo a <<").is_empty());
-        assert!(scan_openers("echo a << ").is_empty());
-        assert!(scan_openers("echo a <<>file").is_empty());
+        assert!(scan_openers("echo a <<").is_empty(), "`<<` without a delimiter opens nothing");
+        assert!(scan_openers("echo a << ").is_empty(), "whitespace is not a delimiter");
+        assert!(scan_openers("echo a <<>file").is_empty(), "an empty delimiter opens nothing");
     }
 
     #[test]
@@ -486,7 +501,7 @@ mod tests {
         ) {
             let heredoc = Heredoc { tag: tag.clone(), strip_tabs: false };
             proptest::prop_assume!(line != tag);
-            proptest::prop_assert!(!heredoc.terminates(&line));
+            proptest::prop_assert!(!heredoc.terminates(line));
         }
 
         /// Every delimiter the scanner reports can actually be found, and the
@@ -499,7 +514,7 @@ mod tests {
             let mut tracker = HeredocTracker::default();
             tracker.open_in(&format!("cat <<{tag}"));
             proptest::prop_assert!(tracker.is_open());
-            proptest::prop_assert!(tracker.consume_body(&body));
+            proptest::prop_assert!(tracker.consume_body(body));
             proptest::prop_assert!(tracker.is_open());
             proptest::prop_assert!(tracker.consume_body(&tag));
             proptest::prop_assert!(!tracker.is_open());

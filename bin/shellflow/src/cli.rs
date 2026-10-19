@@ -240,8 +240,15 @@ pub(crate) struct SecretEditArgs {
     pub identity: Option<PathBuf>,
 
     /// Recipient public key (`age1…`); repeatable. Required unless
-    /// `--recipients-dir` is given.
-    #[arg(short = 'r', long = "recipient", value_name = "AGE1...")]
+    /// `--recipients-dir` is given — re-encrypting without recipients would
+    /// silently drop every operator (age is anonymous, so the original set
+    /// cannot be recovered from the file).
+    #[arg(
+        short = 'r',
+        long = "recipient",
+        value_name = "AGE1...",
+        required_unless_present = "recipients_dir"
+    )]
     pub recipients: Vec<String>,
 
     /// Directory of `*.pub` files to load recipients from.
@@ -522,7 +529,7 @@ mod tests {
                 super::KeysCmd::Generate(g) => {
                     assert_eq!(g.output.to_string_lossy(), "/tmp/k.txt");
                 }
-                other => panic!("expected generate subcommand, got {other:?}"),
+                super::KeysCmd::Public(_) => panic!("expected generate subcommand"),
             },
             other => panic!("expected keys subcommand, got {other:?}"),
         }

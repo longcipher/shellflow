@@ -98,7 +98,12 @@ enum OutputModeState {
 /// stderr and optionally an audit file.
 pub(crate) struct Ui {
     verbose: Verbosity,
-    secrets: Vec<String>,
+    /// Known secret values, longest-first and de-duplicated.
+    ///
+    /// Ordering is computed once in [`Ui::set_secrets`] rather than per
+    /// output line: `mask_line` runs for every streamed line, so re-sorting a
+    /// large `@secrets` set on each call would dominate output throughput.
+    masks: Vec<String>,
     output: OutputModeState,
     /// Optional audit file, guarded by a plain `std::sync::Mutex`. The guard
     /// is never held across an await point, so blocking inside the async
@@ -133,7 +138,7 @@ impl Ui {
                 .ok()
                 .map(|file| Arc::new(std::sync::Mutex::new(file)))
         });
-        Self { verbose: Verbosity(verbose), secrets: Vec::new(), output, log_file }
+        Self { verbose: Verbosity(verbose), masks: Vec::new(), output, log_file }
     }
 
     /// The verbosity level.
@@ -149,8 +154,12 @@ impl Ui {
     }
 
     /// Register secret values to be masked in all output.
+    ///
+    /// Normalizes the set once (longest-first, de-duplicated): `mask_line` runs
+    /// for every streamed line, so re-sorting a large @secrets set per call
+    /// would dominate output throughput.
     pub(crate) fn set_secrets(&mut self, secrets: Vec<String>) {
-        self.secrets = secrets;
+        self.masks = shellflow_core::prepare_masks(&secrets);
     }
 
     /// Print a masked payload preview (used at `-vv`, dry-run, and diff).
@@ -257,7 +266,7 @@ impl Ui {
     }
 
     fn mask(&self, line: &str) -> String {
-        mask_line(line, &self.secrets)
+        mask_line(line, &self.masks)
     }
 
     /// Print a note line (dimmed), routed through the log file if configured.
@@ -412,7 +421,7 @@ mod tests {
             .expect("open log file");
         let ui = super::Ui {
             verbose: super::Verbosity(0),
-            secrets: Vec::new(),
+            masks: Vec::new(),
             output: super::OutputModeState::Stream,
             log_file: Some(Arc::new(std::sync::Mutex::new(file))),
         };
@@ -427,7 +436,7 @@ mod tests {
         colored::control::set_override(false);
         let ui = super::Ui {
             verbose: super::Verbosity(0),
-            secrets: Vec::new(),
+            masks: Vec::new(),
             output: super::OutputModeState::Stream,
             log_file: None,
         };

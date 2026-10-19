@@ -4,6 +4,13 @@
 //! earlier on `PATH` (see `tests/mockbin/`). The shims record argv and stdin,
 //! so we can assert on payloads, flags, and fan-out without any network.
 
+// The workspace denies `panic`/`unwrap`/`expect` in production code; this file
+// is an integration-test crate, so it opts out explicitly rather than relying
+// on the lint gate silently skipping test targets.
+#![allow(clippy::pedantic, clippy::nursery)]
+#![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::print_stderr)]
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -1670,5 +1677,184 @@ fn only_by_index_selects_that_step() -> TestResult<()> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("SECOND_STEP"), "the selected step must run: {stdout}");
     assert!(!stdout.contains("FIRST_STEP"), "the other step must not run: {stdout}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the correctness fixes
+// ---------------------------------------------------------------------------
+
+/// Count `@export` capture files this process could have left in `$TMPDIR`.
+fn export_capture_files() -> Vec<PathBuf> {
+    fs::read_dir(std::env::temp_dir())
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name().is_some_and(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with("shellflow-capture-")
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn export_capture_file_is_removed_when_the_step_fails() -> TestResult<()> {
+    // A failed `@export` step must not leave plaintext behind: the capture
+    // file holds `NAME=VALUE` records and used to survive every non-zero exit.
+    let sb = Sandbox::new("capture-cleanup")?;
+    let script = sb.script(
+        "# @local\nAPI_TOKEN=s3cr3t-token-value\n# @export API_TOKEN\n\
+         printf '%s=%s\\n' API_TOKEN \"$API_TOKEN\" >> \"$SHELLFLOW_CAPTURE\"\nexit 7\n",
+    )?;
+    let before = export_capture_files();
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 4, "a failing local step is exit 4: {out:?}");
+    let after = export_capture_files();
+    for path in &after {
+        assert!(
+            !before.contains(path),
+            "a failed step leaked its capture file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn export_capture_file_is_removed_on_success() -> TestResult<()> {
+    let sb = Sandbox::new("capture-cleanup-ok")?;
+    let script = sb
+        .script("# @local\nOKVAR=value\n# @export OKVAR\necho done\n# @local\necho \"$OKVAR\"\n")?;
+    let before = export_capture_files();
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let after = export_capture_files();
+    for path in &after {
+        assert!(!before.contains(path), "capture file leaked: {}", path.display());
+    }
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("value"),
+        "the exported value must reach the next step"
+    );
+    Ok(())
+}
+
+#[test]
+fn export_value_cannot_forge_a_sibling_variable() -> TestResult<()> {
+    // NUL-delimited records (design §7.6): a newline inside one exported value
+    // must never be read as a second `NAME=VALUE` record.
+    let sb = Sandbox::new("export-forgery")?;
+    let script = sb.script(
+        "# @local\nB=real-B-value\nA=$'legit-a\nB=FORGED-BY-A'\n# @export A,B\necho step-one\n\
+         # @local\nprintf 'SEEN_A=[%s] SEEN_B=[%s]\\n' \"$A\" \"$B\"\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stdout.contains("SEEN_B=[real-B-value]"),
+        "`B` must keep the value the script assigned: {stdout}"
+    );
+    // The full multi-line value of `A` survives (it legitimately contains the
+    // forged text), but that text is never interpreted as a record of its own.
+    assert!(
+        stdout.contains("B=FORGED-BY-A]"),
+        "`A` must retain its complete multi-line value: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn export_value_is_not_truncated_at_an_embedded_newline() -> TestResult<()> {
+    let sb = Sandbox::new("export-multiline")?;
+    let script = sb.script(
+        "# @local\nTOKEN=$'part1\npart2'\n# @export TOKEN\necho step-one\n\
+         # @local\nprintf 'LEN=%s\\n' \"${#TOKEN}\"\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stdout.contains("LEN=11"),
+        "a multi-line value must survive intact (part1\\npart2 is 11 chars): {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn broken_ssh_pipe_is_a_transport_error_not_a_timeout() -> TestResult<()> {
+    // Design §6: a broken stdin pipe means the transport died (ssh 255), so
+    // the run must exit 3. The shim closes stdin and exits immediately, and the
+    // payload is far larger than the pipe buffer, forcing an EPIPE on write.
+    let sb = Sandbox::new("pipe-broken")?;
+    let dying_ssh = sb.mock_dir().join("ssh");
+    fs::write(&dying_ssh, "#!/bin/sh\nexec 0<&-\nexit 255\n").map_err(|e| e.to_string())?;
+    let mut perms = fs::metadata(&dying_ssh).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&dying_ssh, perms).map_err(|e| e.to_string())?;
+
+    let payload = "x".repeat(200_000);
+    let script = sb.script(&format!("# @server web1 ok1@h1\n# @remote web1\n{payload}\n"))?;
+    let out = sb.run(&script, &[])?;
+
+    assert_eq!(status_code(&out), 3, "a dead transport must exit 3 (design §6): {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("TIMED OUT"),
+        "a broken pipe must not be reported as a timeout: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn local_copy_delete_keeps_the_destination_when_the_copy_fails() -> TestResult<()> {
+    // `--delete` used to wipe the destination before copying; a failed copy
+    // therefore left it empty. The staged swap must preserve the old tree.
+    let sb = Sandbox::new("local-copy-delete")?;
+    let src = sb.dir.join("missing-src");
+    let dst = sb.dir.join("local-dst");
+    let script =
+        sb.script(&format!("# @copy {} -> {} @h1 --delete\n", src.display(), dst.display()))?;
+    fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
+    fs::write(dst.join("previous.txt"), "keep me").map_err(|e| e.to_string())?;
+
+    let out = sb.run(&script, &["--local"])?;
+    assert_ne!(status_code(&out), 0, "copying a missing source must fail");
+    assert!(
+        dst.join("previous.txt").exists(),
+        "a failed `--delete` copy must leave the previous destination intact"
+    );
+    assert!(
+        !sb.dir.join("local-dst.shellflow-new").exists(),
+        "the staging copy must be cleaned up"
+    );
+    Ok(())
+}
+
+#[test]
+fn local_copy_delete_swaps_atomically_on_success() -> TestResult<()> {
+    let sb = Sandbox::new("local-copy-delete-ok")?;
+    let src = sb.dir.join("dist");
+    let dst = sb.dir.join("local-dst");
+    let script =
+        sb.script(&format!("# @copy {} -> {} @h1 --delete\n", src.display(), dst.display()))?;
+    fs::create_dir_all(&src).map_err(|e| e.to_string())?;
+    fs::write(src.join("new.txt"), "fresh").map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
+    fs::write(dst.join("stale.txt"), "old").map_err(|e| e.to_string())?;
+
+    let out = sb.run(&script, &["--local"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(dst.join("new.txt").exists(), "the new tree must be in place");
+    assert!(!dst.join("stale.txt").exists(), "`--delete` must mirror removals");
+    assert!(
+        !sb.dir.join("local-dst.shellflow-new").exists(),
+        "no staging directory may be left behind"
+    );
     Ok(())
 }

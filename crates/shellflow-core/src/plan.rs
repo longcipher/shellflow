@@ -1,7 +1,10 @@
 //! The deployment plan data model, target resolution, and state
 //! interpolation.
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     error::{InterpolateError, ParseError},
@@ -186,7 +189,7 @@ impl Step {
     }
 }
 
-/// The fully parsed deployment script.
+/// Fully parsed deployment plan.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecutionPlan {
     /// Server aliases in declaration order (BTreeMap keeps summaries stable).
@@ -194,7 +197,12 @@ pub struct ExecutionPlan {
     /// Group aliases to server member lists.
     pub groups: BTreeMap<String, Vec<String>>,
     /// All `@env` entries in declaration order.
-    pub env: Vec<EnvEntry>,
+    ///
+    /// Copy-on-write behind an `Arc`: every step snapshots the list as it was
+    /// declared, so cloning it wholesale per block would make plan construction
+    /// quadratic in the number of steps. `Arc::make_mut` keeps the common
+    /// layout (`@env` grouped before the first step) at a single allocation.
+    pub env: Arc<Vec<EnvEntry>>,
     /// All `@secrets` file references in declaration order.
     pub secrets: Vec<SecretEntry>,
     /// The steps, in declaration order.
@@ -235,9 +243,16 @@ pub fn resolve_hosts(
     let mut hosts: Vec<ResolvedHost> = Vec::new();
     if let Some(members) = plan.groups.get(&target.text) {
         for member in members {
-            if let Some(spec) = plan.servers.get(member) {
-                hosts.push(ResolvedHost { alias: member.clone(), spec: spec.clone() });
-            }
+            // A member with no `@server` is a plan error, not a host to skip
+            // silently: `parse_script` validates this today, but
+            // `resolve_hosts` is public API and must not quietly drop a host
+            // when handed a hand-built plan.
+            let spec = plan.servers.get(member).ok_or_else(|| ParseError::UnknownGroupMember {
+                line: 0,
+                group: target.text.clone(),
+                server: member.clone(),
+            })?;
+            hosts.push(ResolvedHost { alias: member.clone(), spec: spec.clone() });
         }
     } else if let Some(spec) = plan.servers.get(&target.text) {
         hosts.push(ResolvedHost { alias: target.text.clone(), spec: spec.clone() });

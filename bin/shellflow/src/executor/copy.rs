@@ -8,7 +8,7 @@ use shellflow_core::{CopyStep, ResolvedHost};
 use tokio::{process::Command, task::JoinSet};
 
 use super::{
-    ArcUi, CopyStepArgs, DiffFilter, HostOutcome, LogFile, StepConfig,
+    ArcUi, CopyStepArgs, DiffFilter, HostOutcome, LogFile, StepConfig, fanout_slot,
     process::{GroupGuard, isolate},
     remote::{RunError, resolve_remote_env},
     stream,
@@ -18,6 +18,41 @@ use super::{
 pub(super) struct CopyOpts<'a> {
     pub(super) delete: bool,
     pub(super) excludes: &'a [String],
+}
+
+/// How a copy failed, kept separate from the message so nothing has to
+/// string-match to pick the exit code (design §6 classifies 3 vs 4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyFailureKind {
+    /// The transfer exceeded its per-step timeout.
+    Timeout,
+    /// The transport failed (rsync/scp/ssh could not complete).
+    Transport,
+}
+
+/// A copy failure: a structural classification plus the detail shown in the UI.
+#[derive(Clone, Debug)]
+struct CopyFailure {
+    kind: CopyFailureKind,
+    detail: String,
+}
+
+impl CopyFailure {
+    fn timeout(detail: impl Into<String>) -> Self {
+        Self { kind: CopyFailureKind::Timeout, detail: detail.into() }
+    }
+
+    fn transport(detail: impl Into<String>) -> Self {
+        Self { kind: CopyFailureKind::Transport, detail: detail.into() }
+    }
+}
+
+/// Map a transfer result onto the per-host outcome.
+fn failure_outcome(alias: &str, failure: CopyFailure) -> (String, HostOutcome) {
+    match failure.kind {
+        CopyFailureKind::Timeout => (alias.to_string(), HostOutcome::TimedOut),
+        CopyFailureKind::Transport => (alias.to_string(), HostOutcome::Failed(RunError::Transport)),
+    }
 }
 
 pub(crate) async fn run_copy_step(
@@ -79,10 +114,8 @@ pub(crate) async fn run_copy_step(
         let shell_cache = Arc::clone(&args.shell_cache);
         let log_file = args.log_file.clone();
         tasks.spawn(async move {
-            let _permit = match &semaphore {
-                Some(semaphore) => Arc::clone(semaphore).acquire_owned().await.ok(),
-                None => None,
-            };
+            // Never run unthrottled when the semaphore is closed.
+            let _permit = fanout_slot!(&semaphore, &log_file, host);
             let has_rsync = resolve_remote_env(&host, &shell_cache).await.has_rsync;
             let opts = CopyOpts { delete, excludes: &excludes };
             let host_args = RsyncHostArgs {
@@ -131,14 +164,18 @@ async fn run_copy_step_local(
     }
 
     if delete {
-        let _ = std::fs::remove_dir_all(dst);
-        let _ = std::fs::remove_file(dst);
+        // Stage the replacement *beside* the destination and swap it in only
+        // after `cp` succeeded. Wiping first (the previous behaviour) meant a
+        // failed copy left the destination empty — the worst possible outcome
+        // for a `--delete` deploy.
+        return run_local_copy_delete(src, dst, config, log_file).await;
     }
 
     if let Some(parent) = std::path::Path::new(dst).parent() &&
         !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .wrap_err_with(|| format!("failed to create {} for local copy", parent.display()))?;
     }
 
@@ -152,6 +189,66 @@ async fn run_copy_step_local(
     Ok(vec![("localhost".to_string(), HostOutcome::Ok)])
 }
 
+/// Copy `src` to `dst` with `--delete` semantics, atomically.
+///
+/// The new tree is built in a sibling staging path first. Only once `cp`
+/// exits 0 is the old destination removed and the staging path renamed into
+/// place, so an interrupted or failing copy always leaves the previous
+/// deployment intact.
+async fn run_local_copy_delete(
+    src: &str,
+    dst: &str,
+    config: StepConfig,
+    log_file: &LogFile,
+) -> Result<Vec<(String, HostOutcome)>> {
+    let dst_path = std::path::Path::new(dst);
+    if let Some(parent) = dst_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .wrap_err_with(|| format!("failed to create {} for local copy", parent.display()))?;
+    }
+
+    let staging = dst_path.with_file_name(format!(
+        "{}.shellflow-new",
+        dst_path.file_name().map_or_else(|| "dst".into(), |n| n.to_string_lossy().into_owned())
+    ));
+    remove_path(&staging).await?;
+    if let Some(parent) = staging.parent().filter(|p| !p.as_os_str().is_empty()) {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+
+    let mut cmd = Command::new("cp");
+    cmd.arg("-a").arg(src).arg(&staging);
+    cmd.kill_on_drop(true);
+    let status = run_command_status(cmd, config.timeout, "local copy").await?;
+    if !status.success() {
+        // The old destination is untouched; drop the half-built staging tree.
+        remove_path(&staging).await?;
+        bail!("local copy exited with status {status} (destination left unchanged)");
+    }
+
+    // The replacement is complete: only now is it safe to drop the old tree.
+    if let Err(err) = remove_path(dst_path).await {
+        remove_path(&staging).await?;
+        crate::ui::warn(&format!("could not remove old destination {dst}: {err}"), log_file);
+    }
+    if let Err(err) = tokio::fs::rename(&staging, dst_path).await {
+        remove_path(&staging).await?;
+        bail!("failed to move staged copy into {dst}: {err}");
+    }
+    Ok(vec![("localhost".to_string(), HostOutcome::Ok)])
+}
+
+/// Remove `path` whether it is a file, a symlink, or a directory.
+async fn remove_path(path: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(path).await,
+        Ok(_) => tokio::fs::remove_file(path).await,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 async fn run_command_status(
     mut cmd: Command,
     timeout: Option<u64>,
@@ -159,16 +256,20 @@ async fn run_command_status(
 ) -> Result<std::process::ExitStatus> {
     isolate(&mut cmd);
     cmd.kill_on_drop(true);
+    // Both branches spawn explicitly so every path owns a `GroupGuard`; the
+    // previous `cmd.status()` fallback had none, which let a `cp` descendant
+    // outlive an aborted run.
+    let mut child = cmd.spawn().wrap_err(format!("failed to run {label}"))?;
+    let mut guard = GroupGuard::new(&child);
     let status = match timeout {
         Some(secs) => {
-            let mut child = cmd.spawn().wrap_err(format!("failed to run {label}"))?;
-            let mut guard = GroupGuard::new(&child);
             match tokio::time::timeout(std::time::Duration::from_secs(secs), child.wait()).await {
-                Ok(Ok(status)) => {
+                Ok(Ok(status)) => status,
+                Ok(Err(err)) => {
+                    super::process::terminate(&mut child).await;
                     guard.disarm();
-                    status
+                    return Err(err).wrap_err(format!("failed to run {label}"));
                 }
-                Ok(Err(err)) => return Err(err).wrap_err(format!("failed to run {label}")),
                 Err(_) => {
                     crate::ui::warn(&format!("{label} timed out — killed"), &None);
                     super::process::terminate(&mut child).await;
@@ -177,8 +278,9 @@ async fn run_command_status(
                 }
             }
         }
-        None => cmd.status().await.wrap_err(format!("failed to run {label}"))?,
+        None => child.wait().await.wrap_err(format!("failed to run {label}"))?,
     };
+    guard.disarm();
     Ok(status)
 }
 
@@ -244,19 +346,17 @@ async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
 
     match outcome {
         Ok(()) => (host.alias.clone(), HostOutcome::Ok),
-        Err(err) => {
-            crate::ui::warn(&format!("[{}] {err:#}", host.alias), log_file);
-            if err.to_string().contains("timed out") {
-                (host.alias.clone(), HostOutcome::TimedOut)
-            } else {
-                (host.alias.clone(), HostOutcome::Failed(RunError::Transport))
-            }
+        Err(failure) => {
+            crate::ui::warn(&format!("[{}] {}", host.alias, failure.detail), log_file);
+            failure_outcome(&host.alias, failure)
         }
     }
 }
 
-fn normalize_copy_paths(src: &str, dst: &str) -> (String, String) {
-    if std::fs::metadata(src).is_ok_and(|meta| meta.is_dir()) {
+/// `src` with a trailing slash when it is a directory, so rsync copies the
+/// directory *contents* into `dst` rather than nesting it.
+async fn normalize_copy_paths(src: &str, dst: &str) -> (String, String) {
+    if tokio::fs::metadata(src).await.is_ok_and(|meta| meta.is_dir()) {
         (format!("{}/", src.trim_end_matches('/')), format!("{}/", dst.trim_end_matches('/')))
     } else {
         (src.to_string(), dst.to_string())
@@ -274,7 +374,7 @@ struct RsyncTransferArgs<'a> {
     log_file: &'a LogFile,
 }
 
-async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> Result<()> {
+async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<(), CopyFailure> {
     let mut cmd = Command::new("rsync");
     cmd.args(["-a", "-z"]);
     if args.opts.delete {
@@ -286,7 +386,7 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> Result<()> {
     if args.config.dry_run {
         cmd.args(["--dry-run", "-i"]);
     }
-    let (src, dst) = normalize_copy_paths(args.src, args.dst);
+    let (src, dst) = normalize_copy_paths(args.src, args.dst).await;
     let dir = if dst.ends_with('/') {
         dst.as_str()
     } else {
@@ -323,16 +423,18 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> Result<()> {
         diff_filter,
         args.log_file,
     )
-    .await?
+    .await
+    .map_err(|err| CopyFailure::transport(format!("rsync could not start: {err:#}")))?
     {
         stream::PipedRun::Completed(status) => {
             if !status.success() {
-                bail!("rsync exited with status {status}");
+                return Err(CopyFailure::transport(format!("rsync exited with status {status}")));
             }
             Ok(())
         }
-        stream::PipedRun::TimedOut => {
-            bail!("copy step timed out");
+        stream::PipedRun::TimedOut => Err(CopyFailure::timeout("copy step timed out")),
+        stream::PipedRun::PipeBroken => {
+            Err(CopyFailure::transport("rsync closed its input before the transfer finished"))
         }
     }
 }
@@ -344,12 +446,12 @@ async fn run_scp_transfer(
     dst: &str,
     config: StepConfig,
     log_file: &LogFile,
-) -> Result<()> {
+) -> std::result::Result<(), CopyFailure> {
     if config.verbose >= 2 {
         crate::ui::note(&format!("  [{}] scp fallback: {src} -> {dst}", host.alias), log_file);
     }
 
-    let is_dir_src = std::fs::metadata(src).is_ok_and(|meta| meta.is_dir());
+    let is_dir_src = tokio::fs::metadata(src).await.is_ok_and(|meta| meta.is_dir());
     let (dir, scp_src) = if is_dir_src {
         (dst.trim_end_matches('/').to_string(), format!("{src}/."))
     } else {
@@ -370,10 +472,14 @@ async fn run_scp_transfer(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
     mkdir.kill_on_drop(true);
-    isolate(&mut mkdir);
-    let status = mkdir.status().await.wrap_err("failed to create remote dir")?;
+    // Routed through `run_command_status` so the mkdir honours the per-step
+    // timeout and owns a `GroupGuard`: an unbounded `ssh` here used to hang a
+    // `--timeout`-bounded copy step forever.
+    let status = run_command_status(mkdir, config.timeout, "remote mkdir")
+        .await
+        .map_err(|err| CopyFailure::transport(format!("failed to create remote dir: {err:#}")))?;
     if !status.success() {
-        bail!("remote mkdir for {dir} failed");
+        return Err(CopyFailure::transport(format!("remote mkdir for {dir} failed")));
     }
 
     let dest = format!("{}:{dir}/", host.spec.dest());
@@ -395,16 +501,18 @@ async fn run_scp_transfer(
     }
 
     match stream::run_piped_child(ui, &host.alias, scp, None, config.timeout, None, log_file)
-        .await?
+        .await
+        .map_err(|err| CopyFailure::transport(format!("scp could not start: {err:#}")))?
     {
         stream::PipedRun::Completed(status) => {
             if !status.success() {
-                bail!("scp exited with status {status}");
+                return Err(CopyFailure::transport(format!("scp exited with status {status}")));
             }
             Ok(())
         }
-        stream::PipedRun::TimedOut => {
-            bail!("copy step timed out");
+        stream::PipedRun::TimedOut => Err(CopyFailure::timeout("copy step timed out")),
+        stream::PipedRun::PipeBroken => {
+            Err(CopyFailure::transport("scp closed its input before the transfer finished"))
         }
     }
 }

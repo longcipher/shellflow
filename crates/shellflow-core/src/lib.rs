@@ -5,6 +5,17 @@
 //! and renders shell-safe payload helpers. Everything here is unit- and
 //! property-testable without a network or a shell.
 
+// The workspace denies `panic`/`unwrap`/`expect` in production code. Unit
+// tests need them by construction (`assert!`, `.expect("...")` on fixtures),
+// so the constraint is scoped explicitly here rather than left unenforced by
+// simply not linting test targets.
+//
+// `pedantic` is likewise scoped to production code: it is style guidance, and
+// test fixtures legitimately clone, use single-character patterns, and assert
+// on emptiness. The safety-relevant `deny` lints above still apply.
+#![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(test, allow(clippy::pedantic, clippy::nursery))]
+
 pub mod env;
 pub mod error;
 pub mod heredoc;
@@ -13,8 +24,11 @@ pub mod plan;
 pub mod ssh_spec;
 pub mod template;
 
-pub use env::{MASK, mask_line, render_env, shell_quote_single};
-pub use error::{InterpolateError, ParseError};
+pub use env::{
+    CAPTURE_SEPARATOR, MASK, mask_line, parse_capture_records, prepare_masks, render_env,
+    shell_quote_single,
+};
+pub use error::{CaptureError, InterpolateError, ParseError};
 pub use heredoc::{Heredoc, HeredocTracker};
 pub use parser::parse_script;
 pub use plan::{

@@ -198,6 +198,20 @@ pub(crate) fn step_error_if_failed(hosts: &[(String, HostOutcome)]) -> Option<Ru
     })
 }
 
+/// Acquires a fan-out slot, reporting a failure as a transport error for the
+/// host (see [`acquire_fanout_slot`]).
+macro_rules! fanout_slot {
+    ($semaphore:expr, $log_file:expr, $host:expr) => {
+        match super::acquire_fanout_slot($semaphore, $log_file).await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return ($host.alias.clone(), HostOutcome::Failed(RunError::Transport));
+            }
+        }
+    };
+}
+pub(crate) use fanout_slot;
+
 /// An unpredictable capture path per step: PID + nanosecond nonce. Combined
 /// with `create_new` in the caller this defeats symlink pre-planting.
 pub(crate) fn capture_file_path() -> PathBuf {
@@ -205,4 +219,62 @@ pub(crate) fn capture_file_path() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     std::env::temp_dir().join(format!("shellflow-capture-{}-{nonce}.txt", std::process::id()))
+}
+
+/// Acquire one fan-out slot, or report why the host must fail.
+///
+/// A **closed** semaphore must fail the task, never silently run unthrottled:
+/// `None` means "no limit", so treating a closed semaphore as `None` would
+/// turn it into a full-speed fan-out — the opposite of `--parallel N`.
+pub(crate) async fn acquire_fanout_slot(
+    semaphore: &Option<Arc<tokio::sync::Semaphore>>,
+    log_file: &LogFile,
+) -> eyre::Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    let Some(semaphore) = semaphore else {
+        return Ok(None);
+    };
+    let permit = Arc::clone(semaphore).acquire_owned().await;
+    let permit = permit.map_err(|_| {
+        crate::ui::warn("fan-out semaphore closed; refusing to exceed --parallel", log_file);
+        eyre::eyre!("fan-out semaphore closed; refusing to exceed --parallel")
+    })?;
+    Ok(Some(permit))
+}
+
+/// Deletes an `@export` capture file on **every** exit path.
+///
+/// The file holds plaintext `NAME=VALUE` records for whatever the step
+/// exported, so it must not outlive the step: a failed step (non-zero exit,
+/// spawn error, or an unparsable capture) returns through `?`/`bail!` long
+/// before any explicit cleanup would run. Cleanup is therefore attached to
+/// the guard's lifetime rather than to the happy path, mirroring the
+/// [`process::GroupGuard`] rationale for process teardown.
+pub(crate) struct CaptureFile(PathBuf);
+
+impl CaptureFile {
+    /// Take ownership of an already-created capture file at `path`.
+    pub(super) const fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    /// The path to hand to the child process via `SHELLFLOW_CAPTURE`.
+    pub(super) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for CaptureFile {
+    fn drop(&mut self) {
+        // Best-effort, but a failure to remove a plaintext file is worth
+        // reporting: silently leaving it behind is exactly the leak this
+        // guard exists to prevent.
+        if let Err(err) = std::fs::remove_file(&self.0) &&
+            err.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::ui::warn(
+                &format!("failed to remove export capture file {}: {err}", self.0.display()),
+                &None,
+            );
+        }
+    }
 }

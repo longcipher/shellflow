@@ -1,7 +1,10 @@
 //! Preflight validation: verify that the tools shellflow shells out to are
 //! present on `PATH` before any step runs.
 
-use std::{env, path::PathBuf, process::Command};
+use std::{env, path::PathBuf, process::Command, time::Duration};
+
+/// How long a `--version`-style probe may run before it is treated as broken.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The tools required on the controller machine.
 ///
@@ -47,23 +50,55 @@ fn check_tools(tools: &[(&str, &[&str])]) -> Result<(), String> {
 /// checked for existence on `PATH`. This is the case for `scp`, which — unlike
 /// `ssh -V` / `rsync --version` — has no version flag at all (OpenSSH's
 /// `scp` rejects `-V` as an illegal option).
+/// Run a probe command and report whether it succeeded within [`PROBE_TIMEOUT`].
+///
+/// The wait is bounded so a PATH-shadowed wrapper that never exits cannot hang
+/// the CLI before the engine — and its timeout machinery — is even running.
 fn tool_works(name: &str, args: &[&str]) -> bool {
     if args.is_empty() {
         return which(name).is_some();
     }
-    Command::new(name)
+    let Ok(mut child) = Command::new(name)
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // Still running at the deadline, or the wait itself failed.
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
-/// Minimal `which`: the first directory in `PATH` holding an executable file
-/// with this name.
+/// Minimal `which`: the first directory in `PATH` holding an **executable**
+/// file with this name.
+///
+/// The execute bit is checked, not just `is_file()`: design §7.5 exists to
+/// prevent a mid-run `Command::new` surprise, and a present-but-non-executable
+/// `scp` (0644) would pass an `is_file()` check and then fail every `@copy` to
+/// an rsync-less host at run time.
 fn which(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
     let path = env::var_os("PATH")?;
-    env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| candidate.is_file())
+    env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| {
+        candidate
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    })
 }
 
 #[cfg(test)]
