@@ -43,7 +43,7 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
             "show",
             &unit,
             "-p",
-            "ExecStart,Environment,EnvironmentFile,LoadCredentialEncrypted,ImportCredential,User",
+            "ExecStart,Environment,EnvironmentFile,LoadCredentialEncrypted,ImportCredential,User,Type,NotifyAccess,WatchdogUSec,TimeoutStartSec,ExecReload,StatusText,ActiveState,Result",
         ],
     )?;
     // argv / Environment secret values (ferriskey class): `--password VALUE`
@@ -110,6 +110,17 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
             Check::Fail,
             &mut failures,
         );
+    }
+
+    // Notify / readiness audit: the failures systemd reports for a service
+    // that never signalled readiness, plus the configuration mistakes that
+    // make a notify unit unable to signal at all.
+    let notify_findings = notify_findings(&show, &journal);
+    if notify_findings.is_empty() {
+        report("notify/readiness wiring is sound", Check::Ok, &mut failures);
+    }
+    for (message, status) in notify_findings {
+        report(&message, status, &mut failures);
     }
 
     if failures > 0 {
@@ -246,6 +257,119 @@ fn looks_like_leak(line: &str, _service: &str) -> bool {
     false
 }
 
+/// The notify / readiness findings for a unit.
+///
+/// `show` is the `systemctl show` output (one `Key=Value` per line) and
+/// `journal` is the unit's recent journal. The rules are the ones that
+/// actually break a notify service, in the order systemd itself reports them:
+///
+/// * `Type=notify` with `NotifyAccess=none` — the unit can never become
+///   ready; systemd kills it at `TimeoutStartSec`.
+/// * `Type=notify-reload` without `ExecReload=` — the reload is a no-op, so
+///   a graceful-restart playbook silently degrades to "nothing happened".
+/// * A configured `WatchdogSec=` with a watchdog timeout in the journal — the
+///   service never pings, so systemd killed it. This is a silent production
+///   failure that only the journal shows.
+/// * "no READY=1 notification received" in the journal — the service started
+///   but never signalled readiness.
+/// * A notify unit that is still activating with no `STATUS=` — the operator
+///   has no progress signal, which is exactly what the notify protocol is for.
+/// * A notify unit with a very short `TimeoutStartSec=` — the service is
+///   killed before it can finish initialising.
+fn notify_findings(show: &str, journal: &str) -> Vec<(String, Check)> {
+    let mut findings = Vec::new();
+    let props = parse_show_props(show);
+    let get = |key: &str| props.get(key).map_or("", String::as_str);
+    let unit_type = get("Type");
+    let notify_access = get("NotifyAccess");
+    let watchdog = get("WatchdogUSec").trim().parse::<u64>().unwrap_or(0);
+    let timeout_start = get("TimeoutStartSec");
+    let exec_reload = get("ExecReload");
+    let status_text = get("StatusText");
+    let active = get("ActiveState");
+    let is_notify = unit_type == "notify" || unit_type == "notify-reload";
+
+    if is_notify && notify_access == "none" {
+        findings.push((
+            format!(
+                "Type={unit_type} with NotifyAccess=none: the unit can never become ready \
+                 (systemd kills it at TimeoutStartSec)"
+            ),
+            Check::Fail,
+        ));
+    }
+    if unit_type == "notify-reload" && exec_reload.trim().is_empty() {
+        findings.push((
+            "Type=notify-reload without ExecReload=: the reload is a no-op".to_string(),
+            Check::Fail,
+        ));
+    }
+    if watchdog > 0 && journal_contains(journal, "watchdog timeout") {
+        findings.push((
+            format!(
+                "WatchdogSec={watchdog} is configured but the service never pinged it \
+                 (systemd killed it -- look for a missing WATCHDOG=1 in the service)"
+            ),
+            Check::Fail,
+        ));
+    }
+    if is_notify && journal_contains(journal, "no ready=1 notification") {
+        findings.push((
+            "the service never sent READY=1 (systemd reported it)".to_string(),
+            Check::Fail,
+        ));
+    }
+    if is_notify && active == "activating" && status_text.trim().is_empty() {
+        findings.push((
+            "no STATUS= published while the unit is starting: the operator has no progress \
+             signal"
+                .to_string(),
+            Check::Warn,
+        ));
+    }
+    if is_notify && timeout_start_is_short(timeout_start) {
+        findings.push((
+            format!("Type={unit_type} with a short TimeoutStartSec={timeout_start}"),
+            Check::Warn,
+        ));
+    }
+    findings
+}
+
+/// Parse the `Key=Value` lines of `systemctl show` output.
+fn parse_show_props(show: &str) -> std::collections::BTreeMap<String, String> {
+    let mut props = std::collections::BTreeMap::new();
+    for line in show.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            props.insert(key.trim().to_string(), value.to_string());
+        }
+    }
+    props
+}
+
+/// Case-insensitive journal substring test.
+fn journal_contains(journal: &str, needle: &str) -> bool {
+    journal.to_lowercase().contains(needle)
+}
+
+/// Whether a `TimeoutStartSec=` value is too short for a notify service.
+fn timeout_start_is_short(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() || v == "infinity" {
+        return false;
+    }
+    let split = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    let (num, unit) = v.split_at(split);
+    let Ok(n) = num.parse::<u64>() else {
+        return false;
+    };
+    match unit {
+        "" | "s" => n < 30,
+        "ms" => true,
+        _ => false,
+    }
+}
+
 fn validate_service_name(service: &str) -> Result<()> {
     let valid = !service.is_empty() &&
         service.starts_with(|c: char| c.is_ascii_lowercase()) &&
@@ -259,7 +383,10 @@ fn validate_service_name(service: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_argv_secret, looks_like_leak};
+    use super::{
+        Check, has_argv_secret, journal_contains, looks_like_leak, notify_findings,
+        parse_show_props, timeout_start_is_short,
+    };
 
     #[test]
     fn detects_argv_password() {
@@ -290,5 +417,104 @@ mod tests {
         assert!(looks_like_leak("config: DATABASE_PASSWORD=supersecretvalue123", "x"));
         assert!(!looks_like_leak("credentials KEK loaded; nothing to see", "x"));
         assert!(!looks_like_leak("listening on 127.0.0.1:8080", "x"));
+    }
+
+    #[test]
+    fn parses_show_properties() {
+        let props = parse_show_props("Type=notify\nActiveState=active\nExecStart={ path=/bin/x }");
+        assert_eq!(props.get("Type").map(String::as_str), Some("notify"));
+        assert_eq!(props.get("ActiveState").map(String::as_str), Some("active"));
+        assert_eq!(props.get("ExecStart").map(String::as_str), Some("{ path=/bin/x }"));
+        assert!(!props.contains_key("Missing"));
+    }
+
+    #[test]
+    fn a_notify_unit_with_notify_access_none_fails() {
+        let show = "Type=notify\nNotifyAccess=none\nActiveState=activating\n";
+        let findings = notify_findings(show, "");
+        assert!(
+            findings.iter().any(|(m, s)| m.contains("NotifyAccess=none") && *s == Check::Fail),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_sound_notify_unit_has_no_findings() {
+        let show = "Type=notify\nNotifyAccess=main\nActiveState=active\nStatusText=\n";
+        assert!(notify_findings(show, "").is_empty());
+    }
+
+    #[test]
+    fn a_notify_reload_unit_without_exec_reload_fails() {
+        let show = "Type=notify-reload\nNotifyAccess=main\nExecReload=\nActiveState=active\n";
+        let findings = notify_findings(show, "");
+        assert!(
+            findings.iter().any(|(m, s)| m.contains("ExecReload") && *s == Check::Fail),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_watchdog_kill_is_reported() {
+        let show = "Type=simple\nNotifyAccess=none\nWatchdogUSec=30000000\nActiveState=active\n";
+        let journal = "systemd[1]: foo.service: Watchdog timeout (limit 30s)!";
+        let findings = notify_findings(show, journal);
+        assert!(
+            findings.iter().any(|(m, s)| m.contains("WatchdogSec") && *s == Check::Fail),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_ready_notification_is_reported() {
+        let show = "Type=notify\nNotifyAccess=main\nActiveState=inactive\n";
+        let journal = "systemd[1]: foo.service: Startup finished, but no READY=1 notification received.";
+        let findings = notify_findings(show, journal);
+        assert!(
+            findings.iter().any(|(m, s)| m.contains("READY=1") && *s == Check::Fail),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn an_activating_notify_unit_without_status_is_a_warning() {
+        let show = "Type=notify\nNotifyAccess=main\nActiveState=activating\nStatusText=\n";
+        let findings = notify_findings(show, "");
+        assert!(
+            findings.iter().any(|(m, s)| m.contains("STATUS=") && *s == Check::Warn),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_start_timeout_on_a_notify_unit_is_a_warning() {
+        let show = "Type=notify\nNotifyAccess=main\nActiveState=active\nTimeoutStartSec=10s\n";
+        let findings = notify_findings(show, "");
+        assert!(
+            findings.iter().any(|(m, s)| m.contains("TimeoutStartSec") && *s == Check::Warn),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_simple_unit_is_not_audited_for_notify() {
+        let show = "Type=simple\nNotifyAccess=none\nActiveState=active\nTimeoutStartSec=10s\n";
+        assert!(notify_findings(show, "").is_empty());
+    }
+
+    #[test]
+    fn short_timeouts_are_recognised() {
+        assert!(timeout_start_is_short("10s"));
+        assert!(timeout_start_is_short("500ms"));
+        assert!(!timeout_start_is_short("90s"));
+        assert!(!timeout_start_is_short("1min 30s"));
+        assert!(!timeout_start_is_short("infinity"));
+        assert!(!timeout_start_is_short(""));
+    }
+
+    #[test]
+    fn journal_matching_is_case_insensitive() {
+        assert!(journal_contains("Watchdog TIMEOUT (limit 30s)", "watchdog timeout"));
+        assert!(!journal_contains("all good", "watchdog timeout"));
     }
 }

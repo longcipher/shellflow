@@ -516,6 +516,72 @@ const DEFAULT_WAIT_SECS: u64 = 300;
 /// in its own process group, is killed when the run is interrupted, and
 /// cannot outlive the budget: a blackholed connection used to block the poll
 /// loop indefinitely.
+/// The remote command that waits for a unit to become ready.
+///
+/// The helper does the waiting **on the target**: it polls systemd there and
+/// streams one state line per poll, so the whole wait costs a single SSH
+/// round-trip instead of one per poll.
+///
+/// When the helper is not installed yet (a host that has never seen this
+/// shellflow), a self-contained fallback polls `systemctl is-active` so the
+/// step still works — it just cannot show the service's own `STATUS=` text.
+///
+/// The unit name is validated at parse time (`[A-Za-z0-9._-]` plus `@`/`:`,
+/// no leading dots, no `..`), so interpolating it into the script cannot
+/// smuggle a quote or a shell metacharacter.
+fn wait_command(unit: &str, budget_secs: u64) -> String {
+    format!(
+        "if [ -x /usr/local/bin/shellflow ]; then exec /usr/local/bin/shellflow systemd wait '{unit}' --timeout {budget_secs} --for ready; fi; \
+         u='{unit}'; d=$(( $(date +%s) + {budget_secs} )); \
+         while :; do \
+           if systemctl is-active --quiet \"$u\"; then echo 'SFW active'; exit 0; fi; \
+           if systemctl is-failed --quiet \"$u\"; then echo 'SFW failed'; exit 3; fi; \
+           echo 'SFW pending'; \
+           if [ \"$(date +%s)\" -ge \"$d\" ]; then exit 4; fi; \
+           sleep 5; \
+         done"
+    )
+}
+
+/// Interpret the state lines the target-side helper streams.
+///
+/// The helper emits `SFW<TAB>type<TAB>active<TAB>sub<TAB>result<TAB>status`;
+/// the fallback emits a single word. The operator sees the service's own
+/// `STATUS=` text when it publishes one (that is the whole point of the notify
+/// protocol) and the raw systemd state otherwise.
+fn wait_collector(unit: &str) -> stream::LineCollector {
+    let unit = unit.to_string();
+    stream::LineCollector::new(move |line| {
+        if let Some(state) = crate::systemd::parse_state_line(line) {
+            let mut bits = Vec::new();
+            if !state.unit_type.is_empty() {
+                bits.push(format!("type={}", state.unit_type));
+            }
+            if !state.active.is_empty() {
+                bits.push(format!("active={}", state.active));
+            }
+            if !state.sub.is_empty() {
+                bits.push(format!("sub={}", state.sub));
+            }
+            if !state.result.is_empty() {
+                bits.push(format!("result={}", state.result));
+            }
+            let bits = bits.join(" ");
+            return Some(if state.status.is_empty() {
+                format!("waiting {unit}: {bits}")
+            } else {
+                format!("waiting {unit}: {}", state.status)
+            });
+        }
+        let rest = line.strip_prefix("SFW")?;
+        let word = rest.trim();
+        if word.is_empty() {
+            return None;
+        }
+        Some(format!("waiting {unit}: {word}"))
+    })
+}
+
 pub(super) async fn run_wait_step(
     ui: &ArcUi,
     wait: &shellflow_core::WaitStep,
@@ -525,7 +591,7 @@ pub(super) async fn run_wait_step(
     log_file: &LogFile,
     cancel: &Cancel,
 ) -> eyre::Result<Vec<(String, HostOutcome)>> {
-    use tokio::time::{Duration, Instant};
+    use tokio::time::Duration;
     if config.check || config.dry_run {
         crate::ui::note(
             &format!(
@@ -538,7 +604,6 @@ pub(super) async fn run_wait_step(
         return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
     }
     let budget = Duration::from_secs(config.timeout.unwrap_or(DEFAULT_WAIT_SECS));
-    let interval = Duration::from_secs(wait.interval_secs.max(1));
     let mut tasks = JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(ui);
@@ -556,74 +621,88 @@ pub(super) async fn run_wait_step(
                 },
                 None => None,
             };
-            let deadline = Instant::now() + budget;
-            loop {
-                if cancel.is_cancelled() {
-                    return (host.alias.clone(), HostOutcome::Cancelled);
+            if cancel.is_cancelled() {
+                return (host.alias.clone(), HostOutcome::Cancelled);
+            }
+            // The wait runs *on the target*: the helper polls systemd there and
+            // streams one state line per poll. The whole wait therefore costs
+            // a single SSH round-trip instead of one per poll, and the
+            // operator sees the service's own `STATUS=` text while it starts.
+            let mut cmd = Command::new("ssh");
+            // Fail closed on an unknown host key or a missing key: never prompt.
+            cmd.args(["-o", "BatchMode=yes"]);
+            cmd.args(host.spec.to_ssh_args())
+                .arg("-T")
+                .arg(wait_command(&unit, budget.as_secs()));
+            let args = stream::PipedArgs {
+                ui: &ui,
+                host: &host.alias,
+                payload: None,
+                // The helper enforces its own budget; the transport gets a
+                // little more so the helper's own verdict wins.
+                timeout: Some(budget.as_secs() + 30),
+                diff_filter: None,
+                log_file: &log_file,
+                cancel: cancel.clone(),
+                quiet: false,
+                collector: Some(wait_collector(&unit)),
+            };
+            let outcome = match stream::run_piped_child(args, cmd).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
                 }
-                let mut cmd = Command::new("ssh");
-                // Fail closed on an unknown host key or a missing key: never prompt.
-                cmd.args(["-o", "BatchMode=yes"]);
-                cmd.args(host.spec.to_ssh_args())
-                    .arg("-T")
-                    .arg(format!("systemctl is-active {unit}"));
-                // `systemctl is-active` exits 0 only for an active unit; the
-                // exit code is the verdict, so the poll's own output is
-                // discarded instead of streamed as noise.
-                let args = stream::PipedArgs {
-                    ui: &ui,
-                    host: &host.alias,
-                    payload: None,
-                    // One poll may not outlive the interval: a hung ssh must
-                    // not eat the whole budget in a single attempt.
-                    timeout: Some(interval.as_secs().max(1)),
-                    diff_filter: None,
-                    log_file: &log_file,
-                    cancel: cancel.clone(),
-                    quiet: true,
-                };
-                let outcome = match stream::run_piped_child(args, cmd).await {
-                    Ok(outcome) => outcome,
-                    Err(_) => {
-                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
-                    }
-                };
-                match outcome {
-                    stream::PipedRun::Completed(status) => {
-                        if status.success() {
-                            ui.lock().await.masked_note(&format!("[{}] {unit} active", host.alias));
-                            return (host.alias.clone(), HostOutcome::Ok);
+            };
+            match outcome {
+                stream::PipedRun::Completed(status) => {
+                    let code = status.code().unwrap_or(-1);
+                    match code {
+                        0 => {
+                            ui.lock().await.masked_note(&format!(
+                                "[{}] {unit} active",
+                                host.alias
+                            ));
+                            (host.alias.clone(), HostOutcome::Ok)
                         }
                         // ssh exits 255 when the connection itself failed:
                         // that is a transport failure, not an inactive unit.
-                        if status.code() == Some(255) {
-                            return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
+                        255 => (host.alias.clone(), HostOutcome::Failed(RunError::Transport)),
+                        3 => {
+                            ui.lock().await.masked_note(&format!(
+                                "[{}] {unit} failed",
+                                host.alias
+                            ));
+                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
+                        }
+                        4 => {
+                            ui.lock().await.masked_note(&format!(
+                                "[{}] {unit} not ready after {}s",
+                                host.alias,
+                                budget.as_secs()
+                            ));
+                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
+                        }
+                        5 => {
+                            ui.lock().await.masked_note(&format!(
+                                "[{}] {unit} does not exist",
+                                host.alias
+                            ));
+                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
+                        }
+                        other => {
+                            ui.lock().await.masked_note(&format!(
+                                "[{}] {unit} wait failed (exit {other})",
+                                host.alias
+                            ));
+                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
                         }
                     }
-                    stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken => {
-                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
-                    }
-                    stream::PipedRun::Cancelled => {
-                        return (host.alias.clone(), HostOutcome::Cancelled);
-                    }
                 }
-                if Instant::now() + interval >= deadline {
-                    ui.lock().await.masked_note(&format!(
-                        "[{}] {unit} not active after {}s",
-                        host.alias,
-                        budget.as_secs()
-                    ));
-                    return (host.alias.clone(), HostOutcome::Failed(RunError::Script));
+                stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken => {
+                    (host.alias.clone(), HostOutcome::Failed(RunError::Transport))
                 }
-                // Racing the sleep against cancellation keeps an interrupt
-                // responsive: an uninterrupted 5s sleep per poll would eat
-                // the interrupt grace period one interval at a time.
-                let mut waiter = cancel.clone();
-                tokio::select! {
-                    () = tokio::time::sleep(interval) => {}
-                    () = waiter.cancelled() => {
-                        return (host.alias.clone(), HostOutcome::Cancelled);
-                    }
+                stream::PipedRun::Cancelled => {
+                    (host.alias.clone(), HostOutcome::Cancelled)
                 }
             }
         });
@@ -1176,6 +1255,7 @@ async fn run_remote_guard(args: RemoteGuardArgs<'_>) -> GuardResult {
         log_file,
         cancel: cancel.clone(),
         quiet: true,
+        collector: None,
     };
     match stream::run_piped_child(args, cmd).await {
         Ok(stream::PipedRun::Completed(status)) if status.success() => GuardResult::Pass,
@@ -1211,6 +1291,7 @@ async fn run_ssh_child(
         log_file,
         cancel,
         quiet: false,
+        collector: None,
     };
     match stream::run_piped_child(args, cmd).await.map_err(|_| SshOutcome::Transport)? {
         stream::PipedRun::Completed(status) => {
@@ -1227,5 +1308,66 @@ async fn run_ssh_child(
         // key rejected, reset), not that the step ran out of time: exit 3.
         stream::PipedRun::PipeBroken => Err(SshOutcome::Transport),
         stream::PipedRun::Cancelled => Err(SshOutcome::Cancelled),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{wait_command, wait_collector};
+
+    #[test]
+    fn the_wait_command_prefers_the_target_side_helper() {
+        let cmd = wait_command("foo.service", 300);
+        assert!(
+            cmd.contains("/usr/local/bin/shellflow systemd wait 'foo.service'"),
+            "the helper is the primary path: {cmd}"
+        );
+        assert!(cmd.contains("--timeout 300"), "{cmd}");
+        assert!(cmd.contains("--for ready"), "{cmd}");
+    }
+
+    #[test]
+    fn the_wait_command_has_a_self_contained_fallback() {
+        let cmd = wait_command("foo.service", 30);
+        // A host that has never seen this shellflow has no helper: the step
+        // must still work, so the script falls back to polling systemctl.
+        assert!(cmd.contains("systemctl is-active"), "{cmd}");
+        assert!(cmd.contains("systemctl is-failed"), "{cmd}");
+    }
+
+    #[test]
+    fn the_wait_command_carries_the_budget_into_the_fallback() {
+        let cmd = wait_command("foo.service", 42);
+        assert!(cmd.contains("+ 42"), "{cmd}");
+    }
+
+    #[test]
+    fn the_collector_renders_the_services_own_status() {
+        let collector = wait_collector("foo.service");
+        let line = "SFW\tnotify\tactivating\tstart\tsuccess\tsyncing chain 42%";
+        let rendered = collector.record(line).expect("renders");
+        assert_eq!(rendered, "waiting foo.service: syncing chain 42%");
+    }
+
+    #[test]
+    fn the_collector_falls_back_to_the_raw_state() {
+        let collector = wait_collector("foo.service");
+        let line = "SFW\tnotify\tactivating\tstart\tsuccess\t";
+        let rendered = collector.record(line).expect("renders");
+        assert_eq!(rendered, "waiting foo.service: type=notify active=activating sub=start result=success");
+    }
+
+    #[test]
+    fn the_collector_handles_the_fallback_line() {
+        let collector = wait_collector("foo.service");
+        let rendered = collector.record("SFW pending").expect("renders");
+        assert_eq!(rendered, "waiting foo.service: pending");
+    }
+
+    #[test]
+    fn the_collector_drops_unrelated_output() {
+        let collector = wait_collector("foo.service");
+        assert!(collector.record("some unrelated output").is_none());
+        assert!(collector.record("").is_none());
     }
 }
