@@ -52,9 +52,14 @@ printf 'HOST: %s\n' "$host" >> "$LOG"
 # host deliberately omits it to exercise the scp fallback).
 if [[ " $*" == *'$SHELL'* && " $*" == *'$PATH'* ]]; then
   case "$host" in
-    *zsh*) printf '/usr/bin/zsh\n%s\n' "$PATH" ;;
-    *)     printf '/usr/bin/bash\n%s\n' "$PATH" ;;
+    *zsh*) printf '/usr/bin/zsh\n' ;;
+    *)     printf '/usr/bin/bash\n' ;;
   esac
+  printf 'SHELLFLOW_PATH_BEGIN\n'
+  printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do
+    if [ -n "$d" ] && [ -d "$d" ]; then printf '%s\n' "$d"; fi
+  done
+  printf 'SHELLFLOW_PATH_END\n'
   case "$host" in
     *norsync*) ;;
     *) printf 'SHELLFLOW_HAS_RSYNC\n' ;;
