@@ -486,6 +486,7 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<
         log_file: args.log_file,
         cancel: args.cancel.clone(),
         quiet: false,
+        collector: None,
     };
     match stream::run_piped_child(piped, cmd)
         .await
@@ -609,6 +610,7 @@ async fn run_scp_transfer(
         log_file,
         cancel: cancel.clone(),
         quiet: false,
+        collector: None,
     };
     match stream::run_piped_child(piped, scp)
         .await

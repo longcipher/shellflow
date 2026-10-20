@@ -74,6 +74,37 @@ pub(super) struct PipedArgs<'a> {
     /// Used by the `@wait_active` poll, whose verdict is the child's exit
     /// status and whose per-poll output would only be noise.
     pub quiet: bool,
+    /// Interpret the child's output instead of forwarding it raw.
+    ///
+    /// The `@wait_active` step uses this: the target-side helper streams one
+    /// machine-readable state line per poll, and the collector turns those
+    /// into a progress line for the operator (the service's own `STATUS=`
+    /// text, when it publishes one). Lines the collector does not recognise
+    /// are dropped.
+    pub collector: Option<LineCollector>,
+}
+
+/// Interprets a child's output lines on their way to the UI.
+///
+/// The closure returns the line to display, or `None` to drop it.
+pub(super) struct LineCollector {
+    inner: std::sync::Arc<std::sync::Mutex<LineInterpreter>>,
+}
+
+/// Turns one output line into the line to display (or nothing).
+type LineInterpreter = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+impl LineCollector {
+    /// Build a collector from an interpretation function.
+    pub(super) fn new(f: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> Self {
+        Self { inner: std::sync::Arc::new(std::sync::Mutex::new(Box::new(f))) }
+    }
+
+    /// Interpret one line.
+    pub(super) fn record(&self, line: &str) -> Option<String> {
+        let guard = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        (guard)(line)
+    }
 }
 
 /// Run a piped child with stdout/stderr forwarded through the UI, honoring
@@ -83,9 +114,19 @@ pub(super) struct PipedArgs<'a> {
 /// payload write *and* the wait, so a peer that never reads the payload
 /// cannot outlive the step.
 pub(super) async fn run_piped_child(args: PipedArgs<'_>, mut cmd: Command) -> Result<PipedRun> {
-    let PipedArgs { ui, host, payload, timeout, diff_filter, log_file, mut cancel, quiet } = args;
+    let PipedArgs {
+        ui,
+        host,
+        payload,
+        timeout,
+        diff_filter,
+        log_file,
+        mut cancel,
+        quiet,
+        collector,
+    } = args;
 
-    if quiet {
+    if quiet && collector.is_none() {
         cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     } else {
         cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
@@ -106,7 +147,11 @@ pub(super) async fn run_piped_child(args: PipedArgs<'_>, mut cmd: Command) -> Re
     // with large output. The drain after the wait is bounded (see
     // `DRAIN_GRACE`), which is what stops a backgrounded descendant from
     // hanging the step instead.
-    let mut readers = if quiet { None } else { spawn_readers(ui, host, diff_filter, &mut child) };
+    let mut readers = if quiet && collector.is_none() {
+        None
+    } else {
+        spawn_readers(ui, host, diff_filter, collector, &mut child)
+    };
 
     // 1. Deliver the payload, racing cancellation: with no timeout a stalled
     // peer would otherwise ride out the whole interrupt grace period without
@@ -193,6 +238,7 @@ fn spawn_readers(
     ui: &ArcUi,
     host: &str,
     diff_filter: Option<super::DiffFilter>,
+    collector: Option<LineCollector>,
     child: &mut tokio::process::Child,
 ) -> Option<JoinSet<()>> {
     let stdout = child.stdout.take()?;
@@ -207,6 +253,14 @@ fn spawn_readers(
     readers.spawn(async move {
         let mut rx = rx;
         while let Some((stream, line)) = rx.recv().await {
+            if let Some(collector) = &collector {
+                // The collector owns the line: it decides what (if anything)
+                // the operator sees.
+                if let Some(rendered) = collector.record(&line) {
+                    ui_handle.lock().await.host_line(&host_alias, stream, &rendered);
+                }
+                continue;
+            }
             if let Some(f) = &diff_filter &&
                 stream == Stream::Stdout &&
                 !f(&line)
@@ -315,6 +369,7 @@ mod tests {
             log_file,
             cancel,
             quiet: false,
+            collector: None,
         }
     }
 

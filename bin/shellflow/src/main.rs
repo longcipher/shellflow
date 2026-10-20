@@ -27,6 +27,7 @@ mod secret;
 mod secrets;
 mod service;
 mod service_check;
+mod systemd;
 mod template;
 mod ui;
 
@@ -104,6 +105,13 @@ async fn main() -> Result<()> {
             Err(err) => {
                 eprintln!("error: {err:#}");
                 1
+            }
+        },
+        Some(Command::Systemd(cmd)) => match systemd::run(&cmd.command) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                err.exit_code()
             }
         },
         Some(Command::Service(cmd)) => match service::run(&cmd.command) {
