@@ -8,7 +8,7 @@ use crate::{
     heredoc::HeredocTracker,
     plan::{
         CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, SecretEntry, Step, Target,
-        WaitStep, is_valid_var_name,
+        ReloadStep, WaitStep, is_valid_var_name,
     },
     ssh_spec::SshSpec,
 };
@@ -165,6 +165,10 @@ impl State {
             "wait_active" => {
                 self.flush();
                 self.add_wait(payload, line)
+            }
+            "reload" => {
+                self.flush();
+                self.add_reload(payload, line)
             }
             "export" => self.declare_export(payload, line),
             "timeout" => {
@@ -607,6 +611,137 @@ impl State {
         }));
         Ok(())
     }
+
+    /// Parse `# @reload <unit> @<target> [--signal SIG] [--wait] [--timeout SECS]`.
+    ///
+    /// A graceful reload: the unit's own `ExecReload=` is preferred, an
+    /// explicit `--signal` is the second choice, and a reload that cannot be
+    /// performed fails rather than silently degrading into a restart (a restart
+    /// drops the connections the reload exists to preserve).
+    ///
+    /// Like `@wait_active`, the unit accepts `foo` or `foo.service`, `@only_if`
+    /// is rejected (a reload has no script context), and `@name`/`@timeout`
+    /// apply.
+    fn add_reload(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "reload".to_string(),
+                reason: "`@only_if` is not supported on `@reload`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let pending_timeout = self.pending_timeout.take();
+        let mut tokens: Vec<&str> = payload.split_whitespace().collect();
+        let mut signal: Option<String> = None;
+        let mut wait = false;
+        let mut timeout = pending_timeout;
+
+        // Peel the optional trailing flags. They are peeled from the end so the
+        // `<unit> @<target>` prefix stays where the operator expects it.
+        loop {
+            let last = tokens.last().copied();
+            let flag_before = if tokens.len() >= 2 { tokens[tokens.len() - 2] } else { "" };
+            match last {
+                Some("--wait") => {
+                    tokens.pop();
+                    wait = true;
+                }
+                Some(value)
+                    if (flag_before == "--timeout" || flag_before == "--signal") &&
+                        value != "--wait" =>
+                {
+                    tokens.pop();
+                    let flag = tokens.pop().unwrap_or_default();
+                    if flag == "--timeout" {
+                        let secs: u64 = value.parse().map_err(|_| ParseError::InvalidDirective {
+                            line,
+                            directive: "reload".to_string(),
+                            reason: format!("invalid seconds `{value}`"),
+                        })?;
+                        if secs == 0 {
+                            return Err(ParseError::InvalidDirective {
+                                line,
+                                directive: "reload".to_string(),
+                                reason: "must be greater than zero".to_string(),
+                            });
+                        }
+                        timeout = Some(secs);
+                    } else {
+                        // The signal is interpolated into a remote command, so
+                        // only a bare signal name is accepted.
+                        if value.is_empty() ||
+                            !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            return Err(ParseError::InvalidDirective {
+                                line,
+                                directive: "reload".to_string(),
+                                reason: format!("invalid signal `{value}` (want e.g. SIGUSR1)"),
+                            });
+                        }
+                        signal = Some(value.to_string());
+                    }
+                }
+                Some(flag) if flag == "--timeout" || flag == "--signal" => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "reload".to_string(),
+                        reason: format!("`{flag}` expects a value"),
+                    });
+                }
+                _ => break,
+            }
+        }
+
+        if tokens.len() != 2 {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "reload".to_string(),
+                reason: "expected `<unit> @<target> [--signal SIG] [--wait] [--timeout SECS]`"
+                    .to_string(),
+            });
+        }
+        let mut unit = tokens[0].trim().to_string();
+        if unit.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "reload".to_string(),
+                reason: "missing unit name".to_string(),
+            });
+        }
+        if !unit.ends_with(".service") {
+            unit.push_str(".service");
+        }
+        if !unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':')) ||
+            unit.starts_with('.') ||
+            unit.contains("..")
+        {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "reload".to_string(),
+                reason: format!("unsafe unit name `{unit}`"),
+            });
+        }
+        let target = tokens[1].trim_start_matches('@').trim();
+        if target.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "reload".to_string(),
+                reason: "missing target".to_string(),
+            });
+        }
+        self.plan.steps.push(Step::Reload(ReloadStep {
+            name,
+            target: Target::new(target),
+            unit,
+            signal,
+            wait,
+            timeout,
+        }));
+        Ok(())
+    }
 }
 
 /// Strip one layer of surrounding `"` or `'` quotes.
@@ -764,6 +899,50 @@ mod tests {
         assert_eq!(step.unit, "sws.service");
         assert_eq!(step.timeout, Some(60));
         Ok(())
+    }
+
+    #[test]
+    fn reload_parses_unit_target_and_flags() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @reload sws @api --signal SIGUSR1 --wait --timeout 60\n",
+        )?;
+        let step = plan.steps.first().ok_or("no step")?;
+        let crate::plan::Step::Reload(reload) = step else {
+            return Err("not a reload step".to_string());
+        };
+        assert_eq!(reload.unit, "sws.service");
+        assert_eq!(reload.target.text, "api");
+        assert_eq!(reload.signal.as_deref(), Some("SIGUSR1"));
+        assert!(reload.wait);
+        assert_eq!(reload.timeout, Some(60));
+        Ok(())
+    }
+
+    #[test]
+    fn reload_defaults_to_no_signal_and_no_wait() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @reload sws @api\n")?;
+        let step = plan.steps.first().ok_or("no step")?;
+        let crate::plan::Step::Reload(reload) = step else {
+            return Err("not a reload step".to_string());
+        };
+        assert!(reload.signal.is_none());
+        assert!(!reload.wait);
+        Ok(())
+    }
+
+    #[test]
+    fn reload_rejects_bad_shapes() {
+        for bad in [
+            "# @server api api\n# @reload @api\n",
+            "# @server api api\n# @reload ../evil @api\n",
+            "# @server api api\n# @reload sws\n",
+            "# @server api api\n# @reload 'sws; id' @api\n",
+            "# @server api api\n# @reload sws @api --signal 'SIG; id'\n",
+            "# @server api api\n# @reload sws @api --timeout 0\n",
+        ] {
+            assert!(parse(bad).is_err(), "should reject: {bad}");
+        }
     }
 
     #[test]

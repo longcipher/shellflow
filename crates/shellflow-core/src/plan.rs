@@ -152,6 +152,23 @@ pub struct WaitStep {
     pub interval_secs: u64,
 }
 
+/// A graceful reload of a systemd unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReloadStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// systemd unit name (`foo` or `foo.service`).
+    pub unit: String,
+    /// Signal to send when the unit declares no `ExecReload=` (`SIGUSR1`).
+    pub signal: Option<String>,
+    /// Wait for the reload handshake before reporting success.
+    pub wait: bool,
+    /// How long to wait for the handshake, in seconds.
+    pub timeout: Option<u64>,
+}
+
 /// One executable unit of the plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Step {
@@ -163,6 +180,8 @@ pub enum Step {
     Copy(CopyStep),
     /// Wait for a systemd unit to report active.
     Wait(WaitStep),
+    /// Reload a systemd unit gracefully.
+    Reload(ReloadStep),
 }
 
 impl Step {
@@ -174,6 +193,7 @@ impl Step {
             Self::Remote(s) => s.name.as_deref(),
             Self::Copy(s) => s.name.as_deref(),
             Self::Wait(s) => s.name.as_deref(),
+            Self::Reload(s) => s.name.as_deref(),
         }
     }
 
@@ -186,6 +206,7 @@ impl Step {
             Self::Remote(_) => "remote",
             Self::Copy(_) => "copy",
             Self::Wait(_) => "wait_active",
+            Self::Reload(_) => "reload",
         }
     }
 
@@ -197,6 +218,7 @@ impl Step {
             Self::Remote(s) => Some(&s.target.text),
             Self::Copy(s) => Some(&s.target.text),
             Self::Wait(s) => Some(&s.target.text),
+            Self::Reload(s) => Some(&s.target.text),
         }
     }
 
@@ -207,7 +229,7 @@ impl Step {
             Self::Local(s) => s.guard.as_deref(),
             Self::Remote(s) => s.guard.as_deref(),
             Self::Copy(s) => s.guard.as_deref(),
-            Self::Wait(_) => None,
+            Self::Wait(_) | Self::Reload(_) => None,
         }
     }
 
@@ -219,6 +241,7 @@ impl Step {
             Self::Remote(s) => s.timeout,
             Self::Copy(s) => s.timeout,
             Self::Wait(s) => s.timeout,
+            Self::Reload(s) => s.timeout,
         }
     }
 }
