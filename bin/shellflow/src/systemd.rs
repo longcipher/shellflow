@@ -142,16 +142,12 @@ const SHOW_PROPS: [&str; 5] = ["Type", "ActiveState", "SubState", "Result", "Sta
 
 /// Read a unit's state from the local systemd.
 pub(crate) fn show_state(unit: &str) -> Result<UnitState, SystemdError> {
-    let mut cmd = Command::new("systemctl");
-    cmd.arg("show").arg(unit);
+    let mut args: Vec<&str> = vec!["show", unit];
     for prop in SHOW_PROPS {
-        cmd.arg("-p").arg(prop);
+        args.push("-p");
+        args.push(prop);
     }
-    let out = cmd
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| SystemdError::internal(format!("cannot run `systemctl show`: {err}")))?;
+    let out = systemctl_output(&args)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(SystemdError::internal(format!(
@@ -450,35 +446,44 @@ fn reload(args: &SystemdReloadArgs) -> Result<(), SystemdError> {
     wait_for_reload(&args.unit, Duration::from_secs(args.timeout), Duration::from_secs(args.interval.max(1)))
 }
 
+/// Run `systemctl`, elevating when the caller is not root.
+///
+/// The helper is installed for the deploy user, but `systemctl reload` and
+/// `systemctl kill` are privileged. Passwordless sudo is the same assumption
+/// the `cred-env` helper already makes, so the elevation is attempted the
+/// same way; a host without it gets a clear error instead of a silent no-op.
+fn systemctl_output(args: &[&str]) -> Result<std::process::Output, SystemdError> {
+    let mut cmd = if nix::unistd::Uid::effective().is_root() {
+        let mut cmd = Command::new("systemctl");
+        cmd.args(args);
+        cmd
+    } else {
+        let mut cmd = Command::new("sudo");
+        cmd.arg("-n").arg("systemctl").args(args);
+        cmd
+    };
+    cmd.stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .output()
+        .map_err(|err| SystemdError::internal(format!("cannot run `systemctl`: {err}")))
+}
+
 /// Whether the unit declares a given property (`systemctl show -p X`).
 fn unit_has_property(unit: &str, property: &str) -> bool {
-    let Ok(out) = Command::new("systemctl")
-        .arg("show")
-        .arg(unit)
-        .arg("-p")
-        .arg(property)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+    let Ok(out) = systemctl_output(&["show", unit, "-p", property]) else {
         return false;
     };
     if !out.status.success() {
         return false;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .any(|line| !line.ends_with('=') && !line.is_empty())
+    text.lines().any(|line| !line.ends_with('=') && !line.is_empty())
 }
 
 /// Run `systemctl` with the given arguments, mapping a failure to an error.
 fn run_systemctl(args: &[&str]) -> Result<(), SystemdError> {
-    let out = Command::new("systemctl")
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|err| SystemdError::internal(format!("cannot run `systemctl`: {err}")))?;
+    let out = systemctl_output(args)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(SystemdError::internal(format!(
