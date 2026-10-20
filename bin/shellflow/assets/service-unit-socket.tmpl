@@ -1,0 +1,21 @@
+[Unit]
+Description=__SVC__ (socket-activated)
+Requires=__SVC__.socket
+After=__SVC__.socket
+
+[Service]
+Type=exec
+# The listening socket is passed in as a file descriptor; the service reads
+# LISTEN_FDS / LISTEN_FDNAMES (sd_notify::listen_fds() in Rust) and serves
+# it. With Accept=no in the .socket unit systemd starts this service once per
+# connection, so it handles exactly one connection and exits.
+ExecStart=/usr/local/bin/shellflow cred-env exec /opt/__SVC__/bin/__SVC__
+
+# Dedicated runtime user (created by playbook, least privilege)
+User=__SVC__
+Group=__SVC__
+
+# --- Security hardening: keep it inline in this unit. ---
+
+[Install]
+WantedBy=multi-user.target

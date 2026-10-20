@@ -1,0 +1,17 @@
+[Unit]
+Description=__SVC__ (socket-activated)
+
+[Socket]
+# The listening socket belongs to systemd, so restarting the service does not
+# drop the port: the service inherits the file descriptor (LISTEN_FDS /
+# LISTEN_FDNAMES — sd_notify::listen_fds() in Rust).
+# TODO: set the real address and port.
+ListenStream=127.0.0.1:8080
+# Accept=no -> systemd starts the service once per connection and the service
+# handles exactly that one; Accept=yes -> the service owns the accepted
+# connections and keeps running.
+Accept=no
+Service=__SVC__.service
+
+[Install]
+WantedBy=sockets.target

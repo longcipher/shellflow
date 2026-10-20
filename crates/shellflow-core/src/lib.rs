@@ -32,8 +32,8 @@ pub use error::{CaptureError, InterpolateError, ParseError, RenderEnvError};
 pub use heredoc::{Heredoc, HeredocTracker};
 pub use parser::parse_script;
 pub use plan::{
-    CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, ResolvedHost, RunState, SecretEntry,
-    Step, Target, WaitStep, interpolate, is_valid_var_name, resolve_hosts,
+    CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep, RemoteStep, ResolvedHost,
+    RunState, SecretEntry, Step, Target, WaitStep, interpolate, is_valid_var_name, resolve_hosts,
 };
 pub use ssh_spec::SshSpec;
 pub use template::{render_template, template_keys};

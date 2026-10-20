@@ -661,6 +661,10 @@ pub(crate) enum ServicePattern {
     Oneshot,
     /// Verbatim takeover that never starts the unit (dormant strategies).
     NoStart,
+    /// Readiness over `sd_notify` (Type=notify) with a graceful reload.
+    Notify,
+    /// Socket-activated: systemd owns the port, the service inherits the fd.
+    Socket,
 }
 
 /// Arguments for `service init`.
