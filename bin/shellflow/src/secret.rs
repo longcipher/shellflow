@@ -3,7 +3,7 @@
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt as _,
+    os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
@@ -135,7 +135,7 @@ fn decrypt(args: &SecretDecryptArgs) -> Result<()> {
 /// Shared by every subcommand that decrypts, so the identity path is resolved
 /// and reported the same way everywhere.
 pub(crate) fn load_identity(explicit: Option<&Path>) -> Result<age::x25519::Identity> {
-    let id_path = effective_identity_path(explicit);
+    let id_path = effective_identity_path(explicit).map_err(|err| eyre!("{err}"))?;
     load_x25519_identity(&id_path).map_err(|err| eyre!("{err} (identity: {})", id_path.display()))
 }
 
@@ -181,6 +181,17 @@ fn edit(args: &SecretEditArgs) -> Result<()> {
 
     let cipher = read_input(Some(&args.file))?;
     let identity = load_identity(args.identity.as_deref())?;
+    // The age format is anonymous, so the recipient list is the *only* thing
+    // that decides who can read the file. Re-encrypting to a list that omits
+    // the operator would lock them out of their own secret — silently, and
+    // with no way back. Refuse before the plaintext is staged.
+    let own_public = identity.to_public().to_string();
+    if !recipients.iter().any(|recipient| recipient.to_string() == own_public) {
+        bail!(
+            "the recipient list does not include your own public key ({own_public}); \
+             re-encrypting would lock you out of this file"
+        );
+    }
     let plain = decrypt_bytes(&cipher, &identity).map_err(eyre::Report::msg)?;
 
     // The staging file holds plaintext, so its lifetime is bound to a guard
@@ -224,14 +235,21 @@ impl TempPlaintext {
     /// Create the staging file and write `plain` into it, owner-only.
     fn write(&self, plain: &[u8]) -> Result<()> {
         use std::io::Write as _;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(SECRET_FILE_MODE)
-            .open(&self.0)
-            .wrap_err_with(|| format!("cannot create `{}`", self.0.display()))?;
-        file.write_all(plain).wrap_err("cannot write temporary plaintext")?;
-        file.flush().wrap_err("cannot flush temporary plaintext")?;
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(SECRET_FILE_MODE)
+                .open(&self.0)
+                .wrap_err_with(|| format!("cannot create `{}`", self.0.display()))?;
+            file.write_all(plain).wrap_err("cannot write temporary plaintext")?;
+            file.flush().wrap_err("cannot flush temporary plaintext")?;
+        }
+        // `OpenOptions::mode` is masked by the process umask, so the mode is
+        // re-applied explicitly: the editor must be able to save the file
+        // (owner-write) and nobody else must be able to read it.
+        fs::set_permissions(&self.0, fs::Permissions::from_mode(SECRET_FILE_MODE))
+            .wrap_err_with(|| format!("cannot set mode on `{}`", self.0.display()))?;
         Ok(())
     }
 
@@ -242,8 +260,8 @@ impl TempPlaintext {
 
 impl Drop for TempPlaintext {
     fn drop(&mut self) {
-        if let Err(err) = fs::remove_file(&self.0)
-            && err.kind() != std::io::ErrorKind::NotFound
+        if let Err(err) = fs::remove_file(&self.0) &&
+            err.kind() != std::io::ErrorKind::NotFound
         {
             eprintln!("warning: failed to remove temporary plaintext {}: {err}", self.0.display());
         }
@@ -293,8 +311,8 @@ fn keys_check(args: &SecretKeysCheckArgs) -> Result<()> {
         let entry = entry
             .wrap_err_with(|| format!("failed to read an entry in `{}`", args.dir.display()))?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "age")
-            && path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".env.age"))
+        if path.extension().is_some_and(|ext| ext == "age") &&
+            path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".env.age"))
         {
             files.push(path);
         }
@@ -373,15 +391,17 @@ fn validate_plaintext_env(bytes: &[u8]) -> Result<()> {
 
 /// Find identical credential *values* shared across files.
 ///
-/// Reports groups of `file:KEY` locations whose values hash identically
-/// (hashes are per-process random and never printed — values never leave
-/// memory). A shared value means shared rotation fate: editing one file
-/// without the others silently breaks the rest, which is exactly how zombie
-/// passwords are born. Returns an error when any group is found (CI gate).
+/// Reports groups of `file:KEY` locations whose values hash identically. The
+/// hashes are computed with a **randomly keyed** hasher and are never printed
+/// — values never leave memory. A shared value means shared rotation fate:
+/// editing one file without the others silently breaks the rest, which is
+/// exactly how zombie passwords are born. Returns an error when any group is
+/// found (CI gate).
 fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
-    use std::collections::HashMap;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher as _};
+    use std::{
+        collections::{HashMap, hash_map::RandomState},
+        hash::{Hash, Hasher as _},
+    };
 
     let mut files: Vec<PathBuf> = Vec::new();
     collect_env_age_files(&args.dir, &mut files)?;
@@ -392,6 +412,12 @@ fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
     let identity = load_identity(args.identity.as_deref())?;
 
     let mut by_hash: HashMap<u64, Vec<String>> = HashMap::new();
+    // One hasher state for the whole scan: `RandomState` is randomly keyed
+    // per instance, so building a fresh one per value would give identical
+    // values different digests and the shared-value gate would never fire.
+    // The random key still holds across runs (no offline oracle), while
+    // equality within this run is exact.
+    let hash_state = RandomState::new();
     for file in &files {
         let cipher =
             fs::read(file).wrap_err_with(|| format!("failed to read `{}`", file.display()))?;
@@ -402,7 +428,7 @@ fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
             if value.is_empty() {
                 continue;
             }
-            let mut hasher = DefaultHasher::new();
+            let mut hasher = std::hash::BuildHasher::build_hasher(&hash_state);
             value.hash(&mut hasher);
             by_hash.entry(hasher.finish()).or_default().push(format!("{}:{key}", file.display()));
         }
@@ -449,9 +475,9 @@ fn collect_env_age_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                 continue;
             }
             collect_env_age_files(&path, out)?;
-        } else if file_type.is_file()
-            && path.extension().is_some_and(|ext| ext == "age")
-            && path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".env.age"))
+        } else if file_type.is_file() &&
+            path.extension().is_some_and(|ext| ext == "age") &&
+            path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".env.age"))
         {
             out.push(path);
         }

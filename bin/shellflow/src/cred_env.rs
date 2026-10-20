@@ -272,8 +272,19 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
         return Err(err);
     }
 
-    // Every credential is sealed: swap atomically by renaming the old store
-    // aside, moving staging into place, then deleting the old tree.
+    // Every credential is sealed: swap the staging tree and the live store.
+    // Where the platform supports an atomic exchange, the two paths are
+    // swapped in one syscall — there is no window in which the credential
+    // store does not exist, so a unit that starts during the swap still
+    // finds its credentials. Elsewhere the store is renamed aside and the
+    // staging tree renamed into place; the failure paths restore the
+    // previous store, so the residual is a very short availability gap
+    // rather than a data-loss risk.
+    if exchange_dirs(&staging, &store) {
+        let _ = fs::remove_dir_all(&staging);
+        return Ok(());
+    }
+
     let retired = store.with_extension("old");
     let _ = fs::remove_dir_all(&retired);
     let had_previous = store.exists();
@@ -299,6 +310,40 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
     Ok(())
 }
 
+/// Exchange two directories atomically, if the platform supports it.
+///
+/// Returns `false` when the exchange is unavailable or failed, in which case
+/// the caller falls back to the two-rename swap.
+fn exchange_dirs(a: &Path, b: &Path) -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use nix::fcntl::RenameFlags;
+
+        let (Some(parent), Some(a_name), Some(b_name)) = (a.parent(), a.file_name(), b.file_name())
+        else {
+            return false;
+        };
+        if a.parent() != b.parent() {
+            return false;
+        }
+        // A directory fd avoids `AT_FDCWD` and keeps the call safe: no
+        // `unsafe` is needed anywhere in this crate.
+        let Ok(dir) = fs::File::open(parent) else {
+            return false;
+        };
+        nix::fcntl::renameat2(&dir, a_name, &dir, b_name, RenameFlags::RENAME_EXCHANGE).is_ok()
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        // Atomic exchange is a Linux extension. Elsewhere the caller falls
+        // back to the two-rename swap, whose failure paths restore the
+        // previous store. `Path::exists` is not `const`, which keeps this
+        // function out of the `const fn` candidate set.
+        let _ = a.exists() && b.exists();
+        false
+    }
+}
+
 /// Re-execute `credstore-install` under `sudo` when the store is not directly
 /// writable, preserving exactly `LT_SECRET_KEYS` plus the listed credential
 /// values — and nothing else (never `sudo -E`, whose whole-environment
@@ -320,6 +365,14 @@ fn ensure_elevation(service: &str, store_dir: Option<&Path>, keys: &[String]) ->
     );
     // Probe writability (not mere existence: `create_dir_all` succeeds on
     // an existing root-owned directory even when we cannot write into it).
+    //
+    // Creating the store during the probe is safe here: the deploy user
+    // already holds `sudo` over `credstore-install`, so they can already
+    // write any credential into the store — a user-owned directory grants no
+    // additional capability. The default layout
+    // (`/etc/credstore.encrypted/<svc>`) has a root-owned parent, so
+    // `create_dir_all` fails with `PermissionDenied` and the store is
+    // created by `sudo install -d` instead.
     let probe = store.join(format!(".writetest-{}", std::process::id()));
     match fs::create_dir_all(&store).and_then(|()| fs::write(&probe, b"")) {
         Ok(()) => {
@@ -327,9 +380,8 @@ fn ensure_elevation(service: &str, store_dir: Option<&Path>, keys: &[String]) ->
             return Ok(());
         }
         Err(err) if err.kind() != std::io::ErrorKind::PermissionDenied => {
-            return Err(err).wrap_err_with(|| {
-                format!("cred-env: cannot access store `{}`", store.display())
-            });
+            return Err(err)
+                .wrap_err_with(|| format!("cred-env: cannot access store `{}`", store.display()));
         }
         Err(_) => {}
     }
@@ -348,9 +400,8 @@ fn ensure_elevation(service: &str, store_dir: Option<&Path>, keys: &[String]) ->
     cmd.env("SHELLFLOW_CREDSTORE_ELEVATED", "1");
     // Values travel in the preserved environment (never argv); stdio
     // inherits so `sudo` password prompts (if any) still work.
-    let status = cmd
-        .status()
-        .wrap_err("cred-env credstore-install: cannot run `sudo` for elevation")?;
+    let status =
+        cmd.status().wrap_err("cred-env credstore-install: cannot run `sudo` for elevation")?;
     if !status.success() {
         bail!("cred-env credstore-install: elevated install failed (status {status})");
     }

@@ -17,6 +17,7 @@
 pub mod crypto;
 pub mod env;
 pub mod error;
+pub mod fsx;
 pub mod identity;
 
 pub use error::SecretsError;

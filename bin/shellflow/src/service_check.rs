@@ -9,28 +9,29 @@
 
 use std::process::Command;
 
-use eyre::{Context, Result, bail};
+use eyre::{Result, bail};
 
-use crate::cli::ServiceCheckArgs;
+use crate::{cli::ServiceCheckArgs, service::ServiceError};
 
 /// Run `service check`.
 ///
 /// # Errors
 ///
-/// Returns when the SSH transport fails or when any check reports `FAIL`.
-pub(crate) fn check(args: &ServiceCheckArgs) -> Result<()> {
+/// Returns [`ServiceError::Transport`] when the SSH transport is unavailable
+/// (a missing `ssh`, an unreachable host) and [`ServiceError::Other`] when a
+/// check reports `FAIL` or the request itself is malformed.
+pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
     validate_service_name(&args.service)?;
+    // The same preflight the `run` path uses: a missing `ssh` is a
+    // transport/setup failure (exit 3), not a generic error.
+    preflight_ssh()?;
     let unit = format!("{}.service", args.service);
     let mut failures = 0;
 
     let active = ssh(&args.host, &["systemctl", "is-active", &unit])?;
     report(
         &format!("unit {unit} is {active}"),
-        if active.trim() == "active" {
-            Check::Ok
-        } else {
-            Check::Warn
-        },
+        if active.trim() == "active" { Check::Ok } else { Check::Warn },
         &mut failures,
     );
 
@@ -48,7 +49,11 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<()> {
     // argv / Environment secret values (ferriskey class): `--password VALUE`
     // and `KEY=VALUE` forms. Key *names* are fine; values are not.
     if has_argv_secret(&show) {
-        report("secret value in ExecStart argv or Environment= (`ps` visible)", Check::Fail, &mut failures);
+        report(
+            "secret value in ExecStart argv or Environment= (`ps` visible)",
+            Check::Fail,
+            &mut failures,
+        );
     } else {
         report("no secret values in argv/Environment", Check::Ok, &mut failures);
     }
@@ -62,15 +67,16 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<()> {
             t.starts_with("LoadCredentialEncrypted=") && !t.ends_with('=')
         })
         .count();
-    report(
-        &format!("{n_creds} LoadCredentialEncrypted= import(s)"),
-        Check::Ok,
-        &mut failures,
-    );
-    if show.lines().any(|l| {
-        l.starts_with("EnvironmentFile=") && !l.ends_with('=') && !l.contains("/dev/null")
-    }) {
-        report("EnvironmentFile= referenced (verify it carries no secrets)", Check::Warn, &mut failures);
+    report(&format!("{n_creds} LoadCredentialEncrypted= import(s)"), Check::Ok, &mut failures);
+    if show
+        .lines()
+        .any(|l| l.starts_with("EnvironmentFile=") && !l.ends_with('=') && !l.contains("/dev/null"))
+    {
+        report(
+            "EnvironmentFile= referenced (verify it carries no secrets)",
+            Check::Warn,
+            &mut failures,
+        );
     }
     if show.lines().any(|l| l == "User=" || l == "User=root") {
         report("runs as root (least-privilege follow-up)", Check::Warn, &mut failures);
@@ -88,21 +94,10 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<()> {
 
     let journal = ssh(
         &args.host,
-        &[
-            "sudo",
-            "journalctl",
-            "-u",
-            &unit,
-            "--no-pager",
-            "-n",
-            &args.journal_lines.to_string(),
-        ],
+        &["sudo", "journalctl", "-u", &unit, "--no-pager", "-n", &args.journal_lines.to_string()],
     )?;
-    let leaks: Vec<&str> = journal
-        .lines()
-        .filter(|l| looks_like_leak(l, &args.service))
-        .take(3)
-        .collect();
+    let leaks: Vec<&str> =
+        journal.lines().filter(|l| looks_like_leak(l, &args.service)).take(3).collect();
     if leaks.is_empty() {
         report(
             &format!("no secret-value shapes in last {} journal lines", args.journal_lines),
@@ -118,7 +113,10 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<()> {
     }
 
     if failures > 0 {
-        bail!("service check: {failures} FAIL finding(s) for `{}`", args.service);
+        return Err(ServiceError::Other(eyre::eyre!(
+            "service check: {failures} FAIL finding(s) for `{}`",
+            args.service
+        )));
     }
     println!("service check: {} clean", args.service);
     Ok(())
@@ -144,7 +142,14 @@ fn report(message: &str, status: Check, failures: &mut usize) {
 }
 
 /// Run one remote command over the system `ssh` and return stdout.
-fn ssh(host: &str, argv: &[&str]) -> Result<String> {
+///
+/// # Errors
+///
+/// Returns [`ServiceError::Transport`] when `ssh` itself fails (the binary
+/// could not be started, or the connection was refused — `ssh` exits 255).
+/// A remote command that ran and failed is *not* a transport error: its
+/// output is the finding.
+fn ssh(host: &str, argv: &[&str]) -> Result<String, ServiceError> {
     let output = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -153,17 +158,37 @@ fn ssh(host: &str, argv: &[&str]) -> Result<String> {
         .arg(host)
         .args(argv)
         .output()
-        .wrap_err_with(|| format!("failed to run ssh {host}"))?;
+        .map_err(|err| ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}")))?;
     if !output.status.success() {
         // `systemctl is-active` exits non-zero for inactive units and
         // `ls` fails for a missing credstore — both are findings, not
         // transport errors. Return combined output either way.
         let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        // `ssh` exits 255 when the *connection* failed (auth refused, host
+        // key rejected, unreachable). That is the transport class of §6, not
+        // a finding about the unit.
+        if output.status.code() == Some(255) {
+            return Err(ServiceError::Transport(eyre::eyre!(
+                "ssh {host} could not connect: {}",
+                combined.trim()
+            )));
+        }
         return Ok(combined);
     }
     String::from_utf8(output.stdout)
-        .map_err(|err| eyre::eyre!("non-UTF8 output from ssh {host}: {err}"))
+        .map_err(|err| eyre::eyre!("non-UTF8 output from ssh {host}: {err}").into())
+}
+
+/// Verify that `ssh` is available before the first remote check.
+///
+/// The `run` path reports a missing tool as a transport/setup failure (exit
+/// 3). This subcommand shells out to `ssh` directly, so without the same
+/// preflight a missing `ssh` would surface as a generic error (exit 1) —
+/// two paths disagreeing about the same failure class.
+fn preflight_ssh() -> Result<(), ServiceError> {
+    crate::preflight::preflight_check_ssh()
+        .map_err(|msg| ServiceError::Transport(eyre::eyre!("{msg}")))
 }
 
 /// True when `systemctl show` output carries a secret *value* in argv or
@@ -186,11 +211,11 @@ fn has_argv_secret(show: &str) -> bool {
                     continue;
                 };
                 let name = name.to_uppercase();
-                if value.len() >= 8
-                    && (name.contains("PASSWORD")
-                        || name.contains("SECRET")
-                        || name.ends_with("_TOKEN")
-                        || name.ends_with("_KEY"))
+                if value.len() >= 8 &&
+                    (name.contains("PASSWORD") ||
+                        name.contains("SECRET") ||
+                        name.ends_with("_TOKEN") ||
+                        name.ends_with("_KEY"))
                 {
                     // Import paths and template references are not values.
                     if value.starts_with('/') || value.contains("${") {
@@ -222,10 +247,10 @@ fn looks_like_leak(line: &str, _service: &str) -> bool {
 }
 
 fn validate_service_name(service: &str) -> Result<()> {
-    let valid = !service.is_empty()
-        && service.starts_with(|c: char| c.is_ascii_lowercase())
-        && service.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !service.contains("--");
+    let valid = !service.is_empty() &&
+        service.starts_with(|c: char| c.is_ascii_lowercase()) &&
+        service.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') &&
+        !service.contains("--");
     if !valid {
         bail!("invalid service name `{service}` (want [a-z][a-z0-9-]*)");
     }

@@ -28,6 +28,8 @@ enum CopyFailureKind {
     Timeout,
     /// The transport failed (rsync/scp/ssh could not complete).
     Transport,
+    /// The run was interrupted before the transfer finished.
+    Cancelled,
 }
 
 /// A copy failure: a structural classification plus the detail shown in the UI.
@@ -45,6 +47,10 @@ impl CopyFailure {
     fn transport(detail: impl Into<String>) -> Self {
         Self { kind: CopyFailureKind::Transport, detail: detail.into() }
     }
+
+    fn cancelled(detail: impl Into<String>) -> Self {
+        Self { kind: CopyFailureKind::Cancelled, detail: detail.into() }
+    }
 }
 
 /// Map a transfer result onto the per-host outcome.
@@ -52,6 +58,7 @@ fn failure_outcome(alias: &str, failure: CopyFailure) -> (String, HostOutcome) {
     match failure.kind {
         CopyFailureKind::Timeout => (alias.to_string(), HostOutcome::TimedOut),
         CopyFailureKind::Transport => (alias.to_string(), HostOutcome::Failed(RunError::Transport)),
+        CopyFailureKind::Cancelled => (alias.to_string(), HostOutcome::Cancelled),
     }
 }
 
@@ -60,7 +67,7 @@ pub(crate) async fn run_copy_step(
     copy: &CopyStep,
     hosts: Vec<ResolvedHost>,
     config: StepConfig,
-) -> Result<Vec<(String, HostOutcome)>> {
+) -> (Option<super::RunError>, eyre::Result<Vec<(String, HostOutcome)>>) {
     let (src, dst) = {
         let state = args.run_state.lock().await;
         let interpolated = shellflow_core::interpolate(&copy.src, &state)
@@ -74,29 +81,34 @@ pub(crate) async fn run_copy_step(
                         &format!("{err} — copy skipped (no run state in dry-run/check)"),
                         &args.log_file,
                     );
-                    return Ok(Vec::new());
+                    return (None, Ok(Vec::new()));
                 }
-                return Err(err).wrap_err("copy path interpolation");
+                // An unresolved `$VAR` in a copy path is a plan error: design
+                // §6 assigns it to exit 1, not to the script-failure exit 4.
+                crate::ui::step_failed(0, &err.to_string(), &args.log_file);
+                return (Some(super::RunError::Plan), Ok(Vec::new()));
             }
         }
     };
 
     if config.local {
-        return run_copy_step_local(
-            &args.ui,
-            &src,
-            &dst,
-            copy.delete,
-            &copy.excludes,
+        let outcome = run_copy_step_local(LocalCopyArgs {
+            ui: &args.ui,
+            src: &src,
+            dst: &dst,
+            delete: copy.delete,
+            excludes: &copy.excludes,
             config,
-            &args.log_file,
-        )
+            log_file: &args.log_file,
+            cancel: &args.cancel,
+        })
         .await;
+        return (None, outcome);
     }
 
     if config.check {
         crate::ui::note("  syntax check: copy step (no execution)", &args.log_file);
-        return Ok(Vec::new());
+        return (None, Ok(Vec::new()));
     }
 
     if config.dry_run || config.verbose >= 2 {
@@ -116,10 +128,11 @@ pub(crate) async fn run_copy_step(
         let excludes = copy.excludes.clone();
         let shell_cache = Arc::clone(&args.shell_cache);
         let log_file = args.log_file.clone();
+        let cancel = args.cancel.clone();
         tasks.spawn(async move {
             // Never run unthrottled when the semaphore is closed.
             let _permit = fanout_slot!(&semaphore, &log_file, host);
-            let has_rsync = resolve_remote_env(&host, &shell_cache).await.has_rsync;
+            let has_rsync = resolve_remote_env(&host, &shell_cache, &cancel).await.has_rsync;
             let opts = CopyOpts { delete, excludes: &excludes };
             let host_args = RsyncHostArgs {
                 ui,
@@ -130,23 +143,29 @@ pub(crate) async fn run_copy_step(
                 config,
                 has_rsync,
                 log_file: &log_file,
+                cancel: cancel.clone(),
             };
             run_rsync_host(host_args).await
         });
     }
 
-    stream::collect_hosts(tasks).await
+    (None, Ok(stream::collect_hosts(&args.ui, tasks).await))
 }
 
-async fn run_copy_step_local(
-    ui: &ArcUi,
-    src: &str,
-    dst: &str,
+/// The parameters of a local (`--local`) copy step.
+struct LocalCopyArgs<'a> {
+    ui: &'a ArcUi,
+    src: &'a str,
+    dst: &'a str,
     delete: bool,
-    excludes: &[String],
+    excludes: &'a [String],
     config: StepConfig,
-    log_file: &LogFile,
-) -> Result<Vec<(String, HostOutcome)>> {
+    log_file: &'a LogFile,
+    cancel: &'a super::Cancel,
+}
+
+async fn run_copy_step_local(args: LocalCopyArgs<'_>) -> Result<Vec<(String, HostOutcome)>> {
+    let LocalCopyArgs { ui, src, dst, delete, excludes, config, log_file, cancel } = args;
     if config.check {
         crate::ui::note("  syntax check: copy step (no execution)", log_file);
         return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
@@ -155,7 +174,13 @@ async fn run_copy_step_local(
         ui.lock().await.masked_note(&format!("  local copy {src} -> {dst}"));
     }
     if config.dry_run {
-        return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
+        // `cp` has no dry-run mode either: previewing the copy would mean
+        // performing it, and a dry run must not change anything (§8.2).
+        crate::ui::note(
+            "  dry run: the local copy is not previewed (nothing was copied)",
+            log_file,
+        );
+        return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
     }
 
     if !excludes.is_empty() {
@@ -171,11 +196,11 @@ async fn run_copy_step_local(
         // after `cp` succeeded. Wiping first (the previous behaviour) meant a
         // failed copy left the destination empty — the worst possible outcome
         // for a `--delete` deploy.
-        return run_local_copy_delete(src, dst, config, log_file).await;
+        return run_local_copy_delete(src, dst, config, log_file, cancel).await;
     }
 
-    if let Some(parent) = std::path::Path::new(dst).parent()
-        && !parent.as_os_str().is_empty()
+    if let Some(parent) = std::path::Path::new(dst).parent() &&
+        !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent)
             .await
@@ -185,7 +210,7 @@ async fn run_copy_step_local(
     let mut cmd = Command::new("cp");
     cmd.arg("-a").arg(src).arg(dst);
     cmd.kill_on_drop(true);
-    let status = run_command_status(cmd, config.timeout, "local copy").await?;
+    let status = run_command_status(cmd, config.timeout, "local copy", cancel).await?;
     if !status.success() {
         bail!("local copy exited with status {status}");
     }
@@ -203,6 +228,7 @@ async fn run_local_copy_delete(
     dst: &str,
     config: StepConfig,
     log_file: &LogFile,
+    cancel: &super::Cancel,
 ) -> Result<Vec<(String, HostOutcome)>> {
     let dst_path = std::path::Path::new(dst);
     if let Some(parent) = dst_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -223,7 +249,7 @@ async fn run_local_copy_delete(
     let mut cmd = Command::new("cp");
     cmd.arg("-a").arg(src).arg(&staging);
     cmd.kill_on_drop(true);
-    let status = run_command_status(cmd, config.timeout, "local copy").await?;
+    let status = run_command_status(cmd, config.timeout, "local copy", cancel).await?;
     if !status.success() {
         // The old destination is untouched; drop the half-built staging tree.
         remove_path(&staging).await?;
@@ -256,6 +282,7 @@ async fn run_command_status(
     mut cmd: Command,
     timeout: Option<u64>,
     label: &str,
+    cancel: &super::Cancel,
 ) -> Result<std::process::ExitStatus> {
     isolate(&mut cmd);
     cmd.kill_on_drop(true);
@@ -264,24 +291,27 @@ async fn run_command_status(
     // outlive an aborted run.
     let mut child = cmd.spawn().wrap_err(format!("failed to run {label}"))?;
     let mut guard = GroupGuard::new(&child);
-    let status = match timeout {
-        Some(secs) => {
-            match tokio::time::timeout(std::time::Duration::from_secs(secs), child.wait()).await {
-                Ok(Ok(status)) => status,
-                Ok(Err(err)) => {
-                    super::process::terminate(&mut child).await;
-                    guard.disarm();
-                    return Err(err).wrap_err(format!("failed to run {label}"));
-                }
-                Err(_) => {
-                    crate::ui::warn(&format!("{label} timed out — killed"), &None);
-                    super::process::terminate(&mut child).await;
-                    guard.disarm();
-                    bail!("{label} timed out after {secs}s");
-                }
-            }
+    let mut cancel = cancel.clone();
+    let status = match super::process::wait_child(&mut child, timeout, &mut cancel).await {
+        super::process::ChildOutcome::Finished(Ok(status)) => status,
+        super::process::ChildOutcome::Finished(Err(err)) => {
+            super::process::terminate(&mut child).await;
+            guard.disarm();
+            return Err(err).wrap_err(format!("failed to run {label}"));
         }
-        None => child.wait().await.wrap_err(format!("failed to run {label}"))?,
+        super::process::ChildOutcome::TimedOut => {
+            crate::ui::warn(&format!("{label} timed out — killed"), &None);
+            super::process::terminate(&mut child).await;
+            guard.disarm();
+            bail!("{label} timed out");
+        }
+        super::process::ChildOutcome::Cancelled => {
+            // The run was interrupted: tear the group down so no descendant
+            // survives the abort.
+            super::process::terminate(&mut child).await;
+            guard.disarm();
+            bail!("{label} cancelled");
+        }
     };
     guard.disarm();
     Ok(status)
@@ -296,10 +326,11 @@ struct RsyncHostArgs<'a> {
     config: StepConfig,
     has_rsync: bool,
     log_file: &'a LogFile,
+    cancel: super::Cancel,
 }
 
 async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
-    let RsyncHostArgs { ui, host, src, dst, opts, config, has_rsync, log_file } = args;
+    let RsyncHostArgs { ui, host, src, dst, opts, config, has_rsync, log_file, cancel } = args;
     let remote_shell = host.spec.rsync_remote_shell().unwrap_or_else(|| "ssh".to_string());
 
     if config.verbose >= 2 {
@@ -352,10 +383,26 @@ async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
             remote_shell: &remote_shell,
             config,
             log_file,
+            cancel: cancel.clone(),
         };
         run_rsync_transfer(transfer).await
+    } else if config.dry_run {
+        // `scp` has no dry-run mode: previewing this transfer would mean
+        // performing it. A dry run must not change anything (design §8.2),
+        // so the step is skipped and the gap is reported — a silent write
+        // to the target would make `--dry-run` the most dangerous flag in
+        // the tool.
+        crate::ui::warn(
+            &format!(
+                "[{}] the remote has no rsync, so the copy cannot be previewed without \
+                 writing to it — skipped (nothing was transferred)",
+                host.alias
+            ),
+            log_file,
+        );
+        return (host.alias.clone(), HostOutcome::Skipped);
     } else {
-        run_scp_transfer(ui.clone(), host, src, dst, config, log_file).await
+        run_scp_transfer(ui.clone(), host, src, dst, config, log_file, cancel.clone()).await
     };
 
     match outcome {
@@ -386,6 +433,7 @@ struct RsyncTransferArgs<'a> {
     remote_shell: &'a str,
     config: StepConfig,
     log_file: &'a LogFile,
+    cancel: super::Cancel,
 }
 
 async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<(), CopyFailure> {
@@ -429,17 +477,19 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<
         .config
         .diff
         .then(|| Arc::new(|line: &str| super::is_rsync_itemize_line(line)) as DiffFilter);
-    match stream::run_piped_child(
-        args.ui,
-        &args.host.alias,
-        cmd,
-        None,
-        args.config.timeout,
+    let piped = stream::PipedArgs {
+        ui: &args.ui,
+        host: &args.host.alias,
+        payload: None,
+        timeout: args.config.timeout,
         diff_filter,
-        args.log_file,
-    )
-    .await
-    .map_err(|err| CopyFailure::transport(format!("rsync could not start: {err:#}")))?
+        log_file: args.log_file,
+        cancel: args.cancel.clone(),
+        quiet: false,
+    };
+    match stream::run_piped_child(piped, cmd)
+        .await
+        .map_err(|err| CopyFailure::transport(format!("rsync could not start: {err:#}")))?
     {
         stream::PipedRun::Completed(status) => {
             if !status.success() {
@@ -451,6 +501,32 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<
         stream::PipedRun::PipeBroken => {
             Err(CopyFailure::transport("rsync closed its input before the transfer finished"))
         }
+        stream::PipedRun::Cancelled => Err(CopyFailure::cancelled("copy step cancelled")),
+    }
+}
+
+/// Split an scp-fallback destination into the directory to `mkdir -p` and
+/// whether the destination itself is a directory.
+///
+/// A directory source always lands *in* a directory; a file source may name
+/// a file, in which case the destination is used verbatim. A bare filename
+/// (`app.tar.gz`) has no parent directory — `mkdir -p .` is a no-op — and
+/// `mkdir`-ing the filename itself would create a *directory* by that name
+/// and nest the file inside it.
+fn scp_remote_dir(dst: &str, is_dir_src: bool) -> (String, bool) {
+    if is_dir_src || dst.ends_with('/') {
+        let trimmed = dst.trim_end_matches('/');
+        // `dst = "/"` trims to "": the destination is the filesystem root.
+        let dir = if trimmed.is_empty() { "/" } else { trimmed };
+        return (dir.to_string(), true);
+    }
+    match dst.rsplit_once('/') {
+        Some((dir, file)) if !file.is_empty() && !dir.is_empty() => (dir.to_string(), false),
+        // A leading `/` with an empty parent (e.g. `/app.tar.gz`): the
+        // parent is the filesystem root.
+        Some((dir, file)) if !file.is_empty() && dir.is_empty() => ("/".to_string(), false),
+        // No `/` at all: a bare filename in the remote home directory.
+        _ => (".".to_string(), false),
     }
 }
 
@@ -461,22 +537,21 @@ async fn run_scp_transfer(
     dst: &str,
     config: StepConfig,
     log_file: &LogFile,
+    cancel: super::Cancel,
 ) -> std::result::Result<(), CopyFailure> {
     if config.verbose >= 2 {
         ui.lock().await.masked_note(&format!("  [{}] scp fallback: {src} -> {dst}", host.alias));
     }
 
     let is_dir_src = tokio::fs::metadata(src).await.is_ok_and(|meta| meta.is_dir());
-    let (dir, scp_src) = if is_dir_src {
-        (dst.trim_end_matches('/').to_string(), format!("{src}/."))
-    } else {
-        match dst.rsplit_once('/') {
-            Some((dir, file)) if !file.is_empty() && !dir.is_empty() => {
-                (dir.to_string(), src.to_string())
-            }
-            _ => (dst.to_string(), src.to_string()),
-        }
-    };
+    // A directory source always lands *in* a directory. A file source may
+    // name a file: the destination is then used verbatim, so the artifact
+    // keeps the name the playbook asked for. Copying into the parent
+    // directory instead would silently rename `./out` to `/srv/out` when the
+    // playbook said `/srv/app.tar.gz` — a materially different transfer,
+    // reported as a success.
+    let (dir, dst_is_dir) = scp_remote_dir(dst, is_dir_src);
+    let scp_src = if is_dir_src { format!("{src}/.") } else { src.to_string() };
 
     let quoted_dir = dir.replace('\'', "'\\''");
     let mut mkdir = Command::new("ssh");
@@ -487,19 +562,23 @@ async fn run_scp_transfer(
     mkdir
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::null());
     mkdir.kill_on_drop(true);
     // Routed through `run_command_status` so the mkdir honours the per-step
     // timeout and owns a `GroupGuard`: an unbounded `ssh` here used to hang a
     // `--timeout`-bounded copy step forever.
-    let status = run_command_status(mkdir, config.timeout, "remote mkdir")
+    let status = run_command_status(mkdir, config.timeout, "remote mkdir", &cancel)
         .await
         .map_err(|err| CopyFailure::transport(format!("failed to create remote dir: {err:#}")))?;
     if !status.success() {
         return Err(CopyFailure::transport(format!("remote mkdir for {dir} failed")));
     }
 
-    let dest = format!("{}:{dir}/", host.spec.dest());
+    let dest = if dst_is_dir {
+        format!("{}:{dir}/", host.spec.dest())
+    } else {
+        format!("{}:{dst}", host.spec.dest())
+    };
     let mut scp = Command::new("scp");
     scp.args(["-q", "-o", "BatchMode=yes"]);
     if let Some(port) = host.spec.port {
@@ -521,7 +600,17 @@ async fn run_scp_transfer(
         ));
     }
 
-    match stream::run_piped_child(ui, &host.alias, scp, None, config.timeout, None, log_file)
+    let piped = stream::PipedArgs {
+        ui: &ui,
+        host: &host.alias,
+        payload: None,
+        timeout: config.timeout,
+        diff_filter: None,
+        log_file,
+        cancel: cancel.clone(),
+        quiet: false,
+    };
+    match stream::run_piped_child(piped, scp)
         .await
         .map_err(|err| CopyFailure::transport(format!("scp could not start: {err:#}")))?
     {
@@ -535,5 +624,33 @@ async fn run_scp_transfer(
         stream::PipedRun::PipeBroken => {
             Err(CopyFailure::transport("scp closed its input before the transfer finished"))
         }
+        stream::PipedRun::Cancelled => Err(CopyFailure::cancelled("copy step cancelled")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scp_remote_dir;
+
+    #[test]
+    fn file_destinations_keep_their_parent_dir() {
+        assert_eq!(scp_remote_dir("/srv/app.tar.gz", false), ("/srv".to_string(), false));
+        assert_eq!(scp_remote_dir("/app.tar.gz", false), ("/".to_string(), false));
+    }
+
+    #[test]
+    fn bare_filenames_have_no_parent_to_create() {
+        // `mkdir -p 'app.tar.gz'` would create a *directory* by that name
+        // and nest the file inside it; `mkdir -p .` is a no-op and the
+        // file is transferred verbatim.
+        assert_eq!(scp_remote_dir("app.tar.gz", false), (".".to_string(), false));
+    }
+
+    #[test]
+    fn directory_destinations_land_inside() {
+        assert_eq!(scp_remote_dir("/srv/app/", false), ("/srv/app".to_string(), true));
+        assert_eq!(scp_remote_dir("/srv/app", true), ("/srv/app".to_string(), true));
+        assert_eq!(scp_remote_dir("/", true), ("/".to_string(), true));
+        assert_eq!(scp_remote_dir("/", false), ("/".to_string(), true));
     }
 }

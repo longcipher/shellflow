@@ -37,8 +37,8 @@ use eyre::{Context as _, Result};
 use tokio::sync::Mutex;
 
 use crate::{
-    cli::{Cli, Command, RunArgs},
-    executor::{RunOutcome, StepStats, execute_plan},
+    cli::{Cli, Command, GlobalFlags, RunArgs},
+    executor::{Cancel, RunOutcome, StepStats, execute_plan},
     preflight::{preflight_check, preflight_check_local},
     ui::HostStatus,
 };
@@ -46,14 +46,22 @@ use crate::{
 /// The exit code used when interrupted by a signal.
 const EXIT_INTERRUPTED: i32 = 130;
 
+/// How long the executor is given to tear down its children after an
+/// interrupt.
+///
+/// The teardown is what guarantees that no process group survives the run,
+/// so the wait is bounded but generous: every child gets a `SIGTERM`, a
+/// grace period, and a `SIGKILL`.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(15);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
 
     let code = match &cli.command {
-        None => run_or_deploy(&cli.run).await,
-        Some(Command::Run(args)) => run_or_deploy(args).await,
+        None => run_or_deploy(&cli.run, &cli.globals).await,
+        Some(Command::Run(args)) => run_or_deploy(args, &cli.globals).await,
         Some(Command::Keys(cmd)) => match keys::run(&cmd.command) {
             Ok(()) => 0,
             Err(err) => {
@@ -69,7 +77,13 @@ async fn main() -> Result<()> {
             }
         },
         Some(Command::Template(cmd)) => {
-            let ui = ui::Ui::new(0, cli.run.flags.no_color, cli::OutputMode::Stream, None);
+            let ui = match ui::Ui::new(0, cli.globals.no_color, cli::OutputMode::Stream, None) {
+                Ok(ui) => ui,
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    return Ok(());
+                }
+            };
             match template::run(&cmd.command, &ui) {
                 Ok(()) => 0,
                 Err(err) => {
@@ -96,7 +110,7 @@ async fn main() -> Result<()> {
             Ok(()) => 0,
             Err(err) => {
                 eprintln!("error: {err:#}");
-                1
+                err.exit_code()
             }
         },
         Some(Command::Audit(cmd)) => match audit::audit(cmd) {
@@ -107,11 +121,26 @@ async fn main() -> Result<()> {
             }
         },
     };
+    report_audit_failures();
     std::process::exit(code);
 }
 
+/// Report a truncated audit trail.
+///
+/// A silently truncated audit log is worse than no audit log: the operator
+/// believes the run was recorded in full.
+fn report_audit_failures() {
+    let failures = ui::audit_write_failures();
+    if failures > 0 {
+        eprintln!(
+            "warning: {failures} line(s) could not be written to the audit log — the trail is \
+             incomplete"
+        );
+    }
+}
+
 /// Run a deploy script (the default `run` path).
-async fn run_or_deploy(run: &RunArgs) -> i32 {
+async fn run_or_deploy(run: &RunArgs, globals: &GlobalFlags) -> i32 {
     if let Err(msg) = run_preflight(run) {
         eprintln!("error: {msg}");
         return 3;
@@ -136,7 +165,7 @@ async fn run_or_deploy(run: &RunArgs) -> i32 {
         }
     };
 
-    run_plan(run, plan).await
+    run_plan(run, globals, plan).await
 }
 
 /// Preflight for the `run` path; `--local` needs only `bash`.
@@ -149,31 +178,116 @@ fn run_preflight_flags(flags: &cli::RunFlags) -> Result<(), String> {
 }
 
 /// Execute a plan and map the outcome to an exit code.
-async fn run_plan(run: &RunArgs, plan: shellflow_core::ExecutionPlan) -> i32 {
+async fn run_plan(
+    run: &RunArgs,
+    globals: &GlobalFlags,
+    plan: shellflow_core::ExecutionPlan,
+) -> i32 {
     let total_steps = plan.steps.len();
 
     let progress: Arc<Mutex<Vec<StepStats>>> = Arc::new(Mutex::new(Vec::new()));
+    let cancel = Cancel::new();
+
+    // The UI is created here, before the executor starts, so the audit-log
+    // handle exists for the whole run: an audit trail that cannot be opened
+    // must fail the run *before* anything is attempted, and the interrupt
+    // summary must be able to reach the same file.
+    let ui = match ui::Ui::new(
+        run.flags.verbose,
+        globals.no_color,
+        run.flags.output,
+        globals.log_file.clone(),
+    ) {
+        Ok(ui) => Arc::new(Mutex::new(ui)),
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            return executor::RunError::Config.into_exit_code();
+        }
+    };
+    let log_file = ui.lock().await.log_file();
+
+    // The executor runs in its own task so an interrupt can be handled
+    // *cooperatively*: the signal is delivered to the executor, which tears
+    // every child process group down and returns normally. Dropping the
+    // executor's future instead would abort the host tasks asynchronously,
+    // and the process could exit before their process-group guards ran —
+    // which is exactly how an orphaned `ssh` survives a Ctrl-C.
+    let owned_run = run.clone();
+    let owned_progress = Arc::clone(&progress);
+    let owned_ui = Arc::clone(&ui);
+    let mut executor = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { execute_plan(&owned_run, plan, owned_progress, cancel, owned_ui).await }
+    });
 
     let outcome = tokio::select! {
-        outcome = execute_plan(run, plan, Arc::clone(&progress)) => outcome,
-        _ = wait_for_signal() => {
-            eprintln!("\ninterrupted — aborting; in-flight processes are being terminated");
-            RunOutcome::Interrupted { total: total_steps }
+        result = &mut executor => match result {
+            Ok(outcome) => outcome,
+            Err(join_err) => {
+                eprintln!("error: the executor stopped unexpectedly: {join_err}");
+                RunOutcome::Failed(executor::RunError::Script)
+            }
+        },
+        signal = wait_for_signal() => {
+            match signal {
+                Ok(()) => {
+                    eprintln!("\ninterrupted — aborting; in-flight processes are being terminated");
+                    cancel.cancel();
+                    // Wait for the teardown: this is what guarantees that no
+                    // process group outlives the run.
+                    match tokio::time::timeout(INTERRUPT_GRACE, &mut executor).await {
+                        Ok(Ok(outcome)) => outcome,
+                        Ok(Err(join_err)) => {
+                            eprintln!("error: the executor stopped unexpectedly: {join_err}");
+                            executor.abort();
+                            RunOutcome::Interrupted { total: total_steps, torn_down: false }
+                        }
+                        Err(_) => {
+                            eprintln!("warning: the teardown did not finish in time");
+                            // The executor task is still running with live
+                            // process groups: abort it so it cannot outlive
+                            // the CLI, and report honestly that groups may
+                            // still be terminating.
+                            executor.abort();
+                            RunOutcome::Interrupted { total: total_steps, torn_down: false }
+                        }
+                    }
+                }
+                Err(err) => {
+                    // The signal handler could not be installed: that is not
+                    // an interrupt, and treating it as one would abort the
+                    // run with a misleading exit code. The executor task is
+                    // already running, so cancel it and wait it out rather
+                    // than exiting past live process groups.
+                    eprintln!("error: cannot install the signal handler: {err}");
+                    cancel.cancel();
+                    executor.abort();
+                    let _ = executor.await;
+                    return executor::RunError::Config.into_exit_code();
+                }
+            }
         }
     };
 
     match outcome {
         RunOutcome::Success => 0,
-        RunOutcome::Failed(executor::RunError::Config) => 1,
-        RunOutcome::Failed(executor::RunError::Transport) => 3,
-        RunOutcome::Failed(executor::RunError::Script) => 4,
-        RunOutcome::Interrupted { total } => {
-            eprintln!("interrupted — {total} total steps; in-flight processes were terminated");
+        RunOutcome::Failed(err) => err.into_exit_code(),
+        RunOutcome::Interrupted { total, torn_down } => {
+            if torn_down {
+                eprintln!("interrupted — {total} total steps; in-flight processes were terminated");
+            } else {
+                eprintln!(
+                    "interrupted — {total} total steps; in-flight processes are being terminated"
+                );
+            }
             let done = progress.lock().await;
             if !done.is_empty() {
                 let summary: Vec<(usize, Duration, Vec<HostStatus>)> =
                     done.iter().map(|s| (s.index, s.elapsed, s.statuses.clone())).collect();
-                crate::ui::final_summary(&summary, &None);
+                // The summary goes to the audit trail too: the run's final
+                // state is exactly what an operator needs to reconstruct an
+                // aborted deploy.
+                crate::ui::final_summary(&summary, &log_file);
             }
             EXIT_INTERRUPTED
         }

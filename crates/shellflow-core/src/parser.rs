@@ -91,7 +91,7 @@ impl State {
         let guard = self.pending_guard.take();
         let timeout = self.pending_timeout.take();
         let export = std::mem::take(&mut self.pending_export);
-        let env = Arc::clone(&self.plan.env).as_ref().clone();
+        let env = Arc::clone(&self.plan.env);
 
         let step = match self.mode {
             Mode::Local => Step::Local(LocalStep { name, script, guard, timeout, export, env }),
@@ -152,6 +152,14 @@ impl State {
             }
             "copy" => {
                 self.flush();
+                // A copy step is self-contained: it carries its own target in
+                // its payload and is not a script block. The block mode
+                // therefore returns to `local` (design §4.1 rule 3 lists
+                // `@copy` among the mode-setting directives), so the lines
+                // that follow are not silently streamed to the copy's remote
+                // target.
+                self.mode = Mode::Local;
+                self.target.clear();
                 self.add_copy(payload, line)
             }
             "wait_active" => {
@@ -380,11 +388,32 @@ impl State {
                 });
             }
         }
-        if self.mode != Mode::Local || !self.has_executable() {
-            return Err(ParseError::ExportNotAfterLocal { line });
+        // `@export` binds to the *preceding* local block (design §4.1 rule 4).
+        //
+        // "Preceding" is the block that the operator just wrote, which is not
+        // always the *pending* one: an intervening directive (`@name`,
+        // `@timeout`, `@only_if`, `@remote`, …) flushes the pending block
+        // (design §4.1 rule 1), so by the time `@export` is read the local
+        // block may already have been emitted. Binding to the pending buffer
+        // only would reject a script the design accepts.
+        //
+        // So: bind to the pending block when there is one, and otherwise to the
+        // last emitted local step. A remote block in between is still an error
+        // — remote variables cannot be captured.
+        if self.has_executable() {
+            if self.mode != Mode::Local {
+                return Err(ParseError::ExportNotAfterLocal { line });
+            }
+            self.pending_export.extend(vars);
+            return Ok(());
         }
-        self.pending_export.extend(vars);
-        Ok(())
+        match self.plan.steps.last_mut() {
+            Some(Step::Local(local)) => {
+                local.export.extend(vars);
+                Ok(())
+            }
+            _ => Err(ParseError::ExportNotAfterLocal { line }),
+        }
     }
 
     fn add_copy(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
@@ -401,7 +430,7 @@ impl State {
         }
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
-        let env = self.plan.env.as_ref().clone();
+        let env = Arc::clone(&self.plan.env);
 
         let (src, rest) = payload.split_once("->").ok_or_else(|| ParseError::InvalidDirective {
             line,
@@ -551,9 +580,9 @@ impl State {
         }
         if !unit
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
-            || unit.starts_with('.')
-            || unit.contains("..")
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':')) ||
+            unit.starts_with('.') ||
+            unit.contains("..")
         {
             return Err(ParseError::InvalidDirective {
                 line,
@@ -584,16 +613,11 @@ impl State {
 ///
 /// A directive is a comment line, so no shell quoting applies and quotes are
 /// literal characters; stripping them lets `--exclude '*.key'` read naturally.
+///
+/// The rule lives in [`crate::env::strip_surrounding_quotes`] so the parser
+/// and the secrets crate share one definition.
 fn strip_surrounding_quotes(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.len() >= 2 {
-        let bytes = trimmed.as_bytes();
-        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
-        if first == last && (first == b'"' || first == b'\'') {
-            return trimmed[1..trimmed.len() - 1].to_string();
-        }
-    }
-    trimmed.to_string()
+    crate::env::strip_surrounding_quotes(raw)
 }
 
 /// Extract `(keyword, payload)` from a possible directive line.
@@ -618,7 +642,16 @@ fn directive(line: &str) -> Option<(String, String)> {
     if keyword.is_empty() {
         return None;
     }
-    let payload = after_at[keyword_end..].trim();
+    let rest = &after_at[keyword_end..];
+    // The keyword must be a whole word. `# @server-web x` is not `@server`
+    // with the name `-web` — it is a malformed directive, and reporting it as
+    // unknown beats silently creating a server alias named `-web`.
+    if !rest.is_empty() && !rest.chars().next().is_some_and(char::is_whitespace) {
+        // Report the malformed token (`server-web`), not the whole line.
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        return Some((format!("{keyword}{}", &rest[..token_end]), String::new()));
+    }
+    let payload = rest.trim();
     Some((keyword.to_string(), payload.to_string()))
 }
 
@@ -726,8 +759,7 @@ mod tests {
 
     #[test]
     fn wait_active_appends_service_suffix_and_timeout() -> Result<(), String> {
-        let plan =
-            parse("# @server api api\n# @wait_active sws @api --timeout 60\n")?;
+        let plan = parse("# @server api api\n# @wait_active sws @api --timeout 60\n")?;
         let step = as_wait(&plan.steps[0])?;
         assert_eq!(step.unit, "sws.service");
         assert_eq!(step.timeout, Some(60));
@@ -741,16 +773,32 @@ mod tests {
             "# @server api api\n# @wait_active ../evil @api\n",
             "# @server api api\n# @wait_active sws @api --timeout 0\n",
             "# @server api api\n# @wait_active sws\n",
+            // A unit name is interpolated into `systemctl is-active <unit>`,
+            // so anything that is not a plain unit name is refused: a space
+            // or a `;` would inject a second command.
+            "# @server api api\n# @wait_active 'sws; id' @api\n",
+            "# @server api api\n# @wait_active 'sws id' @api\n",
+            // A leading dot is not a unit name either.
+            "# @server api api\n# @wait_active .hidden @api\n",
+            // The `--timeout` flag needs a unit and a target beside it.
+            "# @server api api\n# @wait_active --timeout 30\n",
         ] {
             parse_script(script).expect_err("malformed wait_active must fail");
         }
     }
 
     #[test]
+    fn wait_active_accepts_a_unit_with_the_usual_punctuation() -> Result<(), String> {
+        // systemd unit names carry `-`, `_`, `.`, `@` and `:`.
+        let plan = parse("# @server api api\n# @wait_active my-app_2.service @api\n")?;
+        let step = as_wait(&plan.steps[0])?;
+        assert_eq!(step.unit, "my-app_2.service");
+        Ok(())
+    }
+
+    #[test]
     fn wait_active_takes_pending_name() -> Result<(), String> {
-        let plan = parse(
-            "# @server api api\n# @name ready\n# @wait_active sws @api\n",
-        )?;
+        let plan = parse("# @server api api\n# @name ready\n# @wait_active sws @api\n")?;
         let step = as_wait(&plan.steps[0])?;
         assert_eq!(step.name.as_deref(), Some("ready"));
         Ok(())
@@ -968,6 +1016,80 @@ mod tests {
     }
 
     #[test]
+    fn export_binds_to_the_preceding_local_block_across_an_intervening_directive()
+    -> Result<(), String> {
+        // An intervening directive flushes the pending block (design §4.1
+        // rule 1), so by the time `@export` is read the local block has
+        // already been emitted. `@export` must still bind to it (design
+        // §4.1 rule 4) instead of failing with "must follow a local block".
+        let plan = parse(
+            "# @local\n\
+             VERSION=$(git rev-parse --short HEAD)\n\
+             # @name build\n\
+             # @export VERSION\n",
+        )?;
+        assert_eq!(plan.steps.len(), 1);
+        let export = &as_local(&plan.steps[0])?.export;
+        assert_eq!(export, &vec!["VERSION".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn export_after_a_remote_block_is_still_an_error() {
+        // A remote block in between remains an error: remote variables cannot
+        // be captured (design §4.1 rule 4).
+        let err = parse_script("# @remote web\necho hi\n# @export X\n").expect_err("must fail");
+        assert!(matches!(err, ParseError::ExportNotAfterLocal { .. }), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn export_after_an_intervening_remote_directive_binds_to_the_local_block() -> Result<(), String>
+    {
+        // `@remote` flushes the local block but does not create a remote
+        // block, so the preceding block is still local and `@export` binds to
+        // it.
+        let plan = parse(
+            "# @local\n\
+             VERSION=1\n\
+             # @remote web\n\
+             # @export VERSION\n",
+        )?;
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(as_local(&plan.steps[0])?.export, vec!["VERSION".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_resets_the_block_mode_to_local() -> Result<(), String> {
+        // `@copy` is a self-contained step with its own target, and design
+        // §4.1 rule 3 lists it among the mode-setting directives: the lines
+        // that follow must not be silently streamed to the copy's target.
+        let plan = parse(
+            "# @remote web\n\
+             echo deploy\n\
+             # @copy app -> /srv/app @web\n\
+             echo after\n",
+        )?;
+        assert_eq!(plan.steps.len(), 3);
+        assert!(matches!(plan.steps[0], Step::Remote(_)));
+        assert!(matches!(plan.steps[1], Step::Copy(_)));
+        let after = as_local(&plan.steps[2])?;
+        assert_eq!(after.script, "echo after\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_directive_keyword_must_be_a_whole_word() {
+        // `# @server-web x` is not `@server` with the name `-web`; it is a
+        // malformed directive and must be reported as one.
+        let err = parse_script("# @server-web x\n").expect_err("must fail");
+        assert!(
+            matches!(&err, ParseError::UnknownDirective { directive, .. } if directive == "server-web"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn export_without_preceding_local_block_is_error() {
         assert!(matches!(
             parse_script("# @remote web\n# @export X\n"),
@@ -1115,8 +1237,8 @@ mod tests {
         assert_eq!(plan.steps.len(), 1);
         let copy = as_copy(&plan.steps[0])?;
         assert_eq!(
-            copy.env,
-            vec![EnvEntry::Literal { key: "KEY".to_string(), value: "value".to_string() }]
+            copy.env.as_ref(),
+            &[EnvEntry::Literal { key: "KEY".to_string(), value: "value".to_string() }]
         );
         Ok(())
     }

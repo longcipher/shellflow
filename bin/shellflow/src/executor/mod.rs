@@ -10,6 +10,7 @@
 //! child traps or blocks `SIGTERM`. `kill_on_drop(true)` remains set as a
 //! last-resort net for paths that drop a child without awaiting `terminate`.
 
+mod cancel;
 mod copy;
 mod local;
 mod process;
@@ -18,6 +19,7 @@ mod stream;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+pub(crate) use cancel::Cancel;
 pub(crate) use process::StepStats;
 pub(crate) use remote::{RunError, RunOutcome, execute_plan};
 use shellflow_core::ResolvedHost;
@@ -45,7 +47,7 @@ pub(crate) type DiffFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// Audit-log file handle shared across executor sub-modules.
 pub(crate) type LogFile = Option<Arc<std::sync::Mutex<std::fs::File>>>;
 
-/// Arguments for [`run_copy_step`] — groups the 8 parameters that would
+/// Arguments for [`run_copy_step`] — groups the parameters that would
 /// otherwise exceed clippy's limit.
 #[derive(Clone)]
 pub(crate) struct CopyStepArgs {
@@ -54,9 +56,11 @@ pub(crate) struct CopyStepArgs {
     pub run_state: Arc<Mutex<shellflow_core::RunState>>,
     pub shell_cache: ShellCache,
     pub log_file: LogFile,
+    /// The cooperative cancellation signal.
+    pub cancel: Cancel,
 }
 
-/// Arguments for [`run_local_block`] — groups the 8 parameters that would
+/// Arguments for [`run_local_block`] — groups the parameters that would
 /// otherwise exceed clippy's limit.
 pub(crate) struct LocalBlockArgs<'a> {
     pub ui: &'a ArcUi,
@@ -67,6 +71,8 @@ pub(crate) struct LocalBlockArgs<'a> {
     pub capture: &'a [String],
     pub extra: &'a [(String, String)],
     pub log_file: &'a LogFile,
+    /// The cooperative cancellation signal.
+    pub cancel: Cancel,
 }
 
 /// Shared, monotonically-appended step progress (for interrupt summaries).
@@ -120,6 +126,8 @@ pub(crate) enum HostOutcome {
     Failed(RunError),
     /// The step exceeded its timeout.
     TimedOut,
+    /// The run was interrupted before the host finished.
+    Cancelled,
 }
 
 /// Cache key for a host: `user@host[:port]`.
@@ -145,6 +153,7 @@ pub(crate) fn outcome_to_statuses(
                     HostOutcome::Skipped => crate::ui::Outcome::Skipped,
                     HostOutcome::Failed(_) => crate::ui::Outcome::Failed,
                     HostOutcome::TimedOut => crate::ui::Outcome::TimedOut,
+                    HostOutcome::Cancelled => crate::ui::Outcome::Cancelled,
                 },
             })
             .collect(),
@@ -184,13 +193,13 @@ pub(crate) fn is_rsync_itemize_line(line: &str) -> bool {
         return false;
     }
     bytes[..10].iter().all(|&b| {
-        b.is_ascii_alphanumeric()
-            || b == b'.'
-            || b == b'*'
-            || b == b'<'
-            || b == b'>'
-            || b == b'c'
-            || b == b'+'
+        b.is_ascii_alphanumeric() ||
+            b == b'.' ||
+            b == b'*' ||
+            b == b'<' ||
+            b == b'>' ||
+            b == b'c' ||
+            b == b'+'
     })
 }
 
@@ -201,7 +210,9 @@ pub(crate) fn step_error_if_failed(hosts: &[(String, HostOutcome)]) -> Option<Ru
     hosts.iter().find_map(|(_, outcome)| match outcome {
         HostOutcome::Failed(err) => Some(*err),
         HostOutcome::TimedOut => Some(RunError::Script),
-        HostOutcome::Ok | HostOutcome::Skipped => None,
+        // A cancelled host is the consequence of the interrupt, not a
+        // failure of the step: the run is already aborting.
+        HostOutcome::Ok | HostOutcome::Skipped | HostOutcome::Cancelled => None,
     })
 }
 
@@ -275,8 +286,8 @@ impl Drop for CaptureFile {
         // Best-effort, but a failure to remove a plaintext file is worth
         // reporting: silently leaving it behind is exactly the leak this
         // guard exists to prevent.
-        if let Err(err) = std::fs::remove_file(&self.0)
-            && err.kind() != std::io::ErrorKind::NotFound
+        if let Err(err) = std::fs::remove_file(&self.0) &&
+            err.kind() != std::io::ErrorKind::NotFound
         {
             crate::ui::warn(
                 &format!("failed to remove export capture file {}: {err}", self.0.display()),

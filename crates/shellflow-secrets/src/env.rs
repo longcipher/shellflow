@@ -3,27 +3,12 @@
 
 use crate::error::SecretsError;
 
-/// True for `[A-Za-z_][A-Za-z0-9_]*`.
-fn is_valid_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 /// Strip one layer of surrounding `"` or `'` quotes.
+///
+/// The rule lives in `shellflow-core` so the parser and this crate share one
+/// definition.
 fn strip_quotes(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() >= 2 {
-        let first = trimmed.as_bytes()[0];
-        let last = trimmed.as_bytes()[trimmed.len() - 1];
-        if first == last && (first == b'"' || first == b'\'') {
-            return trimmed[1..trimmed.len() - 1].to_string();
-        }
-    }
-    trimmed.to_string()
+    shellflow_core::strip_surrounding_quotes(value)
 }
 
 /// Parse an env file into ordered `(key, value)` pairs.
@@ -60,7 +45,7 @@ pub fn parse_env_file(content: &str) -> Result<Vec<(String, String)>, SecretsErr
         };
 
         let key = key.trim();
-        if !is_valid_var_name(key) {
+        if !shellflow_core::is_valid_var_name(key) {
             return Err(SecretsError::MalformedEnv {
                 line: idx + 1,
                 reason: format!("invalid variable name `{key}`"),

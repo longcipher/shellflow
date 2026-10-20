@@ -90,14 +90,6 @@ pub(crate) struct RunFlags {
     #[arg(long, value_enum, value_name = "MODE", default_value_t = OutputMode::Stream)]
     pub output: OutputMode,
 
-    /// Append every streamed line (tagged [host] + stream) to this file.
-    #[arg(short = 'l', long, value_name = "PATH")]
-    pub log_file: Option<PathBuf>,
-
-    /// Disable ANSI colors.
-    #[arg(long)]
-    pub no_color: bool,
-
     /// Run remote blocks and copies on the local machine instead of over SSH
     /// (local debugging; no network or sudo required).
     #[arg(long)]
@@ -545,12 +537,34 @@ pub(crate) struct ServiceCheckArgs {
     pub journal_lines: usize,
 }
 
+/// Flags that apply to every subcommand.
+///
+/// They are declared once, at the top level, and marked `global`: clap
+/// propagates them to every subcommand, so they can be given before *or*
+/// after the subcommand name. That is what makes
+/// `shellflow --no-color template check …` work — the alternative (a flag
+/// per subcommand) drifts, and the alternative (a flag that conflicts with
+/// subcommands) makes the flag unusable at all.
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct GlobalFlags {
+    /// Disable ANSI colors.
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
+    /// Append every streamed line (tagged [host] + stream) to this file.
+    #[arg(short = 'l', long, value_name = "PATH", global = true)]
+    pub log_file: Option<PathBuf>,
+}
+
 /// The top-level CLI: a `run` subcommand (also the default via the bare
 /// positional `SCRIPT`), plus `keys`, `secret`, `template`, and `emit`.
 #[derive(Debug, Parser)]
 #[command(name = "shellflow", version, about, long_about)]
-#[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct Cli {
+    /// Flags that apply to every subcommand.
+    #[command(flatten)]
+    pub globals: GlobalFlags,
+
     /// The default `run` arguments (active when no subcommand is given).
     #[command(flatten)]
     pub run: RunArgs,

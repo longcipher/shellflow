@@ -41,7 +41,7 @@ fn decrypt_env(
 ) -> Result<Vec<(String, String)>> {
     let cipher = fs::read(file)
         .wrap_err_with(|| format!("failed to read secrets file `{}`", file.display()))?;
-    let id_path = effective_identity_path(identity);
+    let id_path = effective_identity_path(identity).map_err(|err| eyre!("{err}"))?;
     let id = load_x25519_identity(&id_path)
         .map_err(|err| eyre!("{err} (identity: {})", id_path.display()))?;
     let plain = decrypt_string(&cipher, &id)

@@ -6,16 +6,15 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use eyre::Result;
 use shellflow_core::{ResolvedHost, RunState, render_env};
 use tokio::{
-    io::AsyncWriteExt,
     process::Command,
     sync::{Mutex, Semaphore},
     task::JoinSet,
 };
 
 use super::{
-    ArcUi, CopyStepArgs, HostOutcome, LogFile, ShellCache, StepConfig, fanout_slot,
-    local::{build_env, run_local_block, run_local_guard},
-    process::{GroupGuard, isolate},
+    ArcUi, Cancel, CopyStepArgs, HostOutcome, LogFile, ShellCache, StepConfig, fanout_slot,
+    local::{GuardOutcome, build_env, run_local_block},
+    process::isolate,
     stream,
 };
 use crate::{secrets::ResolvedSecrets, ui::HostStatus};
@@ -25,6 +24,13 @@ use crate::{secrets::ResolvedSecrets, ui::HostStatus};
 pub(crate) enum RunError {
     /// A configuration/plan-build failure (exit 1), e.g. secrets resolution.
     Config,
+    /// A plan error (exit 1): a bad script, an unresolved `@export` variable,
+    /// an unresolvable target, or a syntax error found by a dry-run check.
+    ///
+    /// Design §6 assigns these to exit 1, distinct from a script that ran
+    /// and failed (exit 4): CI can tell "the playbook is wrong" from "the
+    /// deployment failed".
+    Plan,
     /// A transport/setup failure (exit 3).
     Transport,
     /// A script execution failure (exit 4).
@@ -35,8 +41,25 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config => write!(f, "configuration failure"),
+            Self::Plan => write!(f, "plan error"),
             Self::Transport => write!(f, "transport/setup failure"),
             Self::Script => write!(f, "script execution failure"),
+        }
+    }
+}
+
+impl RunError {
+    /// The process exit code for this failure (design §6).
+    ///
+    /// The mapping lives with the classification so it cannot drift from it:
+    /// 1 = configuration/plan error, 3 = transport/setup failure,
+    /// 4 = script execution failure.
+    #[must_use]
+    pub(crate) const fn into_exit_code(self) -> i32 {
+        match self {
+            Self::Config | Self::Plan => 1,
+            Self::Transport => 3,
+            Self::Script => 4,
         }
     }
 }
@@ -49,7 +72,16 @@ pub(crate) enum RunOutcome {
     /// At least one step failed.
     Failed(RunError),
     /// Interrupted by a signal; `total` is the step count for reporting.
-    Interrupted { total: usize },
+    ///
+    /// The audit-log handle is *not* carried here: the caller owns the UI
+    /// (and therefore the file), so the interrupt summary is recorded in the
+    /// same trail as every other line of the run — including when the
+    /// teardown did not finish inside the grace period.
+    ///
+    /// `torn_down` reports whether every in-flight process group was reaped
+    /// before returning. When the grace period expires the executor is
+    /// aborted and the run must not claim the groups are gone.
+    Interrupted { total: usize, torn_down: bool },
 }
 
 /// The login shell detected on a remote host.
@@ -97,6 +129,7 @@ pub(crate) struct RemoteStepCtx<'a> {
     pub(crate) shell_cache: &'a ShellCache,
     pub(crate) secrets: &'a Arc<ResolvedSecrets>,
     pub(crate) log_file: &'a LogFile,
+    pub(crate) cancel: &'a Cancel,
 }
 
 /// Fully-initialized per-run state, built once by [`setup_run`] so
@@ -111,25 +144,26 @@ struct RunSetup {
     restrict: Vec<String>,
     selected: Vec<(usize, shellflow_core::Step)>,
     total: usize,
+    cancel: Cancel,
 }
 
-/// Build every per-run handle: UI + masks, run state, host selection, secret
-/// resolution, and the fan-out semaphore.
+/// Build every per-run handle: run state, host selection, secret resolution,
+/// and the fan-out semaphore.
+///
+/// The UI is *not* built here: the caller owns it, because the audit-log
+/// handle must exist before the run starts (an audit trail that cannot be
+/// opened has to fail the run) and because the interrupt summary must be
+/// able to reach the same file.
 ///
 /// Returns `None` when setup itself fails (the failure is already reported);
 /// every setup failure maps to [`RunError::Config`].
 async fn setup_run(
     run: &crate::cli::RunArgs,
     plan: &shellflow_core::ExecutionPlan,
+    cancel: &Cancel,
+    ui: ArcUi,
 ) -> Option<RunSetup> {
     let flags = &run.flags;
-    let ui: ArcUi = Arc::new(Mutex::new(crate::ui::Ui::new(
-        flags.verbose,
-        flags.no_color,
-        flags.output,
-        flags.log_file.clone(),
-    )));
-
     let log_file = ui.lock().await.log_file();
 
     let mut secrets: Vec<String> = plan
@@ -179,7 +213,6 @@ async fn setup_run(
             state.vars.insert(key.clone(), value.clone());
         }
     }
-    ui.lock().await.set_secrets(secrets);
     // Surface the exemption instead of staying silent: name the affected KEYS
     // only, never the values.
     if !resolved.shorts().is_empty() {
@@ -194,7 +227,7 @@ async fn setup_run(
             &log_file,
         );
     }
-    ui.lock().await.set_short_secrets(resolved.shorts().to_vec());
+    ui.lock().await.set_secret_values(secrets, resolved.shorts().to_vec());
 
     if flags.local && resolved.has_per_host() && host_aliases.len() > 1 {
         eprintln!(
@@ -217,7 +250,7 @@ async fn setup_run(
     let total = selected.len();
 
     if ui.lock().await.verbosity().info() {
-        ui.lock().await.plan_preview(plan);
+        ui.lock().await.plan_preview(plan, &selected);
     }
 
     Some(RunSetup {
@@ -230,6 +263,7 @@ async fn setup_run(
         restrict,
         selected,
         total,
+        cancel: cancel.clone(),
     })
 }
 
@@ -248,8 +282,14 @@ async fn run_single_step(
     let config = StepConfig::new(run, run.flags.timeout.or_else(|| step.timeout()));
     match step {
         shellflow_core::Step::Local(local) => {
-            let outcome =
-                super::local::run_local_step(&setup.ui, &setup.run_state, local, config).await;
+            let outcome = super::local::run_local_step(
+                &setup.ui,
+                &setup.run_state,
+                local,
+                config,
+                &setup.cancel,
+            )
+            .await;
             (None, outcome)
         }
         shellflow_core::Step::Remote(remote) => {
@@ -262,12 +302,13 @@ async fn run_single_step(
                         shell_cache: &setup.shell_cache,
                         secrets: &setup.resolved,
                         log_file: &setup.log_file,
+                        cancel: &setup.cancel,
                     };
                     (None, run_remote_step(&ctx, remote, hosts, config).await)
                 }
                 Err(err) => {
                     crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Script), Ok(Vec::new()))
+                    (Some(RunError::Plan), Ok(Vec::new()))
                 }
             }
         }
@@ -280,12 +321,13 @@ async fn run_single_step(
                         run_state: Arc::clone(&setup.run_state),
                         shell_cache: Arc::clone(&setup.shell_cache),
                         log_file: setup.log_file.clone(),
+                        cancel: setup.cancel.clone(),
                     };
-                    (None, super::copy::run_copy_step(&copy_args, copy, hosts, config).await)
+                    super::copy::run_copy_step(&copy_args, copy, hosts, config).await
                 }
                 Err(err) => {
                     crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Script), Ok(Vec::new()))
+                    (Some(RunError::Plan), Ok(Vec::new()))
                 }
             }
         }
@@ -300,12 +342,13 @@ async fn run_single_step(
                         config,
                         &setup.semaphore,
                         &setup.log_file,
+                        &setup.cancel,
                     )
                     .await,
                 ),
                 Err(err) => {
                     crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Script), Ok(Vec::new()))
+                    (Some(RunError::Plan), Ok(Vec::new()))
                 }
             }
         }
@@ -313,13 +356,19 @@ async fn run_single_step(
 }
 
 /// Execute the plan and return the overall outcome.
+///
+/// The caller owns the UI (and therefore the audit-log handle) so that the
+/// run's audit trail is opened before anything is attempted and so that the
+/// interrupt summary can be written to it.
 pub(crate) async fn execute_plan(
     run: &crate::cli::RunArgs,
     plan: shellflow_core::ExecutionPlan,
     progress: super::Progress,
+    cancel: Cancel,
+    ui: ArcUi,
 ) -> RunOutcome {
     let flags = &run.flags;
-    let Some(setup) = setup_run(run, &plan).await else {
+    let Some(setup) = setup_run(run, &plan, &cancel, ui).await else {
         return RunOutcome::Failed(RunError::Config);
     };
     let (ui, log_file, total) = (Arc::clone(&setup.ui), setup.log_file.clone(), setup.total);
@@ -330,6 +379,11 @@ pub(crate) async fn execute_plan(
 
     for (pos, (_idx, step)) in setup.selected.iter().enumerate() {
         if fail_fast_error.is_some() {
+            break;
+        }
+        // A cancelled run stops scheduling new steps; the in-flight host
+        // tasks observe the same signal and tear their children down.
+        if cancel.is_cancelled() {
             break;
         }
         let step_no = pos + 1;
@@ -368,6 +422,10 @@ pub(crate) async fn execute_plan(
                 fail_fast_error = Some(err);
             }
         }
+    }
+
+    if cancel.is_cancelled() {
+        return RunOutcome::Interrupted { total, torn_down: true };
     }
 
     if flags.continue_on_error || fail_fast_error.is_none() {
@@ -453,6 +511,11 @@ const DEFAULT_WAIT_SECS: u64 = 300;
 /// The unit name is validated at parse time (`[A-Za-z0-9._-]` plus `@`/`:`,
 /// no leading dots, no `..`), so interpolating it into the poll command is
 /// safe.
+///
+/// The poll runs through the shared child supervisor, so the `ssh` is spawned
+/// in its own process group, is killed when the run is interrupted, and
+/// cannot outlive the budget: a blackholed connection used to block the poll
+/// loop indefinitely.
 pub(super) async fn run_wait_step(
     ui: &ArcUi,
     wait: &shellflow_core::WaitStep,
@@ -460,6 +523,7 @@ pub(super) async fn run_wait_step(
     config: StepConfig,
     semaphore: &Option<Arc<Semaphore>>,
     log_file: &LogFile,
+    cancel: &Cancel,
 ) -> eyre::Result<Vec<(String, HostOutcome)>> {
     use tokio::time::{Duration, Instant};
     if config.check || config.dry_run {
@@ -480,6 +544,8 @@ pub(super) async fn run_wait_step(
         let ui = Arc::clone(ui);
         let unit = wait.unit.clone();
         let semaphore = semaphore.clone();
+        let log_file = log_file.clone();
+        let cancel = cancel.clone();
         tasks.spawn(async move {
             let _permit = match semaphore.as_ref() {
                 Some(sem) => match sem.clone().acquire_owned().await {
@@ -492,40 +558,83 @@ pub(super) async fn run_wait_step(
             };
             let deadline = Instant::now() + budget;
             loop {
+                if cancel.is_cancelled() {
+                    return (host.alias.clone(), HostOutcome::Cancelled);
+                }
                 let mut cmd = Command::new("ssh");
                 // Fail closed on an unknown host key or a missing key: never prompt.
                 cmd.args(["-o", "BatchMode=yes"]);
                 cmd.args(host.spec.to_ssh_args())
                     .arg("-T")
                     .arg(format!("systemctl is-active {unit}"));
-                // `is-active` exits non-zero for anything but active; the
-                // output text is the verdict either way.
-                let output = cmd.output().await;
-                let state = output
-                    .as_ref()
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_default();
-                if state == "active" {
-                    ui.lock().await.masked_note(&format!("[{}] {unit} active", host.alias));
-                    return (host.alias.clone(), HostOutcome::Ok);
+                // `systemctl is-active` exits 0 only for an active unit; the
+                // exit code is the verdict, so the poll's own output is
+                // discarded instead of streamed as noise.
+                let args = stream::PipedArgs {
+                    ui: &ui,
+                    host: &host.alias,
+                    payload: None,
+                    // One poll may not outlive the interval: a hung ssh must
+                    // not eat the whole budget in a single attempt.
+                    timeout: Some(interval.as_secs().max(1)),
+                    diff_filter: None,
+                    log_file: &log_file,
+                    cancel: cancel.clone(),
+                    quiet: true,
+                };
+                let outcome = match stream::run_piped_child(args, cmd).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
+                    }
+                };
+                match outcome {
+                    stream::PipedRun::Completed(status) => {
+                        if status.success() {
+                            ui.lock().await.masked_note(&format!("[{}] {unit} active", host.alias));
+                            return (host.alias.clone(), HostOutcome::Ok);
+                        }
+                        // ssh exits 255 when the connection itself failed:
+                        // that is a transport failure, not an inactive unit.
+                        if status.code() == Some(255) {
+                            return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
+                        }
+                    }
+                    stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken => {
+                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
+                    }
+                    stream::PipedRun::Cancelled => {
+                        return (host.alias.clone(), HostOutcome::Cancelled);
+                    }
                 }
                 if Instant::now() + interval >= deadline {
                     ui.lock().await.masked_note(&format!(
-                        "[{}] {unit} still `{state}` after {}s",
+                        "[{}] {unit} not active after {}s",
                         host.alias,
                         budget.as_secs()
                     ));
                     return (host.alias.clone(), HostOutcome::Failed(RunError::Script));
                 }
-                tokio::time::sleep(interval).await;
+                // Racing the sleep against cancellation keeps an interrupt
+                // responsive: an uninterrupted 5s sleep per poll would eat
+                // the interrupt grace period one interval at a time.
+                let mut waiter = cancel.clone();
+                tokio::select! {
+                    () = tokio::time::sleep(interval) => {}
+                    () = waiter.cancelled() => {
+                        return (host.alias.clone(), HostOutcome::Cancelled);
+                    }
+                }
             }
         });
     }
     let mut out = Vec::new();
     while let Some(res) = tasks.join_next().await {
         match res {
-            Ok(pair) => out.push(pair),
+            Ok(pair) => {
+                ui.lock().await.host_finished(&pair.0);
+                out.push(pair);
+            }
             Err(_) => out.push(("unknown".to_string(), HostOutcome::Failed(RunError::Transport))),
         }
     }
@@ -540,15 +649,16 @@ pub(super) async fn run_remote_step(
 ) -> Result<Vec<(String, HostOutcome)>> {
     if config.local {
         let alias = hosts.first().map(|host| host.alias.clone());
-        return run_remote_step_local(
-            ctx.ui,
-            ctx.run_state,
+        return run_remote_step_local(RemoteLocalArgs {
+            ui: ctx.ui,
+            run_state: ctx.run_state,
             remote,
             config,
-            ctx.secrets,
-            alias.as_deref(),
-            ctx.log_file,
-        )
+            secrets: ctx.secrets,
+            host_alias: alias.as_deref(),
+            log_file: ctx.log_file,
+            cancel: ctx.cancel,
+        })
         .await;
     }
 
@@ -575,25 +685,42 @@ pub(super) async fn run_remote_step(
         let shell_cache = Arc::clone(ctx.shell_cache);
         let secrets = Arc::clone(ctx.secrets);
         let log_file = ctx.log_file.clone();
+        let cancel = ctx.cancel.clone();
         tasks.spawn(async move {
             // Never run unthrottled when the semaphore is closed.
             let _permit = fanout_slot!(&semaphore, &log_file, host);
-            run_remote_host(ui, &host, &parts, config, shell_cache, &secrets, &log_file).await
+            run_remote_host(RemoteHostArgs {
+                ui,
+                host: &host,
+                parts: &parts,
+                config,
+                shell_cache,
+                secrets: &secrets,
+                log_file: &log_file,
+                cancel,
+            })
+            .await
         });
     }
 
-    stream::collect_hosts(tasks).await
+    Ok(stream::collect_hosts(ctx.ui, tasks).await)
 }
 
-async fn run_remote_step_local(
-    ui: &ArcUi,
-    run_state: &Arc<Mutex<RunState>>,
-    remote: &shellflow_core::RemoteStep,
+/// The parameters of a remote block that runs on the controller (`--local`).
+struct RemoteLocalArgs<'a> {
+    ui: &'a ArcUi,
+    run_state: &'a Arc<Mutex<RunState>>,
+    remote: &'a shellflow_core::RemoteStep,
     config: StepConfig,
-    secrets: &Arc<ResolvedSecrets>,
-    host_alias: Option<&str>,
-    log_file: &LogFile,
-) -> Result<Vec<(String, HostOutcome)>> {
+    secrets: &'a Arc<ResolvedSecrets>,
+    host_alias: Option<&'a str>,
+    log_file: &'a LogFile,
+    cancel: &'a Cancel,
+}
+
+async fn run_remote_step_local(args: RemoteLocalArgs<'_>) -> Result<Vec<(String, HostOutcome)>> {
+    let RemoteLocalArgs { ui, run_state, remote, config, secrets, host_alias, log_file, cancel } =
+        args;
     if config.dry_run || config.verbose >= 2 {
         ui.lock().await.payload_preview(
             &format!("Local Payload (remote block @{})", remote.target.text),
@@ -601,26 +728,52 @@ async fn run_remote_step_local(
         );
     }
 
-    let extra: Vec<(String, String)> = host_alias
-        .and_then(|alias| secrets.host_pairs(alias))
-        .map_or_default(|pairs| pairs.to_vec());
+    // The block's environment: the run-state `@export` variables and the
+    // `@env` entries, plus this host's `{host}` secrets. `overlay` also
+    // extends `LT_SECRET_KEYS` with the host's key names, so a per-host
+    // playbook can iterate them — exactly what the remote path does.
+    let mut extra = build_env(run_state, &remote.env).await;
+    if let Some(alias) = host_alias {
+        secrets.overlay(&mut extra, alias);
+    }
 
     // The guard must observe the same environment as the block: run-state
     // `@export` variables, `@env` entries, and this host's `{host}` secrets —
     // exactly what the remote path renders into the guard script.
     if let Some(guard) = &remote.guard {
         let mut guard_env = build_env(run_state, &remote.env).await;
-        for (k, v) in &extra {
-            guard_env.retain(|(gk, _)| gk != k);
-            guard_env.push((k.clone(), v.clone()));
+        if let Some(alias) = host_alias {
+            secrets.overlay(&mut guard_env, alias);
         }
-        if run_local_guard(guard, &guard_env, config.timeout).await {
-            if config.verbose >= 2 {
-                ui.lock().await.masked_note(&format!("  guard passed: {guard}"));
-            }
+        // A dry run must not change anything, so the guard is reported rather
+        // than evaluated — the same rule the remote path follows.
+        if config.dry_run || config.check {
+            crate::ui::note(&format!("  guard not evaluated in dry-run/check: {guard}"), log_file);
         } else {
-            crate::ui::note("  local guard failed — skipping block", log_file);
-            return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
+            match super::local::evaluate_guard(
+                ui,
+                guard,
+                &guard_env,
+                config.timeout,
+                cancel,
+                log_file,
+            )
+            .await
+            {
+                GuardOutcome::Pass => {
+                    if config.verbose >= 2 {
+                        ui.lock().await.masked_note(&format!("  guard passed: {guard}"));
+                    }
+                }
+                GuardOutcome::Fail => {
+                    crate::ui::note("  local guard failed — skipping block", log_file);
+                    return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
+                }
+                GuardOutcome::Failed(err) => {
+                    crate::ui::warn(&format!("local guard failed: {err}"), log_file);
+                    return Ok(vec![("localhost".to_string(), HostOutcome::Failed(err))]);
+                }
+            }
         }
     }
     let args = super::LocalBlockArgs {
@@ -632,25 +785,46 @@ async fn run_remote_step_local(
         capture: &[],
         extra: &extra,
         log_file,
+        cancel: cancel.clone(),
     };
     match run_local_block(&args).await {
         Ok(()) => Ok(vec![("localhost".to_string(), HostOutcome::Ok)]),
-        Err(err) => Err(err),
+        Err(super::local::LocalFailure::Timeout) => {
+            Ok(vec![("localhost".to_string(), HostOutcome::TimedOut)])
+        }
+        Err(super::local::LocalFailure::PipeBroken) => {
+            Ok(vec![("localhost".to_string(), HostOutcome::Failed(RunError::Transport))])
+        }
+        Err(super::local::LocalFailure::Failed(err)) => {
+            crate::ui::warn(&format!("local step failed: {err:#}"), log_file);
+            Ok(vec![("localhost".to_string(), HostOutcome::Failed(RunError::Script))])
+        }
     }
 }
 
-async fn run_remote_host(
+/// The parameters of one host's remote step.
+struct RemoteHostArgs<'a> {
     ui: ArcUi,
-    host: &ResolvedHost,
-    parts: &PayloadParts,
+    host: &'a ResolvedHost,
+    parts: &'a PayloadParts,
     config: StepConfig,
     shell_cache: ShellCache,
-    secrets: &Arc<ResolvedSecrets>,
-    log_file: &LogFile,
-) -> (String, HostOutcome) {
+    secrets: &'a Arc<ResolvedSecrets>,
+    log_file: &'a LogFile,
+    cancel: Cancel,
+}
+
+async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
+    let RemoteHostArgs { ui, host, parts, config, shell_cache, secrets, log_file, cancel } = args;
     if config.check || config.dry_run {
-        let payload =
-            format!("set -eu\n{}{}{}", render_env(&parts.env), parts.trace_line, parts.script);
+        let env_header = match render_env(&parts.env) {
+            Ok(header) => header,
+            Err(err) => {
+                crate::ui::warn(&format!("[{}] {err}", host.alias), log_file);
+                return (host.alias.clone(), HostOutcome::Failed(RunError::Plan));
+            }
+        };
+        let payload = format!("set -eu\n{}{}{}", env_header, parts.trace_line, parts.script);
         if config.verbose >= 2 {
             let cmd = build_ssh_cmd(host, RemoteShell::Bash, true, config);
             ui.lock().await.masked_note(&format!(
@@ -666,6 +840,7 @@ async fn run_remote_host(
             &payload,
             config.timeout,
             log_file,
+            cancel,
         )
         .await
         {
@@ -686,11 +861,22 @@ async fn run_remote_host(
         };
     }
 
-    let remote_env = resolve_remote_env(host, &shell_cache).await;
+    let remote_env = resolve_remote_env(host, &shell_cache, &cancel).await;
     let mut payload_env = with_login_path(parts.env.clone(), remote_env.path.as_deref());
     secrets.overlay(&mut payload_env, &host.alias);
     if let Some(guard) = &parts.guard {
-        match run_remote_guard(host, remote_env.shell, guard, &payload_env, config.timeout).await {
+        match run_remote_guard(RemoteGuardArgs {
+            ui: &ui,
+            host,
+            shell: remote_env.shell,
+            guard,
+            env: &payload_env,
+            timeout: config.timeout,
+            cancel: &cancel,
+            log_file,
+        })
+        .await
+        {
             GuardResult::Pass => {
                 if config.verbose >= 2 {
                     // The guard text is user content and can embed a secret.
@@ -706,11 +892,20 @@ async fn run_remote_host(
             GuardResult::Transport => {
                 return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
             }
+            GuardResult::Cancelled => {
+                return (host.alias.clone(), HostOutcome::Cancelled);
+            }
         }
     }
 
-    let payload =
-        format!("set -eu\n{}{}{}", render_env(&payload_env), parts.trace_line, parts.script);
+    let env_header = match render_env(&payload_env) {
+        Ok(header) => header,
+        Err(err) => {
+            crate::ui::warn(&format!("[{}] {err}", host.alias), log_file);
+            return (host.alias.clone(), HostOutcome::Failed(RunError::Plan));
+        }
+    };
+    let payload = format!("set -eu\n{}{}{}", env_header, parts.trace_line, parts.script);
     let cmd = build_ssh_cmd(host, remote_env.shell, false, config);
     if config.verbose >= 2 {
         ui.lock().await.masked_note(&format!(
@@ -719,7 +914,7 @@ async fn run_remote_host(
             super::display_args(&cmd)
         ));
     }
-    match run_ssh_child(ui, host, cmd, &payload, config.timeout, log_file).await {
+    match run_ssh_child(ui, host, cmd, &payload, config.timeout, log_file, cancel).await {
         Ok(()) => (host.alias.clone(), HostOutcome::Ok),
         Err(outcome) => {
             crate::ui::warn(&format!("[{}] {outcome:?}", host.alias), log_file);
@@ -774,12 +969,16 @@ fn build_ssh_cmd(
     cmd
 }
 
-pub(crate) async fn resolve_remote_env(host: &ResolvedHost, cache: &ShellCache) -> RemoteEnv {
+pub(crate) async fn resolve_remote_env(
+    host: &ResolvedHost,
+    cache: &ShellCache,
+    cancel: &Cancel,
+) -> RemoteEnv {
     let key = super::shell_cache_key(host);
     if let Some(env) = cache.lock().await.get(&key) {
         return env.clone();
     }
-    let env = probe_remote_env(host).await;
+    let env = probe_remote_env(host, cancel).await;
     cache.lock().await.insert(key, env.clone());
     env
 }
@@ -804,10 +1003,24 @@ const PROBE_SCRIPT: &str = r#"
 }
 "#;
 
-async fn probe_remote_env(host: &ResolvedHost) -> RemoteEnv {
+/// The end marker of a successful probe.
+///
+/// The probe's *exit status* must not depend on anything it reports: a
+/// trailing `&&` list would make the status fail on a host without `rsync`,
+/// and the whole probe result — the login shell and the rc-extended PATH —
+/// would be discarded with it. The marker is therefore the only success
+/// criterion, and every field degrades independently.
+const PROBE_END_MARKER: &str = "SHELLFLOW_PROBE_END";
+
+async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
+    use tokio::io::AsyncReadExt as _;
+    // The rsync check is separated from the report by a `;` and its result is
+    // carried in the marker line, so a host without `rsync` still returns a
+    // successful probe.
     let script = format!(
-        "{}\ncommand -v rsync >/dev/null 2>&1 && echo SHELLFLOW_HAS_RSYNC",
-        PROBE_SCRIPT.trim()
+        "{}\ncommand -v rsync >/dev/null 2>&1 && echo SHELLFLOW_HAS_RSYNC\nprintf '%s\\n' {marker}",
+        PROBE_SCRIPT.trim(),
+        marker = PROBE_END_MARKER,
     );
     let mut cmd = Command::new("ssh");
     // Fail closed on an unknown host key or a missing key: never prompt.
@@ -819,11 +1032,52 @@ async fn probe_remote_env(host: &ResolvedHost) -> RemoteEnv {
         .stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
     isolate(&mut cmd);
-    let output = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
-        Ok(Ok(output)) if output.status.success() => output,
-        _ => return RemoteEnv::default(),
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => return RemoteEnv::default(),
     };
-    let text = String::from_utf8_lossy(&output.stdout);
+    let mut group = super::process::GroupGuard::new(&child);
+    // Collect stdout concurrently: waiting before reading deadlocks once the
+    // pipe buffer fills.
+    let stdout = child.stdout.take();
+    let reader = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    // The probe races the timeout *and* cancellation: a hung probe must not
+    // eat the whole interrupt grace period, and its group must not survive
+    // the run.
+    let mut cancel_probe = cancel.clone();
+    let status = super::process::wait_child(&mut child, Some(15), &mut cancel_probe).await;
+    let output = match status {
+        super::process::ChildOutcome::Finished(Ok(status)) if status.success() => {
+            group.disarm();
+            match tokio::time::timeout(Duration::from_secs(2), reader).await {
+                Ok(Ok(buf)) => buf,
+                _ => return RemoteEnv::default(),
+            }
+        }
+        super::process::ChildOutcome::Finished(Ok(_)) => {
+            // Non-zero exit still carries a usable probe when the marker is
+            // present (e.g. a host without rsync): fall through to parsing
+            // rather than discarding the login shell and PATH with it.
+            group.disarm();
+            match tokio::time::timeout(Duration::from_secs(2), reader).await {
+                Ok(Ok(buf)) => buf,
+                _ => return RemoteEnv::default(),
+            }
+        }
+        _ => {
+            super::process::terminate(&mut child).await;
+            group.disarm();
+            reader.abort();
+            return RemoteEnv::default();
+        }
+    };
+    let text = String::from_utf8_lossy(&output);
     let mut lines = text.lines();
     let shell = RemoteShell::detect(lines.next().unwrap_or_default());
     // The PATH is reported between sentinels, one directory per line, so a
@@ -831,14 +1085,21 @@ async fn probe_remote_env(host: &ResolvedHost) -> RemoteEnv {
     let mut dirs: Vec<&str> = Vec::new();
     let mut in_path = false;
     let mut has_rsync = false;
+    let mut completed = false;
     for line in lines {
         match line.trim() {
             "SHELLFLOW_PATH_BEGIN" => in_path = true,
             "SHELLFLOW_PATH_END" => in_path = false,
             "SHELLFLOW_HAS_RSYNC" => has_rsync = true,
+            other if other == PROBE_END_MARKER => completed = true,
             other if in_path && !other.is_empty() => dirs.push(other),
             _ => {}
         }
+    }
+    if !completed {
+        // The probe did not run to completion (a truncated connection, an
+        // unreachable host): fall back rather than act on a partial result.
+        return RemoteEnv::default();
     }
     let path = if dirs.is_empty() { None } else { Some(dirs.join(":")) };
     RemoteEnv { shell, path, has_rsync }
@@ -849,6 +1110,7 @@ enum SshOutcome {
     Transport,
     Script,
     TimedOut,
+    Cancelled,
 }
 
 const fn classify_ssh(outcome: SshOutcome) -> HostOutcome {
@@ -856,6 +1118,7 @@ const fn classify_ssh(outcome: SshOutcome) -> HostOutcome {
         SshOutcome::Transport => HostOutcome::Failed(RunError::Transport),
         SshOutcome::Script => HostOutcome::Failed(RunError::Script),
         SshOutcome::TimedOut => HostOutcome::TimedOut,
+        SshOutcome::Cancelled => HostOutcome::Cancelled,
     }
 }
 
@@ -864,68 +1127,70 @@ enum GuardResult {
     Pass,
     Fail,
     Transport,
+    Cancelled,
 }
 
-async fn run_remote_guard(
-    host: &ResolvedHost,
+/// The parameters of one host's `@only_if` guard evaluation.
+struct RemoteGuardArgs<'a> {
+    ui: &'a ArcUi,
+    host: &'a ResolvedHost,
     shell: RemoteShell,
-    guard: &str,
-    env: &[(String, String)],
+    guard: &'a str,
+    env: &'a [(String, String)],
     timeout: Option<u64>,
-) -> GuardResult {
+    cancel: &'a Cancel,
+    log_file: &'a LogFile,
+}
+
+async fn run_remote_guard(args: RemoteGuardArgs<'_>) -> GuardResult {
+    let RemoteGuardArgs { ui, host, shell, guard, env, timeout, cancel, log_file } = args;
+    let env_header = match render_env(env) {
+        Ok(header) => header,
+        Err(_) => return GuardResult::Transport,
+    };
     let mut cmd = Command::new("ssh");
     // Fail closed on an unknown host key or a missing key: never prompt.
     cmd.args(["-o", "BatchMode=yes"]);
     cmd.args(host.spec.to_ssh_args()).arg("-T");
     cmd.arg(shell.invoke(false));
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::piped());
+    // Stdout/stderr are set by `run_piped_child` (`quiet` discards the
+    // guard's own output); stdin must already be piped so the payload can
+    // be delivered.
     cmd.kill_on_drop(true);
     isolate(&mut cmd);
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(_) => return GuardResult::Transport,
-    };
-    let mut group = GroupGuard::new(&child);
     // Fail closed: a guard that could not be delivered must never be reported
     // as `Pass`. If the write fails, stdin drops, the remote shell reads an
     // empty script and exits 0 — which would otherwise mark an *unevaluated*
-    // precondition as satisfied and release the block.
-    let delivered = match child.stdin.take() {
-        Some(mut stdin) => {
-            let script = format!("set -e\n{}{guard}\n", render_env(env));
-            stdin.write_all(script.as_bytes()).await.is_ok()
-        }
-        None => false,
+    // precondition as satisfied and release the block. Routing through the
+    // shared supervisor also bounds the stdin write by the step deadline,
+    // races it against cancellation, and isolates the child in its own
+    // process group.
+    let script = format!("set -e\n{env_header}{guard}\n");
+    let args = stream::PipedArgs {
+        ui,
+        host: &host.alias,
+        payload: Some(&script),
+        timeout,
+        diff_filter: None,
+        log_file,
+        cancel: cancel.clone(),
+        quiet: true,
     };
-    if !delivered {
-        super::process::terminate(&mut child).await;
-        group.disarm();
-        return GuardResult::Transport;
-    }
-    let wait = match timeout {
-        Some(secs) => tokio::time::timeout(Duration::from_secs(secs), child.wait()).await,
-        None => Ok(child.wait().await),
-    };
-    let result = match wait {
-        Ok(Ok(status)) if status.success() => GuardResult::Pass,
-        Ok(Ok(status)) if status.code() == Some(255) => GuardResult::Transport,
-        Ok(Ok(_)) => GuardResult::Fail,
-        _ => {
-            super::process::terminate(&mut child).await;
-            // `terminate` reaps the child, so its pgid is released: disarm or
-            // the guard's drop would SIGKILL a pgid the OS may already have
-            // recycled onto an unrelated process group.
-            group.disarm();
+    match stream::run_piped_child(args, cmd).await {
+        Ok(stream::PipedRun::Completed(status)) if status.success() => GuardResult::Pass,
+        Ok(stream::PipedRun::Completed(status)) if status.code() == Some(255) => {
             GuardResult::Transport
         }
-    };
-    match result {
-        GuardResult::Pass | GuardResult::Fail => group.disarm(),
-        GuardResult::Transport => {}
+        Ok(stream::PipedRun::Completed(_)) => GuardResult::Fail,
+        Ok(stream::PipedRun::Cancelled) => GuardResult::Cancelled,
+        // Timed out, broken pipe, or spawn failure: the guard was never
+        // evaluated, so it must not pass. Timeouts surface as transport
+        // here to match the historical classification.
+        Ok(stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken) | Err(_) => {
+            if cancel.is_cancelled() { GuardResult::Cancelled } else { GuardResult::Transport }
+        }
     }
-    result
 }
 
 async fn run_ssh_child(
@@ -935,11 +1200,19 @@ async fn run_ssh_child(
     payload: &str,
     timeout: Option<u64>,
     log_file: &LogFile,
+    cancel: Cancel,
 ) -> Result<(), SshOutcome> {
-    match stream::run_piped_child(ui, &host.alias, cmd, Some(payload), timeout, None, log_file)
-        .await
-        .map_err(|_| SshOutcome::Transport)?
-    {
+    let args = stream::PipedArgs {
+        ui: &ui,
+        host: &host.alias,
+        payload: Some(payload),
+        timeout,
+        diff_filter: None,
+        log_file,
+        cancel,
+        quiet: false,
+    };
+    match stream::run_piped_child(args, cmd).await.map_err(|_| SshOutcome::Transport)? {
         stream::PipedRun::Completed(status) => {
             if !status.success() {
                 if status.code() == Some(255) {
@@ -953,5 +1226,6 @@ async fn run_ssh_child(
         // A broken stdin pipe means the transport died (auth refused, host
         // key rejected, reset), not that the step ran out of time: exit 3.
         stream::PipedRun::PipeBroken => Err(SshOutcome::Transport),
+        stream::PipedRun::Cancelled => Err(SshOutcome::Cancelled),
     }
 }

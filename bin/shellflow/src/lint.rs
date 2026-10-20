@@ -7,9 +7,8 @@
 //! This module scans block bodies for the three patterns that have caused
 //! real production incidents:
 //!
-//! 1. `for x in $VAR` / `for x in ${VAR}` — `zsh` does not word-split
-//!    unquoted expansions, so the loop runs once with the whole string.
-//!    (Fix: literal lists, `for x in a b c`.)
+//! 1. `for x in $VAR` / `for x in ${VAR}` — `zsh` does not word-split unquoted expansions, so the
+//!    loop runs once with the whole string. (Fix: literal lists, `for x in a b c`.)
 //! 2. `${!name}` indirect expansion — unsupported by `zsh`.
 //! 3. `${}` empty braces — a syntax error at runtime under `set -u`.
 //!
@@ -104,7 +103,9 @@ fn for_unquoted_expansion(code: &str) -> Option<String> {
     if word.starts_with('$') && word.len() > 1 {
         // `$@`, `$*`, `$1`… are positional/special — unaffected.
         let second = word.as_bytes()[1];
-        if second.is_ascii_digit() || matches!(second, b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!') {
+        if second.is_ascii_digit() ||
+            matches!(second, b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!')
+        {
             return None;
         }
         return Some(word.to_string());

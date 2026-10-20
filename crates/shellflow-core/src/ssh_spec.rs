@@ -25,8 +25,9 @@ impl SshSpec {
     ///
     /// # Errors
     ///
-    /// Returns a [`ParseError`] when the spec has no host, an empty user, or a
-    /// non-numeric / out-of-range port.
+    /// Returns a [`ParseError`] when the spec has no host, an empty user, a
+    /// non-numeric / out-of-range port, or a user or host that contains
+    /// characters outside `[A-Za-z0-9._-]`.
     pub fn parse(spec: &str) -> Result<Self, ParseError> {
         let (user, rest) = match spec.split_once('@') {
             Some((user, rest)) => {
@@ -35,6 +36,15 @@ impl SshSpec {
                         line: 0,
                         spec: spec.to_string(),
                         reason: "empty user before `@`".to_string(),
+                    });
+                }
+                if !is_valid_spec_component(user) {
+                    return Err(ParseError::InvalidSshSpec {
+                        line: 0,
+                        spec: spec.to_string(),
+                        reason: format!(
+                            "invalid user `{user}` (allowed: letters, digits, `.`, `_`, `-`)"
+                        ),
                     });
                 }
                 (Some(user.to_string()), rest)
@@ -59,6 +69,13 @@ impl SshSpec {
                 line: 0,
                 spec: spec.to_string(),
                 reason: "empty host".to_string(),
+            });
+        }
+        if !is_valid_spec_component(&host) {
+            return Err(ParseError::InvalidSshSpec {
+                line: 0,
+                spec: spec.to_string(),
+                reason: format!("invalid host `{host}` (allowed: letters, digits, `.`, `_`, `-`)"),
             });
         }
 
@@ -92,6 +109,19 @@ impl SshSpec {
         args.push(self.dest());
         args
     }
+}
+
+/// Whether a user or host component contains only characters that are valid in
+/// a POSIX login name or a DNS host name.
+///
+/// The spec is never handed to a shell (it becomes one `ssh`/`rsync` argv
+/// element), so this is not an injection guard — it is a correctness guard: a
+/// host containing whitespace or a quote cannot be a real destination, and
+/// accepting it produces an opaque `ssh` failure instead of a parse-time
+/// diagnostic.
+fn is_valid_spec_component(component: &str) -> bool {
+    !component.is_empty() &&
+        component.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 #[cfg(test)]
@@ -144,6 +174,16 @@ mod tests {
     fn rejects_bad_port() {
         assert!(SshSpec::parse("host:not-a-port").is_err());
         assert!(SshSpec::parse("host:99999").is_err());
+    }
+
+    #[test]
+    fn rejects_a_host_or_user_that_is_not_a_valid_name() {
+        // A whitespace- or quote-bearing component can never be a real
+        // destination: accepting it produces an opaque `ssh` failure instead
+        // of a parse-time diagnostic.
+        for spec in ["web1 web2", "deploy user@host", "host;id", "host'", "ho st"] {
+            assert!(SshSpec::parse(spec).is_err(), "`{spec}` must be rejected");
+        }
     }
 
     #[test]
