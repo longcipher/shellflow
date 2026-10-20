@@ -523,8 +523,9 @@ fn reload_command(unit: &str, signal: Option<&str>, wait: bool, timeout_secs: u6
     format!(
         "if [ -x /usr/local/bin/shellflow ]; then exec /usr/local/bin/shellflow {helper}; fi; \
          u='{unit}'; \
-         if [ -n \"$(systemctl show \"$u\" -p ExecReload --value 2>/dev/null)\" ]; then systemctl reload \"$u\"; \
-         else systemctl kill --signal '{fallback_signal}' \"$u\"; fi"
+         if [ \"$(id -u)\" = 0 ]; then SC=systemctl; else SC='sudo -n systemctl'; fi; \
+         if [ -n \"$($SC show \"$u\" -p ExecReload --value 2>/dev/null)\" ]; then $SC reload \"$u\"; \
+         else $SC kill --signal '{fallback_signal}' \"$u\"; fi"
     )
 }
 
