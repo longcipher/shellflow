@@ -91,16 +91,16 @@ impl Verdict {
 /// A target-side systemd error.
 #[derive(Debug)]
 pub(crate) struct SystemdError {
-    message: String,
-    code: i32,
+    pub(crate) message: String,
+    pub(crate) code: i32,
 }
 
 impl SystemdError {
-    fn usage(message: impl Into<String>) -> Self {
+    pub(crate) fn usage(message: impl Into<String>) -> Self {
         Self { message: message.into(), code: EXIT_USAGE }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self { message: message.into(), code: EXIT_USAGE }
     }
 
@@ -141,7 +141,7 @@ fn validate_unit(unit: &str) -> Result<(), SystemdError> {
 const SHOW_PROPS: [&str; 5] = ["Type", "ActiveState", "SubState", "Result", "StatusText"];
 
 /// Read a unit's state from the local systemd.
-fn show_state(unit: &str) -> Result<UnitState, SystemdError> {
+pub(crate) fn show_state(unit: &str) -> Result<UnitState, SystemdError> {
     let mut cmd = Command::new("systemctl");
     cmd.arg("show").arg(unit);
     for prop in SHOW_PROPS {
@@ -230,7 +230,7 @@ fn failure_reason(state: &UnitState) -> String {
 }
 
 /// Render a state as the machine-readable line the controller parses.
-fn state_line(state: &UnitState) -> String {
+pub(crate) fn state_line(state: &UnitState) -> String {
     let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
     format!(
         "{}\t{}\t{}\t{}\t{}\t{}",
@@ -276,13 +276,13 @@ impl WaitFor {
 }
 
 /// Run a `shellflow systemd` subcommand.
-pub(crate) fn run(cmd: &SystemdCmd) -> Result<(), SystemdError> {
+pub(crate) async fn run(cmd: &SystemdCmd) -> Result<(), SystemdError> {
     match cmd {
         SystemdCmd::Notify(args) => notify(args),
         SystemdCmd::Wait(args) => wait(args),
         SystemdCmd::Reload(args) => reload(args),
         SystemdCmd::Status(args) => status(args),
-        SystemdCmd::Watch(args) => watch(args),
+        SystemdCmd::Watch(args) => watch(args).await,
         SystemdCmd::Transient(args) => transient(args),
     }
 }
@@ -529,11 +529,16 @@ fn wait_for_reload(unit: &str, timeout: Duration, interval: Duration) -> Result<
 /// With the `dbus` feature the state changes are *events* (systemd's
 /// `PropertiesChanged` signal), so the wait is instantaneous instead of
 /// polled. Without it, the same output is produced by polling.
-fn watch(args: &SystemdWatchArgs) -> Result<(), SystemdError> {
+async fn watch(args: &SystemdWatchArgs) -> Result<(), SystemdError> {
     validate_unit(&args.unit)?;
     let deadline = Instant::now() + Duration::from_secs(args.timeout);
     let interval = Duration::from_secs(args.interval.max(1));
 
+    #[cfg(feature = "dbus")]
+    {
+        return crate::systemd_dbus::watch(&args.unit, deadline, interval).await;
+    }
+    #[cfg(not(feature = "dbus"))]
     {
         let mut last = String::new();
         loop {
@@ -552,7 +557,7 @@ fn watch(args: &SystemdWatchArgs) -> Result<(), SystemdError> {
                     code: EXIT_TIMEOUT,
                 });
             }
-            sleep(interval);
+            tokio::time::sleep(interval).await;
         }
     }
 }

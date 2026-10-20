@@ -10,9 +10,17 @@ keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
 
+[features]
+# Event-driven systemd unit state (D-Bus). Off by default so the standard
+# build stays a single static binary with no D-Bus dependency; the CLI path
+# produces the same output by polling.
+default = []
+dbus = ["dep:zbus", "dep:futures-util"]
+
 [dependencies]
 age = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+futures-util = { workspace = true, optional = true }
 colored = { workspace = true }
 eyre = { workspace = true }
 nix = { workspace = true, features = ["process", "signal", "user", "fs"] }
@@ -24,6 +32,7 @@ tokio = { workspace = true, features = ["full"] }
 toml_edit = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 zeroize = { workspace = true }
+zbus = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

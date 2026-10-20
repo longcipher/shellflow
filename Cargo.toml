@@ -26,6 +26,7 @@ age = "0.12.1"
 clap = "4.6.7"
 colored = "3.1.1"
 eyre = "0.6.14"
+futures-util = "0.3.31"
 nix = "0.31.3"
 proptest = "1.11.0"
 sd-notify = "0.5.0"
@@ -36,6 +37,7 @@ tokio = "1.54.0"
 toml_edit = "0.25.17"
 tracing-subscriber = "0.3.23"
 zeroize = "1.9.1"
+zbus = { version = "5.0.0", default-features = false, features = ["tokio"] }
 
 [workspace.lints.clippy]
 # Enable pedantic lints for stricter code quality
