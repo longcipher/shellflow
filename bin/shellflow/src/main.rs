@@ -28,6 +28,8 @@ mod secrets;
 mod service;
 mod service_check;
 mod systemd;
+#[cfg(feature = "dbus")]
+mod systemd_dbus;
 mod template;
 mod ui;
 
@@ -107,7 +109,7 @@ async fn main() -> Result<()> {
                 1
             }
         },
-        Some(Command::Systemd(cmd)) => match systemd::run(&cmd.command) {
+        Some(Command::Systemd(cmd)) => match systemd::run(&cmd.command).await {
             Ok(()) => 0,
             Err(err) => {
                 eprintln!("error: {err:#}");
