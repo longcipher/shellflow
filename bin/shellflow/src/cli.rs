@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 /// Env var that overrides the default `@secrets` masking threshold.
 const MASK_MIN_LEN_ENV: &str = "SHELLFLOW_MASK_MIN_LEN";
@@ -394,6 +394,168 @@ pub(crate) struct EmitCredEnvArgs {
     pub output: Option<PathBuf>,
 }
 
+/// Arguments for `shellflow systemd` — the target-side systemd helpers.
+///
+/// These subcommands run **on the target host** (the binary is installed once
+/// per host by a deploy playbook). They talk to the local systemd only and
+/// never open the network.
+///
+/// `wait` is the reason the helper exists: the whole wait loop runs on the
+/// host that owns the unit, so a controller-side wait costs **one** SSH
+/// round-trip instead of one per poll. Each poll streams a machine-readable
+/// state line (`SFW<TAB>type<TAB>active<TAB>sub<TAB>result<TAB>status`) and
+/// the verdict is the exit code (0 ready, 3 failed, 4 timeout, 5 not found).
+#[derive(Debug, Args)]
+pub(crate) struct SystemdArgs {
+    #[command(subcommand)]
+    pub command: SystemdCmd,
+}
+
+/// The `systemd` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum SystemdCmd {
+    /// Send a systemd notification for the unit this process runs in.
+    Notify(SystemdNotifyArgs),
+    /// Wait for a unit to reach a state (runs on the target host).
+    Wait(SystemdWaitArgs),
+    /// Trigger a graceful reload and wait for the handshake.
+    Reload(SystemdReloadArgs),
+    /// Print a unit's state once.
+    Status(SystemdStatusArgs),
+    /// Stream a unit's state until it becomes ready.
+    Watch(SystemdWatchArgs),
+    /// Run a command as a transient systemd unit.
+    Transient(SystemdTransientArgs),
+}
+
+/// What a wait is waiting for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum WaitForArg {
+    /// The unit is active (or a oneshot that finished successfully).
+    Ready,
+    /// The unit is active *and* running.
+    Running,
+}
+
+/// Arguments for `systemd notify`.
+#[derive(Debug, Args)]
+pub(crate) struct SystemdNotifyArgs {
+    /// Send `READY=1` (the unit finished starting).
+    #[arg(long)]
+    pub ready: bool,
+    /// Send `RELOADING=1` (with `MONOTONIC_USEC`, as systemd >= 253 requires).
+    #[arg(long)]
+    pub reloading: bool,
+    /// Send `STOPPING=1`.
+    #[arg(long)]
+    pub stopping: bool,
+    /// Send `WATCHDOG=1` (the service is still alive).
+    #[arg(long)]
+    pub watchdog: bool,
+    /// Send `STATUS=<text>` (the service's own status line).
+    #[arg(long, value_name = "TEXT")]
+    pub status: Option<String>,
+    /// Send `MAINPID=<pid>`.
+    #[arg(long, value_name = "PID")]
+    pub main_pid: Option<u32>,
+    /// Send a raw `KEY=VALUE` state (repeatable).
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub raw: Vec<String>,
+}
+
+/// Arguments for `systemd wait`.
+#[derive(Debug, Args)]
+pub(crate) struct SystemdWaitArgs {
+    /// The unit to wait for.
+    #[arg(value_name = "UNIT")]
+    pub unit: String,
+
+    /// What to wait for.
+    #[arg(long = "for", value_enum, default_value_t = WaitForArg::Ready)]
+    pub for_: WaitForArg,
+
+    /// How long to wait, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = 300)]
+    pub timeout: u64,
+
+    /// Seconds between polls.
+    #[arg(long, value_name = "SECS", default_value_t = 5)]
+    pub interval: u64,
+}
+
+/// Arguments for `systemd reload`.
+#[derive(Debug, Args)]
+pub(crate) struct SystemdReloadArgs {
+    /// The unit to reload.
+    #[arg(value_name = "UNIT")]
+    pub unit: String,
+
+    /// Send this signal instead of `systemctl reload` (e.g. `SIGUSR1`).
+    #[arg(long, value_name = "SIG")]
+    pub signal: Option<String>,
+
+    /// Wait for the reload to finish.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// How long to wait for the handshake, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = 120)]
+    pub timeout: u64,
+
+    /// Seconds between polls.
+    #[arg(long, value_name = "SECS", default_value_t = 2)]
+    pub interval: u64,
+}
+
+/// Arguments for `systemd status`.
+#[derive(Debug, Args)]
+pub(crate) struct SystemdStatusArgs {
+    /// The unit to inspect.
+    #[arg(value_name = "UNIT")]
+    pub unit: String,
+}
+
+/// Arguments for `systemd watch`.
+#[derive(Debug, Args)]
+pub(crate) struct SystemdWatchArgs {
+    /// The unit to watch.
+    #[arg(value_name = "UNIT")]
+    pub unit: String,
+
+    /// How long to watch, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = 300)]
+    pub timeout: u64,
+
+    /// Seconds between polls (only used without the `dbus` feature).
+    #[arg(long, value_name = "SECS", default_value_t = 5)]
+    pub interval: u64,
+}
+
+/// Arguments for `systemd transient`.
+#[derive(Debug, Args)]
+pub(crate) struct SystemdTransientArgs {
+    /// The command to run, with its arguments.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        required = true,
+        value_name = "CMD"
+    )]
+    pub command: Vec<String>,
+
+    /// The transient unit name.
+    #[arg(long, value_name = "NAME")]
+    pub unit: Option<String>,
+
+    /// A unit property to set (repeatable).
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub property: Option<String>,
+
+    /// Run the command in a scope instead of a service.
+    #[arg(long)]
+    pub scope: bool,
+}
+
 /// Arguments for `shellflow cred-env` — the target-side credential helpers.
 ///
 /// These subcommands run **on the target host** (the binary is installed once
@@ -589,6 +751,8 @@ pub(crate) enum Command {
     Emit(EmitArgs),
     /// Target-side credential helpers (run on the target host).
     CredEnv(CredEnvArgs),
+    /// Target-side systemd helpers (run on the target host).
+    Systemd(SystemdArgs),
     /// Scaffold new services in the flat repository layout.
     Service(ServiceArgs),
     /// Scan a repository for secret-shaped plaintext (pre-commit gate).

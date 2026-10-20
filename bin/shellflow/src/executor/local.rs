@@ -304,6 +304,7 @@ pub(crate) async fn evaluate_guard(
         log_file,
         cancel: cancel.clone(),
         quiet: false,
+        collector: None,
     };
     match super::stream::run_piped_child(args, cmd).await {
         Ok(super::stream::PipedRun::Completed(status)) => {
@@ -339,6 +340,7 @@ async fn run_bash_streamed(
         log_file,
         cancel: cancel.clone(),
         quiet: false,
+        collector: None,
     };
     match super::stream::run_piped_child(args, cmd).await.map_err(LocalFailure::Failed)? {
         super::stream::PipedRun::Completed(status) => Ok(status),
