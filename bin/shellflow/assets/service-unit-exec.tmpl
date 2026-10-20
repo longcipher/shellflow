@@ -1,0 +1,27 @@
+[Unit]
+Description=__SVC__ (encrypted credentials via systemd-creds)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Dedicated runtime user (created by playbook, least privilege)
+User=__SVC__
+Group=__SVC__
+
+# Shared helper: exports systemd credentials as environment variables, then
+# execs the real binary (process replacement: signals and supervision apply
+# to the real program). Key names must equal the env names the binary reads.
+ExecStart=/usr/local/bin/shellflow cred-env exec /opt/__SVC__/bin/__SVC__
+
+# == Per-key import from per-service credstore (regenerate this section):
+#   shellflow secret creds --store-dir /etc/credstore.encrypted/__SVC__ \
+#     services/__SVC__/<host>.env.age
+# Paste the LoadCredentialEncrypted= lines below (all hosts must share keys;
+# verify with `shellflow secret keys-check services/__SVC__`).
+# LoadCredentialEncrypted=API_KEY:/etc/credstore.encrypted/__SVC__/API_KEY
+
+# --- Security hardening: keep it inline in this unit. ---
+
+[Install]
+WantedBy=multi-user.target

@@ -107,6 +107,12 @@ pub(super) async fn run_local_block(args: &LocalBlockArgs<'_>) -> Result<()> {
     if args.config.check || args.config.dry_run {
         run_bash_n(args.script, args.log_file).await?;
         crate::ui::note("  local syntax check (bash -n): OK", args.log_file);
+        for finding in crate::lint::lint_block(args.script) {
+            crate::ui::warn(
+                &format!("  line {}: {}", finding.line, finding.message),
+                args.log_file,
+            );
+        }
         return Ok(());
     }
 

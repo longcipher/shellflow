@@ -25,9 +25,11 @@ nix = "0.31.3"
 proptest = "1.11.0"
 shellflow-core = { path = "crates/shellflow-core", version = "0.2.2" }
 shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.2.2" }
+serde_json = "1.0.143"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = "1.53.1"
+toml_edit = "0.22.27"
 tracing-subscriber = "0.3.23"
 
 [workspace.lints.clippy]

@@ -1,0 +1,13 @@
+[Unit]
+Description=__SVC__ (infra managed oneshot task)
+
+[Service]
+Type=oneshot
+# TODO: set User= (root only if the task needs it, with a comment why).
+ExecStart=/opt/__SVC__/bin/__SVC__
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

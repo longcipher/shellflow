@@ -274,6 +274,26 @@ async fn run_single_step(
                 }
             }
         }
+        shellflow_core::Step::Wait(wait) => {
+            match shellflow_core::resolve_hosts(plan, &wait.target, &setup.restrict) {
+                Ok(hosts) => (
+                    None,
+                    run_wait_step(
+                        &setup.ui,
+                        wait,
+                        hosts,
+                        config,
+                        &setup.semaphore,
+                        &setup.log_file,
+                    )
+                    .await,
+                ),
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Script), Ok(Vec::new()))
+                }
+            }
+        }
     }
 }
 
@@ -374,6 +394,7 @@ fn target_host_aliases(
         let target = match step {
             shellflow_core::Step::Remote(remote) => &remote.target,
             shellflow_core::Step::Copy(copy) => &copy.target,
+            shellflow_core::Step::Wait(wait) => &wait.target,
             shellflow_core::Step::Local(_) => continue,
         };
         match shellflow_core::resolve_hosts(plan, target, restrict) {
@@ -402,6 +423,101 @@ pub(super) struct PayloadParts {
     pub(super) guard: Option<String>,
     pub(super) env: Vec<(String, String)>,
     pub(super) trace_line: &'static str,
+}
+
+/// Default wait budget in seconds when neither `@timeout` nor `--timeout`
+/// bounds a `@wait_active` step (slow starters: substrate nodes, JVMs,
+/// container image pulls).
+const DEFAULT_WAIT_SECS: u64 = 300;
+
+/// Poll `systemctl is-active <unit>` on every target host until it reports
+/// active or the budget expires. One slow host never blocks others (fan-out
+/// with the run semaphore); a host that never reports active is `FAILED`
+/// (script class: the unit is broken, not the transport).
+///
+/// The unit name is validated at parse time (`[A-Za-z0-9._-]` plus `@`/`:`,
+/// no leading dots, no `..`), so interpolating it into the poll command is
+/// safe.
+pub(super) async fn run_wait_step(
+    ui: &ArcUi,
+    wait: &shellflow_core::WaitStep,
+    hosts: Vec<ResolvedHost>,
+    config: StepConfig,
+    semaphore: &Option<Arc<Semaphore>>,
+    log_file: &LogFile,
+) -> eyre::Result<Vec<(String, HostOutcome)>> {
+    use tokio::time::{Duration, Instant};
+    if config.check || config.dry_run {
+        crate::ui::note(
+            &format!(
+                "  wait_active {} ({}s budget): no-op in check/dry-run",
+                wait.unit,
+                config.timeout.unwrap_or(DEFAULT_WAIT_SECS),
+            ),
+            log_file,
+        );
+        return Ok(hosts
+            .into_iter()
+            .map(|host| (host.alias, HostOutcome::Ok))
+            .collect());
+    }
+    let budget = Duration::from_secs(config.timeout.unwrap_or(DEFAULT_WAIT_SECS));
+    let interval = Duration::from_secs(wait.interval_secs.max(1));
+    let mut tasks = JoinSet::new();
+    for host in hosts {
+        let ui = Arc::clone(ui);
+        let unit = wait.unit.clone();
+        let semaphore = semaphore.clone();
+        tasks.spawn(async move {
+            let _permit = match semaphore.as_ref() {
+                Some(sem) => match sem.clone().acquire_owned().await {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport))
+                    }
+                },
+                None => None,
+            };
+            let deadline = Instant::now() + budget;
+            loop {
+                let mut cmd = Command::new("ssh");
+                cmd.args(host.spec.to_ssh_args())
+                    .arg("-T")
+                    .arg(format!("systemctl is-active {unit}"));
+                // `is-active` exits non-zero for anything but active; the
+                // output text is the verdict either way.
+                let output = cmd.output().await;
+                let state = output
+                    .as_ref()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if state == "active" {
+                    ui.lock()
+                        .await
+                        .masked_note(&format!("[{}] {unit} active", host.alias));
+                    return (host.alias.clone(), HostOutcome::Ok);
+                }
+                if Instant::now() + interval >= deadline {
+                    ui.lock().await.masked_note(&format!(
+                        "[{}] {unit} still `{state}` after {}s",
+                        host.alias,
+                        budget.as_secs()
+                    ));
+                    return (host.alias.clone(), HostOutcome::Failed(RunError::Script));
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            Ok(pair) => out.push(pair),
+            Err(_) => out.push(("unknown".to_string(), HostOutcome::Failed(RunError::Transport))),
+        }
+    }
+    Ok(out)
 }
 
 pub(super) async fn run_remote_step(
@@ -519,8 +635,7 @@ async fn run_remote_host(
     shell_cache: ShellCache,
     secrets: &Arc<ResolvedSecrets>,
     log_file: &LogFile,
-) -> (String, HostOutcome) {
-    if config.check || config.dry_run {
+) -> (String, HostOutcome) {    if config.check || config.dry_run {
         let payload =
             format!("set -eu\n{}{}{}", render_env(&parts.env), parts.trace_line, parts.script);
         if config.verbose >= 2 {
@@ -542,6 +657,12 @@ async fn run_remote_host(
         {
             Ok(()) => {
                 crate::ui::note(&format!("[{}] syntax check (bash -n): OK", host.alias), log_file);
+                for finding in crate::lint::lint_block(&parts.script) {
+                    crate::ui::warn(
+                        &format!("[{}] line {}: {}", host.alias, finding.line, finding.message),
+                        log_file,
+                    );
+                }
                 (host.alias.clone(), HostOutcome::Ok)
             }
             Err(outcome) => {
@@ -604,6 +725,20 @@ fn build_ssh_cmd(
 ) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.args(host.spec.to_ssh_args()).arg("-T");
+    if config.ssh_reuse {
+        // Opt-in connection reuse: later steps in the same run share the
+        // first step's authenticated connection instead of re-handshaking.
+        // Off by default so a stale master socket can never break a deploy
+        // silently; rsync/scp copies always go direct.
+        cmd.args([
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPath=~/.ssh/shellflow-%r@%h-%p",
+            "-o",
+            "ControlPersist=60",
+        ]);
+    }
     if config.verbose >= 3 {
         cmd.arg("-v");
     }

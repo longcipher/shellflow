@@ -74,6 +74,7 @@ lines belong to the current block.
 | `@timeout` | `# @timeout <seconds>` | Per-step timeout for the next block |
 | `@name` | `# @name <label>` | Name the next block (for `--only`/`--skip`/reporting) |
 | `@only_if` | `# @only_if <command>` | Skip the next block where `<command>` fails |
+| `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active` until active or budget expires (default 300s). Replaces hand-rolled `for/sleep/ss` loops; a timeout is a script-class failure |
 
 Behavioral rules to remember:
 
@@ -81,6 +82,11 @@ Behavioral rules to remember:
   dropped.
 - Local and remote blocks get `set -eu` injected (`set -eux` at `-vvv`):
   a failing command stops the block.
+- Remote blocks run under the target's login shell, which may be `zsh`.
+  `-k` / `--dry-run` lint every block for zsh-unsafe constructs (`for x in
+  $VAR` without word splitting, `${!name}`, `${}` literals) and print
+  `zsh-risk` warnings next to the `bash -n` result. `bash -n` alone cannot
+  catch these — treat warnings as errors before deploying to zsh hosts.
 - `@copy` paths are parsed by shellflow, not Bash. Capture values with
   `@export` and reference them as `$VAR` / `${VAR}`. Unresolved variables are
   a hard error in a real run, and a warning + skip in `--dry-run`/`--check`.
@@ -204,6 +210,10 @@ shellflow secret creds [-i PATH] [--store-dir PATH] FILE   print ImportCredentia
                                              LoadCredentialEncrypted=KEY:PATH lines)
 shellflow template check [-i PATH] <tmpl> <file.env.age>   every ${KEY} in the
                                             template must exist in the env file
+shellflow template render [-i PATH] [--format toml|json|none] <tmpl> <file.env.age>
+                                            decrypt + substitute in memory and
+                                            validate the output (never prints
+                                            values; catches joined lines etc.)
 shellflow emit cred-env [-o PATH]         print the target-side `cred-env`
                                             bash fallback (export creds /
                                             render templates)
@@ -214,11 +224,21 @@ shellflow cred-env render <tmpl> <out>    [target] substitute ${KEY} credential
 shellflow cred-env credstore-install <svc> [--store-dir PATH]
                                           [target] clear + re-seal the
                                             per-service credential store
+                                            (self-elevates: call as plain
+                                            `sudo …`, never `sudo -E`)
 shellflow secret keys-check [-i PATH] <dir>   all <host>.env.age in <dir> must
                                             share the same key set
-shellflow service init <svc> [--host H]…  scaffold services/<svc>/ +
+shellflow secret find-duplicates [-i PATH] [dir]   identical values shared
+                                            across files (rotation linkage)
+shellflow service init <svc> [--host H]… [--pattern full|exec|no-secret|container|oneshot|no-start] [--timer SCHEDULE]
+                                            scaffold services/<svc>/ +
                                             playbooks/deploy-<svc>.sh (flat
                                             layout, shared-helper unit)
+shellflow service check <svc> --host H [--journal-lines N]   read-only audit
+                                            of the deployed unit (argv/env
+                                            leaks, wiring, journal shapes)
+shellflow audit [PATH]                  scan the repo for secret-shaped
+                                            plaintext (pre-commit gate)
 ```
 
 ## Complete secrets workflow
@@ -356,9 +376,10 @@ cargo zigbuild --release -p shellflow --target x86_64-unknown-linux-musl
 # …ship target/x86_64-unknown-linux-musl/release/shellflow via @copy, then:
 sudo install -m 0755 /tmp/<stamp>/shellflow /usr/local/bin/shellflow
 
-# In the playbook's remote install step — seal the per-service store with the
-# helper (reads $LT_SECRET_KEYS + values from the environment that @secrets
-# injected; values travel on stdin, never argv; works under zsh or bash):
+# In the playbook's remote install step — seal the per-service store.
+# Call it WITHOUT sudo: the helper probes store writability and re-executes
+# itself under `sudo --preserve-env=<exact keys>` only when elevation is
+# actually needed (never `sudo -E`).
 /usr/local/bin/shellflow cred-env credstore-install <svc>
 ```
 
@@ -394,6 +415,18 @@ ExecStart=/usr/local/bin/shellflow cred-env exec /usr/local/bin/<svc> -c /run/<s
   `shellflow template check -i <identity> services/<svc>/<svc>.json5.tmpl services/<svc>/<host>.env.age`
   (missing keys fail; env keys the template never references are reported as
   notes).
+- Render-check it too (catches structural accidents `check` cannot see):
+  `shellflow template render -i <identity> --format toml <tmpl> <env.age>`
+  (decrypts + substitutes in memory, validates TOML/JSON, prints no values).
+- For DB/KV/RPC credentials, verify the candidate against the live backend
+  before sealing (`psql … SELECT 1`, RESP `AUTH`+`PING`, authed API probe):
+  `systemctl show` proves what is configured, never what works. Seal only
+  verified values.
+- After deploying, audit the live unit:
+  `shellflow service check <svc> --host <alias>`
+  (argv/env leaks, credential wiring, journal value shapes).
+- Before committing, scan the repo: `shellflow audit .`
+  (URL-embedded creds, live assignments, token shapes, PEM blocks).
 
 `shellflow emit cred-env` still prints a pure-bash equivalent of `exec`/`render`
 for targets that cannot host the binary — a documented fallback with the same

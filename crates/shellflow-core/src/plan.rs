@@ -126,6 +126,24 @@ pub struct CopyStep {
     pub env: Vec<EnvEntry>,
 }
 
+/// A wait-for-active step (`@wait_active`): poll `systemctl is-active`
+/// until the unit reports active or the budget expires. Replaces the
+/// hand-rolled `for/sleep/ss` poll loops that differ in every playbook
+/// (and have shipped with wrong ports).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WaitStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// systemd unit name (`foo` or `foo.service`).
+    pub unit: String,
+    /// Wait budget in seconds (`@timeout` or `--timeout N`, else 300).
+    pub timeout: Option<u64>,
+    /// Poll interval in seconds (fixed at 5: kind to systemd, not a knob).
+    pub interval_secs: u64,
+}
+
 /// One executable unit of the plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Step {
@@ -135,6 +153,8 @@ pub enum Step {
     Remote(RemoteStep),
     /// Sync a file/dir to remote hosts with rsync.
     Copy(CopyStep),
+    /// Wait for a systemd unit to report active.
+    Wait(WaitStep),
 }
 
 impl Step {
@@ -145,6 +165,7 @@ impl Step {
             Self::Local(s) => s.name.as_deref(),
             Self::Remote(s) => s.name.as_deref(),
             Self::Copy(s) => s.name.as_deref(),
+            Self::Wait(s) => s.name.as_deref(),
         }
     }
 
@@ -155,6 +176,7 @@ impl Step {
             Self::Local(_) => "local",
             Self::Remote(_) => "remote",
             Self::Copy(_) => "copy",
+            Self::Wait(_) => "wait_active",
         }
     }
 
@@ -165,6 +187,7 @@ impl Step {
             Self::Local(_) => None,
             Self::Remote(s) => Some(&s.target.text),
             Self::Copy(s) => Some(&s.target.text),
+            Self::Wait(s) => Some(&s.target.text),
         }
     }
 
@@ -175,6 +198,7 @@ impl Step {
             Self::Local(s) => s.guard.as_deref(),
             Self::Remote(s) => s.guard.as_deref(),
             Self::Copy(s) => s.guard.as_deref(),
+            Self::Wait(_) => None,
         }
     }
 
@@ -185,6 +209,7 @@ impl Step {
             Self::Local(s) => s.timeout,
             Self::Remote(s) => s.timeout,
             Self::Copy(s) => s.timeout,
+            Self::Wait(s) => s.timeout,
         }
     }
 }
