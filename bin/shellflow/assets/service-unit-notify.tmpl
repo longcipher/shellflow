@@ -1,0 +1,64 @@
+[Unit]
+Description=__SVC__ (encrypted credentials via systemd-creds, readiness over sd_notify)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+# The service announces readiness with `READY=1` (sd_notify). systemd only
+# reports the unit active after that message arrives, so a service that
+# starts but never signals is *visible* instead of silently "up".
+# `shellflow service check` audits this wiring.
+NotifyAccess=main
+
+# Dedicated runtime user (created by playbook, least privilege)
+User=__SVC__
+Group=__SVC__
+
+# tmpfs directory: render output lands here (0700, wiped on unit exit)
+RuntimeDirectory=__SVC__
+RuntimeDirectoryMode=0700
+
+# For third-party apps needing a config file: render the plaintext template
+# (no secret values, lives at /opt/__SVC__/etc/) into tmpfs.
+ExecStartPre=/usr/local/bin/shellflow cred-env render /opt/__SVC__/etc/__SVC__.json5.tmpl /run/__SVC__/__SVC__.json5
+
+# Shared helper (installed to /usr/local/bin/shellflow by playbook, shared
+# across all services, no per-service starter script): exports systemd
+# credentials as environment variables then execs the real binary.
+ExecStart=/usr/local/bin/shellflow cred-env exec /opt/__SVC__/bin/__SVC__
+
+# Graceful reload. Declaring ExecReload= is what lets
+# `# @reload __SVC__ @<host> --wait` hand the service over instead of
+# restarting it — a restart drops the connections a reload preserves.
+# The service must handle the signal (SIGHUP by default).
+ExecReload=/bin/kill -HUP $MAINPID
+# The service should also publish progress while it starts, so the operator
+# sees *why* it is not ready yet:
+#   /usr/local/bin/shellflow systemd notify status "syncing chain 42%"
+# and, if WatchdogSec= is enabled below, ping the watchdog at half that
+# interval:
+#   /usr/local/bin/shellflow systemd notify watchdog
+
+# A notify service needs room to initialise: systemd gives up at
+# TimeoutStartSec and kills it, so keep this generous.
+TimeoutStartSec=180
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+# Watchdog: uncomment to have systemd kill a service that stops pinging.
+# The service must then send `WATCHDOG=1` (sd_notify) at half this interval.
+# WatchdogSec=60
+
+# == Per-key import from per-service credstore (regenerate this section):
+#   shellflow secret creds --store-dir /etc/credstore.encrypted/__SVC__ \
+#     services/__SVC__/<host>.env.age
+# LoadCredentialEncrypted=API_KEY:/etc/credstore.encrypted/__SVC__/API_KEY
+
+# --- Security hardening: keep it inline in this unit (ProtectSystem,
+# NoNewPrivileges, PrivateTmp, …). Shared drop-ins drift from units that
+# duplicate ExecStart (observed with per-flag drop-ins); prefer explicit. ---
+
+[Install]
+WantedBy=multi-user.target

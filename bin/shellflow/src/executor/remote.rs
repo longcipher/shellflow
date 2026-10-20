@@ -352,7 +352,180 @@ async fn run_single_step(
                 }
             }
         }
+        shellflow_core::Step::Reload(reload) => {
+            match shellflow_core::resolve_hosts(plan, &reload.target, &setup.restrict) {
+                Ok(hosts) => (
+                    None,
+                    run_reload_step(
+                        &setup.ui,
+                        reload,
+                        hosts,
+                        config,
+                        &setup.semaphore,
+                        &setup.log_file,
+                        &setup.cancel,
+                    )
+                    .await,
+                ),
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
     }
+}
+
+/// Trigger a graceful reload of a unit on the remote hosts.
+///
+/// The ladder is the one the target-side helper implements: the unit's own
+/// `ExecReload=` first, then an explicit `--signal`, and never a silent
+/// fallback to a restart — a restart drops the connections the reload exists
+/// to preserve, so failing is the honest answer.
+pub(super) async fn run_reload_step(
+    ui: &ArcUi,
+    reload: &shellflow_core::ReloadStep,
+    hosts: Vec<ResolvedHost>,
+    config: StepConfig,
+    semaphore: &Option<Arc<Semaphore>>,
+    log_file: &LogFile,
+    cancel: &Cancel,
+) -> eyre::Result<Vec<(String, HostOutcome)>> {
+    use tokio::time::Duration;
+    if config.check || config.dry_run {
+        crate::ui::note(
+            &format!("  reload {} (no-op in check/dry-run)", reload.unit),
+            log_file,
+        );
+        return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
+    }
+    let timeout = Duration::from_secs(reload.timeout.unwrap_or(DEFAULT_RELOAD_SECS));
+    let mut tasks = JoinSet::new();
+    for host in hosts {
+        let ui = Arc::clone(ui);
+        let unit = reload.unit.clone();
+        let signal = reload.signal.clone();
+        let wait = reload.wait;
+        let semaphore = semaphore.clone();
+        let log_file = log_file.clone();
+        let cancel = cancel.clone();
+        tasks.spawn(async move {
+            let _permit = match semaphore.as_ref() {
+                Some(sem) => match sem.clone().acquire_owned().await {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
+                    }
+                },
+                None => None,
+            };
+            if cancel.is_cancelled() {
+                return (host.alias.clone(), HostOutcome::Cancelled);
+            }
+            // One SSH round-trip: the helper performs the reload and, with
+            // `--wait`, waits for the notify handshake on the target.
+            let mut cmd = Command::new("ssh");
+            // Fail closed on an unknown host key or a missing key: never prompt.
+            cmd.args(["-o", "BatchMode=yes"]);
+            cmd.args(host.spec.to_ssh_args())
+                .arg("-T")
+                .arg(reload_command(&unit, signal.as_deref(), wait, timeout.as_secs()));
+            let args = stream::PipedArgs {
+                ui: &ui,
+                host: &host.alias,
+                payload: None,
+                timeout: Some(timeout.as_secs() + 30),
+                diff_filter: None,
+                log_file: &log_file,
+                cancel: cancel.clone(),
+                quiet: false,
+                collector: Some(wait_collector(&unit)),
+            };
+            let outcome = match stream::run_piped_child(args, cmd).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
+                }
+            };
+            match outcome {
+                stream::PipedRun::Completed(status) => {
+                    let code = status.code().unwrap_or(-1);
+                    match code {
+                        0 => {
+                            ui.lock().await.masked_note(&format!(
+                                "[{}] {unit} reloaded",
+                                host.alias
+                            ));
+                            (host.alias.clone(), HostOutcome::Ok)
+                        }
+                        255 => (host.alias.clone(), HostOutcome::Failed(RunError::Transport)),
+                        3 => {
+                            ui.lock().await.masked_note(&format!(
+                                "[{}] {unit} reload failed",
+                                host.alias
+                            ));
+                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
+                        }
+                        4 => {
+                            ui.lock().await.masked_note(&format!(
+                                "[{}] {unit} did not finish reloading within {}s",
+                                host.alias,
+                                timeout.as_secs()
+                            ));
+                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
+                        }
+                        other => {
+                            ui.lock().await.masked_note(&format!(
+                                "[{}] {unit} reload failed (exit {other})",
+                                host.alias
+                            ));
+                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
+                        }
+                    }
+                }
+                stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken => {
+                    (host.alias.clone(), HostOutcome::Failed(RunError::Transport))
+                }
+                stream::PipedRun::Cancelled => {
+                    (host.alias.clone(), HostOutcome::Cancelled)
+                }
+            }
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            Ok(pair) => {
+                ui.lock().await.host_finished(&pair.0);
+                out.push(pair);
+            }
+            Err(_) => out.push(("unknown".to_string(), HostOutcome::Failed(RunError::Transport))),
+        }
+    }
+    Ok(out)
+}
+
+/// The remote command that reloads a unit.
+///
+/// The helper does the work on the target — it knows the unit's `ExecReload=`,
+/// it can send the notify handshake, and it can wait for the reload to
+/// finish. The inline fallback covers a host that has never seen this
+/// shellflow: it still refuses to degrade into a restart.
+fn reload_command(unit: &str, signal: Option<&str>, wait: bool, timeout_secs: u64) -> String {
+    let mut helper = format!("systemd reload '{unit}'");
+    if let Some(sig) = signal {
+        helper.push_str(&format!(" --signal {sig}"));
+    }
+    if wait {
+        helper.push_str(&format!(" --wait --timeout {timeout_secs}"));
+    }
+    let fallback_signal = signal.unwrap_or("SIGUSR1");
+    format!(
+        "if [ -x /usr/local/bin/shellflow ]; then exec /usr/local/bin/shellflow {helper}; fi; \
+         u='{unit}'; \
+         if [ -n \"$(systemctl show \"$u\" -p ExecReload --value 2>/dev/null)\" ]; then systemctl reload \"$u\"; \
+         else systemctl kill --signal '{fallback_signal}' \"$u\"; fi"
+    )
 }
 
 /// Execute the plan and return the overall outcome.
@@ -468,6 +641,7 @@ fn target_host_aliases(
             shellflow_core::Step::Remote(remote) => &remote.target,
             shellflow_core::Step::Copy(copy) => &copy.target,
             shellflow_core::Step::Wait(wait) => &wait.target,
+            shellflow_core::Step::Reload(reload) => &reload.target,
             shellflow_core::Step::Local(_) => continue,
         };
         match shellflow_core::resolve_hosts(plan, target, restrict) {
@@ -502,6 +676,9 @@ pub(super) struct PayloadParts {
 /// bounds a `@wait_active` step (slow starters: substrate nodes, JVMs,
 /// container image pulls).
 const DEFAULT_WAIT_SECS: u64 = 300;
+
+/// The default budget for a graceful reload handshake.
+const DEFAULT_RELOAD_SECS: u64 = 120;
 
 /// Poll `systemctl is-active <unit>` on every target host until it reports
 /// active or the budget expires. One slow host never blocks others (fan-out
