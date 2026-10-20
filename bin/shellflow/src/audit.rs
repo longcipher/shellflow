@@ -35,12 +35,7 @@ pub(crate) fn audit(args: &AuditArgs) -> Result<()> {
         };
         for finding in scan_file(&content) {
             let rel = file.strip_prefix(root).unwrap_or(file);
-            println!(
-                "FAIL {}:{}: {}",
-                rel.display(),
-                finding.line,
-                finding.message
-            );
+            println!("FAIL {}:{}: {}", rel.display(), finding.line, finding.message);
             findings += 1;
             if findings >= 20 {
                 println!("… stopping after 20 findings");
@@ -64,8 +59,7 @@ pub(crate) struct Finding {
 /// Collect scannable files: skip `.git/`, `target/`, encrypted blobs, and
 /// lockfiles full of hashes.
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let entries =
-        fs::read_dir(root).wrap_err_with(|| format!("cannot read {}", root.display()))?;
+    let entries = fs::read_dir(root).wrap_err_with(|| format!("cannot read {}", root.display()))?;
     for entry in entries {
         let entry = entry.wrap_err("cannot read directory entry")?;
         let path = entry.path();
@@ -73,9 +67,7 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         if name == ".git" || name == "target" || name == "node_modules" || name == ".codebuddy" {
             continue;
         }
-        let file_type = entry
-            .file_type()
-            .wrap_err("cannot stat directory entry")?;
+        let file_type = entry.file_type().wrap_err("cannot stat directory entry")?;
         if file_type.is_dir() {
             collect_files(&path, out)?;
         } else if file_type.is_file() {
@@ -151,7 +143,8 @@ fn url_credential(line: &str, lower: &str) -> Option<String> {
         return None;
     }
     // Strip quotes/brackets for the doc-literal check.
-    let pass_clean: String = pass.chars().filter(|c| !matches!(c, '"' | '\'' | '[' | ']')).collect();
+    let pass_clean: String =
+        pass.chars().filter(|c| !matches!(c, '"' | '\'' | '[' | ']')).collect();
     if pass_clean.is_empty()
         || pass_clean == "password"
         || pass_clean == "user"
@@ -186,8 +179,12 @@ fn assignment_secret(line: &str, lower: &str) -> Option<String> {
     if value.len() < 6 {
         return None;
     }
-    if ["dummy", "postgres", "changeme", "example", "test", "none", "false", "true"]
-        .contains(&vl.as_str())
+    // Placeholder-shaped values are skipped. The list names *shapes* that are
+    // conventionally placeholders, not specific credential values: a real
+    // default (a database superuser password, for instance) must be flagged
+    // even when it is a well-known word, because a well-known password is
+    // still a password.
+    if ["dummy", "changeme", "example", "test", "none", "false", "true"].contains(&vl.as_str())
         || value.starts_with("xxxx")
         || value.contains("...")
         || value.contains("***")
@@ -213,10 +210,7 @@ mod tests {
 
     #[test]
     fn flags_url_embedded_password() {
-        assert_eq!(
-            hits("url = \"postgresql://akagi201:s3cr3tpass@localhost/db\""),
-            1
-        );
+        assert_eq!(hits("url = \"postgresql://akagi201:s3cr3tpass@localhost/db\""), 1);
     }
 
     #[test]
@@ -226,7 +220,12 @@ mod tests {
         assert_eq!(hits("password = \"hunter2\""), 1);
         assert_eq!(hits("password = \"${DB_PASSWORD}\""), 0);
         assert_eq!(hits("password = \"\""), 0);
-        assert_eq!(hits("password = \"postgres\""), 0);
+        // A well-known default is still a password: the scanner must not be
+        // silenced by the *value* being a common word.
+        assert_eq!(hits("password = \"postgres\""), 1);
+        // Placeholder-shaped values are still skipped.
+        assert_eq!(hits("password = \"changeme\""), 0);
+        assert_eq!(hits("password = \"dummy\""), 0);
     }
 
     #[test]
@@ -237,10 +236,7 @@ mod tests {
 
     #[test]
     fn flags_pem_blocks() {
-        assert_eq!(
-            hits("-----BEGIN EC PRIVATE KEY-----\nabc"),
-            1
-        );
+        assert_eq!(hits("-----BEGIN EC PRIVATE KEY-----\nabc"), 1);
     }
 
     #[test]

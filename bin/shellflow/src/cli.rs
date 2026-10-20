@@ -113,6 +113,15 @@ pub(crate) struct RunFlags {
     #[arg(long)]
     pub ssh_reuse: bool,
 
+    /// Allow a copy step to fall back to `scp` on a host without `rsync`,
+    /// dropping `--delete` and `--exclude`.
+    ///
+    /// Off by default: the fallback cannot mirror deletions or filter files,
+    /// so it silently performs a *different* transfer than the playbook
+    /// asked for. With this flag the downgrade is accepted explicitly.
+    #[arg(long)]
+    pub allow_unfiltered_copy: bool,
+
     /// Minimum value length to mask for values sourced from `@secrets` files.
     ///
     /// Defaults to `$SHELLFLOW_MASK_MIN_LEN`, or 6 when that is unset or
@@ -849,10 +858,7 @@ mod tests {
         match cli.command {
             Some(Command::Service(service)) => match service.command {
                 super::ServiceCmd::Init(i) => {
-                    assert!(matches!(
-                        i.pattern,
-                        super::ServicePattern::Container
-                    ));
+                    assert!(matches!(i.pattern, super::ServicePattern::Container));
                 }
                 super::ServiceCmd::Check(_) => {
                     panic!("expected init subcommand")
@@ -923,10 +929,7 @@ mod tests {
         match cli.command {
             Some(Command::Template(template)) => match template.command {
                 super::TemplateCmd::Render(a) => {
-                    assert!(matches!(
-                        a.format,
-                        super::RenderFormat::Toml
-                    ));
+                    assert!(matches!(a.format, super::RenderFormat::Toml));
                     assert_eq!(a.template.to_string_lossy(), "services/zenoh/zenoh.json5.tmpl");
                 }
                 super::TemplateCmd::Check(_) => {

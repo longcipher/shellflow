@@ -100,7 +100,10 @@ pub(crate) async fn run_copy_step(
     }
 
     if config.dry_run || config.verbose >= 2 {
-        crate::ui::note(&format!("  rsync {src} -> {dst} ({} hosts)", hosts.len()), &args.log_file);
+        args.ui
+            .lock()
+            .await
+            .masked_note(&format!("  rsync {src} -> {dst} ({} hosts)", hosts.len()));
     }
 
     let mut tasks = JoinSet::new();
@@ -136,7 +139,7 @@ pub(crate) async fn run_copy_step(
 }
 
 async fn run_copy_step_local(
-    _ui: &ArcUi,
+    ui: &ArcUi,
     src: &str,
     dst: &str,
     delete: bool,
@@ -149,7 +152,7 @@ async fn run_copy_step_local(
         return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
     }
     if config.dry_run || config.verbose >= 2 {
-        crate::ui::note(&format!("  local copy {src} -> {dst}"), log_file);
+        ui.lock().await.masked_note(&format!("  local copy {src} -> {dst}"));
     }
     if config.dry_run {
         return Ok(vec![("localhost".to_string(), HostOutcome::Ok)]);
@@ -171,8 +174,8 @@ async fn run_copy_step_local(
         return run_local_copy_delete(src, dst, config, log_file).await;
     }
 
-    if let Some(parent) = std::path::Path::new(dst).parent() &&
-        !parent.as_os_str().is_empty()
+    if let Some(parent) = std::path::Path::new(dst).parent()
+        && !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent)
             .await
@@ -309,19 +312,30 @@ async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
             log_file,
         );
     }
-    if opts.delete && !has_rsync {
+    // The scp fallback cannot mirror deletions or filter files. Performing a
+    // materially different transfer than the playbook asked for is worse than
+    // failing: an excluded secret would land on the target and stale files
+    // would survive, while the step still reported success. Fail closed
+    // unless the operator explicitly accepted the downgrade.
+    if !has_rsync && (opts.delete || !opts.excludes.is_empty()) {
+        let what = if opts.delete { "`--delete`" } else { "`--exclude`" };
+        if !config.allow_unfiltered_copy {
+            crate::ui::warn(
+                &format!(
+                    "[{}] {what} cannot be honoured: the remote has no rsync, so the scp \
+                     fallback cannot filter files or mirror deletions. Re-run with \
+                     --allow-unfiltered-copy to accept the downgrade, or install rsync on \
+                     the target.",
+                    host.alias
+                ),
+                log_file,
+            );
+            return (host.alias.clone(), HostOutcome::Failed(super::remote::RunError::Config));
+        }
         crate::ui::warn(
             &format!(
-                "[{}] `--delete` ignored: remote has no rsync, so the scp fallback cannot mirror deletions",
-                host.alias
-            ),
-            log_file,
-        );
-    }
-    if !opts.excludes.is_empty() && !has_rsync {
-        crate::ui::warn(
-            &format!(
-                "[{}] `--exclude` ignored: remote has no rsync, so the scp fallback cannot filter files",
+                "[{}] {what} ignored: remote has no rsync, so the scp fallback cannot mirror \
+                 deletions or filter files (accepted via --allow-unfiltered-copy)",
                 host.alias
             ),
             log_file,
@@ -404,10 +418,11 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<
     cmd.kill_on_drop(true);
 
     if args.config.verbose >= 2 {
-        crate::ui::note(
-            &format!("  [{}] rsync {}", args.host.alias, super::display_args(&cmd)),
-            args.log_file,
-        );
+        args.ui.lock().await.masked_note(&format!(
+            "  [{}] rsync {}",
+            args.host.alias,
+            super::display_args(&cmd)
+        ));
     }
 
     let diff_filter: Option<DiffFilter> = args
@@ -448,7 +463,7 @@ async fn run_scp_transfer(
     log_file: &LogFile,
 ) -> std::result::Result<(), CopyFailure> {
     if config.verbose >= 2 {
-        crate::ui::note(&format!("  [{}] scp fallback: {src} -> {dst}", host.alias), log_file);
+        ui.lock().await.masked_note(&format!("  [{}] scp fallback: {src} -> {dst}", host.alias));
     }
 
     let is_dir_src = tokio::fs::metadata(src).await.is_ok_and(|meta| meta.is_dir());
@@ -465,6 +480,8 @@ async fn run_scp_transfer(
 
     let quoted_dir = dir.replace('\'', "'\\''");
     let mut mkdir = Command::new("ssh");
+    // Fail closed on an unknown host key or a missing key: never prompt.
+    mkdir.args(["-o", "BatchMode=yes"]);
     mkdir.args(host.spec.to_ssh_args()).arg("-T");
     mkdir.arg(format!("mkdir -p '{quoted_dir}'"));
     mkdir
@@ -497,7 +514,11 @@ async fn run_scp_transfer(
     isolate(&mut scp);
 
     if config.verbose >= 2 {
-        crate::ui::note(&format!("  [{}] scp {}", host.alias, super::display_args(&scp)), log_file);
+        ui.lock().await.masked_note(&format!(
+            "  [{}] scp {}",
+            host.alias,
+            super::display_args(&scp)
+        ));
     }
 
     match stream::run_piped_child(ui, &host.alias, scp, None, config.timeout, None, log_file)

@@ -180,6 +180,21 @@ async fn setup_run(
         }
     }
     ui.lock().await.set_secrets(secrets);
+    // Surface the exemption instead of staying silent: name the affected KEYS
+    // only, never the values.
+    if !resolved.shorts().is_empty() {
+        let keys: Vec<&str> = resolved.shorts().iter().map(|(key, _)| key.as_str()).collect();
+        crate::ui::warn(
+            &format!(
+                "@secrets value(s) shorter than the masking threshold are masked only where they \
+                 appear as a standalone token or under their own key: {}. Lower --mask-min-len / \
+                 $SHELLFLOW_MASK_MIN_LEN to mask them everywhere. Values are never printed.",
+                keys.join(", ")
+            ),
+            &log_file,
+        );
+    }
+    ui.lock().await.set_short_secrets(resolved.shorts().to_vec());
 
     if flags.local && resolved.has_per_host() && host_aliases.len() > 1 {
         eprintln!(
@@ -456,10 +471,7 @@ pub(super) async fn run_wait_step(
             ),
             log_file,
         );
-        return Ok(hosts
-            .into_iter()
-            .map(|host| (host.alias, HostOutcome::Ok))
-            .collect());
+        return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
     }
     let budget = Duration::from_secs(config.timeout.unwrap_or(DEFAULT_WAIT_SECS));
     let interval = Duration::from_secs(wait.interval_secs.max(1));
@@ -473,7 +485,7 @@ pub(super) async fn run_wait_step(
                 Some(sem) => match sem.clone().acquire_owned().await {
                     Ok(permit) => Some(permit),
                     Err(_) => {
-                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport))
+                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
                     }
                 },
                 None => None,
@@ -481,6 +493,8 @@ pub(super) async fn run_wait_step(
             let deadline = Instant::now() + budget;
             loop {
                 let mut cmd = Command::new("ssh");
+                // Fail closed on an unknown host key or a missing key: never prompt.
+                cmd.args(["-o", "BatchMode=yes"]);
                 cmd.args(host.spec.to_ssh_args())
                     .arg("-T")
                     .arg(format!("systemctl is-active {unit}"));
@@ -493,9 +507,7 @@ pub(super) async fn run_wait_step(
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_default();
                 if state == "active" {
-                    ui.lock()
-                        .await
-                        .masked_note(&format!("[{}] {unit} active", host.alias));
+                    ui.lock().await.masked_note(&format!("[{}] {unit} active", host.alias));
                     return (host.alias.clone(), HostOutcome::Ok);
                 }
                 if Instant::now() + interval >= deadline {
@@ -635,15 +647,17 @@ async fn run_remote_host(
     shell_cache: ShellCache,
     secrets: &Arc<ResolvedSecrets>,
     log_file: &LogFile,
-) -> (String, HostOutcome) {    if config.check || config.dry_run {
+) -> (String, HostOutcome) {
+    if config.check || config.dry_run {
         let payload =
             format!("set -eu\n{}{}{}", render_env(&parts.env), parts.trace_line, parts.script);
         if config.verbose >= 2 {
             let cmd = build_ssh_cmd(host, RemoteShell::Bash, true, config);
-            crate::ui::note(
-                &format!("  [{}] ssh {}", host.alias, super::display_args(&cmd)),
-                log_file,
-            );
+            ui.lock().await.masked_note(&format!(
+                "  [{}] ssh {}",
+                host.alias,
+                super::display_args(&cmd)
+            ));
         }
         return match run_ssh_child(
             ui,
@@ -679,7 +693,10 @@ async fn run_remote_host(
         match run_remote_guard(host, remote_env.shell, guard, &payload_env, config.timeout).await {
             GuardResult::Pass => {
                 if config.verbose >= 2 {
-                    crate::ui::note(&format!("  [{}] guard passed: {guard}", host.alias), log_file);
+                    // The guard text is user content and can embed a secret.
+                    ui.lock()
+                        .await
+                        .masked_note(&format!("  [{}] guard passed: {guard}", host.alias));
                 }
             }
             GuardResult::Fail => {
@@ -696,7 +713,11 @@ async fn run_remote_host(
         format!("set -eu\n{}{}{}", render_env(&payload_env), parts.trace_line, parts.script);
     let cmd = build_ssh_cmd(host, remote_env.shell, false, config);
     if config.verbose >= 2 {
-        crate::ui::note(&format!("  [{}] ssh {}", host.alias, super::display_args(&cmd)), log_file);
+        ui.lock().await.masked_note(&format!(
+            "  [{}] ssh {}",
+            host.alias,
+            super::display_args(&cmd)
+        ));
     }
     match run_ssh_child(ui, host, cmd, &payload, config.timeout, log_file).await {
         Ok(()) => (host.alias.clone(), HostOutcome::Ok),
@@ -724,6 +745,8 @@ fn build_ssh_cmd(
     config: StepConfig,
 ) -> Command {
     let mut cmd = Command::new("ssh");
+    // Fail closed on an unknown host key or a missing key: never prompt.
+    cmd.args(["-o", "BatchMode=yes"]);
     cmd.args(host.spec.to_ssh_args()).arg("-T");
     if config.ssh_reuse {
         // Opt-in connection reuse: later steps in the same run share the
@@ -779,6 +802,8 @@ async fn probe_remote_env(host: &ResolvedHost) -> RemoteEnv {
         PROBE_SCRIPT.trim()
     );
     let mut cmd = Command::new("ssh");
+    // Fail closed on an unknown host key or a missing key: never prompt.
+    cmd.args(["-o", "BatchMode=yes"]);
     cmd.args(host.spec.to_ssh_args()).arg("-T");
     cmd.arg(script);
     cmd.stdin(std::process::Stdio::null())
@@ -828,6 +853,8 @@ async fn run_remote_guard(
     timeout: Option<u64>,
 ) -> GuardResult {
     let mut cmd = Command::new("ssh");
+    // Fail closed on an unknown host key or a missing key: never prompt.
+    cmd.args(["-o", "BatchMode=yes"]);
     cmd.args(host.spec.to_ssh_args()).arg("-T");
     cmd.arg(shell.invoke(false));
     cmd.stdin(std::process::Stdio::piped())

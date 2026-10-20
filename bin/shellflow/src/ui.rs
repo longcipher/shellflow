@@ -3,13 +3,15 @@
 //! that `--log-file`, `--no-color`, and secret masking are applied uniformly.
 
 use std::{
+    collections::HashMap,
     io::{Write, stderr, stdout},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     sync::Arc,
 };
 
 use colored::Colorize;
-use shellflow_core::{ExecutionPlan, Step, mask_line};
+use shellflow_core::{ExecutionPlan, SecretMasker, Step, prepare_masks};
 
 /// Verbosity levels, aligned with `-v`/`-vv`/`-vvv`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -30,7 +32,7 @@ impl Verbosity {
 }
 
 /// Which stream produced a line.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum Stream {
     /// Standard output.
     Stdout,
@@ -101,9 +103,20 @@ pub(crate) struct Ui {
     /// Known secret values, longest-first and de-duplicated.
     ///
     /// Ordering is computed once in [`Ui::set_secrets`] rather than per
-    /// output line: `mask_line` runs for every streamed line, so re-sorting a
+    /// output line: the masker runs for every streamed line, so re-sorting a
     /// large `@secrets` set on each call would dominate output throughput.
-    masks: Vec<String>,
+    masks: Arc<Vec<String>>,
+    /// Below-threshold `(key, value)` pairs, redacted by the narrow rules.
+    shorts: Arc<Vec<(String, String)>>,
+    /// Masker for standalone text (notes, previews, log headers).
+    text_masker: SecretMasker,
+    /// One masker per (host, stream).
+    ///
+    /// A secret that a target program split across two output lines must be
+    /// redacted as a whole, which needs state that spans lines. The state
+    /// cannot be shared between hosts: one host's line must not consume
+    /// another's pending continuation.
+    maskers: HashMap<(String, Stream), SecretMasker>,
     output: OutputModeState,
     /// Optional audit file, guarded by a plain `std::sync::Mutex`. The guard
     /// is never held across an await point, so blocking inside the async
@@ -128,17 +141,38 @@ impl Ui {
             }
         };
         let log_file = log_file.and_then(|path| {
-            std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
+                .mode(0o600)
                 .open(&path)
                 .map_err(|err| {
                     eprintln!("warning: cannot open log file {:?}: {err}", path.display());
                 })
-                .ok()
-                .map(|file| Arc::new(std::sync::Mutex::new(file)))
+                .ok()?;
+            // `OpenOptions::mode` only applies when the file is created, and
+            // the log is opened in append mode — so a log that an earlier
+            // version created 0644 stays world-readable unless the mode is
+            // re-applied here.
+            if let Err(err) =
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                eprintln!("warning: cannot set mode on log file {:?}: {err}", path.display());
+            }
+            Some(Arc::new(std::sync::Mutex::new(file)))
         });
-        Self { verbose: Verbosity(verbose), masks: Vec::new(), output, log_file }
+        let masks = Arc::new(Vec::new());
+        let shorts = Arc::new(Vec::new());
+        let text_masker = SecretMasker::new(Arc::clone(&masks), Arc::clone(&shorts));
+        Self {
+            verbose: Verbosity(verbose),
+            masks,
+            shorts,
+            text_masker,
+            maskers: HashMap::new(),
+            output,
+            log_file,
+        }
     }
 
     /// The verbosity level.
@@ -155,11 +189,26 @@ impl Ui {
 
     /// Register secret values to be masked in all output.
     ///
-    /// Normalizes the set once (longest-first, de-duplicated): `mask_line` runs
+    /// Normalizes the set once (longest-first, de-duplicated): the masker runs
     /// for every streamed line, so re-sorting a large @secrets set per call
     /// would dominate output throughput.
     pub(crate) fn set_secrets(&mut self, secrets: Vec<String>) {
-        self.masks = shellflow_core::prepare_masks(&secrets);
+        self.masks = Arc::new(prepare_masks(&secrets));
+        self.text_masker = SecretMasker::new(Arc::clone(&self.masks), Arc::clone(&self.shorts));
+        // The per-stream maskers were built from the previous set.
+        self.maskers.clear();
+    }
+
+    /// Register the below-threshold secret values for narrow redaction.
+    ///
+    /// A value shorter than the masking threshold cannot be redacted with a
+    /// global substring replace (that would shred unrelated output), so it is
+    /// redacted only where it stands alone as a token or appears under its
+    /// own key.
+    pub(crate) fn set_short_secrets(&mut self, shorts: Vec<(String, String)>) {
+        self.shorts = Arc::new(shorts);
+        self.text_masker = SecretMasker::new(Arc::clone(&self.masks), Arc::clone(&self.shorts));
+        self.maskers.clear();
     }
 
     /// Print a masked payload preview (used at `-vv`, dry-run, and diff).
@@ -207,8 +256,11 @@ impl Ui {
     }
 
     /// Stream a line from a host; honors `--output grouped` by buffering.
-    pub(crate) fn host_line(&self, host: &str, stream: Stream, line: &str) {
-        let masked = self.mask(line);
+    ///
+    /// Takes `&mut self`: the masker is stateful across lines so that a secret
+    /// a target program split across two lines is redacted as a whole.
+    pub(crate) fn host_line(&mut self, host: &str, stream: Stream, line: &str) {
+        let masked = self.mask_host_line(host, stream, line);
         match &self.output {
             OutputModeState::Stream => self.emit_host_line(host, stream, &masked),
             OutputModeState::Grouped { buf } => {
@@ -216,6 +268,16 @@ impl Ui {
                 buf.push(OutLine { host: host.to_string(), stream, text: masked });
             }
         }
+    }
+
+    /// Redact one line of host output with the masker for this host+stream.
+    fn mask_host_line(&mut self, host: &str, stream: Stream, line: &str) -> String {
+        let masks = Arc::clone(&self.masks);
+        let shorts = Arc::clone(&self.shorts);
+        self.maskers
+            .entry((host.to_string(), stream))
+            .or_insert_with(|| SecretMasker::new(masks, shorts))
+            .redact_line(line)
     }
 
     /// Flush grouped host buffers to stdout. No-op in stream mode.
@@ -266,7 +328,7 @@ impl Ui {
     }
 
     fn mask(&self, line: &str) -> String {
-        mask_line(line, &self.masks)
+        self.text_masker.redact_text(line)
     }
 
     /// Print a note line (dimmed), routed through the log file if configured.
@@ -419,12 +481,8 @@ mod tests {
             .append(true)
             .open(&log_path)
             .expect("open log file");
-        let ui = super::Ui {
-            verbose: super::Verbosity(0),
-            masks: Vec::new(),
-            output: super::OutputModeState::Stream,
-            log_file: Some(Arc::new(std::sync::Mutex::new(file))),
-        };
+        let mut ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, None);
+        ui.log_file = Some(Arc::new(std::sync::Mutex::new(file)));
         ui.log_line("test line".to_string());
         drop(ui);
         let content = std::fs::read_to_string(&log_path).expect("read log file");
@@ -432,14 +490,36 @@ mod tests {
     }
 
     #[test]
+    fn log_file_is_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        colored::control::set_override(false);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("audit.log");
+        let ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, Some(log_path.clone()));
+        drop(ui);
+        let mode = std::fs::metadata(&log_path).expect("log file").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the audit log must not be readable by other users");
+    }
+
+    #[test]
+    fn an_existing_world_readable_log_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        colored::control::set_override(false);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("audit.log");
+        std::fs::write(&log_path, "old line\n").expect("seed log");
+        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen log");
+        let ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, Some(log_path.clone()));
+        drop(ui);
+        let mode = std::fs::metadata(&log_path).expect("log file").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "an existing log must be tightened, not left world-readable");
+    }
+
+    #[test]
     fn log_line_without_log_file_writes_to_stdout_only() {
         colored::control::set_override(false);
-        let ui = super::Ui {
-            verbose: super::Verbosity(0),
-            masks: Vec::new(),
-            output: super::OutputModeState::Stream,
-            log_file: None,
-        };
+        let ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, None);
         ui.log_line("stdout only".to_string());
     }
 }

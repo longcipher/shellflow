@@ -20,10 +20,11 @@ use age::x25519::Identity;
 use eyre::{Context as _, Result, eyre};
 use shellflow_core::SecretEntry;
 use shellflow_secrets::{
-    crypto::decrypt_bytes,
+    crypto::decrypt_string,
     env::parse_env_file,
     identity::{effective_identity_path, expand_home, load_x25519_identity},
 };
+use zeroize::Zeroize;
 
 /// The space-separated list of keys exported after resolving `@secrets`.
 pub(crate) const SECRET_KEYS_VAR: &str = "LT_SECRET_KEYS";
@@ -34,6 +35,32 @@ pub(crate) struct ResolvedSecrets {
     shared: Vec<(String, String)>,
     per_host: HashMap<String, Vec<(String, String)>>,
     masks: Vec<String>,
+    /// Below-threshold `(key, value)` pairs, redacted by the narrow rules.
+    shorts: Vec<(String, String)>,
+}
+
+impl Drop for ResolvedSecrets {
+    /// Scrub the resolved values when the run ends.
+    ///
+    /// The values are also cloned into the run-state env map, the mask
+    /// registry, and the child process environment — those copies are not
+    /// covered by this, and the residual is documented in SKILL.md.
+    fn drop(&mut self) {
+        for (_, value) in &mut self.shared {
+            value.zeroize();
+        }
+        for pairs in self.per_host.values_mut() {
+            for (_, value) in pairs {
+                value.zeroize();
+            }
+        }
+        for value in &mut self.masks {
+            value.zeroize();
+        }
+        for (_, value) in &mut self.shorts {
+            value.zeroize();
+        }
+    }
 }
 
 impl ResolvedSecrets {
@@ -44,7 +71,7 @@ impl ResolvedSecrets {
     /// exporting an empty list here would let a secrets-less playbook wipe a
     /// service store. Absent var fails closed instead (no wipe).
     pub(crate) fn empty() -> Self {
-        Self { shared: Vec::new(), per_host: HashMap::new(), masks: Vec::new() }
+        Self { shared: Vec::new(), per_host: HashMap::new(), masks: Vec::new(), shorts: Vec::new() }
     }
 
     /// Whether any entry used the `{host}` placeholder (needs a single
@@ -60,6 +87,11 @@ impl ResolvedSecrets {
 
     pub(crate) fn masks(&self) -> &[String] {
         &self.masks
+    }
+
+    /// Below-threshold `(key, value)` pairs for narrow redaction.
+    pub(crate) fn shorts(&self) -> &[(String, String)] {
+        &self.shorts
     }
 
     /// This host's `{host}` pairs, if it had any per-host `@secrets` entries.
@@ -133,6 +165,7 @@ pub(crate) fn resolve_secrets(
     let mut shared_keys: Vec<String> = Vec::new();
     let mut per_host: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut masks: Vec<String> = Vec::new();
+    let mut shorts: Vec<(String, String)> = Vec::new();
 
     for entry in entries {
         // Per-entry `--identity` also expands `~/` (same as the run-wide
@@ -156,11 +189,11 @@ pub(crate) fn resolve_secrets(
             // hard error (fail closed) rather than a guessed placeholder.
             for alias in host_aliases {
                 let path = entry.file.replace("{host}", alias);
-                let pairs = decrypt_file(&path, identity, &mut masks, mask_min_len)?;
+                let pairs = decrypt_file(&path, identity, &mut masks, &mut shorts, mask_min_len)?;
                 per_host.entry(alias.clone()).or_default().extend(pairs);
             }
         } else {
-            let pairs = decrypt_file(&entry.file, identity, &mut masks, mask_min_len)?;
+            let pairs = decrypt_file(&entry.file, identity, &mut masks, &mut shorts, mask_min_len)?;
             for (key, _) in &pairs {
                 if !shared_keys.contains(key) {
                     shared_keys.push(key.clone());
@@ -176,30 +209,36 @@ pub(crate) fn resolve_secrets(
     }
 
     shared.push((SECRET_KEYS_VAR.to_string(), shared_keys.join(" ")));
-    Ok(ResolvedSecrets { shared, per_host, masks })
+    Ok(ResolvedSecrets { shared, per_host, masks, shorts })
 }
 
 /// Read, decrypt, and parse one age-encrypted env file, registering any value
-/// at or above `mask_min_len` for masking.
+/// at or above `mask_min_len` for masking and any shorter one for narrow
+/// redaction.
 fn decrypt_file(
     path: &str,
     identity: &Identity,
     masks: &mut Vec<String>,
+    shorts: &mut Vec<(String, String)>,
     mask_min_len: usize,
 ) -> Result<Vec<(String, String)>> {
     let cipher =
         fs::read(path).wrap_err_with(|| format!("failed to read secrets file `{path}`"))?;
-    let plain =
-        decrypt_bytes(&cipher, identity).wrap_err_with(|| format!("failed to decrypt `{path}`"))?;
-    let plain = String::from_utf8(plain)
-        .wrap_err_with(|| format!("secrets file `{path}` is not valid UTF-8"))?;
+    let plain = decrypt_string(&cipher, identity)
+        .wrap_err_with(|| format!("failed to decrypt `{path}`"))?;
     let pairs = parse_env_file(&plain).wrap_err_with(|| format!("malformed env file `{path}`"))?;
     let mut out = Vec::new();
     for (key, value) in pairs {
         // De-duplicate masks so repeated values are not redundantly replaced;
-        // `mask_line` also sorts longest-first to avoid prefix leakage.
+        // the masker also sorts longest-first to avoid prefix leakage.
         if value.len() >= mask_min_len && !masks.contains(&value) {
             masks.push(value.clone());
+        } else if !value.is_empty() && !shorts.iter().any(|(k, _)| k == &key) {
+            // A value below the threshold is still a secret: a global
+            // substring replace would shred unrelated output, so it is
+            // registered for token/key-anchored redaction instead of being
+            // silently exempted.
+            shorts.push((key.clone(), value.clone()));
         }
         out.retain(|(existing, _)| existing != &key);
         out.push((key, value));

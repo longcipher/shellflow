@@ -89,6 +89,9 @@ pub(crate) struct StepConfig {
     pub(crate) local: bool,
     /// Reuse SSH connections within a run (ControlMaster).
     pub(crate) ssh_reuse: bool,
+    /// Accept the scp fallback on a host without rsync, dropping the
+    /// `--delete` / `--exclude` contract the copy step asked for.
+    pub(crate) allow_unfiltered_copy: bool,
 }
 
 impl StepConfig {
@@ -101,6 +104,7 @@ impl StepConfig {
             timeout,
             local: run.flags.local,
             ssh_reuse: run.flags.ssh_reuse,
+            allow_unfiltered_copy: run.flags.allow_unfiltered_copy,
         }
     }
 }
@@ -180,13 +184,13 @@ pub(crate) fn is_rsync_itemize_line(line: &str) -> bool {
         return false;
     }
     bytes[..10].iter().all(|&b| {
-        b.is_ascii_alphanumeric() ||
-            b == b'.' ||
-            b == b'*' ||
-            b == b'<' ||
-            b == b'>' ||
-            b == b'c' ||
-            b == b'+'
+        b.is_ascii_alphanumeric()
+            || b == b'.'
+            || b == b'*'
+            || b == b'<'
+            || b == b'>'
+            || b == b'c'
+            || b == b'+'
     })
 }
 
@@ -271,8 +275,8 @@ impl Drop for CaptureFile {
         // Best-effort, but a failure to remove a plaintext file is worth
         // reporting: silently leaving it behind is exactly the leak this
         // guard exists to prevent.
-        if let Err(err) = std::fs::remove_file(&self.0) &&
-            err.kind() != std::io::ErrorKind::NotFound
+        if let Err(err) = std::fs::remove_file(&self.0)
+            && err.kind() != std::io::ErrorKind::NotFound
         {
             crate::ui::warn(
                 &format!("failed to remove export capture file {}: {err}", self.0.display()),

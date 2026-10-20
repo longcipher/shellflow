@@ -11,7 +11,7 @@ use std::{
 
 use eyre::{Result, WrapErr, bail, eyre};
 use shellflow_secrets::{
-    crypto::{decrypt_bytes, encrypt_bytes},
+    crypto::{decrypt_bytes, decrypt_string, encrypt_bytes},
     env::parse_env_file,
     error::SecretsError,
     identity::{effective_identity_path, load_x25519_identity},
@@ -242,8 +242,8 @@ impl TempPlaintext {
 
 impl Drop for TempPlaintext {
     fn drop(&mut self) {
-        if let Err(err) = fs::remove_file(&self.0) &&
-            err.kind() != std::io::ErrorKind::NotFound
+        if let Err(err) = fs::remove_file(&self.0)
+            && err.kind() != std::io::ErrorKind::NotFound
         {
             eprintln!("warning: failed to remove temporary plaintext {}: {err}", self.0.display());
         }
@@ -253,8 +253,7 @@ impl Drop for TempPlaintext {
 fn creds(args: &SecretCredsArgs) -> Result<()> {
     let cipher = read_input(Some(&args.file))?;
     let identity = load_identity(args.identity.as_deref())?;
-    let plain = decrypt_bytes(&cipher, &identity).map_err(eyre::Report::msg)?;
-    let plain = String::from_utf8(plain).wrap_err("decrypted file is not valid UTF-8")?;
+    let plain = decrypt_string(&cipher, &identity).map_err(eyre::Report::msg)?;
     for (key, _) in parse_env_file(&plain).map_err(eyre::Report::msg)? {
         match &args.store_dir {
             // Per-service store: `ImportCredential=` searches only the flat
@@ -294,8 +293,8 @@ fn keys_check(args: &SecretKeysCheckArgs) -> Result<()> {
         let entry = entry
             .wrap_err_with(|| format!("failed to read an entry in `{}`", args.dir.display()))?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "age") &&
-            path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".env.age"))
+        if path.extension().is_some_and(|ext| ext == "age")
+            && path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".env.age"))
         {
             files.push(path);
         }
@@ -316,10 +315,8 @@ fn keys_check(args: &SecretKeysCheckArgs) -> Result<()> {
             .unwrap_or_else(|| file.display().to_string());
         let cipher =
             fs::read(file).wrap_err_with(|| format!("failed to read `{}`", file.display()))?;
-        let plain = decrypt_bytes(&cipher, &identity)
+        let plain = decrypt_string(&cipher, &identity)
             .map_err(|err| eyre!("{err} (`{}`)", file.display()))?;
-        let plain = String::from_utf8(plain)
-            .wrap_err_with(|| format!("`{}` is not valid UTF-8", file.display()))?;
         let mut keys: Vec<String> = parse_env_file(&plain)
             .map_err(|err| eyre!("`{}`: {err}", file.display()))?
             .into_iter()
@@ -398,22 +395,16 @@ fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
     for file in &files {
         let cipher =
             fs::read(file).wrap_err_with(|| format!("failed to read `{}`", file.display()))?;
-        let plain = decrypt_bytes(&cipher, &identity)
+        let plain = decrypt_string(&cipher, &identity)
             .map_err(|err| eyre!("{err} (`{}`)", file.display()))?;
-        let plain = String::from_utf8(plain)
-            .wrap_err_with(|| format!("`{}` is not valid UTF-8", file.display()))?;
-        let pairs = parse_env_file(&plain)
-            .map_err(|err| eyre!("`{}`: {err}", file.display()))?;
+        let pairs = parse_env_file(&plain).map_err(|err| eyre!("`{}`: {err}", file.display()))?;
         for (key, value) in pairs {
             if value.is_empty() {
                 continue;
             }
             let mut hasher = DefaultHasher::new();
             value.hash(&mut hasher);
-            by_hash.entry(hasher.finish()).or_default().push(format!(
-                "{}:{key}",
-                file.display()
-            ));
+            by_hash.entry(hasher.finish()).or_default().push(format!("{}:{key}", file.display()));
         }
     }
     let mut groups: Vec<Vec<String>> = by_hash
@@ -436,24 +427,19 @@ fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
             println!("  {loc}");
         }
     }
-    bail!(
-        "found {} shared credential value(s) under {}",
-        groups.len(),
-        args.dir.display()
-    );
+    bail!("found {} shared credential value(s) under {}", groups.len(), args.dir.display());
 }
 
 /// Recursively collect `*.env.age` files.
 fn collect_env_age_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir)
-        .wrap_err_with(|| format!("failed to read `{}`", dir.display()))?
+    for entry in
+        fs::read_dir(dir).wrap_err_with(|| format!("failed to read `{}`", dir.display()))?
     {
         let entry =
             entry.wrap_err_with(|| format!("failed to read an entry in `{}`", dir.display()))?;
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .wrap_err_with(|| format!("failed to stat `{}`", path.display()))?;
+        let file_type =
+            entry.file_type().wrap_err_with(|| format!("failed to stat `{}`", path.display()))?;
         if file_type.is_dir() {
             if path
                 .file_name()

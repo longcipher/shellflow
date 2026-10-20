@@ -611,6 +611,13 @@ host:<parent-dir>/`, keeping the design promise that targets only need `bash`
 (§9). This preserves the delta/idempotency properties in the common case and
 degrades gracefully to a plain copy on minimal hosts.
 
+The fallback **cannot** mirror deletions or filter files, so a copy step that
+asked for `--delete` or `--exclude` fails closed on such a host (exit 1)
+instead of performing a materially different transfer than the playbook
+requested — an excluded file would land on the target and stale files would
+survive, while the step reported success. `--allow-unfiltered-copy` is the
+explicit opt-out; the downgrade is then reported in the step output.
+
 ### 7.4 Concurrency & output integrity
 
 - Each step fans out over hosts with `tokio::task::JoinSet`, bounded by
@@ -758,7 +765,14 @@ Three cooperating layers, deliberately *not* a state engine:
 
 - **Inherit the user's SSH trust**: keys, `~/.ssh/config`, `ssh-agent`, jump
   hosts, YubiKey — all handled by the system `ssh`. We never touch credentials.
-- **No interactive prompts**: we use `ssh -T` (no TTY). `sudo` in scripts
+- **No interactive prompts**: we use `ssh -T` (no TTY) **and**
+  `-o BatchMode=yes` on every ssh invocation the tool makes. The secrets
+  payload travels over that channel, so an unknown host key or a missing key
+  must fail closed rather than raise a prompt an operator may approve for a
+  rogue key. Host-key *policy* stays with the user's `~/.ssh/config` — the
+  tool does not add `accept-new` or `no`, which would auto-trust an unseen
+  key. Provision a first connection explicitly:
+  `ssh-keyscan <host> >> ~/.ssh/known_hosts`. `sudo` in scripts
   requires passwordless sudo or a pre-provisioned key. This is documented
   behavior, not a bug.
 - **Remote requirement**: only `bash` on the target; `rsync`/`ssh` needed only
@@ -770,10 +784,29 @@ Three cooperating layers, deliberately *not* a state engine:
   local steps they are passed via `Command::env()`; for remote steps they exist
   only inside the payload streamed over stdin, placed *before* any `set -x` so
   the export lines themselves are never traced (§7.2). Known values are masked
-  (`***`) in payload previews, trace output, and `--log-file`. Residual caveat:
-  if the *user's own script* echoes a secret, that is the script's doing —
-  treat `-vvv` as a debug tool and prefer `@env KEY` passthrough from CI over
-  literal values in the deploy file.
+  (`***`) in payload previews, trace output, and `--log-file`. The audit log is
+  created `0600` (and re-tightened when an existing file is appended to).
+  Redaction is **stateful across output lines**: a value that a target program
+  split across two lines (`fold`, a pager, a progress bar) is redacted as a
+  whole, because the two fragments would otherwise reassemble into the
+  original in the scrollback or in the audit trail. Values below the masking
+  threshold cannot use a global substring replace (it would shred unrelated
+  output), so they are redacted only where they stand alone as a token or
+  appear as `KEY=value`; the run names the affected keys so the exemption is
+  never silent. Residual caveat: redaction is a plaintext match, so a
+  base64/hex rendering of a value is never redacted.
+- **Decrypted values in memory.** The plaintext buffer is zeroized when it is
+  dropped, and the resolved values are scrubbed when the run ends. The
+  residual is explicit: the values are also cloned into the run-state env map,
+  the mask registry, and the **child process environment**, where the same
+  UID can read them through `/proc/<pid>/environ`; they are not `mlock`'d and
+  may reach swap. A same-UID or root attacker on the controller can read the
+  `0600` age identity directly and decrypt every sealed file anyway, so this
+  is a defense-in-depth property, not a boundary.
+- **The age identity must be owner-only.** `keys generate` writes `0600`, and
+  the loader enforces it: a group- or world-readable identity is refused
+  (the identity opens every sealed env file the operator owns).
+  `SHELLFLOW_ALLOW_UNSAFE_IDENTITY=1` is the explicit opt-out.
 - **Trust boundary**: the deploy script is code with the controller user's
   privileges. Users should review scripts as they would any shell code.
 - No `unsafe` anywhere; `unwrap_used`/`expect_used`/`panic` are denied by the

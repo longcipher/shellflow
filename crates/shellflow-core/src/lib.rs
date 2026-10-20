@@ -25,8 +25,8 @@ pub mod ssh_spec;
 pub mod template;
 
 pub use env::{
-    CAPTURE_SEPARATOR, MASK, mask_line, parse_capture_records, prepare_masks, render_env,
-    shell_quote_single,
+    CAPTURE_SEPARATOR, MASK, SecretMasker, mask_keyed, mask_line, mask_token,
+    parse_capture_records, prepare_masks, render_env, shell_quote_single,
 };
 pub use error::{CaptureError, InterpolateError, ParseError};
 pub use heredoc::{Heredoc, HeredocTracker};

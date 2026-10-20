@@ -6,7 +6,7 @@
 //! second parses the `NAME=VALUE\0` records a local block writes back so that
 //! `@export` state survives a step boundary (design §7.6).
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::error::CaptureError;
 
@@ -117,14 +117,322 @@ pub fn mask_line<S: AsRef<str>>(line: &str, masks: &[S]) -> String {
     out
 }
 
+/// Whether `c` is part of a shell-style identifier.
+///
+/// Used to decide whether a secret occurrence stands alone as a token.
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Redact a below-threshold secret that appears as a standalone token.
+///
+/// A value shorter than the masking threshold cannot be redacted with a
+/// global substring replace (that would shred unrelated output), but it is
+/// still a secret. This replaces the value only where it is delimited by
+/// non-word characters, so `pin=12345`, `v=abc` and `export PIN='12345'`
+/// are redacted while `order=123456` and `abcdef` are left alone.
+#[must_use]
+pub fn mask_token(line: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(idx) = rest.find(secret) {
+        let (before, after) = rest.split_at(idx);
+        let tail = &after[secret.len()..];
+        let left_ok = before.chars().next_back().is_none_or(|c| !is_word(c));
+        let right_ok = tail.chars().next().is_none_or(|c| !is_word(c));
+        out.push_str(before);
+        out.push_str(if left_ok && right_ok { MASK } else { secret });
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Redact `KEY=value`, `KEY='value'` and `KEY="value"` for one secret.
+///
+/// The key is matched case-insensitively and as a whole identifier, because a
+/// playbook routinely prints the value under a different label than the
+/// environment key (`PIN` vs `pin`).
+#[must_use]
+pub fn mask_keyed(line: &str, key: &str, value: &str) -> String {
+    if key.is_empty() || value.is_empty() {
+        return line.to_string();
+    }
+    let mut out = line.to_string();
+    for suffix in [format!("={value}"), format!("='{value}'"), format!("=\"{value}\"")] {
+        out = replace_keyed(&out, key, &suffix);
+    }
+    out
+}
+
+/// Replace every `IDENT<suffix>` occurrence whose identifier is `key`.
+fn replace_keyed(line: &str, key: &str, suffix: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(idx) = rest.find(suffix) {
+        let (before, after) = rest.split_at(idx);
+        let ident_start = before
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !is_word(*c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let ident = &before[ident_start..];
+        out.push_str(before);
+        if ident.eq_ignore_ascii_case(key) {
+            // `before` already ends with the identifier.
+            out.push('=');
+            out.push_str(MASK);
+        } else {
+            out.push_str(suffix);
+        }
+        rest = &after[suffix.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Minimum number of characters a line's trailing fragment must match before
+/// it is redacted in place.
+///
+/// A line that ends with the first character of a secret matches by chance
+/// (any secret starting with `s` matches every line ending in `s`), and
+/// replacing one character with `***` on every such line would make the
+/// output unreadable. Four characters is long enough that a chance match is
+/// rare and short enough that a real split secret is still fully covered.
+///
+/// A split whose prefix is *shorter* than this still has its continuation
+/// redacted (see [`SecretMasker::redact_line`]), so the complete value never
+/// appears either way — only a fragment of at most three characters can.
+const MIN_PREFIX_REDACT: usize = 4;
+
+/// Byte offsets of the proper prefixes of `s`, longest first.
+///
+/// Each offset is the byte length of the prefix made of the first *k*
+/// characters, for every *k* below the character count of `s`.
+fn prefix_boundaries(s: &str) -> Vec<usize> {
+    let mut out: Vec<usize> = s.char_indices().skip(1).map(|(i, _)| i).collect();
+    out.reverse();
+    out
+}
+
+/// Replace the byte ranges of `line` with [`MASK`], merging overlaps.
+fn apply_ranges(line: &str, ranges: &[(usize, usize)]) -> String {
+    if ranges.is_empty() {
+        return line.to_string();
+    }
+    let mut sorted: Vec<(usize, usize)> = ranges.to_vec();
+    sorted.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, len) in sorted {
+        let end = start + len;
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut cursor = 0;
+    for (start, end) in merged {
+        if start > cursor {
+            out.push_str(&line[cursor..start]);
+        }
+        out.push_str(MASK);
+        cursor = cursor.max(end);
+    }
+    if cursor < line.len() {
+        out.push_str(&line[cursor..]);
+    }
+    out
+}
+
+/// Redacts known secret values from program output.
+///
+/// Two rules apply:
+///
+/// 1. **Long values** (at or above the masking threshold) are redacted with a
+///    plain substring replacement, but the matcher is *stateful across lines*:
+///    a secret that a target program split across two output lines — `fold`,
+///    a pager, a progress bar — is redacted as a whole instead of leaking two
+///    fragments that reassemble into the original value in the console
+///    scrollback or in the `--log-file` audit trail.
+/// 2. **Short values** (below the threshold) are redacted with narrow rules
+///    that cannot shred unrelated output: the value is replaced where it
+///    stands alone as a token, or where it appears as `KEY=value`.
+///
+/// One masker belongs to one output stream. Sharing it between hosts would
+/// let a line from one host consume the pending state of another.
+#[derive(Clone, Debug)]
+pub struct SecretMasker {
+    /// Long values, longest-first and de-duplicated.
+    masks: Arc<Vec<String>>,
+    /// Proper-prefix byte offsets of each long value, longest first.
+    boundaries: Arc<Vec<Vec<usize>>>,
+    /// Short values as `(key, value)` pairs.
+    shorts: Arc<Vec<(String, String)>>,
+    /// Values whose prefix was seen at the end of an earlier line, with the
+    /// number of bytes of the value already accounted for.
+    pending: Vec<(String, usize)>,
+}
+
+impl SecretMasker {
+    /// Create a masker for the given values.
+    ///
+    /// `masks` holds the values at or above the masking threshold (longest
+    /// first, de-duplicated — see [`prepare_masks`]); `shorts` holds the
+    /// `(key, value)` pairs below it.
+    #[must_use]
+    pub fn new(masks: Arc<Vec<String>>, shorts: Arc<Vec<(String, String)>>) -> Self {
+        let boundaries = Arc::new(masks.iter().map(|s| prefix_boundaries(s)).collect());
+        Self { masks, boundaries, shorts, pending: Vec::new() }
+    }
+
+    /// Redact a standalone fragment of text (a note, a preview, a log header).
+    ///
+    /// Unlike [`Self::redact_line`] this keeps no state: a note is a
+    /// self-contained string, never a fragment of a longer stream.
+    #[must_use]
+    pub fn redact_text(&self, text: &str) -> String {
+        let mut out = mask_line(text, &self.masks);
+        for (key, value) in self.shorts.iter() {
+            out = mask_token(&out, value);
+            out = mask_keyed(&out, key, value);
+        }
+        out
+    }
+
+    /// Redact one line of program output.
+    ///
+    /// Stateful: the line is redacted in the context of the lines before it,
+    /// so a value that was split across a line boundary is redacted as a
+    /// whole. The state is per stream — see [`Self`].
+    #[must_use]
+    pub fn redact_line(&mut self, line: &str) -> String {
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+        // 1. A value whose prefix ended on an earlier line continues here.
+        let mut kept: Vec<(String, usize)> = Vec::new();
+        for (secret, consumed) in std::mem::take(&mut self.pending) {
+            let Some(rest) = secret.get(consumed..) else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            if !line.is_empty() && rest.starts_with(line) {
+                // The whole line continues the value.
+                ranges.push((0, line.len()));
+                let consumed = consumed + line.len();
+                if consumed < secret.len() {
+                    kept.push((secret, consumed));
+                }
+            } else if line.starts_with(rest) {
+                // The line completes the value and continues past it.
+                ranges.push((0, rest.len()));
+            }
+            // Otherwise the continuation broke and the pending is dropped: the
+            // earlier prefix was redacted in place, or is a bounded fragment.
+        }
+        self.pending = kept;
+
+        // 2. Complete occurrences inside this line.
+        ranges.extend(self.occurrences(line));
+
+        // 3. A value that starts at the tail of this line.
+        if let Some((prefix_len, secret)) = self.tail_prefix(line) {
+            let start = line.len() - prefix_len;
+            let covered = ranges.iter().any(|(s, l)| start < s + l && *s < start + prefix_len);
+            if !covered {
+                if prefix_len >= MIN_PREFIX_REDACT {
+                    ranges.push((start, prefix_len));
+                }
+                // The continuation is tracked even when the prefix was too
+                // short to redact in place: redacting the continuation is what
+                // keeps the complete value out of the output.
+                self.pending.push((secret, prefix_len));
+            }
+        }
+
+        // 4. Narrow rules for the values below the masking threshold.
+        let mut out = apply_ranges(line, &ranges);
+        for (key, value) in self.shorts.iter() {
+            out = mask_token(&out, value);
+            out = mask_keyed(&out, key, value);
+        }
+        out
+    }
+
+    /// The complete occurrences of the long values inside `line`.
+    ///
+    /// Leftmost-first, longest-first on a tie: the mask set is ordered
+    /// longest-first by [`prepare_masks`] and the comparison is strict, so
+    /// the first candidate at a given position wins.
+    fn occurrences(&self, line: &str) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut rest = line;
+        let mut offset = 0;
+        loop {
+            let mut best: Option<(usize, usize)> = None;
+            for secret in self.masks.iter() {
+                if let Some(pos) = rest.find(secret.as_str())
+                    && best.is_none_or(|(best_pos, _)| pos < best_pos)
+                {
+                    best = Some((pos, secret.len()));
+                }
+            }
+            let Some((pos, len)) = best else {
+                break;
+            };
+            ranges.push((offset + pos, len));
+            offset += pos + len;
+            rest = &rest[pos + len..];
+        }
+        ranges
+    }
+
+    /// The longest suffix of `line` that is a proper prefix of a long value.
+    ///
+    /// Returns the byte length of the prefix and the value it belongs to.
+    fn tail_prefix(&self, line: &str) -> Option<(usize, String)> {
+        if line.is_empty() {
+            return None;
+        }
+        let bytes = line.as_bytes();
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, secret) in self.masks.iter().enumerate() {
+            let secret_bytes = secret.as_bytes();
+            for &boundary in &self.boundaries[idx] {
+                if boundary > bytes.len() {
+                    continue;
+                }
+                // Cheap reject first: the suffix starts with the value's first
+                // byte, so a mismatch there rules the length out in O(1).
+                if bytes[bytes.len() - boundary] != secret_bytes[0] {
+                    continue;
+                }
+                if bytes.ends_with(&secret_bytes[..boundary]) {
+                    if best.is_none_or(|(best_len, _)| boundary > best_len) {
+                        best = Some((boundary, idx));
+                    }
+                    break;
+                }
+            }
+        }
+        best.map(|(len, idx)| (len, self.masks[idx].clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::{prop_assert, prop_assert_eq};
 
     use super::{
-        CAPTURE_SEPARATOR, MASK, mask_line, parse_capture_records, prepare_masks, render_env,
-        shell_quote_single,
+        CAPTURE_SEPARATOR, MASK, SecretMasker, mask_keyed, mask_line, mask_token,
+        parse_capture_records, prepare_masks, render_env, shell_quote_single,
     };
+    use std::sync::Arc;
 
     #[test]
     fn parses_basic_capture_records() {
@@ -252,6 +560,77 @@ mod tests {
     #[test]
     fn mask_is_stable_constant() {
         assert_eq!(MASK, "***");
+    }
+
+    #[test]
+    fn mask_token_redacts_only_standalone_occurrences() {
+        // The value stands alone: redacted.
+        assert_eq!(mask_token("pin=12345", "12345"), "pin=***");
+        assert_eq!(mask_token("export PIN='12345'", "12345"), "export PIN='***'");
+        // The value is part of a longer word: left alone.
+        assert_eq!(mask_token("order=123456", "12345"), "order=123456");
+        assert_eq!(mask_token("id=12345abc", "12345"), "id=12345abc");
+        assert_eq!(mask_token("abcdef", "abc"), "abcdef");
+    }
+
+    #[test]
+    fn mask_keyed_redacts_the_key_anchored_forms() {
+        assert_eq!(mask_keyed("PIN=12345", "PIN", "12345"), "PIN=***");
+        assert_eq!(mask_keyed("PIN='12345'", "PIN", "12345"), "PIN=***");
+        assert_eq!(mask_keyed("PIN=\"12345\"", "PIN", "12345"), "PIN=***");
+        // The label may differ in case from the environment key.
+        assert_eq!(mask_keyed("pin=12345", "PIN", "12345"), "pin=***");
+        // A different identifier with the same value is left alone.
+        assert_eq!(mask_keyed("OTHER=12345", "PIN", "12345"), "OTHER=12345");
+    }
+
+    #[test]
+    fn secret_masker_redacts_a_secret_split_across_lines() {
+        let mut masker = SecretMasker::new(
+            Arc::new(prepare_masks(&["supersecret_value".to_string()])),
+            Arc::new(Vec::new()),
+        );
+        // The value is split across two lines: neither fragment may survive.
+        let first = masker.redact_line("token=supersecret_v");
+        let second = masker.redact_line("alue");
+        assert!(!first.contains("supersecret_v"), "prefix leaked: {first}");
+        assert!(!second.contains("alue"), "suffix leaked: {second}");
+        assert!(!format!("{first}{second}").contains("supersecret_value"));
+    }
+
+    #[test]
+    fn secret_masker_redacts_a_secret_split_at_the_first_character() {
+        let mut masker = SecretMasker::new(
+            Arc::new(prepare_masks(&["supersecret_value".to_string()])),
+            Arc::new(Vec::new()),
+        );
+        let first = masker.redact_line("s");
+        let second = masker.redact_line("upersecret_value");
+        // The first fragment is too short to redact in place (redacting every
+        // line that ends in `s` would make the output unreadable), but the
+        // continuation is redacted, so the value cannot be reassembled.
+        assert!(!second.contains("upersecret_value"), "suffix leaked: {second}");
+        assert!(!format!("{first}{second}").contains("supersecret_value"));
+    }
+
+    #[test]
+    fn secret_masker_leaves_unrelated_lines_alone() {
+        let mut masker = SecretMasker::new(
+            Arc::new(prepare_masks(&["supersecret_value".to_string()])),
+            Arc::new(Vec::new()),
+        );
+        assert_eq!(masker.redact_line("ordinary output"), "ordinary output");
+        assert_eq!(masker.redact_line("ends with s"), "ends with s");
+    }
+
+    #[test]
+    fn secret_masker_redacts_short_values_with_the_narrow_rules() {
+        let mut masker = SecretMasker::new(
+            Arc::new(Vec::new()),
+            Arc::new(vec![("PIN".to_string(), "12345".to_string())]),
+        );
+        assert_eq!(masker.redact_line("pin=12345"), "pin=***");
+        assert_eq!(masker.redact_line("order=123456"), "order=123456");
     }
 
     /// Inverse of [`shell_quote_single`] for property testing: returns `None`

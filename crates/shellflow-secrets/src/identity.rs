@@ -4,7 +4,7 @@
 use std::{
     fs,
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -15,6 +15,20 @@ use crate::error::SecretsError;
 
 /// Env var that overrides the identity file path.
 pub const IDENTITY_ENV: &str = "SHELLFLOW_AGE_IDENTITY";
+
+/// Env var that allows loading an identity file that other local users can
+/// read.
+///
+/// The opt-out is an environment variable rather than a flag so that it
+/// applies to every subcommand that touches an identity (`secret`,
+/// `keys`, `template`, `deploy`) without threading a flag through each of
+/// them.
+pub const ALLOW_UNSAFE_IDENTITY_ENV: &str = "SHELLFLOW_ALLOW_UNSAFE_IDENTITY";
+
+/// Whether the operator explicitly accepted a laxly-permissioned identity.
+fn allow_unsafe_identity() -> bool {
+    std::env::var(ALLOW_UNSAFE_IDENTITY_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+}
 
 /// Expand a leading `~/` to `$HOME`.
 ///
@@ -27,8 +41,8 @@ pub fn expand_home(path: &Path) -> PathBuf {
     // An empty `$HOME` is treated as absent: `PathBuf::from("")` would make a
     // `~/x` expansion fall back to the relative path `x`, which resolves
     // against whatever directory happens to be current.
-    if let Some(rest) = s.strip_prefix("~/") &&
-        let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
     {
         return PathBuf::from(home).join(rest);
     }
@@ -65,12 +79,38 @@ pub fn effective_identity_path(explicit: Option<&Path>) -> PathBuf {
 
 /// Load an X25519 identity from an age identity file.
 ///
+/// The identity is the master key for every sealed env file the operator
+/// owns: anyone who can read it can decrypt all of them. Generation enforces
+/// mode `0600`, so a lax mode here is an accident (a shell redirect, an
+/// editor save, a restore from a lax backup) rather than a choice — the
+/// loader refuses it unless the operator sets
+/// [`ALLOW_UNSAFE_IDENTITY_ENV`].
+///
 /// # Errors
 ///
 /// Returns [`SecretsError::MissingIdentity`] when the file does not exist,
-/// [`SecretsError::InvalidIdentity`] when no `AGE-SECRET-KEY-1…` line is found
-/// or the key does not parse.
+/// [`SecretsError::InvalidIdentity`] when no `AGE-SECRET-KEY-1…` line is found,
+/// the key does not parse, or the file is readable by other local users.
 pub fn load_x25519_identity(path: &Path) -> Result<age::x25519::Identity, SecretsError> {
+    let metadata = fs::metadata(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => SecretsError::MissingIdentity(path.display().to_string()),
+        _ => SecretsError::ReadIdentity {
+            path: path.display().to_string(),
+            source: std::io::Error::from(err.kind()),
+        },
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 && !allow_unsafe_identity() {
+        return Err(SecretsError::InvalidIdentity {
+            path: path.display().to_string(),
+            reason: format!(
+                "identity file is group/world-accessible (mode {mode:o}); run `chmod 600 {}` \
+                 (or set {ALLOW_UNSAFE_IDENTITY_ENV}=1 to override)",
+                path.display()
+            ),
+        });
+    }
+
     let content = fs::read_to_string(path).map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => SecretsError::MissingIdentity(path.display().to_string()),
         _ => SecretsError::ReadIdentity {
@@ -192,6 +232,42 @@ mod tests {
         let path = dir.path().join("keys.txt");
         generate_identity(&path).expect("first write");
         assert!(matches!(generate_identity(&path), Err(SecretsError::WriteIdentity { .. })));
+    }
+
+    #[test]
+    fn a_group_readable_identity_is_refused() {
+        // The identity is the master key for every sealed env file the
+        // operator owns: anyone who can read it can decrypt all of them.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("keys.txt");
+        generate_identity(&path).expect("generate");
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("loosen");
+        let err = match load_x25519_identity(&path) {
+            Err(err) => err,
+            Ok(_) => panic!("a world-readable identity must be refused"),
+        };
+        let SecretsError::InvalidIdentity { reason, .. } = &err else {
+            panic!("expected an invalid-identity error, got {err:?}");
+        };
+        assert!(reason.contains("group/world-accessible"), "reason: {reason}");
+    }
+
+    #[test]
+    fn a_group_readable_identity_is_accepted_with_the_opt_out() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("keys.txt");
+        generate_identity(&path).expect("generate");
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        // SAFETY: guarded by ENV_LOCK.
+        let _opt_out = unsafe { EnvRestore::set(ALLOW_UNSAFE_IDENTITY_ENV, "1") };
+        assert!(load_x25519_identity(&path).is_ok(), "the opt-out must allow the load");
     }
 
     #[test]
