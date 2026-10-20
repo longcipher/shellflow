@@ -73,7 +73,11 @@ pub struct LocalStep {
     /// Variables captured into run state after this step (`@export`).
     pub export: Vec<String>,
     /// Environment snapshot (`@env`) in effect when the block was declared.
-    pub env: Vec<EnvEntry>,
+    ///
+    /// Shared, copy-on-write: the plan keeps one list and every step points
+    /// at the snapshot that was current when the step was declared, so a
+    /// plan with many steps and many `@env` entries stays linear.
+    pub env: Arc<Vec<EnvEntry>>,
 }
 
 /// A block of Bash lines streamed to the target hosts over SSH.
@@ -90,7 +94,9 @@ pub struct RemoteStep {
     /// Optional per-step timeout in seconds from `@timeout`.
     pub timeout: Option<u64>,
     /// Environment snapshot (`@env`) in effect when the block was declared.
-    pub env: Vec<EnvEntry>,
+    ///
+    /// Shared, copy-on-write: see [`LocalStep::env`].
+    pub env: Arc<Vec<EnvEntry>>,
 }
 
 /// A local-to-remote file sync step.
@@ -123,7 +129,9 @@ pub struct CopyStep {
     /// transfer), unlike `guard`.
     pub timeout: Option<u64>,
     /// Environment snapshot (`@env`) in effect when the block was declared.
-    pub env: Vec<EnvEntry>,
+    ///
+    /// Shared, copy-on-write: see [`LocalStep::env`].
+    pub env: Arc<Vec<EnvEntry>>,
 }
 
 /// A wait-for-active step (`@wait_active`): poll `systemctl is-active`
@@ -169,7 +177,8 @@ impl Step {
         }
     }
 
-    /// The step kind as a short stable string (`local` | `remote` | `copy`).
+    /// The step kind as a short stable string (`local` | `remote` | `copy` |
+    /// `wait_active`).
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -224,9 +233,10 @@ pub struct ExecutionPlan {
     /// All `@env` entries in declaration order.
     ///
     /// Copy-on-write behind an `Arc`: every step snapshots the list as it was
-    /// declared, so cloning it wholesale per block would make plan construction
-    /// quadratic in the number of steps. `Arc::make_mut` keeps the common
-    /// layout (`@env` grouped before the first step) at a single allocation.
+    /// declared by holding an `Arc` clone, so snapshotting the environment into
+    /// every step costs one pointer copy rather than a deep copy of every
+    /// key/value pair. A step's `env` field therefore shares one allocation
+    /// with every other step declared between two `@env` directives.
     pub env: Arc<Vec<EnvEntry>>,
     /// All `@secrets` file references in declaration order.
     pub secrets: Vec<SecretEntry>,
@@ -313,7 +323,13 @@ fn allowed_aliases(plan: &ExecutionPlan, restrict: &[String]) -> HashSet<String>
 }
 
 /// True for `[A-Za-z_][A-Za-z0-9_]*`.
-pub(crate) fn is_valid_var_name(name: &str) -> bool {
+///
+/// This is the single definition of a shell identifier across the workspace:
+/// the parser validates `@env`/`@export` names with it, [`crate::env::render_env`]
+/// refuses to emit an `export` statement for anything else, and the secrets
+/// crate reuses it for the keys of a sealed env file.
+#[must_use]
+pub fn is_valid_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
@@ -334,57 +350,66 @@ pub(crate) fn is_valid_var_name(name: &str) -> bool {
 /// Returns [`InterpolateError::Unresolved`] when a referenced variable is
 /// missing from the state.
 pub fn interpolate(template: &str, state: &RunState) -> Result<String, InterpolateError> {
-    let bytes = template.as_bytes();
     let mut out = String::with_capacity(template.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'$' {
-            let rest = &template[i..];
-            let ch = rest.chars().next().unwrap_or('\u{FFFD}');
+    // The scanner advances by *consuming* the iterator, never by adding to
+    // an index: an index that stops advancing would loop forever.
+    let mut chars = template.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch != '$' {
             out.push(ch);
-            i += ch.len_utf8();
             continue;
         }
 
-        if bytes.get(i + 1) == Some(&b'{') {
-            if let Some(close) = template[i + 2..].find('}') {
-                let name = &template[i + 2..i + 2 + close];
-                // Empty or invalid names are literal `$` (mirrors the unbraced
-                // scanner, which only interpolates valid `[A-Za-z_]\w*` names).
-                if !is_valid_var_name(name) {
-                    out.push('$');
-                    i += 1;
-                    continue;
+        if chars.peek().is_some_and(|(_, next)| *next == '{') {
+            // `${NAME}`: the closing brace ends the reference.
+            chars.next();
+            let mut name = String::new();
+            let mut closed = false;
+            for (_, c) in chars.by_ref() {
+                if c == '}' {
+                    closed = true;
+                    break;
                 }
-                let value = state.vars.get(name).ok_or_else(|| InterpolateError::Unresolved {
-                    var: name.to_string(),
+                name.push(c);
+            }
+            if closed && is_valid_var_name(&name) {
+                let value = state.vars.get(&name).ok_or_else(|| InterpolateError::Unresolved {
+                    var: name.clone(),
                     template: template.to_string(),
                 })?;
                 out.push_str(value);
-                i += 2 + close + 1;
             } else {
+                // Not a reference: the `$` is literal and the braces are
+                // copied as they are.
                 out.push('$');
-                i += 1;
+                out.push('{');
+                out.push_str(&name);
+                if closed {
+                    out.push('}');
+                }
             }
             continue;
         }
 
-        let start = i + 1;
-        let mut end = start;
-        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-            end += 1;
+        // `$NAME`: the name runs to the first character that cannot be part
+        // of an identifier.
+        let mut name = String::new();
+        while let Some((_, c)) = chars.peek().copied() {
+            if !(c.is_ascii_alphanumeric() || c == '_') {
+                break;
+            }
+            name.push(c);
+            chars.next();
         }
-        let name = &template[start..end];
-        if is_valid_var_name(name) {
-            let value = state.vars.get(name).ok_or_else(|| InterpolateError::Unresolved {
-                var: name.to_string(),
+        if is_valid_var_name(&name) {
+            let value = state.vars.get(&name).ok_or_else(|| InterpolateError::Unresolved {
+                var: name.clone(),
                 template: template.to_string(),
             })?;
             out.push_str(value);
-            i = end;
         } else {
             out.push('$');
-            i += 1;
+            out.push_str(&name);
         }
     }
     Ok(out)
@@ -554,7 +579,7 @@ mod tests {
         state.vars.insert("VERSION".to_string(), "abc123".to_string());
         let entries =
             vec![EnvEntry::Literal { key: "VERSION".to_string(), value: "abc123".to_string() }];
-        let rendered = render_env(&resolved(&entries));
+        let rendered = render_env(&resolved(&entries)).map_err(|e| e.to_string())?;
         assert!(rendered.contains("export VERSION='abc123';"));
         Ok(())
     }
@@ -815,6 +840,57 @@ mod tests {
             .map_err(|e| TestCaseError::fail(e.to_string()))?;
             prop_assert_eq!(restricted.len(), 1);
             prop_assert!(keep >= 1, "sanity: keep is at least 1");
+        }
+
+        /// Re-parsing a parsed payload yields the same payload: the scanner is
+        /// idempotent, so a plan can be round-tripped through the parser
+        /// without drift.
+        #[test]
+        fn reparse_is_idempotent(
+            body in "[a-z]{1,8}( [a-z]{1,8}){0,4}",
+        ) {
+            let script = format!("# @local\n{body}\n");
+            let plan = parse_script(&script).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let first = match &plan.steps[0] {
+                Step::Local(local) => local.script.clone(),
+                other => return Err(TestCaseError::fail(format!("expected a local step, got {other:?}"))),
+            };
+            let round = format!("# @local\n{first}");
+            let reparsed = parse_script(&round).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let second = match &reparsed.steps[0] {
+                Step::Local(local) => local.script.clone(),
+                other => return Err(TestCaseError::fail(format!("expected a local step, got {other:?}"))),
+            };
+            prop_assert_eq!(second, first);
+        }
+
+        /// `resolve_hosts` returns the same hosts in the same order for a
+        /// fixed plan, however many times it is called: the resolution order
+        /// is a property of the plan, not of the call.
+        #[test]
+        fn resolve_hosts_is_deterministic(
+            count in 1_usize..6,
+        ) {
+            let mut script = String::new();
+            let mut members = String::new();
+            for i in 0..count {
+                script.push_str(&format!("# @server web{i} deploy@10.0.0.{i}\n"));
+                if i > 0 {
+                    members.push(',');
+                }
+                members.push_str(&format!("web{i}"));
+            }
+            script.push_str(&format!("# @group web {members}\n"));
+            let plan = parse_script(&script).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let target = Target::new("web");
+
+            let first = resolve_hosts(&plan, &target, &[]).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let second = resolve_hosts(&plan, &target, &[]).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(first.clone(), second);
+
+            let aliases: Vec<&str> = first.iter().map(|h| h.alias.as_str()).collect();
+            let expected: Vec<String> = (0..count).map(|i| format!("web{i}")).collect();
+            prop_assert_eq!(aliases, expected.iter().map(String::as_str).collect::<Vec<_>>());
         }
     }
 

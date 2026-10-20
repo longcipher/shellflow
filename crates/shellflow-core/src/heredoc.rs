@@ -94,7 +94,14 @@ pub fn scan_openers(line: &str) -> Vec<Heredoc> {
     // Bash starts a comment only where a `#` begins a word; tracking that
     // keeps `# see <<EOF` from opening a here-document.
     let mut word_start = true;
-    while i < bytes.len() {
+    // The scan is bounded by the length of the line: every round consumes at
+    // least one byte, so the line can never hold more rounds than it has
+    // bytes. The bound also means an index that stopped advancing cannot
+    // spin forever.
+    for _ in 0..=bytes.len() {
+        if i >= bytes.len() {
+            break;
+        }
         match bytes[i] {
             b'\\' => {
                 i = (i + 2).min(bytes.len());
@@ -130,7 +137,12 @@ pub fn scan_openers(line: &str) -> Vec<Heredoc> {
 /// Index just past the closing `quote`, or the line length when unterminated.
 /// With `escapes`, a backslash consumes the byte that follows it.
 fn quote_end(bytes: &[u8], mut start: usize, quote: u8, escapes: bool) -> usize {
-    while start < bytes.len() {
+    // Bounded by the length of the line, so a start that stopped advancing
+    // cannot spin forever.
+    for _ in 0..=bytes.len() {
+        if start >= bytes.len() {
+            break;
+        }
         if escapes && bytes[start] == b'\\' {
             start = (start + 2).min(bytes.len());
             continue;
@@ -152,7 +164,12 @@ fn read_heredoc(bytes: &[u8], mut start: usize) -> Option<(Heredoc, usize)> {
     if strip_tabs {
         start += 1;
     }
-    while matches!(bytes.get(start), Some(b' ' | b'\t')) {
+    // Bounded by the length of the line: a start that stopped advancing
+    // cannot spin forever.
+    for _ in 0..=bytes.len() {
+        if !matches!(bytes.get(start), Some(b' ' | b'\t')) {
+            break;
+        }
         start += 1;
     }
     let (tag, next, literal) = read_tag(bytes, start)?;
@@ -187,7 +204,12 @@ fn read_tag(bytes: &[u8], start: usize) -> Option<(String, usize, bool)> {
     let mut raw: Vec<u8> = Vec::new();
     let mut i = start;
     let mut literal = true;
-    while let Some(&byte) = bytes.get(i) {
+    // Bounded by the length of the line: an index that stopped advancing
+    // cannot spin forever.
+    for _ in 0..=bytes.len() {
+        let Some(&byte) = bytes.get(i) else {
+            break;
+        };
         if is_tag_end(byte) {
             break;
         }
@@ -213,7 +235,12 @@ fn read_tag(bytes: &[u8], start: usize) -> Option<(String, usize, bool)> {
 /// Index of the closing `quote` at or after `start`, or `None` when the line
 /// ends before it. With `escapes`, a backslash consumes the byte after it.
 fn closing_quote(bytes: &[u8], mut start: usize, quote: u8, escapes: bool) -> Option<usize> {
-    while start < bytes.len() {
+    // Bounded by the length of the line, so a start that stopped advancing
+    // cannot spin forever.
+    for _ in 0..=bytes.len() {
+        if start >= bytes.len() {
+            break;
+        }
         if escapes && bytes[start] == b'\\' {
             start = (start + 2).min(bytes.len());
             continue;

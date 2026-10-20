@@ -50,6 +50,11 @@ printf 'HOST: %s\n' "$host" >> "$LOG"
 # (the mock PATH, so tests can assert the PATH injection into payloads),
 # line 3 = `SHELLFLOW_HAS_RSYNC` when the host provides rsync (the `norsync`
 # host deliberately omits it to exercise the scp fallback).
+#
+# The probe ends with `SHELLFLOW_PROBE_END`: the login shell and the PATH
+# are usable even on a host *without* rsync, and the marker — not the exit
+# status — is what says the probe completed. A host without rsync exits
+# non-zero, mirroring a real `command -v rsync && …` probe.
 if [[ " $*" == *'$SHELL'* && " $*" == *'$PATH'* ]]; then
   case "$host" in
     *zsh*) printf '/usr/bin/zsh\n' ;;
@@ -64,7 +69,27 @@ if [[ " $*" == *'$SHELL'* && " $*" == *'$PATH'* ]]; then
     *norsync*) ;;
     *) printf 'SHELLFLOW_HAS_RSYNC\n' ;;
   esac
-  exit 0
+  printf 'SHELLFLOW_PROBE_END\n'
+  case "$host" in
+    *norsync*) exit 1 ;;
+    *) exit 0 ;;
+  esac
+fi
+
+# The `@wait_active` poll: `systemctl is-active` exits 0 only for an active
+# unit, so the exit status is the verdict.
+if [[ " $*" == *"systemctl is-active"* ]]; then
+  case "$host" in
+    *running*) exit 0 ;;
+    *hang*)
+      # Record this process's pid so a test can assert that an interrupt left
+      # no orphaned process group behind.
+      printf '%s\n' "$$" >> "$MOCK_DIR/ssh.pids"
+      sleep 300
+      exit 0
+      ;;
+    *) exit 3 ;;
+  esac
 fi
 
 # Persist whatever was piped to us so tests can assert on the payload.
@@ -82,11 +107,26 @@ case "$host" in
     ;;
   *echo*)
     # Re-emit the recorded payload so tests can observe streamed output.
-    # A READY/DONE barrier makes fan-out observable without wall-clock races:
-    # concurrent hosts produce READY,READY,DONE,DONE; serialized hosts produce
-    # READY,DONE,READY,DONE.
+    # A rendezvous barrier makes fan-out observable without wall-clock races:
+    # concurrent hosts both announce READY before either announces DONE
+    # (READY,READY,DONE,DONE); a serialized run interleaves
+    # (READY,DONE,READY,DONE).
+    #
+    # The wait is bounded, so a *serialized* run — where only ever one host
+    # stands at the barrier — still makes progress. The bound is generous by
+    # default (a busy machine must not turn a concurrent run into a false
+    # negative) and is shortened by the tests that assert the serialized
+    # order, which are the only ones that pay for it.
     echo "READY-$host" >> "$MOCK_DIR/order.log"
-    sleep 0.3
+    wait_ms="${MOCK_BARRIER_WAIT_MS:-5000}"
+    waited=0
+    while [ "$waited" -lt "$wait_ms" ]; do
+      ready_count=$(grep -c '^READY-' "$MOCK_DIR/order.log" 2>/dev/null || true)
+      [ -z "$ready_count" ] && ready_count=0
+      [ "$ready_count" -ge 2 ] && break
+      sleep 0.05
+      waited=$((waited + 50))
+    done
     echo "DONE-$host" >> "$MOCK_DIR/order.log"
     cat "$MOCK_DIR/ssh-stdin-$host.txt"
     exit 0
@@ -103,6 +143,9 @@ case "$host" in
     exit 7
     ;;
   *hang*)
+    # Record this process's pid so a test can assert that an interrupt left
+    # no orphaned process group behind.
+    printf '%s\n' "$$" >> "$MOCK_DIR/ssh.pids"
     sleep 300
     exit 0
     ;;

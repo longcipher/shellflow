@@ -59,7 +59,9 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
 - **Idempotent dry-run & diff** — `--dry-run` / `--diff` syntax-check payloads
   (`bash -n`, remote `bash -n -s`) and itemize file changes via
   `rsync --dry-run -i`. Nothing is written; `--diff` hides status prose and
-  shows only the change list.
+  shows only the change list. A copy that *cannot* be previewed — the `scp`
+  fallback on a host without rsync, or a local `cp` — is skipped with a
+  warning instead of being performed: a dry run never writes to a target.
 - **State passing** — `@export VAR` captures a variable from a local block and
   injects it into later `@copy` paths, `@remote` blocks, and `@only_if` guards
   as `$VAR` / `${VAR}` / env.
@@ -70,7 +72,9 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
   step that asked for `--delete` or `--exclude` **fails closed** on such a
   host rather than performing a different transfer than the playbook
   requested. `--allow-unfiltered-copy` accepts the downgrade explicitly (the
-  step then warns that the options were dropped).
+  step then warns that the options were dropped). The `scp` fallback has no
+  dry-run mode, so under `--dry-run`/`--diff` it is skipped with a warning
+  rather than performed.
 - **Guards & timeouts** — `@only_if <cmd>` skips a block where the
   precondition fails; `--timeout SECS` / `@timeout SECS` kills hung hosts
   (guards included).
@@ -142,6 +146,7 @@ lines belong to the current block.
 | `@timeout` | `# @timeout <seconds>` | Per-step timeout for the next block |
 | `@name` | `# @name <label>` | Name the next block (for `--only`/`--skip` and reporting) |
 | `@only_if` | `# @only_if <command>` | Skip the next block where `<command>` fails |
+| `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active <unit>` until the unit reports active or the budget expires (default 300s). Replaces hand-rolled `for/sleep/ss` loops; a timeout is a script-class failure |
 
 Key rules:
 
@@ -154,6 +159,12 @@ Key rules:
   in a real run (and a warning + skip in dry-run/check).
 - `@copy` paths must not contain the literal `->`; the target is the last
   whitespace-separated token; paths with spaces are unsupported.
+- `@copy` returns the block mode to `local`: it is a self-contained step, so
+  the lines that follow are not streamed to the copy's remote target.
+- `@export` binds to the **preceding** local block, even when another
+  directive sits between the block and the `@export` line.
+- `@only_if` is never evaluated in `--dry-run`/`--check`: the guard is
+  reported instead of run, so a preview changes nothing.
 - `@only_if` guards run on each host with the same env as the block.
 - Lines inside a here-document body are **data, never directives**: a `# @…`
   line inside `cat <<EOF … EOF` is passed through to the block verbatim, so

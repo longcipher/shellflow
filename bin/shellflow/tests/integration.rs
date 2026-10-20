@@ -57,6 +57,14 @@ impl Sandbox {
         run_with_env(script, args, &self.mock_dir(), &[])
     }
 
+    /// Run the shellflow binary with the mock PATH and extra environment.
+    ///
+    /// The mock shims inherit the environment, so this is how a test tunes
+    /// the shims themselves (e.g. the fan-out barrier's wait bound).
+    fn run_with(&self, script: &Path, args: &[&str], extra: &[(&str, &str)]) -> TestResult<Output> {
+        run_with_env(script, args, &self.mock_dir(), extra)
+    }
+
     fn read(&self, file: &str) -> String {
         fs::read_to_string(self.mock_dir().join(file)).unwrap_or_default()
     }
@@ -580,8 +588,10 @@ fn diff_hides_rsync_status_lines() -> TestResult<()> {
 
 #[test]
 fn parallel_default_fans_out_concurrently() -> TestResult<()> {
-    // Two echo hosts each take ~0.3s. With default `--parallel all` the step
-    // finishes in ~0.3s; a serialized (buggy) default would take ~0.6s.
+    // Two echo hosts meet at a rendezvous barrier. With default `--parallel
+    // all` both hosts enter the barrier before either leaves it
+    // (READY,READY,DONE,DONE). A serialized (buggy) default would interleave
+    // (READY,DONE,READY,DONE).
     let sb = Sandbox::new("parallel")?;
     let script = sb.script(
         "# @server e1 echo1@h1\n\
@@ -727,7 +737,10 @@ fn unresolved_export_variable_is_error() -> TestResult<()> {
          # @copy out/myapp-$VERSION -> /srv @ok1\n",
     )?;
     let out = sb.run(&script, &[])?;
-    assert_eq!(status_code(&out), 4, "unresolved variable should fail the run");
+    // Design §6 assigns an unresolved `@export` variable to exit 1 ("plan /
+    // parse error"), not to the script-failure exit 4: CI can tell "the
+    // playbook is wrong" from "the deployment failed".
+    assert_eq!(status_code(&out), 1, "unresolved variable should fail the run as a plan error");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let all = format!("{stdout}{stderr}");
@@ -1413,9 +1426,9 @@ fn guard_is_visible_at_verbose_two() -> TestResult<()> {
 /// orphan. On Linux the process state is authoritative; elsewhere fall back to
 /// the signal probe.
 fn pid_running(pid: i32) -> bool {
-    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
-        && let Some((_, rest)) = stat.rsplit_once(") ")
-        && let Some(state) = rest.chars().next()
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) &&
+        let Some((_, rest)) = stat.rsplit_once(") ") &&
+        let Some(state) = rest.chars().next()
     {
         return state != 'Z';
     }
@@ -1539,7 +1552,9 @@ fn e2e_full_deploy_pipeline() -> TestResult<()> {
 #[test]
 fn parallel_one_serializes_hosts() -> TestResult<()> {
     // Mirror of `parallel_default_fans_out_concurrently`: with `-p 1` the mock
-    // barrier must interleave as READY,DONE,READY,DONE.
+    // barrier must interleave as READY,DONE,READY,DONE. Only one host ever
+    // stands at the barrier, so the rendezvous bound is shortened — the test
+    // is about the order, not about waiting.
     let sb = Sandbox::new("parallel-one")?;
     let script = sb.script(
         "# @server e1 echo1@h1\n\
@@ -1548,7 +1563,7 @@ fn parallel_one_serializes_hosts() -> TestResult<()> {
          # @remote g\n\
          echo hi\n",
     )?;
-    let out = sb.run(&script, &["-p", "1"])?;
+    let out = sb.run_with(&script, &["-p", "1"], &[("MOCK_BARRIER_WAIT_MS", "200")])?;
     assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let order = sb.read("order.log");
     let events: Vec<&str> = order.lines().collect();
@@ -1902,5 +1917,382 @@ fn local_copy_delete_swaps_atomically_on_success() -> TestResult<()> {
         !sb.dir.join("local-dst.shellflow-new").exists(),
         "no staging directory may be left behind"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the architecture-review fixes
+// ---------------------------------------------------------------------------
+
+/// Whether a process group still has a live member.
+///
+/// `killpg(pgid, 0)` succeeds while any process in the group exists. The
+/// group is the unit that must not survive: the direct child *and* every
+/// descendant it spawned.
+fn group_running(pgid: i32) -> bool {
+    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None).is_ok()
+}
+
+#[test]
+fn a_syntax_error_never_leaks_a_registered_secret() -> TestResult<()> {
+    // `bash -n` echoes the offending source line, and that line can hold a
+    // secret. The warning must go through the masked render path — in the
+    // console *and* in the audit log (design §9).
+    let sb = Sandbox::new("secret-leak")?;
+    let script = sb.script(
+        "# @env TOKEN=s3cr3tvalue\n\
+         # @local\n\
+         echo (s3cr3tvalue\n",
+    )?;
+    let log_path = sb.dir.join("audit.log");
+    let out = sb.run(&script, &["-k", "--log-file", log_path.to_str().ok_or("utf8")?])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let audit = fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
+    for (what, text) in
+        [("stdout", stdout.as_ref()), ("stderr", stderr.as_ref()), ("audit log", audit.as_str())]
+    {
+        assert!(!text.contains("s3cr3tvalue"), "the secret leaked into the {what}: {text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn sigint_leaves_no_orphaned_process_group() -> TestResult<()> {
+    // Design §7.5: "No orphan processes survive." The interrupt must tear the
+    // process group down *before* the process exits — not leave it to the
+    // garbage collector of an aborted task.
+    let sb = Sandbox::new("sigint-orphan")?;
+    let script = sb.script(
+        "# @server hang1 hang@h1\n\
+         # @remote hang1\n\
+         sleep 300\n",
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shellflow"))
+        .arg(&script)
+        .env("MOCK_DIR", sb.mock_dir())
+        .env("PATH", format!("{}:/usr/bin:/bin", sb.mock_dir().display()))
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    // Wait for the mock ssh to record its pid (it leads its own process
+    // group, so the pid is also the pgid).
+    let pid_file = sb.mock_dir().join("ssh.pids");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !pid_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let pids = fs::read_to_string(&pid_file).map_err(|e| e.to_string())?;
+    let last = pids.trim().lines().last().ok_or("no ssh pid recorded")?.trim().to_string();
+    let pgid: i32 = last.parse::<i32>().map_err(|e| e.to_string())?;
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .map_err(|e| e.to_string())?;
+    let status = child.wait().map_err(|e| e.to_string())?;
+    assert_eq!(status.code(), Some(130), "SIGINT must exit 130");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while group_running(pgid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !group_running(pgid),
+        "the ssh process group {pgid} survived the interrupt — orphaned processes"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_dry_run_never_writes_through_the_scp_fallback() -> TestResult<()> {
+    // `--dry-run` must not change anything (design §8.2). The scp fallback
+    // has no dry-run mode, so on a host without rsync the transfer must be
+    // skipped rather than performed.
+    let sb = Sandbox::new("dryrun-scp")?;
+    let src = sb.dir.join("out");
+    fs::write(&src, b"artifact").map_err(|e| e.to_string())?;
+    let script = sb.script(&format!(
+        "# @server norsync1 norsync@h1\n# @copy {} -> /srv/app.tar.gz @norsync1\n",
+        src.display()
+    ))?;
+    let out = sb.run(&script, &["--dry-run"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(sb.scp_log().is_empty(), "the dry run must not transfer: {}", sb.scp_log());
+    Ok(())
+}
+
+#[test]
+fn the_plan_preview_and_the_step_headers_share_one_numbering() -> TestResult<()> {
+    // `-v` prints the plan preview; the step headers carry their own number.
+    // When `--skip` filters the plan, both must count the *selected* steps —
+    // otherwise the same run shows two different numbering spaces and the
+    // operator cannot tell which header belongs to which preview entry.
+    let sb = Sandbox::new("plan-numbering")?;
+    let script = sb.script(
+        "# @local\n\
+         echo FIRST\n\
+         # @local\n\
+         echo SECOND\n\
+         # @local\n\
+         echo THIRD\n",
+    )?;
+    let out = sb.run(&script, &["-v", "--skip", "2"])?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let preview: Vec<&str> = stdout
+        .lines()
+        // The preview entries are `step <n>: <kind>`; the summary lines are
+        // `step <n>  <time>  <status>`.
+        .filter(|line| line.trim_start().starts_with("step ") && line.contains(": "))
+        .collect();
+    assert_eq!(preview.len(), 2, "the preview must list the selected steps: {stdout}");
+    assert!(preview[0].contains(" 1: local"), "preview numbering: {stdout}");
+    assert!(preview[1].contains(" 2: local"), "preview numbering: {stdout}");
+
+    // The headers number the same two steps out of two.
+    assert!(stdout.contains("[STEP 1/2]"), "step header numbering missing: {stdout}");
+    assert!(stdout.contains("[STEP 2/2]"), "step header numbering missing: {stdout}");
+    assert!(!stdout.contains("[STEP 3/"), "the skipped step must not get a header: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn the_interrupt_summary_is_recorded_in_the_audit_trail() -> TestResult<()> {
+    // An aborted run must leave a trail an operator can reconstruct from:
+    // the summary of the steps that did finish belongs in the audit log, not
+    // only on the terminal.
+    let sb = Sandbox::new("interrupt-audit")?;
+    let script = sb.script(
+        "# @local\n\
+         echo FINISHED_STEP\n\
+         # @server hang1 hang@h1\n\
+         # @remote hang1\n\
+         sleep 300\n",
+    )?;
+    let log_path = sb.dir.join("audit.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shellflow"))
+        .arg(&script)
+        .arg("--log-file")
+        .arg(&log_path)
+        .env("MOCK_DIR", sb.mock_dir())
+        .env("PATH", format!("{}:/usr/bin:/bin", sb.mock_dir().display()))
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    // Wait for the mock ssh to record its pid: the remote step is in flight.
+    let pid_file = sb.mock_dir().join("ssh.pids");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !pid_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(pid_file.exists(), "the remote step never started");
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .map_err(|e| e.to_string())?;
+    let status = child.wait().map_err(|e| e.to_string())?;
+    assert_eq!(status.code(), Some(130), "SIGINT must exit 130");
+
+    let audit = fs::read_to_string(&log_path).map_err(|e| e.to_string())?;
+    assert!(audit.contains("Summary:"), "the interrupt summary is missing: {audit}");
+    assert!(audit.contains("step  1"), "the completed step is missing from the summary: {audit}");
+    Ok(())
+}
+
+#[test]
+fn service_check_without_ssh_reports_a_transport_failure() -> TestResult<()> {
+    // Design §6: a missing tool is a transport/setup failure (exit 3) on
+    // every path. `service check` must agree with the `run` path instead of
+    // reporting the same failure class as a generic error.
+    let sb = Sandbox::new("service-check-no-ssh")?;
+    let script = sb.script("# @local\necho hi\n")?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shellflow"));
+    cmd.arg("service").arg("check").arg("--host").arg("h1").arg("myapp");
+    cmd.env("MOCK_DIR", sb.mock_dir());
+    // A PATH with no `ssh` at all: an empty directory, not the mock dir
+    // (which holds an `ssh` shim that would satisfy the preflight). The
+    // tool must be genuinely absent so the preflight → exit-3 path is what
+    // is actually exercised.
+    let empty = sb.dir.join("empty-path");
+    fs::create_dir_all(&empty).map_err(|e| e.to_string())?;
+    cmd.env("PATH", empty.display().to_string());
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    assert_eq!(
+        status_code(&out),
+        3,
+        "a missing ssh must be a transport failure; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ssh"), "the error should name the missing tool; stderr: {stderr}");
+    let _ = script;
+    Ok(())
+}
+
+#[test]
+fn a_backgrounded_descendant_does_not_hang_the_step() -> TestResult<()> {
+    // A block that backgrounds a process and exits must not hold the step
+    // open: the descendant inherits the output pipe, and `--timeout` must
+    // still bound the step.
+    let sb = Sandbox::new("background")?;
+    let script = sb.script("# @local\nsleep 30 &\necho done\n")?;
+    let started = std::time::Instant::now();
+    let out = sb.run(&script, &["--timeout", "5"])?;
+    let elapsed = started.elapsed();
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the step hung on the backgrounded descendant: {elapsed:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_login_probe_survives_a_host_without_rsync() -> TestResult<()> {
+    // The probe must not fail as a whole because the host has no rsync: the
+    // login shell and the rc-extended PATH are still usable (design §7.2).
+    let sb = Sandbox::new("probe-norsync")?;
+    let script = sb.script(
+        "# @server norsync1 norsync@h1\n\
+         # @remote norsync1\n\
+         echo hello\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdin = fs::read_to_string(sb.mock_dir().join("ssh-stdin-norsync@h1.txt"))
+        .map_err(|e| e.to_string())?;
+    assert!(
+        stdin.contains("export PATH="),
+        "the probed PATH must be injected into the payload: {stdin}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_dry_run_does_not_execute_a_local_guard() -> TestResult<()> {
+    // Design §8.2: "Nothing is written in either mode." A guard is a command
+    // like any other, so a dry run must report it, not run it.
+    let sb = Sandbox::new("dry-run-guard")?;
+    let marker = sb.dir.join("guard-ran");
+    let script = sb.script(&format!(
+        "# @local\n\
+         # @only_if touch {}\n\
+         echo hello\n",
+        marker.display()
+    ))?;
+    let out = sb.run(&script, &["--dry-run"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !marker.exists(),
+        "the guard must not be evaluated in a dry run: {} was created",
+        marker.display()
+    );
+    Ok(())
+}
+
+#[test]
+fn global_flags_are_accepted_before_a_subcommand() -> TestResult<()> {
+    // `--no-color` applies to every subcommand and may be given before or
+    // after the subcommand name.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shellflow"));
+    let out = cmd
+        .args(["--no-color", "template", "check", "missing.tmpl", "missing.env.age"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    // A usage error is exit 2; a missing file is exit 1.
+    assert_ne!(status_code(&out), 2, "the global flag must not be a usage error");
+    Ok(())
+}
+
+#[test]
+fn the_scp_fallback_keeps_the_requested_file_name() -> TestResult<()> {
+    // The rsync path honours the destination file name; the scp fallback
+    // must not silently rename the artifact to the source basename.
+    let sb = Sandbox::new("scp-name")?;
+    let script = sb.script(
+        "# @server norsync1 norsync@h1\n\
+         # @copy ./out -> /srv/app.tar.gz @norsync1\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let scp = sb.scp_log();
+    assert!(
+        scp.contains("/srv/app.tar.gz"),
+        "the artifact must land under the requested name: {scp}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_wait_active_step_leaves_no_orphan_on_interrupt() -> TestResult<()> {
+    // The `@wait_active` poll is the only child that used to be spawned
+    // outside the process-group machinery.
+    let sb = Sandbox::new("wait-orphan")?;
+    let script = sb.script(
+        "# @server hang1 hang@h1\n\
+         # @wait_active myapp.service @hang1\n",
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shellflow"))
+        .arg(&script)
+        .env("MOCK_DIR", sb.mock_dir())
+        .env("PATH", format!("{}:/usr/bin:/bin", sb.mock_dir().display()))
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    let pid_file = sb.mock_dir().join("ssh.pids");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !pid_file.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let pids = fs::read_to_string(&pid_file).map_err(|e| e.to_string())?;
+    let last = pids.trim().lines().last().ok_or("no ssh pid recorded")?.trim().to_string();
+    let pgid: i32 = last.parse::<i32>().map_err(|e| e.to_string())?;
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .map_err(|e| e.to_string())?;
+    let status = child.wait().map_err(|e| e.to_string())?;
+    assert_eq!(status.code(), Some(130), "SIGINT must exit 130");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while group_running(pgid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !group_running(pgid),
+        "the wait_active ssh process group {pgid} survived the interrupt"
+    );
+    Ok(())
+}
+
+#[test]
+fn wait_active_succeeds_when_the_unit_is_active() -> TestResult<()> {
+    // The poll's verdict is the child's exit status: `systemctl is-active`
+    // exits 0 only for an active unit.
+    let sb = Sandbox::new("wait-active")?;
+    let script =
+        sb.script("# @server running1 running@h1\n# @wait_active myapp.service @running1\n")?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    Ok(())
+}
+
+#[test]
+fn wait_active_fails_when_the_unit_stays_inactive() -> TestResult<()> {
+    // A unit that never reports active is a script-class failure (exit 4),
+    // not a transport failure: the unit is broken, the connection is fine.
+    let sb = Sandbox::new("wait-inactive")?;
+    let script = sb.script(
+        "# @server stopped1 stopped@h1\n\
+         # @wait_active myapp.service @stopped1 --timeout 2\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 4, "stderr: {}", String::from_utf8_lossy(&out.stderr));
     Ok(())
 }

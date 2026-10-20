@@ -12,6 +12,7 @@ readme.workspace = true
 
 [dependencies]
 age = { workspace = true }
+shellflow-core = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 

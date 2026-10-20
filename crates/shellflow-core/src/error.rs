@@ -85,6 +85,21 @@ pub enum InterpolateError {
     },
 }
 
+/// Errors produced while rendering the payload environment header.
+///
+/// The header is shell source that is streamed to a remote host, so a key that
+/// is not a shell identifier must never be emitted: it would break out of the
+/// `export` statement and inject shell into the payload.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum RenderEnvError {
+    /// A key was not a valid shell identifier.
+    #[error("environment variable name `{name}` is not a valid shell identifier")]
+    InvalidKey {
+        /// The offending key.
+        name: String,
+    },
+}
+
 /// Errors produced while parsing the NUL-delimited `@export` capture file
 /// written by the runner (design §7.6).
 #[derive(Clone, Debug, Eq, PartialEq, Error)]

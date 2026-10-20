@@ -3,13 +3,13 @@
 
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 use age::secrecy::ExposeSecret;
+use zeroize::Zeroizing;
 
 use crate::error::SecretsError;
 
@@ -26,55 +26,77 @@ pub const IDENTITY_ENV: &str = "SHELLFLOW_AGE_IDENTITY";
 pub const ALLOW_UNSAFE_IDENTITY_ENV: &str = "SHELLFLOW_ALLOW_UNSAFE_IDENTITY";
 
 /// Whether the operator explicitly accepted a laxly-permissioned identity.
+///
+/// Only an affirmative value enables the override. Anything else — including
+/// `false`, `no` and an unrecognized string — leaves the refusal in place:
+/// the env var gates the acceptance of a file that holds the master key for
+/// every sealed env file, so it must fail closed.
+///
+/// The value is an environment variable rather than a flag so that it applies
+/// to every subcommand that touches an identity (`secret`, `keys`, `template`,
+/// `deploy`) without threading a flag through each of them.
 fn allow_unsafe_identity() -> bool {
-    std::env::var(ALLOW_UNSAFE_IDENTITY_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+    matches!(std::env::var(ALLOW_UNSAFE_IDENTITY_ENV).as_deref(), Ok("1" | "true" | "yes" | "on"))
 }
 
 /// Expand a leading `~/` to `$HOME`.
 ///
-/// Returns the path unchanged when it does not start with `~/` or when
-/// `$HOME` is unset (the caller then fails with a missing-file error rather
-/// than silently writing to a literal `~` directory).
-#[must_use]
-pub fn expand_home(path: &Path) -> PathBuf {
+/// # Errors
+///
+/// Returns [`SecretsError::NoHome`] when the path starts with `~/` and
+/// `$HOME` is unset or empty. Leaving the path unchanged would make it
+/// *relative*, and a relative path is resolved against the current working
+/// directory — so a planted `./…` file could be adopted as the operator's
+/// identity.
+pub fn expand_home(path: &Path) -> Result<PathBuf, SecretsError> {
     let s = path.to_string_lossy();
     // An empty `$HOME` is treated as absent: `PathBuf::from("")` would make a
     // `~/x` expansion fall back to the relative path `x`, which resolves
     // against whatever directory happens to be current.
-    if let Some(rest) = s.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
+    if let Some(rest) = s.strip_prefix("~/") &&
+        let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
     {
-        return PathBuf::from(home).join(rest);
+        return Ok(PathBuf::from(home).join(rest));
     }
-    path.to_path_buf()
+    if s.starts_with("~/") {
+        return Err(SecretsError::NoHome);
+    }
+    Ok(path.to_path_buf())
 }
 
 /// The default identity file: `~/.config/age/keys.txt` (age convention).
 ///
 /// Overridden by `$SHELLFLOW_AGE_IDENTITY` or an explicit `--identity`.
-/// A leading `~/` in the env var is expanded against `$HOME`.
-#[must_use]
-pub fn default_identity_path() -> PathBuf {
+///
+/// # Errors
+///
+/// Returns [`SecretsError::NoHome`] when neither `$SHELLFLOW_AGE_IDENTITY`
+/// nor a usable `$HOME` is available. Without a usable `$HOME` there is no
+/// honest default: a *relative* path would silently adopt whatever identity
+/// happens to sit in the current directory, so the path is reported as
+/// undefined instead.
+pub fn default_identity_path() -> Result<PathBuf, SecretsError> {
     if let Some(env) = std::env::var_os(IDENTITY_ENV).filter(|v| !v.is_empty()) {
         return expand_home(&PathBuf::from(env));
     }
-    // Without a usable `$HOME` there is no honest default: returning a
-    // relative `.config/age/keys.txt` would silently adopt whatever identity
-    // happens to sit in the current directory. Report the missing path
-    // instead, which surfaces as a clear "identity not found".
-    match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        Some(home) => PathBuf::from(home).join(".config/age/keys.txt"),
-        None => PathBuf::from(".config/age/keys.txt"),
-    }
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).ok_or(SecretsError::NoHome)?;
+    Ok(PathBuf::from(home).join(".config/age/keys.txt"))
 }
 
 /// Resolve the effective identity path: explicit `--identity` wins, then
 /// `$SHELLFLOW_AGE_IDENTITY`, then the default location.
 ///
 /// A leading `~/` in any of these is expanded against `$HOME`.
-#[must_use]
-pub fn effective_identity_path(explicit: Option<&Path>) -> PathBuf {
-    explicit.map_or_else(default_identity_path, expand_home)
+///
+/// # Errors
+///
+/// Returns [`SecretsError::NoHome`] when no path can be determined — see
+/// [`default_identity_path`].
+pub fn effective_identity_path(explicit: Option<&Path>) -> Result<PathBuf, SecretsError> {
+    match explicit {
+        Some(path) => expand_home(path),
+        None => default_identity_path(),
+    }
 }
 
 /// Load an X25519 identity from an age identity file.
@@ -92,12 +114,20 @@ pub fn effective_identity_path(explicit: Option<&Path>) -> PathBuf {
 /// [`SecretsError::InvalidIdentity`] when no `AGE-SECRET-KEY-1…` line is found,
 /// the key does not parse, or the file is readable by other local users.
 pub fn load_x25519_identity(path: &Path) -> Result<age::x25519::Identity, SecretsError> {
-    let metadata = fs::metadata(path).map_err(|err| match err.kind() {
+    // The file is opened once and inspected through the open descriptor.
+    // Stat-then-open would allow the file to be replaced in between, so the
+    // mode that was checked could belong to a different file than the one
+    // that is actually read.
+    let mut file = fs::File::open(path).map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => SecretsError::MissingIdentity(path.display().to_string()),
         _ => SecretsError::ReadIdentity {
             path: path.display().to_string(),
             source: std::io::Error::from(err.kind()),
         },
+    })?;
+    let metadata = file.metadata().map_err(|source| SecretsError::ReadIdentity {
+        path: path.display().to_string(),
+        source,
     })?;
     let mode = metadata.permissions().mode() & 0o777;
     if mode & 0o077 != 0 && !allow_unsafe_identity() {
@@ -111,12 +141,12 @@ pub fn load_x25519_identity(path: &Path) -> Result<age::x25519::Identity, Secret
         });
     }
 
-    let content = fs::read_to_string(path).map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => SecretsError::MissingIdentity(path.display().to_string()),
-        _ => SecretsError::ReadIdentity {
-            path: path.display().to_string(),
-            source: std::io::Error::from(err.kind()),
-        },
+    // The identity file holds the master key for every sealed env file the
+    // operator owns: the buffer is scrubbed when it is dropped, like every
+    // other secret in this crate.
+    let mut content = Zeroizing::new(String::new());
+    std::io::Read::read_to_string(&mut file, &mut content).map_err(|source| {
+        SecretsError::ReadIdentity { path: path.display().to_string(), source }
     })?;
 
     let line = content.lines().map(str::trim).find(|l| l.starts_with("AGE-SECRET-KEY-"));
@@ -151,13 +181,12 @@ pub fn generate_identity(path: &Path) -> Result<age::x25519::Identity, SecretsEr
         })?;
     }
 
-    let mut file =
-        fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).map_err(
-            |source| SecretsError::WriteIdentity { path: path.display().to_string(), source },
-        )?;
-    writeln!(file, "{}", identity.to_string().expose_secret()).map_err(|source| {
-        SecretsError::WriteIdentity { path: path.display().to_string(), source }
-    })?;
+    // The key is staged in a sibling temp file and then linked into place:
+    // a crash cannot leave a truncated identity behind, and the link fails
+    // when the destination already exists, so the "never overwrite" rule is
+    // enforced by the filesystem instead of a check-then-write race.
+    let secret = identity.to_string();
+    crate::fsx::write_new_file(path, secret.expose_secret().as_bytes(), 0o600)?;
 
     Ok(identity)
 }
@@ -194,6 +223,20 @@ mod tests {
             // SAFETY: guarded by ENV_LOCK; values are non-secret test fixtures.
             unsafe {
                 std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+
+        /// Remove an env var for the duration of the guard.
+        ///
+        /// # Safety
+        /// Callers must hold `ENV_LOCK` so no other thread reads or writes the
+        /// same env var concurrently (env access is process-global).
+        unsafe fn clear(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: guarded by ENV_LOCK.
+            unsafe {
+                std::env::remove_var(key);
             }
             Self { key, original }
         }
@@ -271,6 +314,28 @@ mod tests {
     }
 
     #[test]
+    fn the_opt_out_fails_closed_for_a_negative_value() {
+        // `false` / `no` / an unrecognized string must leave the refusal in
+        // place: the env var gates the acceptance of the master key file.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("keys.txt");
+        generate_identity(&path).expect("generate");
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        for value in ["false", "no", "off", "0", "maybe", ""] {
+            // SAFETY: guarded by ENV_LOCK.
+            let _opt_out = unsafe { EnvRestore::set(ALLOW_UNSAFE_IDENTITY_ENV, value) };
+            assert!(
+                load_x25519_identity(&path).is_err(),
+                "`{value}` must not enable the unsafe-identity override"
+            );
+        }
+    }
+
+    #[test]
     fn load_missing_identity_reports_path() {
         let err = match load_x25519_identity(Path::new("/nonexistent/keys.txt")) {
             Err(err) => err,
@@ -294,7 +359,10 @@ mod tests {
     #[test]
     fn effective_identity_prefers_explicit() {
         let explicit = Path::new("/tmp/explicit-key.txt");
-        assert_eq!(effective_identity_path(Some(explicit)), explicit.to_path_buf());
+        assert_eq!(
+            effective_identity_path(Some(explicit)).expect("explicit path"),
+            explicit.to_path_buf()
+        );
     }
 
     #[test]
@@ -305,11 +373,35 @@ mod tests {
         {
             // SAFETY: guarded by ENV_LOCK.
             let _identity_env = unsafe { EnvRestore::set(IDENTITY_ENV, "/custom/key.txt") };
-            assert_eq!(default_identity_path(), PathBuf::from("/custom/key.txt"));
+            assert_eq!(
+                default_identity_path().expect("env override"),
+                PathBuf::from("/custom/key.txt")
+            );
         }
         // SAFETY: guarded by ENV_LOCK.
         let _home = unsafe { EnvRestore::set("HOME", "/home/test-user") };
-        assert_eq!(default_identity_path(), PathBuf::from("/home/test-user/.config/age/keys.txt"));
+        assert_eq!(
+            default_identity_path().expect("home default"),
+            PathBuf::from("/home/test-user/.config/age/keys.txt")
+        );
+    }
+
+    #[test]
+    fn an_unset_home_yields_no_identity_path() {
+        // The default identity location is undefined without a usable `$HOME`.
+        // It must NOT degrade to a relative path: a relative path is resolved
+        // against the current working directory, so a planted
+        // `./.config/age/keys.txt` would be adopted as the operator's identity.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            // SAFETY: guarded by ENV_LOCK.
+            let _identity_env = unsafe { EnvRestore::clear(IDENTITY_ENV) };
+            // SAFETY: guarded by ENV_LOCK.
+            let _home = unsafe { EnvRestore::clear("HOME") };
+            assert!(matches!(default_identity_path(), Err(SecretsError::NoHome)));
+            assert!(matches!(effective_identity_path(None), Err(SecretsError::NoHome)));
+            assert!(matches!(expand_home(Path::new("~/keys.txt")), Err(SecretsError::NoHome)));
+        }
     }
 
     #[test]
@@ -317,13 +409,22 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: guarded by ENV_LOCK.
         let _home = unsafe { EnvRestore::set("HOME", "/home/test-user") };
-        assert_eq!(expand_home(Path::new("~/keys.txt")), PathBuf::from("/home/test-user/keys.txt"));
         assert_eq!(
-            expand_home(Path::new("~/.config/age/keys.txt")),
+            expand_home(Path::new("~/keys.txt")).expect("tilde"),
+            PathBuf::from("/home/test-user/keys.txt")
+        );
+        assert_eq!(
+            expand_home(Path::new("~/.config/age/keys.txt")).expect("tilde"),
             PathBuf::from("/home/test-user/.config/age/keys.txt")
         );
-        assert_eq!(expand_home(Path::new("/abs/keys.txt")), PathBuf::from("/abs/keys.txt"));
-        assert_eq!(expand_home(Path::new("relative/keys.txt")), PathBuf::from("relative/keys.txt"));
+        assert_eq!(
+            expand_home(Path::new("/abs/keys.txt")).expect("absolute"),
+            PathBuf::from("/abs/keys.txt")
+        );
+        assert_eq!(
+            expand_home(Path::new("relative/keys.txt")).expect("relative"),
+            PathBuf::from("relative/keys.txt")
+        );
     }
 
     #[test]
@@ -332,7 +433,7 @@ mod tests {
         // SAFETY: guarded by ENV_LOCK.
         let _home = unsafe { EnvRestore::set("HOME", "/home/tilde-user") };
         assert_eq!(
-            effective_identity_path(Some(Path::new("~/keys.txt"))),
+            effective_identity_path(Some(Path::new("~/keys.txt"))).expect("tilde"),
             PathBuf::from("/home/tilde-user/keys.txt")
         );
     }

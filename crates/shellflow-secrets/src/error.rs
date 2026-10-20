@@ -95,4 +95,15 @@ pub enum SecretsError {
         /// The editor command string.
         String,
     ),
+
+    /// The home directory could not be determined.
+    ///
+    /// `$HOME` is unset or empty, so no path under it can be resolved. The
+    /// identity location is undefined in that case — resolving it to a
+    /// *relative* path would adopt whatever identity happens to sit in the
+    /// current working directory.
+    #[error(
+        "cannot determine the home directory: $HOME is not set (pass an explicit identity path)"
+    )]
+    NoHome,
 }

@@ -94,11 +94,6 @@ impl ResolvedSecrets {
         &self.shorts
     }
 
-    /// This host's `{host}` pairs, if it had any per-host `@secrets` entries.
-    pub(crate) fn host_pairs(&self, alias: &str) -> Option<&[(String, String)]> {
-        self.per_host.get(alias).map(Vec::as_slice)
-    }
-
     /// Layer this host's `{host}` pairs onto `env` (a later value wins on a
     /// duplicate key), and extend `LT_SECRET_KEYS` with this host's keys.
     pub(crate) fn overlay(&self, env: &mut Vec<(String, String)>, alias: &str) {
@@ -171,10 +166,10 @@ pub(crate) fn resolve_secrets(
         // Per-entry `--identity` also expands `~/` (same as the run-wide
         // flag); previously it used `PathBuf::from` directly, so
         // `@secrets x.age --identity ~/keys.txt` read a literal `~` path.
-        let id_path = entry
-            .identity
-            .as_deref()
-            .map_or_else(|| effective_identity_path(identity), |s| expand_home(Path::new(s)));
+        let id_path = match entry.identity.as_deref() {
+            Some(explicit) => expand_home(Path::new(explicit)).map_err(|err| eyre!("{err}"))?,
+            None => effective_identity_path(identity).map_err(|err| eyre!("{err}"))?,
+        };
         if !cache.contains_key(&id_path) {
             let loaded = load_x25519_identity(&id_path)
                 .map_err(|err| eyre!("{err} (identity: {})", id_path.display()))?;
@@ -208,7 +203,16 @@ pub(crate) fn resolve_secrets(
         }
     }
 
-    shared.push((SECRET_KEYS_VAR.to_string(), shared_keys.join(" ")));
+    // `LT_SECRET_KEYS` is exported only when there *are* shared keys.
+    // `cred-env credstore-install` treats a set-but-empty list as "this
+    // service has no credentials" and clears the store — so exporting an
+    // empty list would let a per-host-only playbook destroy the credential
+    // store of the target it is deploying to. An absent variable fails
+    // closed instead. The per-host keys are added by `ResolvedSecrets::overlay`,
+    // which the executor calls for the host it is about to talk to.
+    if !shared_keys.is_empty() {
+        shared.push((SECRET_KEYS_VAR.to_string(), shared_keys.join(" ")));
+    }
     Ok(ResolvedSecrets { shared, per_host, masks, shorts })
 }
 
@@ -330,6 +334,37 @@ mod tests {
         Ok(())
     }
 
+    /// A playbook whose secrets are all per-host must not export an *empty*
+    /// `LT_SECRET_KEYS`.
+    ///
+    /// `cred-env credstore-install` treats a set-but-empty list as "this
+    /// service has no credentials" and clears the credential store — so an
+    /// empty export would let a per-host playbook destroy the store of the
+    /// target it is deploying to. An absent variable fails closed instead.
+    #[test]
+    fn a_per_host_only_playbook_exports_no_key_list() -> TestResult<()> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let identity_path = dir.path().join("perhost.key");
+        let identity = generate_identity(&identity_path).map_err(|err| err.to_string())?;
+        write_secrets(dir.path(), "web1", &identity, "TOKEN=perhostvalue\n")?;
+        let entries = vec![SecretEntry {
+            file: dir.path().join("{host}.age").display().to_string(),
+            identity: None,
+        }];
+
+        let resolved = resolve_secrets(&entries, &["web1".to_string()], Some(&identity_path), 6)
+            .map_err(|err| format!("{err:#}"))?;
+        assert!(
+            !resolved.shared_env().iter().any(|(key, _)| key == SECRET_KEYS_VAR),
+            "a per-host-only playbook must not export a key list"
+        );
+        // The per-host value is still delivered to its host.
+        let mut overlay = Vec::new();
+        resolved.overlay(&mut overlay, "web1");
+        assert_eq!(value_of(&overlay, "TOKEN"), "perhostvalue");
+        Ok(())
+    }
+
     #[test]
     fn short_values_below_the_threshold_are_not_masked() -> TestResult<()> {
         let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
@@ -419,5 +454,40 @@ mod tests {
             "a targeted host without its file must fail closed"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lt_secret_keys_tests {
+    use super::{ResolvedSecrets, SECRET_KEYS_VAR};
+
+    /// A per-host-only playbook must not export an *empty* `LT_SECRET_KEYS`.
+    ///
+    /// `cred-env credstore-install` treats a set-but-empty list as "this
+    /// service has no credentials" and clears the credential store — so an
+    /// empty export would let a per-host playbook destroy the store of the
+    /// target it is deploying to. An absent variable fails closed instead.
+    #[test]
+    fn an_empty_key_list_is_not_exported() {
+        let resolved = ResolvedSecrets {
+            shared: Vec::new(),
+            per_host: Default::default(),
+            masks: Vec::new(),
+            shorts: Vec::new(),
+        };
+        assert!(
+            !resolved.shared_env().iter().any(|(key, _)| key == SECRET_KEYS_VAR),
+            "an empty key list must not be exported"
+        );
+    }
+
+    /// The no-secrets case must not export the variable either.
+    #[test]
+    fn the_empty_resolution_exports_no_key_list() {
+        let resolved = ResolvedSecrets::empty();
+        assert!(
+            !resolved.shared_env().iter().any(|(key, _)| key == SECRET_KEYS_VAR),
+            "the empty resolution must not export a key list"
+        );
     }
 }

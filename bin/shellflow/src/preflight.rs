@@ -27,6 +27,15 @@ pub(crate) fn preflight_check_local() -> Result<(), String> {
     check_tools(&[("bash", &["--version"])])
 }
 
+/// Verify that `ssh` is available.
+///
+/// Used by the subcommands that shell out to `ssh` directly, so a missing
+/// tool is reported as the transport/setup failure it is (exit 3) rather
+/// than as a generic error.
+pub(crate) fn preflight_check_ssh() -> Result<(), String> {
+    check_tools(&[("ssh", &["-V"])])
+}
+
 fn check_tools(tools: &[(&str, &[&str])]) -> Result<(), String> {
     let missing: Vec<&str> = tools
         .iter()
@@ -58,14 +67,19 @@ fn tool_works(name: &str, args: &[&str]) -> bool {
     if args.is_empty() {
         return which(name).is_some();
     }
-    let Ok(mut child) = Command::new(name)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
+    let mut command = Command::new(name);
+    command.args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    // The probe leads its own process group, exactly like every other child
+    // shellflow spawns (design §7.5). Killing only the direct child at the
+    // deadline would leave its descendants running after the CLI exits.
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let Ok(mut child) = command.spawn() else {
         return false;
     };
+    let pid = child.id();
 
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     loop {
@@ -76,6 +90,12 @@ fn tool_works(name: &str, args: &[&str]) -> bool {
             }
             // Still running at the deadline, or the wait itself failed.
             Ok(None) | Err(_) => {
+                // Kill the whole group: the probe may have spawned helpers
+                // of its own, and they must not outlive the preflight.
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
                 let _ = child.kill();
                 let _ = child.wait();
                 return false;
