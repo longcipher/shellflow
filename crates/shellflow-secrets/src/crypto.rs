@@ -7,6 +7,8 @@
 
 use std::io;
 
+use zeroize::Zeroizing;
+
 use crate::error::SecretsError;
 
 /// Encrypt `plain` to every recipient, returning the age file bytes.
@@ -36,6 +38,10 @@ pub fn encrypt_bytes(
 
 /// Decrypt an age file with `identity`, returning the plaintext.
 ///
+/// The plaintext is returned in a [`Zeroizing`] buffer: it is scrubbed when
+/// the buffer is dropped, so the decrypted bytes do not linger in the heap
+/// (and on their way to swap) for the rest of the process lifetime.
+///
 /// # Errors
 ///
 /// Returns [`SecretsError::Decrypt`] when the file is not valid age data or
@@ -43,16 +49,39 @@ pub fn encrypt_bytes(
 pub fn decrypt_bytes(
     cipher: &[u8],
     identity: &age::x25519::Identity,
-) -> Result<Vec<u8>, SecretsError> {
+) -> Result<Zeroizing<Vec<u8>>, SecretsError> {
     let decryptor =
         age::Decryptor::new(cipher).map_err(|err| SecretsError::Decrypt(err.to_string()))?;
     let mut reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
         .map_err(|err| SecretsError::Decrypt(err.to_string()))?;
 
-    let mut plain = Vec::with_capacity(cipher.len());
-    io::copy(&mut reader, &mut plain).map_err(|err| SecretsError::Decrypt(err.to_string()))?;
+    let mut plain = Zeroizing::new(Vec::with_capacity(cipher.len()));
+    io::copy(&mut reader, &mut *plain).map_err(|err| SecretsError::Decrypt(err.to_string()))?;
     Ok(plain)
+}
+
+/// Decrypt an age file with `identity`, returning the plaintext as text.
+///
+/// The plaintext is returned in a [`Zeroizing`] string: it is scrubbed when
+/// the string is dropped, so the decrypted bytes do not linger in the heap
+/// (and on their way to swap) for the rest of the process lifetime.
+///
+/// # Errors
+///
+/// Returns [`SecretsError::Decrypt`] when the file is not valid age data, the
+/// identity cannot open it, or the plaintext is not valid UTF-8.
+pub fn decrypt_string(
+    cipher: &[u8],
+    identity: &age::x25519::Identity,
+) -> Result<Zeroizing<String>, SecretsError> {
+    let mut bytes = decrypt_bytes(cipher, identity)?;
+    // Move the buffer out of the `Zeroizing` wrapper (leaving it empty) so
+    // the string owns it, then wrap the string instead: the plaintext is
+    // still scrubbed exactly once, on drop.
+    let text = String::from_utf8(std::mem::take(&mut *bytes))
+        .map_err(|_| SecretsError::Decrypt("plaintext is not valid UTF-8".to_string()))?;
+    Ok(Zeroizing::new(text))
 }
 
 #[cfg(test)]
@@ -72,7 +101,7 @@ mod tests {
         let plain = b"KEY=value\nSECRET=xyz\n";
         let cipher = encrypt_bytes(plain, &[recipient]).expect("encrypt");
         let round = decrypt_bytes(&cipher, &identity).expect("decrypt");
-        assert_eq!(round, plain);
+        assert_eq!(&*round, plain);
     }
 
     #[test]
@@ -81,8 +110,8 @@ mod tests {
         let b = make_identity();
         let plain = b"hello";
         let cipher = encrypt_bytes(plain, &[a.to_public(), b.to_public()]).expect("encrypt");
-        assert_eq!(decrypt_bytes(&cipher, &a).expect("a"), plain);
-        assert_eq!(decrypt_bytes(&cipher, &b).expect("b"), plain);
+        assert_eq!(&*decrypt_bytes(&cipher, &a).expect("a"), plain);
+        assert_eq!(&*decrypt_bytes(&cipher, &b).expect("b"), plain);
     }
 
     #[test]

@@ -66,9 +66,11 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
 - **Graceful file copies** — `@copy` uses rsync when the target has it (with a
   `mkdir -p` remote wrapper), and automatically falls back to
   `ssh mkdir -p` + `scp` on hosts without rsync. Destination directories are
-  always created. `scp` cannot mirror deletions or filter files, so `--delete`
-  and `--exclude` are reported as ignored on the fallback path rather than
-  silently leaving stale files (or shipping excluded files).
+  always created. `scp` cannot mirror deletions or filter files, so a copy
+  step that asked for `--delete` or `--exclude` **fails closed** on such a
+  host rather than performing a different transfer than the playbook
+  requested. `--allow-unfiltered-copy` accepts the downgrade explicitly (the
+  step then warns that the options were dropped).
 - **Guards & timeouts** — `@only_if <cmd>` skips a block where the
   precondition fails; `--timeout SECS` / `@timeout SECS` kills hung hosts
   (guards included).
@@ -90,9 +92,19 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
   block environment, exports the space-separated key list as
   `LT_SECRET_KEYS`, and masks all values in previews/traces/logs. Targets
   never see the decryption identity. Values shorter than the masking
-  threshold are left alone (a global substring replace would shred unrelated
-  output); the threshold is `--mask-min-len`, else `$SHELLFLOW_MASK_MIN_LEN`,
-  else `6`.
+  threshold are not redacted by a global substring replace (that would shred
+  unrelated output); instead they are redacted only where they stand alone
+  as a token or appear as `KEY=value`, and the run names the affected keys so
+  the exemption is never silent. The threshold is `--mask-min-len`, else
+  `$SHELLFLOW_MASK_MIN_LEN`, else `6`.
+  Redaction is stateful across output lines, so a value that a target program
+  split across two lines (`fold`, a pager, a progress bar) is redacted as a
+  whole instead of leaking two fragments that reassemble into the original.
+  Two residuals are documented rather than implied: redaction is a plaintext
+  match, so a base64/hex rendering of a value is never redacted; and the
+  decrypted values live in the controller's and the child process's memory
+  (visible to the same UID through `/proc/<pid>/environ`, and not
+  `mlock`'d) until the run ends.
 - **Embedded age tooling** — `keys` (generate/public) and `secret`
   (encrypt/decrypt/edit/creds) subcommands manage identities and encrypted env
   files; no `age`/`rage` CLI required on the controller.
@@ -182,6 +194,7 @@ OPTIONS:
       --no-color              Disable ANSI colors
   -i, --identity <PATH>       Age identity for @secrets decryption
       --mask-min-len <N>      Minimum value length to mask for @secrets
+      --allow-unfiltered-copy Accept the scp fallback dropping --delete/--exclude
       --local                 Run remote blocks/copies locally (debugging)
   -h, --help                  Print help
   -V, --version               Print version
@@ -241,6 +254,18 @@ shellflow keys generate -o ~/.config/age/my-project-keys.txt
 shellflow keys public
 # -> age1abc123def456...
 ```
+
+The identity is the master key for every sealed env file the operator owns:
+anyone who can read it can decrypt all of them. `keys generate` writes the
+file `0600`, and **the loader enforces that too** — a group- or
+world-readable identity is refused with an error naming the fix:
+
+```bash
+chmod 600 ~/.config/age/keys.txt
+```
+
+If a lax mode is deliberate (a key on a shared build agent, for instance),
+`SHELLFLOW_ALLOW_UNSAFE_IDENTITY=1` accepts it explicitly.
 
 ### 2. Create an encrypted env file
 

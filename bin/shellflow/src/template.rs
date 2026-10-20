@@ -11,7 +11,7 @@ use std::{collections::HashMap, fs};
 use eyre::{Result, WrapErr, eyre};
 use shellflow_core::{render_template, template_keys};
 use shellflow_secrets::{
-    crypto::decrypt_bytes,
+    crypto::decrypt_string,
     env::parse_env_file,
     identity::{effective_identity_path, load_x25519_identity},
 };
@@ -39,14 +39,13 @@ fn decrypt_env(
     file: &std::path::Path,
     identity: Option<&std::path::Path>,
 ) -> Result<Vec<(String, String)>> {
-    let cipher =
-        fs::read(file).wrap_err_with(|| format!("failed to read secrets file `{}`", file.display()))?;
+    let cipher = fs::read(file)
+        .wrap_err_with(|| format!("failed to read secrets file `{}`", file.display()))?;
     let id_path = effective_identity_path(identity);
     let id = load_x25519_identity(&id_path)
         .map_err(|err| eyre!("{err} (identity: {})", id_path.display()))?;
-    let plain =
-        decrypt_bytes(&cipher, &id).wrap_err_with(|| format!("failed to decrypt `{}`", file.display()))?;
-    let plain = String::from_utf8(plain).wrap_err("decrypted file is not valid UTF-8")?;
+    let plain = decrypt_string(&cipher, &id)
+        .wrap_err_with(|| format!("failed to decrypt `{}`", file.display()))?;
     parse_env_file(&plain).wrap_err("malformed env file")
 }
 
@@ -108,16 +107,12 @@ fn render(args: &TemplateRenderArgs, ui: &Ui) -> Result<()> {
                 // `toml_edit` echoes the offending source line, which may
                 // contain a substituted secret — report location only.
                 let first = err.to_string().lines().next().unwrap_or("parse error").to_string();
-                eyre!(
-                    "rendered output is not valid TOML: {first} (unit would fail to parse it)"
-                )
+                eyre!("rendered output is not valid TOML: {first} (unit would fail to parse it)")
             })?;
         }
         RenderFormat::Json => {
             serde_json::from_str::<serde_json::Value>(&rendered).map_err(|err| {
-                eyre!(
-                    "rendered output is not valid JSON: {err} (unit would fail to parse it)"
-                )
+                eyre!("rendered output is not valid JSON: {err} (unit would fail to parse it)")
             })?;
         }
         RenderFormat::None => {}

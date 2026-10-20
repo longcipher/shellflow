@@ -69,7 +69,7 @@ lines belong to the current block.
 | `@secrets` | `# @secrets <file.env.age> [--identity <PATH>]` | Decrypt an age-encrypted env file at run time; inject every key into the block environment, export the space-separated key list as `LT_SECRET_KEYS`, and mask all values. Identity precedence: the directive's `--identity`, then run-wide `-i`, then `$SHELLFLOW_AGE_IDENTITY`, then `~/.config/age/keys.txt`. Resolution is a hard error without a usable identity |
 | `@local` | `# @local` | Following lines run locally (default) |
 | `@remote` | `# @remote <target>` | Following lines stream to the target (alias, group, raw spec) |
-| `@copy` | `# @copy <src> -> <dst> @<target> [--delete] [--exclude <glob>]` | Copy a local path (rsync, or scp fallback); creates the destination dir; `$VAR` interpolated; `--exclude` is repeatable and honored by rsync (warned as ignored on the scp fallback and in `--local` mode) |
+| `@copy` | `# @copy <src> -> <dst> @<target> [--delete] [--exclude <glob>]` | Copy a local path (rsync, or scp fallback); creates the destination dir; `$VAR` interpolated; `--exclude` is repeatable and honored by rsync. On a host without rsync the scp fallback cannot filter or mirror, so a step that asked for `--delete`/`--exclude` **fails closed** unless `--allow-unfiltered-copy` accepts the downgrade |
 | `@export` | `# @export <VAR>[,<VAR>…]` | Capture variables from the preceding local block into run state |
 | `@timeout` | `# @timeout <seconds>` | Per-step timeout for the next block |
 | `@name` | `# @name <label>` | Name the next block (for `--only`/`--skip`/reporting) |
@@ -155,9 +155,12 @@ cat "${WORKDIR}/marker.txt"
   summary).
 - `SKIPPED` → `@only_if` guard failed on that host (check the guard command
   and whether `@export`ed variables are referenced).
-- A copy step on a minimal host silently uses the `scp` fallback; `-vv` shows
-  which path was taken (`remote rsync: present|missing`) and the fallback
-  warns that `--delete` cannot be mirrored.
+- A copy step on a minimal host uses the `scp` fallback; `-vv` shows
+  which path was taken (`remote rsync: present|missing`). If the step asked
+  for `--delete` or `--exclude`, the fallback **cannot** honour it and the
+  step fails (exit 1) rather than shipping excluded files or leaving stale
+  ones; install rsync on the target, or pass `--allow-unfiltered-copy` to
+  accept the downgrade explicitly.
 - Payload previews are masked with `***` where secrets appear — that is
   expected.
 
@@ -192,6 +195,7 @@ OPTIONS:
       --no-color              Disable ANSI colors
   -i, --identity <PATH>       Age identity for @secrets decryption
       --mask-min-len <N>      Minimum value length to mask for @secrets
+      --allow-unfiltered-copy Accept the scp fallback dropping --delete/--exclude
       --local                 Run remote blocks/copies locally (debugging)
   -h, --help                  Print help
   -V, --version               Print version
@@ -262,6 +266,18 @@ shellflow keys generate -o ~/.config/age/my-project-keys.txt
 shellflow keys public
 # -> age1abc123def456...
 ```
+
+The identity is the master key for every sealed env file the operator owns:
+anyone who can read it can decrypt all of them. `keys generate` writes the
+file `0600`, and the loader enforces that too — a group- or
+world-readable identity is refused with an error naming the fix:
+
+```bash
+chmod 600 ~/.config/age/keys.txt
+```
+
+If a lax mode is deliberate, `SHELLFLOW_ALLOW_UNSAFE_IDENTITY=1` accepts it
+explicitly.
 
 ### 2. Create an encrypted env file
 

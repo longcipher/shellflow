@@ -385,15 +385,24 @@ fn copy_exclude_passes_globs_to_rsync() -> TestResult<()> {
 }
 
 #[test]
-fn copy_exclude_warns_on_scp_fallback() -> TestResult<()> {
-    // The scp fallback cannot filter files; the warning must be visible
-    // instead of silently shipping excluded files.
+fn copy_exclude_fails_closed_without_rsync() -> TestResult<()> {
+    // The scp fallback cannot filter files. Shipping the excluded files anyway
+    // (while the step reports success) is worse than failing, so the copy
+    // step fails closed unless the operator explicitly accepts the downgrade.
     let sb = Sandbox::new("exclude-scp")?;
     let script = sb.script(
         "# @server norsync1 norsync@h1\n\
          # @copy ./out -> /srv/app @norsync1 --exclude *.env.age\n",
     )?;
     let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 1, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let combined =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(combined.contains("--allow-unfiltered-copy"), "hint missing: {combined}");
+    assert!(sb.scp_log().is_empty(), "the fallback must not run: {}", sb.scp_log());
+
+    // With the opt-out, the downgrade is accepted and reported.
+    let out = sb.run(&script, &["--allow-unfiltered-copy"])?;
     assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let combined =
         format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1216,14 +1225,25 @@ fn mask_min_len_env_var_controls_secrets_masking() -> TestResult<()> {
     ])?;
     let script = sb.script(&format!("# @secrets {}\n# @local\necho \"v=$S\"\n", age.display()))?;
 
-    // Default threshold (6): a 3-char value is left alone.
+    // Default threshold (6): a 3-char value is below it, so it is not
+    // redacted by a global substring replace — but it is still a secret, so
+    // it is redacted where it stands alone as a token.
     let out =
         run_with_env(&script, &["--local", "-i", &key.display().to_string()], &sb.mock_dir(), &[])?;
     assert_eq!(status_code(&out), 0, "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("v=abc"), "short value must not be masked by default: {stdout}");
+    assert!(stdout.contains("v=***"), "short value must be redacted: {stdout}");
+    assert!(!stdout.contains("v=abc"), "short value leaked: {stdout}");
 
-    // `SHELLFLOW_MASK_MIN_LEN=3`: now it is masked.
+    // The run names the exempted key so the operator knows which credential to
+    // look at (never the value itself).
+    assert!(
+        stdout.contains("shorter than the masking threshold"),
+        "the exemption must be surfaced: {stdout}"
+    );
+    assert!(!stdout.contains("abc"), "the value must never be printed: {stdout}");
+
+    // `SHELLFLOW_MASK_MIN_LEN=3`: masked by the global replace as well.
     let out = run_with_env(
         &script,
         &["--local", "-i", &key.display().to_string()],
@@ -1322,19 +1342,45 @@ fn preflight_reports_missing_scp() -> TestResult<()> {
 }
 
 #[test]
-fn scp_fallback_warns_that_delete_is_ignored() -> TestResult<()> {
-    // `scp` cannot mirror deletions. Silently ignoring `--delete` would leave
-    // stale files on the target while reporting a successful "mirror".
+fn scp_fallback_fails_closed_when_delete_cannot_be_mirrored() -> TestResult<()> {
+    // `scp` cannot mirror deletions. Ignoring `--delete` would leave stale
+    // files on the target while reporting a successful "mirror", so the step
+    // fails closed unless the operator accepts the downgrade.
     let sb = Sandbox::new("scpdelete")?;
     let script = sb.script(
         "# @server norsync1 norsync@h1\n\
          # @copy ./out -> /srv/app @norsync1 --delete\n",
     )?;
     let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 1, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--delete"), "must say which option was dropped: {stdout}");
+    assert!(stdout.contains("--allow-unfiltered-copy"), "must name the opt-out: {stdout}");
+
+    // With the opt-out, the downgrade is accepted and reported.
+    let out = sb.run(&script, &["--allow-unfiltered-copy"])?;
     assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("--delete"), "must warn that --delete is dropped: {stdout}");
     assert!(stdout.contains("ignored"), "must warn that --delete is dropped: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn ssh_is_always_non_interactive() -> TestResult<()> {
+    // The secrets-carrying ssh path must never be able to prompt: an unknown
+    // host key or a missing key has to fail closed, not wait for an operator
+    // who may approve a rogue key.
+    let sb = Sandbox::new("batchmode")?;
+    let script = sb.script(
+        "# @server ok1 ok@h1\n\
+         # @remote ok1\n\
+         echo hi\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = sb.ssh_log();
+    assert!(log.contains("BatchMode=yes"), "ssh must be non-interactive: {log}");
     Ok(())
 }
 
@@ -1367,9 +1413,9 @@ fn guard_is_visible_at_verbose_two() -> TestResult<()> {
 /// orphan. On Linux the process state is authoritative; elsewhere fall back to
 /// the signal probe.
 fn pid_running(pid: i32) -> bool {
-    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) &&
-        let Some((_, rest)) = stat.rsplit_once(") ") &&
-        let Some(state) = rest.chars().next()
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
+        && let Some((_, rest)) = stat.rsplit_once(") ")
+        && let Some(state) = rest.chars().next()
     {
         return state != 'Z';
     }

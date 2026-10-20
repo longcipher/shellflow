@@ -24,9 +24,17 @@ for arg in "$@"; do
 done
 
 # The destination is the first non-flag argument (e.g. `ssh host -T bash -s`).
+# Options that take a separate value (`-o BatchMode=yes`) must not be mistaken
+# for the destination, so the value is skipped too.
 host=""
+skip_next=0
 for arg in "$@"; do
+  if [[ "$skip_next" == "1" ]]; then
+    skip_next=0
+    continue
+  fi
   case "$arg" in
+    -o|-p|-i|-F|-l|-c|-m|-b|-D|-L|-R|-W|-e|-S|-J|-I) skip_next=1 ;;
     -*) ;;
     *)
       host="$arg"
