@@ -107,6 +107,12 @@ pub(crate) struct RunFlags {
     #[arg(short = 'i', long, value_name = "PATH")]
     pub identity: Option<PathBuf>,
 
+    /// Reuse SSH connections within a run (`ControlMaster=auto`,
+    /// `ControlPersist=60s`). Faster for many small steps; off by default
+    /// so a stale master socket can never break a deploy silently.
+    #[arg(long)]
+    pub ssh_reuse: bool,
+
     /// Minimum value length to mask for values sourced from `@secrets` files.
     ///
     /// Defaults to `$SHELLFLOW_MASK_MIN_LEN`, or 6 when that is unset or
@@ -182,6 +188,10 @@ pub(crate) enum SecretCmd {
     /// Check that every `<host>.env.age` in a service directory shares the
     /// same key set (units are shared across hosts, so drift breaks deploys).
     KeysCheck(SecretKeysCheckArgs),
+    /// Find identical credential *values* shared across files (by hash —
+    /// values are never printed). Shared values mean shared rotation:
+    /// rotating one file without the others silently breaks the rest.
+    FindDuplicates(SecretFindDuplicatesArgs),
 }
 
 /// Arguments for `secret keys-check`.
@@ -193,6 +203,18 @@ pub(crate) struct SecretKeysCheckArgs {
 
     /// Service directory containing `<host>.env.age` files.
     #[arg(value_name = "DIR")]
+    pub dir: PathBuf,
+}
+
+/// Arguments for `secret find-duplicates`.
+#[derive(Debug, Args)]
+pub(crate) struct SecretFindDuplicatesArgs {
+    /// Identity file to decrypt with.
+    #[arg(short = 'i', long, value_name = "PATH")]
+    pub identity: Option<PathBuf>,
+
+    /// Directory tree to scan for `*.env.age` files (default: current dir).
+    #[arg(value_name = "DIR", default_value = ".")]
     pub dir: PathBuf,
 }
 
@@ -291,6 +313,11 @@ pub(crate) enum TemplateCmd {
     /// Check that every `${KEY}` placeholder in a template exists in an
     /// encrypted env file (the manifest `cred-env render` needs at runtime).
     Check(TemplateCheckArgs),
+    /// Decrypt, substitute, and validate a template entirely in memory
+    /// (nothing is written). Catches structural accidents — a dropped
+    /// newline that joins two TOML lines, an unclosed quote — that `check`
+    /// cannot see because it only compares key sets.
+    Render(TemplateRenderArgs),
 }
 
 /// Arguments for `template check`.
@@ -305,6 +332,38 @@ pub(crate) struct TemplateCheckArgs {
     pub template: PathBuf,
 
     /// Encrypted env file providing the credential keys.
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+}
+
+/// Output format for `template render` validation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum RenderFormat {
+    /// TOML (also accepts JSON5-ish superset constructs toml_edit tolerates).
+    Toml,
+    /// Strict JSON.
+    Json,
+    /// Substitute only; skip structural validation.
+    #[default]
+    None,
+}
+
+/// Arguments for `template render`.
+#[derive(Debug, Args)]
+pub(crate) struct TemplateRenderArgs {
+    /// Identity file to decrypt the env file with.
+    #[arg(short = 'i', long, value_name = "PATH")]
+    pub identity: Option<PathBuf>,
+
+    /// Validate the rendered output as this format (default: none).
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    pub format: RenderFormat,
+
+    /// Template file with `${KEY}` placeholders.
+    #[arg(value_name = "TEMPLATE")]
+    pub template: PathBuf,
+
+    /// Encrypted env file providing the credential values.
     #[arg(value_name = "FILE")]
     pub file: PathBuf,
 }
@@ -405,12 +464,40 @@ pub(crate) struct ServiceArgs {
     pub command: ServiceCmd,
 }
 
+/// Arguments for `shellflow audit`.
+#[derive(Debug, Args)]
+pub(crate) struct AuditArgs {
+    /// Repository root to scan (default: current directory).
+    #[arg(value_name = "PATH", default_value = ".")]
+    pub path: PathBuf,
+}
 /// The `service` subcommands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum ServiceCmd {
     /// Scaffold a new service in the flat layout (config template, systemd
     /// unit, deploy playbook skeleton) in the current repository.
     Init(ServiceInitArgs),
+    /// Audit a deployed systemd unit over SSH (read-only): argv/env secret
+    /// exposure, credential wiring, listening sockets, journal leak scan.
+    Check(ServiceCheckArgs),
+}
+
+/// Scaffold pattern: which credential/deployment shape to generate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum ServicePattern {
+    /// Config-file render + env export (third-party apps reading files).
+    #[default]
+    Full,
+    /// Env export only, no config template (apps reading env vars).
+    Exec,
+    /// No secrets at all (verbatim unit takeover + management playbook).
+    NoSecret,
+    /// Podman quadlet container with env-file render.
+    Container,
+    /// One-shot task (+ optional `--timer` schedule).
+    Oneshot,
+    /// Verbatim takeover that never starts the unit (dormant strategies).
+    NoStart,
 }
 
 /// Arguments for `service init`.
@@ -423,6 +510,30 @@ pub(crate) struct ServiceInitArgs {
     /// Host alias this service deploys to (repeatable; default `api`).
     #[arg(long = "host", value_name = "HOST")]
     pub hosts: Vec<String>,
+
+    /// Scaffold pattern (default: full).
+    #[arg(long, value_enum, value_name = "PATTERN", default_value_t = ServicePattern::Full)]
+    pub pattern: ServicePattern,
+
+    /// For `--pattern oneshot`: also scaffold a timer with this schedule.
+    #[arg(long, value_name = "SCHEDULE")]
+    pub timer: Option<String>,
+}
+
+/// Arguments for `service check`.
+#[derive(Debug, Args)]
+pub(crate) struct ServiceCheckArgs {
+    /// Service name (systemd unit `<svc>.service` on the target).
+    #[arg(value_name = "SVC")]
+    pub service: String,
+
+    /// SSH target (alias, `[user@]host[:port]`, or `~/.ssh/config` entry).
+    #[arg(long = "host", value_name = "HOST")]
+    pub host: String,
+
+    /// Also grep this many journal lines for secret-value shapes (default 50).
+    #[arg(long, value_name = "N", default_value_t = 50)]
+    pub journal_lines: usize,
 }
 
 /// The top-level CLI: a `run` subcommand (also the default via the bare
@@ -457,6 +568,8 @@ pub(crate) enum Command {
     CredEnv(CredEnvArgs),
     /// Scaffold new services in the flat repository layout.
     Service(ServiceArgs),
+    /// Scan a repository for secret-shaped plaintext (pre-commit gate).
+    Audit(AuditArgs),
 }
 
 impl RunArgs {
@@ -695,6 +808,55 @@ mod tests {
                     assert_eq!(i.service, "myapp");
                     assert_eq!(i.hosts, vec!["api".to_string(), "trade".to_string()]);
                 }
+                super::ServiceCmd::Check(_) => {
+                    panic!("expected init subcommand")
+                }
+            },
+            other => panic!("expected service subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_check_parses() {
+        let cli = Cli::parse_from(["shellflow", "service", "check", "webhook", "--host", "api"]);
+        match cli.command {
+            Some(Command::Service(service)) => match service.command {
+                super::ServiceCmd::Check(a) => {
+                    assert_eq!(a.service, "webhook");
+                    assert_eq!(a.host, "api");
+                    assert_eq!(a.journal_lines, 50);
+                }
+                super::ServiceCmd::Init(_) => {
+                    panic!("expected check subcommand")
+                }
+            },
+            other => panic!("expected service subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_init_pattern_parses() {
+        let cli = Cli::parse_from([
+            "shellflow",
+            "service",
+            "init",
+            "myapp",
+            "--pattern",
+            "container",
+            "--host",
+            "api",
+        ]);
+        match cli.command {
+            Some(Command::Service(service)) => match service.command {
+                super::ServiceCmd::Init(i) => {
+                    assert!(matches!(
+                        i.pattern,
+                        super::ServicePattern::Container
+                    ));
+                }
+                super::ServiceCmd::Check(_) => {
+                    panic!("expected init subcommand")
+                }
             },
             other => panic!("expected service subcommand, got {other:?}"),
         }
@@ -736,6 +898,39 @@ mod tests {
                     );
                     assert_eq!(a.template.to_string_lossy(), "services/zenoh/zenoh.json5.tmpl");
                     assert_eq!(a.file.to_string_lossy(), "services/zenoh/api.env.age");
+                }
+                super::TemplateCmd::Render(_) => {
+                    panic!("expected check subcommand")
+                }
+            },
+            other => panic!("expected template subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_render_parses() {
+        let cli = Cli::parse_from([
+            "shellflow",
+            "template",
+            "render",
+            "--format",
+            "toml",
+            "-i",
+            "/keys.txt",
+            "services/zenoh/zenoh.json5.tmpl",
+            "services/zenoh/api.env.age",
+        ]);
+        match cli.command {
+            Some(Command::Template(template)) => match template.command {
+                super::TemplateCmd::Render(a) => {
+                    assert!(matches!(
+                        a.format,
+                        super::RenderFormat::Toml
+                    ));
+                    assert_eq!(a.template.to_string_lossy(), "services/zenoh/zenoh.json5.tmpl");
+                }
+                super::TemplateCmd::Check(_) => {
+                    panic!("expected render subcommand")
                 }
             },
             other => panic!("expected template subcommand, got {other:?}"),

@@ -14,16 +14,19 @@
 #![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used, clippy::expect_used))]
 #![cfg_attr(test, allow(clippy::pedantic, clippy::nursery))]
 
+mod audit;
 mod cli;
 mod cred_env;
 mod emit;
 mod executor;
 mod fsx;
 mod keys;
+mod lint;
 mod preflight;
 mod secret;
 mod secrets;
 mod service;
+mod service_check;
 mod template;
 mod ui;
 
@@ -90,6 +93,13 @@ async fn main() -> Result<()> {
             }
         },
         Some(Command::Service(cmd)) => match service::run(&cmd.command) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                1
+            }
+        },
+        Some(Command::Audit(cmd)) => match audit::audit(cmd) {
             Ok(()) => 0,
             Err(err) => {
                 eprintln!("error: {err:#}");

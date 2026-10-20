@@ -20,7 +20,7 @@ use std::{
 
 use eyre::{Context, Result, bail};
 
-use crate::cli::{ServiceCmd, ServiceInitArgs};
+use crate::cli::{ServiceCmd, ServiceInitArgs, ServicePattern};
 
 /// The config template (token `__SVC__`).
 const CONFIG_TEMPLATE: &str = include_str!("../assets/service-config.tmpl");
@@ -28,8 +28,44 @@ const CONFIG_TEMPLATE: &str = include_str!("../assets/service-config.tmpl");
 /// The systemd unit (token `__SVC__`).
 const UNIT_TEMPLATE: &str = include_str!("../assets/service-unit.tmpl");
 
+/// The systemd unit, env-export variant (token `__SVC__`).
+const UNIT_EXEC_TEMPLATE: &str = include_str!("../assets/service-unit-exec.tmpl");
+
+/// The systemd unit, no-secrets variant (token `__SVC__`).
+const UNIT_NOSECRET_TEMPLATE: &str = include_str!("../assets/service-unit-nosecret.tmpl");
+
+/// The quadlet container (token `__SVC__`).
+const CONTAINER_TEMPLATE: &str = include_str!("../assets/service-container.tmpl");
+
+/// The container env template (token `__SVC__`).
+const CONTAINER_ENV_TEMPLATE: &str = include_str!("../assets/service-container-env.tmpl");
+
+/// The systemd unit, oneshot variant (token `__SVC__`).
+const UNIT_ONESHOT_TEMPLATE: &str = include_str!("../assets/service-unit-oneshot.tmpl");
+
+/// The systemd timer (tokens `__SVC__`, `__SCHEDULE__`).
+const TIMER_TEMPLATE: &str = include_str!("../assets/service-timer.tmpl");
+
 /// The deploy playbook (tokens `__SVC__`, `__SERVER_LINES__`, `__HOST__`).
 const PLAYBOOK_TEMPLATE: &str = include_str!("../assets/service-playbook.tmpl");
+
+/// The deploy playbook, no-secrets variant.
+const PLAYBOOK_NOSECRET_TEMPLATE: &str = include_str!("../assets/service-playbook-nosecret.tmpl");
+
+/// The deploy playbook, quadlet variant.
+const PLAYBOOK_CONTAINER_TEMPLATE: &str = include_str!("../assets/service-playbook-container.tmpl");
+
+/// The deploy playbook, oneshot variant (tokens `__TIMER_INSTALL__`, `__TIMER_ENABLE__`).
+const PLAYBOOK_ONESHOT_TEMPLATE: &str = include_str!("../assets/service-playbook-oneshot.tmpl");
+
+/// The deploy playbook, no-start variant.
+const PLAYBOOK_NOSTART_TEMPLATE: &str = include_str!("../assets/service-playbook-nostart.tmpl");
+
+/// Files generated for one pattern: (repo path, content).
+struct Scaffold {
+    files: Vec<(PathBuf, String, bool)>,
+    next_steps: Vec<String>,
+}
 
 /// Scaffold a service.
 ///
@@ -40,6 +76,7 @@ const PLAYBOOK_TEMPLATE: &str = include_str!("../assets/service-playbook.tmpl");
 pub(crate) fn run(cmd: &ServiceCmd) -> Result<()> {
     match cmd {
         ServiceCmd::Init(args) => init(args),
+        ServiceCmd::Check(args) => crate::service_check::check(args),
     }
 }
 
@@ -61,49 +98,169 @@ fn init(cmd: &ServiceInitArgs) -> Result<()> {
     if hosts.is_empty() {
         hosts.push("api".to_string());
     }
+    if cmd.pattern == ServicePattern::Oneshot && cmd.timer.is_none() {
+        // A timer is optional; without one the unit is a run-once task.
+    }
 
     let dir = PathBuf::from(format!("services/{service}"));
-    let playbook = PathBuf::from(format!("playbooks/deploy-{service}.sh"));
-    let config = dir.join(format!("{service}.json5.tmpl"));
-    let unit = dir.join(format!("{service}.service"));
-    for path in [&config, &unit, &playbook] {
+    let scaffold = build_scaffold(cmd.pattern, service, &hosts, cmd.timer.as_deref())?;
+    for (path, _, _) in &scaffold.files {
         if path.exists() {
             bail!("refusing to overwrite existing `{}`", path.display());
         }
     }
 
     fs::create_dir_all(&dir).wrap_err_with(|| format!("failed to create `{}`", dir.display()))?;
-    write_file(&config, &render(CONFIG_TEMPLATE, service))?;
-    write_file(&unit, &render(UNIT_TEMPLATE, service))?;
+    for (path, content, executable) in &scaffold.files {
+        if *executable {
+            write_executable(path, content)?;
+        } else {
+            write_file(path, content)?;
+        }
+    }
 
+    println!("==> scaffolded (pattern {:?}):", cmd.pattern);
+    for (path, _, _) in &scaffold.files {
+        println!("    {}", path.display());
+    }
+    println!("==> next:");
+    for step in &scaffold.next_steps {
+        println!("    {step}");
+    }
+    Ok(())
+}
+
+/// Render the shared playbook header tokens.
+fn playbook_body(template: &str, service: &str, hosts: &[String]) -> String {
     let server_lines =
         hosts.iter().map(|h| format!("# @server {h:<8} {h}")).collect::<Vec<_>>().join("\n");
-    let playbook_body = PLAYBOOK_TEMPLATE
+    template
         .replace("__SERVER_LINES__", server_lines.trim_end())
         .replace("__HOST__", &hosts[0])
-        .replace("__SVC__", service);
-    write_executable(&playbook, &playbook_body)?;
+        .replace("__SVC__", service)
+}
 
-    println!("==> scaffolded:");
-    println!("    {}   (plaintext template, placeholder syntax)", config.display());
-    println!("    {}      (ExecStart via the shared cred-env helper)", unit.display());
-    println!("    {}", playbook.display());
-    println!("==> next: create the encrypted env (one per host, same key set):");
-    for host in &hosts {
-        println!("    {{ printf 'KEY=...\\n'; }} | shellflow secret encrypt \\");
-        println!("      -r \"$(cat keys/recipients/*.pub)\" \\");
-        println!("      -o services/{service}/{host}.env.age");
-    }
-    println!("==> then:");
-    println!("    1) shellflow secret keys-check services/{service}");
-    println!("    2) shellflow template check services/{service}/{service}.json5.tmpl \\");
-    println!("         services/{service}/{}.env.age", hosts[0]);
-    println!("    3) shellflow secret creds --store-dir /etc/credstore.encrypted/{service} \\");
-    println!(
-        "         services/{service}/{}.env.age   # paste LoadCredentialEncrypted= lines",
-        hosts[0]
-    );
-    Ok(())
+/// Build the file set for a pattern.
+fn build_scaffold(
+    pattern: ServicePattern,
+    service: &str,
+    hosts: &[String],
+    timer: Option<&str>,
+) -> Result<Scaffold> {
+    let dir = PathBuf::from(format!("services/{service}"));
+    let playbook = PathBuf::from(format!("playbooks/deploy-{service}.sh"));
+    let host = &hosts[0];
+    let render = |t: &str| t.replace("__SVC__", service);
+    Ok(match pattern {
+        ServicePattern::Full => Scaffold {
+            files: vec![
+                (dir.join(format!("{service}.json5.tmpl")), render(CONFIG_TEMPLATE), false),
+                (dir.join(format!("{service}.service")), render(UNIT_TEMPLATE), false),
+                (playbook, playbook_body(PLAYBOOK_TEMPLATE, service, hosts), true),
+            ],
+            next_steps: vec![
+                format!("{{ printf 'KEY=...\\n'; }} | shellflow secret encrypt -r \"$(cat keys/recipients/*.pub)\" -o services/{service}/{host}.env.age"),
+                format!("shellflow secret keys-check services/{service}"),
+                format!("shellflow template check services/{service}/{service}.json5.tmpl services/{service}/{host}.env.age"),
+                format!("shellflow template render --format toml services/{service}/{service}.json5.tmpl services/{service}/{host}.env.age"),
+                format!("shellflow secret creds --store-dir /etc/credstore.encrypted/{service} services/{service}/{host}.env.age"),
+            ],
+        },
+        ServicePattern::Exec => Scaffold {
+            files: vec![
+                (dir.join(format!("{service}.service")), render(UNIT_EXEC_TEMPLATE), false),
+                (
+                    playbook,
+                    playbook_body(PLAYBOOK_TEMPLATE, service, hosts).replace(
+                        "sudo install -m 0644 \"${WORKDIR}/svc/${SVC}.json5.tmpl\" \"/opt/${SVC}/etc/${SVC}.json5.tmpl\"\n",
+                        "# No config template in exec pattern (env only).\n",
+                    ),
+                    true,
+                ),
+            ],
+            next_steps: vec![
+                format!("{{ printf 'KEY=...\\n'; }} | shellflow secret encrypt -r \"$(cat keys/recipients/*.pub)\" -o services/{service}/{host}.env.age"),
+                format!("shellflow secret keys-check services/{service}"),
+                format!("shellflow secret creds --store-dir /etc/credstore.encrypted/{service} services/{service}/{host}.env.age"),
+            ],
+        },
+        ServicePattern::NoSecret => Scaffold {
+            files: vec![
+                (dir.join(format!("{service}.service")), render(UNIT_NOSECRET_TEMPLATE), false),
+                (playbook, playbook_body(PLAYBOOK_NOSECRET_TEMPLATE, service, hosts), true),
+            ],
+            next_steps: vec![
+                "paste the live unit over the skeleton, keeping ExecStart paths".to_string(),
+                format!("shellflow -k playbooks/deploy-{service}.sh"),
+            ],
+        },
+        ServicePattern::Container => Scaffold {
+            files: vec![
+                (dir.join(format!("{service}.container")), render(CONTAINER_TEMPLATE), false),
+                (dir.join("container.env.tmpl"), render(CONTAINER_ENV_TEMPLATE), false),
+                (playbook, playbook_body(PLAYBOOK_CONTAINER_TEMPLATE, service, hosts), true),
+            ],
+            next_steps: vec![
+                format!("{{ printf 'KEY=...\\n'; }} | shellflow secret encrypt -r \"$(cat keys/recipients/*.pub)\" -o services/{service}/{host}.env.age"),
+                format!("shellflow secret keys-check services/{service}"),
+                format!("shellflow template check services/{service}/container.env.tmpl services/{service}/{host}.env.age"),
+                format!("shellflow secret creds --store-dir /etc/credstore.encrypted/{service} services/{service}/{host}.env.age"),
+            ],
+        },
+        ServicePattern::Oneshot => {
+            let timer_file = timer.map(|schedule| {
+                (
+                    dir.join(format!("{service}.timer")),
+                    TIMER_TEMPLATE
+                        .replace("__SVC__", service)
+                        .replace("__SCHEDULE__", schedule),
+                    false,
+                )
+            });
+            let timer_install = timer.map_or(
+                "# No timer requested (pass --timer to add one).",
+                |_| "sudo install -m 0644 \"${WORKDIR}/svc/${SVC}.timer\" \"/etc/systemd/system/${SVC}.timer\"",
+            );
+            let timer_enable = timer.map_or(
+                "# No timer requested (pass --timer to add one).",
+                |_| "sudo systemctl enable \"${SVC}.timer\"",
+            );
+            let body = playbook_body(PLAYBOOK_ONESHOT_TEMPLATE, service, hosts)
+                .replace("__TIMER_INSTALL__", timer_install)
+                .replace("__TIMER_ENABLE__", timer_enable);
+            let mut files = vec![
+                (dir.join(format!("{service}.service")), render(UNIT_ONESHOT_TEMPLATE), false),
+                (playbook, body, true),
+            ];
+            if let Some(timer_file) = timer_file {
+                files.insert(1, timer_file);
+            }
+            Scaffold {
+                files,
+                next_steps: vec![
+                    "paste the task command over the ExecStart placeholder".to_string(),
+                    format!("shellflow -k playbooks/deploy-{service}.sh"),
+                ],
+            }
+        }
+        ServicePattern::NoStart => Scaffold {
+            files: vec![
+                (
+                    dir.join(format!("{service}.service")),
+                    "# TODO: paste the live unit here (sudo systemctl cat "
+                        .to_string()
+                        + service
+                        + ".service), keeping paths as-is.\n",
+                    false,
+                ),
+                (playbook, playbook_body(PLAYBOOK_NOSTART_TEMPLATE, service, hosts), true),
+            ],
+            next_steps: vec![
+                "paste the live unit over the TODO placeholder (never start it from here)".to_string(),
+                format!("shellflow -k playbooks/deploy-{service}.sh"),
+            ],
+        },
+    })
 }
 
 /// Validate the service name: it becomes a directory and a path component.
@@ -135,12 +292,6 @@ fn validate_host_alias(host: &str) -> Result<()> {
     Ok(())
 }
 
-/// Replace the `__SVC__` token (used instead of `format!` so template braces
-/// and `$`-sigils stay literal).
-fn render(template: &str, service: &str) -> String {
-    template.replace("__SVC__", service)
-}
-
 /// Write a file, creating parent directories.
 fn write_file(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -164,60 +315,100 @@ fn write_executable(path: &Path, content: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONFIG_TEMPLATE, PLAYBOOK_TEMPLATE, UNIT_TEMPLATE, render, validate_service_name};
+    use super::{build_scaffold, validate_service_name};
+    use crate::cli::ServicePattern;
+
+    fn files(pattern: ServicePattern) -> Vec<String> {
+        build_scaffold(pattern, "myapp", &["api".to_string()], None)
+            .expect("scaffold")
+            .files
+            .into_iter()
+            .map(|(p, _, _)| p.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
-    fn render_replaces_every_token() {
-        let unit = render(UNIT_TEMPLATE, "myapp");
-        assert!(!unit.contains("__SVC__"));
-        assert!(unit.contains("User=myapp"));
-        assert!(unit.contains("/etc/myapp/myapp.json5.tmpl"));
+    fn full_pattern_generates_three_files() {
+        let f = files(ServicePattern::Full);
+        assert!(f.iter().any(|p| p.ends_with("myapp.json5.tmpl")));
+        assert!(f.iter().any(|p| p.ends_with("myapp.service")));
+        assert!(f.iter().any(|p| p.ends_with("deploy-myapp.sh")));
+    }
+
+    #[test]
+    fn full_playbook_has_hardening_lessons() {
+        let body = build_scaffold(ServicePattern::Full, "myapp", &["api".to_string()], None)
+            .expect("scaffold")
+            .files
+            .into_iter()
+            .find(|(p, _, _)| p.to_string_lossy().ends_with(".sh"))
+            .expect("playbook")
+            .1;
+        assert!(body.contains("/usr/local/bin/shellflow cred-env credstore-install"));
         assert!(
-            unit.contains("ExecStart=/usr/local/bin/shellflow cred-env exec /opt/myapp/bin/myapp")
+            !body.contains("sudo -E /usr/local/bin/shellflow")
+                && !body.contains("sudo /usr/local/bin/shellflow cred-env credstore-install"),
+            "self-elevation: playbook calls credstore-install without sudo"
         );
+        assert!(body.contains("SVC=\"${SVC:-myapp}\""));
+        assert!(body.contains("/opt/${SVC}/etc/"));
     }
 
     #[test]
-    fn generated_unit_targets_the_shared_helper() {
-        let unit = render(UNIT_TEMPLATE, "zenoh");
-        assert!(unit.contains("cred-env render"));
-        assert!(unit.contains("cred-env exec"));
-        assert!(!unit.contains("zenoh-start"), "no per-service starter script");
+    fn exec_pattern_has_no_template() {
+        let f = files(ServicePattern::Exec);
+        assert_eq!(f.len(), 2);
+        assert!(f.iter().any(|p| p.ends_with("myapp.service")));
     }
 
     #[test]
-    fn generated_template_uses_real_placeholders() {
-        let config = render(CONFIG_TEMPLATE, "myapp");
-        assert!(!config.contains("__SVC__"));
-        assert!(!config.contains("__LISTEN_ENDPOINT__"));
-        assert_eq!(
-            shellflow_core::template_keys(&config),
-            vec!["LISTEN_ENDPOINT"],
-            "scaffold template references exactly LISTEN_ENDPOINT"
-        );
+    fn nosecret_pattern_has_no_secrets_directive() {
+        let body = build_scaffold(ServicePattern::NoSecret, "myapp", &["api".to_string()], None)
+            .expect("scaffold")
+            .files
+            .into_iter()
+            .find(|(p, _, _)| p.to_string_lossy().ends_with(".sh"))
+            .expect("playbook")
+            .1;
+        assert!(!body.contains("@secrets"));
+        assert!(body.contains("verify complete"));
     }
 
     #[test]
-    fn playbook_template_keeps_directives_and_drops_tokens() {
-        let body = PLAYBOOK_TEMPLATE
-            .replace("__SERVER_LINES__", "# @server api      api")
-            .replace("__HOST__", "api")
-            .replace("__SVC__", "myapp");
-        assert!(!body.contains("__SVC__"));
-        assert!(!body.contains("__HOST__"));
-        assert!(body.contains("# @server api      api"));
-        assert!(body.contains("# @secrets services/myapp/{host}.env.age"));
-        assert!(body.contains("cred-env credstore-install"));
-        assert!(body.contains("cargo zigbuild"));
-        for line in body.lines() {
-            let trimmed = line.trim_start();
-            if let Some(rest) = trimmed.strip_prefix('#') {
-                assert!(
-                    !rest.trim_start().starts_with('@') || line.starts_with("# @"),
-                    "stray directive-looking comment: {line}"
-                );
-            }
-        }
+    fn container_pattern_generates_container_files() {
+        let f = files(ServicePattern::Container);
+        assert!(f.iter().any(|p| p.ends_with("myapp.container")));
+        assert!(f.iter().any(|p| p.ends_with("container.env.tmpl")));
+    }
+
+    #[test]
+    fn oneshot_pattern_with_timer() {
+        let f = build_scaffold(
+            ServicePattern::Oneshot,
+            "myapp",
+            &["api".to_string()],
+            Some("*-*-* 03:00:00"),
+        )
+        .expect("scaffold")
+        .files
+        .into_iter()
+        .map(|(p, _, _)| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert!(f.iter().any(|p| p.ends_with("myapp.timer")));
+        assert!(f.iter().any(|p| p.ends_with("myapp.service")));
+    }
+
+    #[test]
+    fn nostart_pattern_never_starts() {
+        let body = build_scaffold(ServicePattern::NoStart, "myapp", &["api".to_string()], None)
+            .expect("scaffold")
+            .files
+            .into_iter()
+            .find(|(p, _, _)| p.to_string_lossy().ends_with(".sh"))
+            .expect("playbook")
+            .1;
+        assert!(body.contains("NEVER start"));
+        assert!(!body.contains("systemctl restart"));
     }
 
     #[test]

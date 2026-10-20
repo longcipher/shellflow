@@ -14,8 +14,9 @@ RuntimeDirectory=__SVC__
 RuntimeDirectoryMode=0700
 
 # For third-party apps needing a config file: render the plaintext template
-# (no secret values) into tmpfs; delete this line if not needed
-ExecStartPre=/usr/local/bin/shellflow cred-env render /etc/__SVC__/__SVC__.json5.tmpl /run/__SVC__/__SVC__.json5
+# (no secret values, lives at /opt/__SVC__/etc/) into tmpfs; delete this
+# line (and the RuntimeDirectory pair above) if the app only needs env vars.
+ExecStartPre=/usr/local/bin/shellflow cred-env render /opt/__SVC__/etc/__SVC__.json5.tmpl /run/__SVC__/__SVC__.json5
 
 # Shared helper (installed to /usr/local/bin/shellflow by playbook, shared
 # across all services, no per-service starter script): exports systemd
@@ -27,11 +28,15 @@ ExecStart=/usr/local/bin/shellflow cred-env exec /opt/__SVC__/bin/__SVC__
 # == Per-key import from per-service credstore (regenerate this section):
 #   shellflow secret creds --store-dir /etc/credstore.encrypted/__SVC__ \
 #     services/__SVC__/<host>.env.age
-# Paste the LoadCredentialEncrypted= lines below (all hosts must share keys):
+# Paste the LoadCredentialEncrypted= lines below (all hosts must share keys;
+# verify with `shellflow secret keys-check services/__SVC__`).
+# NOTE: for `cred-env exec` the key name must equal the env name the binary
+# reads; for render-only keys any KEY works (template maps `${KEY}`).
 # LoadCredentialEncrypted=API_KEY:/etc/credstore.encrypted/__SVC__/API_KEY
 
-# --- Security hardening: see services/_common/10-hardening.conf ---
-# Playbook installs it as /etc/systemd/system/__SVC__.service.d/10-hardening.conf
+# --- Security hardening: keep it inline in this unit (ProtectSystem,
+# NoNewPrivileges, PrivateTmp, …). Shared drop-ins drift from units that
+# duplicate ExecStart (observed with per-flag drop-ins); prefer explicit. ---
 
 [Install]
 WantedBy=multi-user.target

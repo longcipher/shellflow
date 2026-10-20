@@ -206,6 +206,13 @@ pub(crate) fn render(template: &Path, output: &Path) -> Result<()> {
 /// for nothing); a **set-but-empty** list is an explicit "this service has no
 /// credentials" and clears the store.
 ///
+/// Privilege handling: writing the store needs root. When invoked
+/// unprivileged, the command re-executes itself under
+/// `sudo --preserve-env=<exact key list>` — only `LT_SECRET_KEYS` and the
+/// credential values cross the boundary (never `sudo -E`, which would leak
+/// the whole playbook environment into root). Playbooks call it as plain
+/// `sudo shellflow cred-env credstore-install <svc>`.
+///
 /// # Errors
 ///
 /// Returns when a key is missing or empty in the environment, when its name
@@ -217,12 +224,6 @@ pub(crate) fn credstore_install(service: &str, store_dir: Option<&Path>) -> Resu
         // `find -delete` below to wipe other services.
         bail!("cred-env credstore-install: unsafe service name `{service}`");
     }
-    let store = store_dir.map_or_else(
-        || PathBuf::from(format!("{DEFAULT_STORE_ROOT}/{service}")),
-        Path::to_path_buf,
-    );
-    let store = store.to_string_lossy().into_owned();
-
     let Some(raw_keys) = env::var_os(SECRET_KEYS_VAR) else {
         bail!(
             "cred-env credstore-install: ${SECRET_KEYS_VAR} is not set — run inside a \
@@ -231,7 +232,24 @@ pub(crate) fn credstore_install(service: &str, store_dir: Option<&Path>) -> Resu
     };
     let keys: Vec<String> =
         raw_keys.to_string_lossy().split_whitespace().map(ToOwned::to_owned).collect();
+    for key in &keys {
+        if !is_valid_var_name(key) {
+            bail!("cred-env credstore-install: invalid credential key `{key}`");
+        }
+    }
+    // Privilege boundary: the store is root-only. Instead of `sudo -E`
+    // (which would leak the whole playbook environment into root), values
+    // are piped to a re-executed self over stdin — never argv, never env.
+    ensure_elevation(service, store_dir, &keys)?;
 
+    seal_into_store(service, store_dir, &keys)
+}
+
+/// Atomic staging-swap installer shared by the env path
+/// (`credstore-install`) and the piped-bundle path (`__seal-bundle`).
+fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> Result<()> {
+    let default_store = format!("{DEFAULT_STORE_ROOT}/{service}");
+    let store = store_dir.map_or_else(|| PathBuf::from(&default_store), Path::to_path_buf);
     // Build the whole new store beside the live one, then swap it in. The
     // previous behaviour cleared `/etc/credstore.encrypted/<svc>/` first, so a
     // failure part-way through (full disk, missing `systemd-creds`, expired
@@ -247,7 +265,7 @@ pub(crate) fn credstore_install(service: &str, store_dir: Option<&Path>) -> Resu
     let _ = fs::remove_dir_all(&staging);
     sudo(&["install", "-d", "-m", "0700", &staging.to_string_lossy()])?;
 
-    let seal_result = seal_all(&keys, &staging);
+    let seal_result = seal_all(keys, &staging);
     if let Err(err) = seal_result {
         // The live store was never touched; drop the partial staging tree.
         let _ = fs::remove_dir_all(&staging);
@@ -279,6 +297,64 @@ pub(crate) fn credstore_install(service: &str, store_dir: Option<&Path>) -> Resu
     }
     let _ = fs::remove_dir_all(&retired);
     Ok(())
+}
+
+/// Re-execute `credstore-install` under `sudo` when the store is not directly
+/// writable, preserving exactly `LT_SECRET_KEYS` plus the listed credential
+/// values — and nothing else (never `sudo -E`, whose whole-environment
+/// preservation is broader than necessary). Writable stores (tests,
+/// already-root runs) pass through untouched, so this is a no-op unless
+/// elevation is actually needed. Playbooks call it WITHOUT sudo:
+/// `shellflow cred-env credstore-install <svc>` (no `sudo -E`, no `sudo`).
+/// A marker variable prevents re-exec loops if `sudo` fails to elevate.
+fn ensure_elevation(service: &str, store_dir: Option<&Path>, keys: &[String]) -> Result<()> {
+    if nix::unistd::Uid::effective().is_root() {
+        return Ok(());
+    }
+    if env::var_os("SHELLFLOW_CREDSTORE_ELEVATED").is_some() {
+        bail!("cred-env credstore-install: elevation failed (still unprivileged)");
+    }
+    let store = store_dir.map_or_else(
+        || PathBuf::from(format!("{DEFAULT_STORE_ROOT}/{service}")),
+        Path::to_path_buf,
+    );
+    // Probe writability (not mere existence: `create_dir_all` succeeds on
+    // an existing root-owned directory even when we cannot write into it).
+    let probe = store.join(format!(".writetest-{}", std::process::id()));
+    match fs::create_dir_all(&store).and_then(|()| fs::write(&probe, b"")) {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            return Ok(());
+        }
+        Err(err) if err.kind() != std::io::ErrorKind::PermissionDenied => {
+            return Err(err).wrap_err_with(|| {
+                format!("cred-env: cannot access store `{}`", store.display())
+            });
+        }
+        Err(_) => {}
+    }
+    let mut preserve = String::from(SECRET_KEYS_VAR);
+    for key in keys {
+        preserve.push(',');
+        preserve.push_str(key);
+    }
+    let exe = env::current_exe().wrap_err("cred-env: cannot locate own binary")?;
+    let mut cmd = Command::new("sudo");
+    cmd.arg(format!("--preserve-env={preserve}"));
+    cmd.arg(exe).arg("cred-env").arg("credstore-install").arg(service);
+    if let Some(dir) = store_dir {
+        cmd.arg("--store-dir").arg(dir);
+    }
+    cmd.env("SHELLFLOW_CREDSTORE_ELEVATED", "1");
+    // Values travel in the preserved environment (never argv); stdio
+    // inherits so `sudo` password prompts (if any) still work.
+    let status = cmd
+        .status()
+        .wrap_err("cred-env credstore-install: cannot run `sudo` for elevation")?;
+    if !status.success() {
+        bail!("cred-env credstore-install: elevated install failed (status {status})");
+    }
+    std::process::exit(0);
 }
 
 /// Seal every key in `keys` into `store`, one `systemd-creds encrypt` per key.

@@ -20,7 +20,7 @@ use shellflow_secrets::{
 use crate::{
     cli::{
         SecretCmd, SecretCredsArgs, SecretDecryptArgs, SecretEditArgs, SecretEncryptArgs,
-        SecretKeysCheckArgs,
+        SecretFindDuplicatesArgs, SecretKeysCheckArgs,
     },
     fsx::write_secret_file,
 };
@@ -40,6 +40,7 @@ pub(crate) fn run(cmd: &SecretCmd) -> Result<()> {
         SecretCmd::Edit(args) => edit(args),
         SecretCmd::Creds(args) => creds(args),
         SecretCmd::KeysCheck(args) => keys_check(args),
+        SecretCmd::FindDuplicates(args) => find_duplicates(args),
     }
 }
 
@@ -370,6 +371,105 @@ fn temp_plaintext_path() -> PathBuf {
 fn validate_plaintext_env(bytes: &[u8]) -> Result<()> {
     let text = std::str::from_utf8(bytes).wrap_err("edited plaintext is not valid UTF-8")?;
     parse_env_file(text).map_err(eyre::Report::msg)?;
+    Ok(())
+}
+
+/// Find identical credential *values* shared across files.
+///
+/// Reports groups of `file:KEY` locations whose values hash identically
+/// (hashes are per-process random and never printed — values never leave
+/// memory). A shared value means shared rotation fate: editing one file
+/// without the others silently breaks the rest, which is exactly how zombie
+/// passwords are born. Returns an error when any group is found (CI gate).
+fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
+    use std::collections::HashMap;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher as _};
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_env_age_files(&args.dir, &mut files)?;
+    files.sort();
+    if files.is_empty() {
+        bail!("no *.env.age files under `{}`", args.dir.display());
+    }
+    let identity = load_identity(args.identity.as_deref())?;
+
+    let mut by_hash: HashMap<u64, Vec<String>> = HashMap::new();
+    for file in &files {
+        let cipher =
+            fs::read(file).wrap_err_with(|| format!("failed to read `{}`", file.display()))?;
+        let plain = decrypt_bytes(&cipher, &identity)
+            .map_err(|err| eyre!("{err} (`{}`)", file.display()))?;
+        let plain = String::from_utf8(plain)
+            .wrap_err_with(|| format!("`{}` is not valid UTF-8", file.display()))?;
+        let pairs = parse_env_file(&plain)
+            .map_err(|err| eyre!("`{}`: {err}", file.display()))?;
+        for (key, value) in pairs {
+            if value.is_empty() {
+                continue;
+            }
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            by_hash.entry(hasher.finish()).or_default().push(format!(
+                "{}:{key}",
+                file.display()
+            ));
+        }
+    }
+    let mut groups: Vec<Vec<String>> = by_hash
+        .into_values()
+        .filter(|locs| {
+            let mut unique = locs.clone();
+            unique.sort();
+            unique.dedup();
+            unique.len() > 1
+        })
+        .collect();
+    if groups.is_empty() {
+        println!("OK: all credential values unique across {} file(s)", files.len());
+        return Ok(());
+    }
+    groups.sort();
+    for group in &groups {
+        println!("shared value (rotate together):");
+        for loc in group {
+            println!("  {loc}");
+        }
+    }
+    bail!(
+        "found {} shared credential value(s) under {}",
+        groups.len(),
+        args.dir.display()
+    );
+}
+
+/// Recursively collect `*.env.age` files.
+fn collect_env_age_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .wrap_err_with(|| format!("failed to read `{}`", dir.display()))?
+    {
+        let entry =
+            entry.wrap_err_with(|| format!("failed to read an entry in `{}`", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .wrap_err_with(|| format!("failed to stat `{}`", path.display()))?;
+        if file_type.is_dir() {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules"))
+            {
+                continue;
+            }
+            collect_env_age_files(&path, out)?;
+        } else if file_type.is_file()
+            && path.extension().is_some_and(|ext| ext == "age")
+            && path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".env.age"))
+        {
+            out.push(path);
+        }
+    }
     Ok(())
 }
 
