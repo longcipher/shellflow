@@ -9,7 +9,7 @@ use nix::{
 };
 use tokio::process::Child;
 
-use super::KILL_GRACE;
+use super::{Cancel, KILL_GRACE};
 
 /// Put `cmd` in a fresh process group so its whole tree can be signalled.
 ///
@@ -42,6 +42,41 @@ pub(crate) async fn terminate(child: &mut Child) {
     signal_group(pid, Signal::SIGKILL);
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+/// The outcome of waiting for a child process.
+pub(crate) enum ChildOutcome {
+    /// The child exited, or the wait itself failed.
+    Finished(std::io::Result<std::process::ExitStatus>),
+    /// The timeout expired.
+    TimedOut,
+    /// The run was interrupted.
+    Cancelled,
+}
+
+/// Wait for `child`, racing the timeout and the cancellation signal.
+///
+/// The timeout covers the wait only; the caller is responsible for writing
+/// any payload before calling this.
+pub(crate) async fn wait_child(
+    child: &mut Child,
+    timeout: Option<u64>,
+    cancel: &mut Cancel,
+) -> ChildOutcome {
+    let deadline = timeout.map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs));
+    let wait = async {
+        match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, child.wait()).await {
+                Ok(result) => ChildOutcome::Finished(result),
+                Err(_) => ChildOutcome::TimedOut,
+            },
+            None => ChildOutcome::Finished(child.wait().await),
+        }
+    };
+    tokio::select! {
+        outcome = wait => outcome,
+        () = cancel.cancelled() => ChildOutcome::Cancelled,
+    }
 }
 
 /// Keeps a spawned child's process group from outliving the current scope.

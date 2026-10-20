@@ -160,7 +160,9 @@ cat "${WORKDIR}/marker.txt"
   for `--delete` or `--exclude`, the fallback **cannot** honour it and the
   step fails (exit 1) rather than shipping excluded files or leaving stale
   ones; install rsync on the target, or pass `--allow-unfiltered-copy` to
-  accept the downgrade explicitly.
+  accept the downgrade explicitly. Under `--dry-run`/`--diff` the fallback is
+  skipped with a warning — `scp` has no dry-run mode, and a dry run must
+  never write to a target.
 - Payload previews are masked with `***` where secrets appear — that is
   expected.
 

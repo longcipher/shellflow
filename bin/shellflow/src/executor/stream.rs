@@ -11,8 +11,16 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::{ArcUi, HostOutcome};
+use super::{ArcUi, Cancel, HostOutcome};
 use crate::ui::Stream;
+
+/// How long the reader tasks may take to drain after the child exited.
+///
+/// A descendant that inherited the child's stdout/stderr keeps the pipe open
+/// after the child itself is gone (`nohup svc &` without redirecting). The
+/// drain is therefore bounded: a group that still holds the step's output
+/// pipe past the grace period is killed rather than hanging the run.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 async fn forward_stream<R>(reader: R, tx: mpsc::Sender<(Stream, String)>, stream: Stream)
 where
@@ -26,8 +34,11 @@ where
     }
 }
 
+#[derive(Debug)]
 pub(super) enum PipedRun {
+    /// The child ran to completion.
     Completed(std::process::ExitStatus),
+    /// The step exceeded its timeout.
     TimedOut,
     /// The payload could not be delivered because the child closed its stdin
     /// early (EPIPE).
@@ -38,47 +49,162 @@ pub(super) enum PipedRun {
     /// configuration instead of the real cause, and would break the exit-code
     /// contract in design §6 (ssh 255 => exit 3, not exit 4).
     PipeBroken,
+    /// The run was interrupted; the child group was terminated.
+    Cancelled,
+}
+
+/// Everything [`run_piped_child`] needs besides the child itself.
+pub(super) struct PipedArgs<'a> {
+    /// The output sink.
+    pub ui: &'a ArcUi,
+    /// The display alias used in log lines.
+    pub host: &'a str,
+    /// The payload written to the child's stdin.
+    pub payload: Option<&'a str>,
+    /// The per-step timeout in seconds.
+    pub timeout: Option<u64>,
+    /// A filter applied to the child's stdout lines.
+    pub diff_filter: Option<super::DiffFilter>,
+    /// The audit log handle.
+    pub log_file: &'a super::LogFile,
+    /// The cooperative cancellation signal.
+    pub cancel: Cancel,
+    /// Discard the child's output instead of forwarding it.
+    ///
+    /// Used by the `@wait_active` poll, whose verdict is the child's exit
+    /// status and whose per-poll output would only be noise.
+    pub quiet: bool,
 }
 
 /// Run a piped child with stdout/stderr forwarded through the UI, honoring
-/// the timeout. `payload` is written to stdin when non-empty. Returns the
-/// exit status or `TimedOut`.
-pub(super) async fn run_piped_child(
-    ui: ArcUi,
-    host: &str,
-    mut cmd: Command,
-    payload: Option<&str>,
-    timeout: Option<u64>,
-    diff_filter: Option<super::DiffFilter>,
-    log_file: &super::LogFile,
-) -> Result<PipedRun> {
-    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+/// the timeout and the cancellation signal.
+///
+/// The payload is written to stdin when non-empty. The timeout covers the
+/// payload write *and* the wait, so a peer that never reads the payload
+/// cannot outlive the step.
+pub(super) async fn run_piped_child(args: PipedArgs<'_>, mut cmd: Command) -> Result<PipedRun> {
+    let PipedArgs { ui, host, payload, timeout, diff_filter, log_file, mut cancel, quiet } = args;
+
+    if quiet {
+        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    } else {
+        cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    }
     cmd.kill_on_drop(true);
     super::process::isolate(&mut cmd);
     let mut child = cmd.spawn().map_err(|_| eyre::eyre!("spawn failed"))?;
+    let pid = child.id();
     let mut guard = super::process::GroupGuard::new(&child);
 
-    if let Some(mut stdin) = child.stdin.take() &&
-        let Some(payload) = payload &&
-        stdin.write_all(payload.as_bytes()).await.is_err()
-    {
-        crate::ui::warn(&format!("[{}] stdin write failed", host), log_file);
-        super::process::terminate(&mut child).await;
-        guard.disarm();
-        return Ok(PipedRun::PipeBroken);
-    }
+    // One deadline covers the payload write *and* the wait: a peer that
+    // neither reads the payload nor closes its stdin would otherwise block
+    // the write forever, and the step timeout would never start ticking.
+    let deadline = timeout.map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs));
 
-    let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("stdout not piped"))?;
-    let stderr = child.stderr.take().ok_or_else(|| eyre::eyre!("stderr not piped"))?;
+    // Start the readers *before* waiting: the child blocks once its stdout /
+    // stderr pipe buffers fill (~64 KB), so waiting first deadlocks any step
+    // with large output. The drain after the wait is bounded (see
+    // `DRAIN_GRACE`), which is what stops a backgrounded descendant from
+    // hanging the step instead.
+    let mut readers = if quiet { None } else { spawn_readers(ui, host, diff_filter, &mut child) };
+
+    // 1. Deliver the payload, racing cancellation: with no timeout a stalled
+    // peer would otherwise ride out the whole interrupt grace period without
+    // ever observing the cancel signal.
+    if let Some(mut stdin) = child.stdin.take() &&
+        let Some(payload) = payload
+    {
+        let write = with_deadline(deadline, stdin.write_all(payload.as_bytes()));
+        let delivered = tokio::select! {
+            result = write => match result {
+                Ok(Ok(())) => true,
+                Ok(Err(_)) => {
+                    crate::ui::warn(&format!("[{host}] stdin write failed"), log_file);
+                    super::process::terminate(&mut child).await;
+                    guard.disarm();
+                    drain_started(readers.take(), pid).await;
+                    return Ok(PipedRun::PipeBroken);
+                }
+                Err(()) => {
+                    super::process::terminate(&mut child).await;
+                    guard.disarm();
+                    drain_started(readers.take(), pid).await;
+                    return Ok(PipedRun::TimedOut);
+                }
+            },
+            () = cancel.cancelled() => {
+                super::process::terminate(&mut child).await;
+                guard.disarm();
+                drain_started(readers.take(), pid).await;
+                return Ok(PipedRun::Cancelled);
+            }
+        };
+        let _ = delivered;
+    }
+    drop(child.stdin.take());
+
+    // 2. Wait for the child, racing the cancellation signal.
+    let outcome = {
+        let wait = with_deadline(deadline, child.wait());
+        tokio::select! {
+            result = wait => result,
+            () = cancel.cancelled() => {
+                super::process::terminate(&mut child).await;
+                guard.disarm();
+                drain_started(readers.take(), pid).await;
+                return Ok(PipedRun::Cancelled);
+            }
+        }
+    };
+    let result = match outcome {
+        Ok(Ok(status)) => PipedRun::Completed(status),
+        Ok(Err(err)) => {
+            // The wait itself failed: tear the group down before giving up,
+            // otherwise `kill_on_drop` would only reap the direct child and
+            // the rest of the tree would survive.
+            super::process::terminate(&mut child).await;
+            guard.disarm();
+            drain_started(readers.take(), pid).await;
+            return Err(eyre::eyre!("wait error: {err}"));
+        }
+        Err(()) => {
+            super::process::terminate(&mut child).await;
+            guard.disarm();
+            drain_started(readers.take(), pid).await;
+            return Ok(PipedRun::TimedOut);
+        }
+    };
+
+    // 3. Drain the readers. Buffered lines already in the pipe belong in the
+    // UI and the audit log even though the child is gone.
+    drain_started(readers.take(), pid).await;
+    guard.disarm();
+
+    Ok(result)
+}
+
+/// Spawn the stdout/stderr forwarder tasks for a piped child.
+///
+/// Returns `None` when the child has no piped output to read (e.g. the
+/// pipes were not requested). Callers must still drive the returned set to
+/// completion via [`drain_started`], on *every* terminal path — not just the
+/// success path — or buffered lines never reach the UI/audit log.
+fn spawn_readers(
+    ui: &ArcUi,
+    host: &str,
+    diff_filter: Option<super::DiffFilter>,
+    child: &mut tokio::process::Child,
+) -> Option<JoinSet<()>> {
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
 
     let (tx, rx) = mpsc::channel::<(Stream, String)>(256);
     let host_alias = host.to_string();
-    let out_task = tokio::spawn(forward_stream(stdout, tx.clone(), Stream::Stdout));
-    let err_task = tokio::spawn(forward_stream(stderr, tx, Stream::Stderr));
-
-    let ui_handle = Arc::clone(&ui);
-    let diff_filter = diff_filter.clone();
-    let read_task = tokio::spawn(async move {
+    let ui_handle = Arc::clone(ui);
+    let mut readers = JoinSet::new();
+    readers.spawn(forward_stream(stdout, tx.clone(), Stream::Stdout));
+    readers.spawn(forward_stream(stderr, tx, Stream::Stderr));
+    readers.spawn(async move {
         let mut rx = rx;
         while let Some((stream, line)) = rx.recv().await {
             if let Some(f) = &diff_filter &&
@@ -90,99 +216,125 @@ pub(super) async fn run_piped_child(
             ui_handle.lock().await.host_line(&host_alias, stream, &line);
         }
     });
+    Some(readers)
+}
 
-    let result = match timeout {
-        Some(secs) => {
-            let timed_out = tokio::time::timeout(Duration::from_secs(secs), child.wait()).await;
-            match timed_out {
-                Ok(Ok(status)) => Ok(PipedRun::Completed(status)),
-                Ok(Err(err)) => Err(eyre::eyre!("wait error: {err}")),
-                Err(_) => {
-                    // Terminate first so closing the group closes the inherited
-                    // pipe ends, which lets both reader tasks see EOF and drain
-                    // what is already buffered. Aborting the consumer first
-                    // would discard those lines, breaking the `--log-file`
-                    // audit trail exactly when an operator needs it most.
-                    super::process::terminate(&mut child).await;
-                    guard.disarm();
-                    Ok(PipedRun::TimedOut)
-                }
-            }
-        }
-        None => match child.wait().await {
-            Ok(status) => Ok(PipedRun::Completed(status)),
-            Err(err) => Err(eyre::eyre!("wait error: {err}")),
-        },
+/// Drive an already-started reader set to EOF, with a bound.
+///
+/// A descendant that inherited the child's stdout/stderr keeps the pipe open
+/// after the child itself is gone (`nohup svc &` without redirecting). The
+/// drain is therefore bounded: a group that still holds the step's output
+/// pipe past the grace period is killed rather than hanging the run.
+async fn drain_started(readers: Option<JoinSet<()>>, pid: Option<u32>) {
+    let Some(mut readers) = readers else {
+        return;
     };
-    guard.disarm();
+    // Both streams are drained to EOF. The group may still be alive on the
+    // success path (a backgrounded descendant keeps the pipe open), so the
+    // drain is bounded: a group that still holds the step's output pipe past
+    // the grace period is killed rather than hanging the run.
+    let drained =
+        tokio::time::timeout(DRAIN_GRACE, async { while readers.join_next().await.is_some() {} })
+            .await;
+    if drained.is_err() {
+        // A descendant still holds the pipe: kill the whole group so the
+        // step can finish, then reap the readers.
+        if let Some(pid) = pid {
+            super::process::signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+        let _ = tokio::time::timeout(DRAIN_GRACE, async {
+            while readers.join_next().await.is_some() {}
+        })
+        .await;
+        readers.shutdown().await;
+    }
+}
 
-    // Both streams are drained to EOF on every path, including the timeout
-    // path above: killing the group closes the inherited pipe ends, so the
-    // reader tasks finish on their own and joining them cannot hang.
-    let _ = out_task.await;
-    let _ = err_task.await;
-    let _ = read_task.await;
-    result
+/// Run `fut` with an optional deadline.
+///
+/// `Err(())` means the deadline expired.
+async fn with_deadline<F, T>(deadline: Option<tokio::time::Instant>, fut: F) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, fut).await.map_err(|_| ()),
+        None => Ok(fut.await),
+    }
 }
 
 /// Collect per-host results, preserving the ones that completed.
 ///
 /// A join error (a host task panicked or was aborted) must not discard the
 /// statuses of hosts that already finished — the caller renders those in the
-/// step summary, and dropping them would misreport the fan-out.
+/// step summary, and dropping them would misreport the fan-out. The error is
+/// reported and the affected host is reported as failed.
 pub(super) async fn collect_hosts(
+    ui: &ArcUi,
     mut tasks: JoinSet<(String, HostOutcome)>,
-) -> Result<Vec<(String, HostOutcome)>> {
+) -> Vec<(String, HostOutcome)> {
     let mut results = Vec::with_capacity(tasks.len());
-    let mut first_join_error: Option<String> = None;
     while let Some(res) = tasks.join_next().await {
         match res {
-            Ok(outcome) => results.push(outcome),
+            Ok((alias, outcome)) => {
+                // The host is finished: flush its grouped block so the log
+                // reads as one block per host.
+                ui.lock().await.host_finished(&alias);
+                results.push((alias, outcome));
+            }
             Err(join_err) => {
-                if first_join_error.is_none() {
-                    first_join_error = Some(join_err.to_string());
-                }
+                crate::ui::warn(&format!("host task failed: {join_err}"), &None);
+                results.push(("unknown".to_string(), HostOutcome::Failed(super::RunError::Script)));
             }
         }
     }
-    match first_join_error {
-        Some(err) => Err(eyre::eyre!("host task failed: {err}")),
-        None => Ok(results),
-    }
+    results
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ui() -> ArcUi {
+        Arc::new(tokio::sync::Mutex::new(
+            crate::ui::Ui::new(0, true, crate::cli::OutputMode::Stream, None).expect("ui"),
+        ))
+    }
+
+    fn args<'a>(
+        ui: &'a ArcUi,
+        log_file: &'a crate::executor::LogFile,
+        cancel: Cancel,
+    ) -> PipedArgs<'a> {
+        PipedArgs {
+            ui,
+            host: "test-host",
+            payload: None,
+            timeout: None,
+            diff_filter: None,
+            log_file,
+            cancel,
+            quiet: false,
+        }
+    }
+
     /// Verify that `run_piped_child` with a `diff_filter` correctly filters
     /// stdout lines and returns the completed status.
     #[tokio::test]
     async fn piped_child_with_diff_filter_filters_stdout() {
-        let ui: ArcUi = Arc::new(tokio::sync::Mutex::new(crate::ui::Ui::new(
-            0,
-            true,
-            crate::cli::OutputMode::Stream,
-            None,
-        )));
+        let ui = ui();
+        let log_file = None;
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg("echo hello");
-        let filter = |line: &str| -> bool { line.contains("KEEP") };
-        let result = run_piped_child(
-            ui,
-            "test-host",
-            cmd,
-            None,
-            None,
-            Some(Arc::new(filter) as super::super::DiffFilter),
-            &None,
-        )
-        .await
-        .expect("run_piped_child should succeed");
+        let filter = |line: &str| line.contains("KEEP");
+        let mut args = args(&ui, &log_file, Cancel::new());
+        args.diff_filter = Some(Arc::new(filter) as super::super::DiffFilter);
+        let result = run_piped_child(args, cmd).await.expect("run_piped_child should succeed");
         match result {
             PipedRun::Completed(status) => assert!(status.success()),
             PipedRun::TimedOut => panic!("should not time out"),
             PipedRun::PipeBroken => panic!("should not break the pipe"),
+            PipedRun::Cancelled => panic!("should not be cancelled"),
         }
     }
 
@@ -190,42 +342,100 @@ mod tests {
     /// lines through.
     #[tokio::test]
     async fn piped_child_without_filter_passes_all_lines() {
-        let ui: ArcUi = Arc::new(tokio::sync::Mutex::new(crate::ui::Ui::new(
-            0,
-            true,
-            crate::cli::OutputMode::Stream,
-            None,
-        )));
+        let ui = ui();
+        let log_file = None;
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg("echo hello");
-        let result = run_piped_child(ui, "test-host", cmd, None, None, None, &None)
+        let result = run_piped_child(args(&ui, &log_file, Cancel::new()), cmd)
             .await
             .expect("run_piped_child should succeed");
         match result {
             PipedRun::Completed(status) => assert!(status.success()),
             PipedRun::TimedOut => panic!("should not time out"),
             PipedRun::PipeBroken => panic!("should not break the pipe"),
+            PipedRun::Cancelled => panic!("should not be cancelled"),
         }
     }
 
     /// Verify that `run_piped_child` times out correctly.
     #[tokio::test]
     async fn piped_child_times_out() {
-        let ui: ArcUi = Arc::new(tokio::sync::Mutex::new(crate::ui::Ui::new(
-            0,
-            true,
-            crate::cli::OutputMode::Stream,
-            None,
-        )));
+        let ui = ui();
+        let log_file = None;
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg("sleep 10");
-        let result = run_piped_child(ui, "test-host", cmd, None, Some(1), None, &None)
-            .await
-            .expect("run_piped_child should succeed");
+        let mut args = args(&ui, &log_file, Cancel::new());
+        args.timeout = Some(1);
+        let result = run_piped_child(args, cmd).await.expect("run_piped_child should succeed");
         match result {
             PipedRun::Completed(_) => panic!("should have timed out"),
             PipedRun::TimedOut => {}
             PipedRun::PipeBroken => panic!("should not break the pipe"),
+            PipedRun::Cancelled => panic!("should not be cancelled"),
         }
+    }
+
+    /// A backgrounded descendant that keeps the output pipe open must not
+    /// hang the step: the drain is bounded and the group is killed.
+    #[tokio::test]
+    async fn a_backgrounded_descendant_does_not_hang_the_step() {
+        let ui = ui();
+        let log_file = None;
+        let mut cmd = Command::new("bash");
+        // `sleep` inherits the stdout pipe and holds it open after bash exits.
+        cmd.arg("-c").arg("sleep 30 &");
+        let started = std::time::Instant::now();
+        let result = run_piped_child(args(&ui, &log_file, Cancel::new()), cmd)
+            .await
+            .expect("run_piped_child should succeed");
+        assert!(matches!(result, PipedRun::Completed(_)), "the block itself succeeded");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the step must not wait for the backgrounded descendant"
+        );
+    }
+
+    /// A cancelled run terminates the child group and reports it.
+    #[tokio::test]
+    async fn cancellation_terminates_the_child() {
+        let ui = ui();
+        let log_file = None;
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg("sleep 30");
+        let cancel = Cancel::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+        let args = args(&ui, &log_file, cancel);
+        let started = std::time::Instant::now();
+        let result = run_piped_child(args, cmd).await.expect("run_piped_child should succeed");
+        assert!(matches!(result, PipedRun::Cancelled), "expected a cancelled run");
+        assert!(started.elapsed() < Duration::from_secs(20), "the child must be torn down");
+    }
+
+    /// Output larger than the pipe buffer must not deadlock the wait: the
+    /// readers run *while* the child runs, not after it exits.
+    #[tokio::test]
+    async fn large_output_does_not_deadlock_without_a_timeout() {
+        let ui = ui();
+        let log_file = None;
+        let mut cmd = Command::new("bash");
+        // ~200 KB on stdout: far past the ~64 KB pipe buffer.
+        cmd.arg("-c").arg("yes | head -n 100000");
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_piped_child(args(&ui, &log_file, Cancel::new()), cmd),
+        )
+        .await
+        .expect("the step must finish instead of deadlocking")
+        .expect("run_piped_child should succeed");
+        assert!(matches!(result, PipedRun::Completed(_)), "expected completion, got {result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "large output must stream, not block the wait"
+        );
     }
 }

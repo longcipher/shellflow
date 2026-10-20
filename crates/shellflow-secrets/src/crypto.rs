@@ -7,7 +7,7 @@
 
 use std::io;
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::SecretsError;
 
@@ -79,8 +79,14 @@ pub fn decrypt_string(
     // Move the buffer out of the `Zeroizing` wrapper (leaving it empty) so
     // the string owns it, then wrap the string instead: the plaintext is
     // still scrubbed exactly once, on drop.
-    let text = String::from_utf8(std::mem::take(&mut *bytes))
-        .map_err(|_| SecretsError::Decrypt("plaintext is not valid UTF-8".to_string()))?;
+    let text = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|err| {
+        // The error owns the plaintext buffer. Scrub it here, because
+        // dropping it would leave the decrypted bytes in the heap unzeroed.
+        let mut bytes = err.into_bytes();
+        bytes.zeroize();
+        drop(bytes);
+        SecretsError::Decrypt("plaintext is not valid UTF-8".to_string())
+    })?;
     Ok(Zeroizing::new(text))
 }
 
@@ -102,6 +108,25 @@ mod tests {
         let cipher = encrypt_bytes(plain, &[recipient]).expect("encrypt");
         let round = decrypt_bytes(&cipher, &identity).expect("decrypt");
         assert_eq!(&*round, plain);
+    }
+
+    #[test]
+    fn decrypt_string_returns_the_plaintext() {
+        let identity = make_identity();
+        let recipient = identity.to_public();
+        let plain = "KEY=value\nSECRET=xyz\n";
+        let cipher = encrypt_bytes(plain.as_bytes(), &[recipient]).expect("encrypt");
+        let round = decrypt_string(&cipher, &identity).expect("decrypt");
+        assert_eq!(&*round, plain);
+    }
+
+    #[test]
+    fn decrypt_string_rejects_plaintext_that_is_not_utf8() {
+        let identity = make_identity();
+        let recipient = identity.to_public();
+        let cipher = encrypt_bytes(&[0xff, 0xfe], &[recipient]).expect("encrypt");
+        let err = decrypt_string(&cipher, &identity).expect_err("non-UTF8 plaintext must fail");
+        assert!(err.to_string().contains("UTF-8"), "unexpected error: {err}");
     }
 
     #[test]

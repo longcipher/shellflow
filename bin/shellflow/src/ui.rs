@@ -1,13 +1,26 @@
 //! User-facing output helpers: step headers, host-prefixed streaming lines,
-//! previews, and summaries. All output is routed through the [`Ui`] struct so
-//! that `--log-file`, `--no-color`, and secret masking are applied uniformly.
+//! previews, and summaries.
+//!
+//! Every byte that reaches the terminal or the audit log goes through this
+//! module, and every line that carries user content is redacted on the way
+//! out. That is a deliberate structural choice: a secret leaked because some
+//! call site forgot to mask is a bug the compiler cannot catch, so masking is
+//! applied by the *sink* rather than requested by the caller.
+//!
+//! The mask set itself lives in a process-wide registry ([`install_masks`] /
+//! [`redact`]) so the free functions — which have no `Ui` handle — redact
+//! exactly like the `Ui` methods do. There is therefore no unmasked twin of
+//! any render function.
 
 use std::{
     collections::HashMap,
     io::{Write, stderr, stdout},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use colored::Colorize;
@@ -47,6 +60,62 @@ struct OutLine {
     text: String,
 }
 
+/// The known secret values, shared by every render site.
+///
+/// Stored behind an `Arc` so the read path is a pointer copy rather than a
+/// copy of the secret values themselves.
+#[derive(Clone, Debug, Default)]
+struct MaskSet {
+    /// Long values, longest-first and de-duplicated.
+    masks: Arc<Vec<String>>,
+    /// Below-threshold `(key, value)` pairs, redacted by the narrow rules.
+    shorts: Arc<Vec<(String, String)>>,
+}
+
+/// The process-wide mask registry.
+static MASK_SET: OnceLock<RwLock<Arc<MaskSet>>> = OnceLock::new();
+
+/// The number of lines that could not be written to the audit log.
+static AUDIT_WRITE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+fn mask_set() -> &'static RwLock<Arc<MaskSet>> {
+    MASK_SET.get_or_init(Default::default)
+}
+
+/// Register the secret values that every render site must redact.
+///
+/// Called once per run, after the `@secrets` entries are resolved. The mask
+/// set is normalized here (longest-first, de-duplicated) rather than per
+/// output line: the masker runs for every streamed line, so re-sorting a
+/// large `@secrets` set on each call would dominate output throughput.
+pub(crate) fn install_masks(masks: Vec<String>, shorts: Vec<(String, String)>) {
+    let mut guard = mask_set().write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Arc::new(MaskSet { masks: Arc::new(prepare_masks(&masks)), shorts: Arc::new(shorts) });
+}
+
+/// Redact every known secret in `text`.
+///
+/// This is the single redaction entry point. Notes, warnings, step headers,
+/// previews and summaries all route through it, so a secret cannot leak by
+/// being rendered through a path that forgot to mask.
+pub(crate) fn redact(text: &str) -> String {
+    let set = mask_set().read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let mut out = shellflow_core::mask_line(text, &set.masks);
+    for (key, value) in set.shorts.iter() {
+        out = shellflow_core::mask_token(&out, value);
+        out = shellflow_core::mask_keyed(&out, key, value);
+    }
+    out
+}
+
+/// How many lines could not be appended to the audit log.
+///
+/// A silently truncated audit trail is worse than no audit trail: the
+/// operator believes the run was recorded in full.
+pub(crate) fn audit_write_failures() -> usize {
+    AUDIT_WRITE_FAILURES.load(Ordering::Relaxed)
+}
+
 /// Aggregated per-host result for a step summary.
 #[derive(Clone, Debug)]
 pub(crate) struct HostStatus {
@@ -68,6 +137,8 @@ pub(crate) enum Outcome {
     Failed,
     /// The step exceeded its timeout.
     TimedOut,
+    /// The run was interrupted before the host finished.
+    Cancelled,
 }
 
 impl Outcome {
@@ -77,8 +148,44 @@ impl Outcome {
             Self::Skipped => "SKIPPED".dimmed(),
             Self::Failed => "FAILED".red(),
             Self::TimedOut => "TIMEOUT".yellow(),
+            Self::Cancelled => "CANCELLED".yellow(),
         }
         .to_string()
+    }
+}
+
+/// Buffered output for `--output grouped`, bucketed per host.
+#[derive(Default)]
+struct GroupedBuffer {
+    /// The hosts in first-seen order.
+    order: Vec<String>,
+    /// The buffered lines per host.
+    lines: HashMap<String, Vec<OutLine>>,
+}
+
+impl GroupedBuffer {
+    fn push(&mut self, host: &str, line: OutLine) {
+        if !self.lines.contains_key(host) {
+            self.order.push(host.to_string());
+        }
+        self.lines.entry(host.to_string()).or_default().push(line);
+    }
+
+    /// Take the lines of one host, removing it from the buffer.
+    fn take_host(&mut self, host: &str) -> Vec<OutLine> {
+        self.order.retain(|name| name != host);
+        self.lines.remove(host).unwrap_or_default()
+    }
+
+    /// Take every host's lines, in first-seen order.
+    fn take_all(&mut self) -> Vec<Vec<OutLine>> {
+        let mut out = Vec::with_capacity(self.order.len());
+        for host in std::mem::take(&mut self.order) {
+            if let Some(lines) = self.lines.remove(&host) {
+                out.push(lines);
+            }
+        }
+        out
     }
 }
 
@@ -90,26 +197,14 @@ enum OutputModeState {
     ///
     /// A `std::sync::Mutex` is used on purpose: every access happens behind
     /// the outer `Ui` mutex (so there is no real contention), and the
-    /// `blocking_lock` below is safe because the flush critical section never
-    /// awaits while holding the guard. This avoids the interleaving that a
-    /// `try_lock`-failure fallback would produce.
-    Grouped { buf: std::sync::Mutex<Vec<OutLine>> },
+    /// critical sections never await while holding the guard.
+    Grouped { buf: std::sync::Mutex<GroupedBuffer> },
 }
 
 /// The output sink: aggregates host lines, applies masking, writes to stdout /
 /// stderr and optionally an audit file.
 pub(crate) struct Ui {
     verbose: Verbosity,
-    /// Known secret values, longest-first and de-duplicated.
-    ///
-    /// Ordering is computed once in [`Ui::set_secrets`] rather than per
-    /// output line: the masker runs for every streamed line, so re-sorting a
-    /// large `@secrets` set on each call would dominate output throughput.
-    masks: Arc<Vec<String>>,
-    /// Below-threshold `(key, value)` pairs, redacted by the narrow rules.
-    shorts: Arc<Vec<(String, String)>>,
-    /// Masker for standalone text (notes, previews, log headers).
-    text_masker: SecretMasker,
     /// One masker per (host, stream).
     ///
     /// A secret that a target program split across two output lines must be
@@ -126,53 +221,47 @@ pub(crate) struct Ui {
 
 impl Ui {
     /// Create a UI sink. `no_color` disables ANSI globally via colored.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the audit log cannot be opened or its mode
+    /// cannot be tightened. A run that was asked to keep an audit trail and
+    /// silently keeps none is worse than a run that refuses to start.
     pub(crate) fn new(
         verbose: u8,
         no_color: bool,
         mode: super::cli::OutputMode,
         log_file: Option<PathBuf>,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
         colored::control::set_override(!no_color);
         let output = match mode {
             super::cli::OutputMode::Stream => OutputModeState::Stream,
             super::cli::OutputMode::Grouped => {
-                OutputModeState::Grouped { buf: std::sync::Mutex::new(Vec::new()) }
+                OutputModeState::Grouped { buf: std::sync::Mutex::new(GroupedBuffer::default()) }
             }
         };
-        let log_file = log_file.and_then(|path| {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|err| {
-                    eprintln!("warning: cannot open log file {:?}: {err}", path.display());
-                })
-                .ok()?;
-            // `OpenOptions::mode` only applies when the file is created, and
-            // the log is opened in append mode — so a log that an earlier
-            // version created 0644 stays world-readable unless the mode is
-            // re-applied here.
-            if let Err(err) =
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            {
-                eprintln!("warning: cannot set mode on log file {:?}: {err}", path.display());
+        let log_file = match log_file {
+            None => None,
+            Some(path) => {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(|err| {
+                        eyre::eyre!("cannot open the audit log `{}`: {err}", path.display())
+                    })?;
+                // `OpenOptions::mode` only applies when the file is created, and
+                // the log is opened in append mode — so a log that an earlier
+                // version created 0644 stays world-readable unless the mode is
+                // re-applied here.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
+                    |err| eyre::eyre!("cannot secure the audit log `{}`: {err}", path.display()),
+                )?;
+                Some(Arc::new(std::sync::Mutex::new(file)))
             }
-            Some(Arc::new(std::sync::Mutex::new(file)))
-        });
-        let masks = Arc::new(Vec::new());
-        let shorts = Arc::new(Vec::new());
-        let text_masker = SecretMasker::new(Arc::clone(&masks), Arc::clone(&shorts));
-        Self {
-            verbose: Verbosity(verbose),
-            masks,
-            shorts,
-            text_masker,
-            maskers: HashMap::new(),
-            output,
-            log_file,
-        }
+        };
+        Ok(Self { verbose: Verbosity(verbose), maskers: HashMap::new(), output, log_file })
     }
 
     /// The verbosity level.
@@ -182,73 +271,83 @@ impl Ui {
     }
 
     /// Clone the audit-file handle so executor sub-modules can route
-    /// `print_line` output to the same file without holding the Ui lock.
+    /// output to the same file without holding the Ui lock.
     pub(crate) fn log_file(&self) -> Option<Arc<std::sync::Mutex<std::fs::File>>> {
         self.log_file.clone()
     }
 
-    /// Register secret values to be masked in all output.
+    /// Register the secret values to be masked in all output.
     ///
-    /// Normalizes the set once (longest-first, de-duplicated): the masker runs
-    /// for every streamed line, so re-sorting a large @secrets set per call
-    /// would dominate output throughput.
-    pub(crate) fn set_secrets(&mut self, secrets: Vec<String>) {
-        self.masks = Arc::new(prepare_masks(&secrets));
-        self.text_masker = SecretMasker::new(Arc::clone(&self.masks), Arc::clone(&self.shorts));
-        // The per-stream maskers were built from the previous set.
-        self.maskers.clear();
-    }
-
-    /// Register the below-threshold secret values for narrow redaction.
+    /// `masks` holds the values at or above the masking threshold; `shorts`
+    /// holds the below-threshold `(key, value)` pairs, which are redacted
+    /// only where they stand alone as a token or under their own key (a
+    /// global substring replace would shred unrelated output).
     ///
-    /// A value shorter than the masking threshold cannot be redacted with a
-    /// global substring replace (that would shred unrelated output), so it is
-    /// redacted only where it stands alone as a token or appears under its
-    /// own key.
-    pub(crate) fn set_short_secrets(&mut self, shorts: Vec<(String, String)>) {
-        self.shorts = Arc::new(shorts);
-        self.text_masker = SecretMasker::new(Arc::clone(&self.masks), Arc::clone(&self.shorts));
+    /// The set is normalized once (longest-first, de-duplicated) and installed
+    /// in the process-wide registry, so every render site — including the
+    /// free functions that have no `Ui` handle — redacts the same values.
+    pub(crate) fn set_secret_values(&mut self, masks: Vec<String>, shorts: Vec<(String, String)>) {
+        install_masks(masks, shorts);
         self.maskers.clear();
     }
 
     /// Print a masked payload preview (used at `-vv`, dry-run, and diff).
+    ///
+    /// The preview is redacted with a *stateful* masker, so a secret that the
+    /// block splits across two lines is redacted as a whole — exactly like the
+    /// streamed output. The masker is fresh per preview, so one step's
+    /// pending fragment can never leak into the next step's preview.
     pub(crate) fn payload_preview(&self, title: &str, script: &str) {
-        self.log_line(format!("  |--- {title} ---").dimmed().to_string());
+        let set = mask_set().read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let mut masker = SecretMasker::new(Arc::clone(&set.masks), Arc::clone(&set.shorts));
+
+        self.log_line(format!("  |--- {} ---", redact(title)).dimmed().to_string());
         for line in script.lines() {
-            self.log_line(format!("  | {}", self.mask(line)).dimmed().to_string());
+            let masked = masker.redact_line(line);
+            self.log_line(format!("  | {masked}").dimmed().to_string());
         }
         self.log_line("  |------------------".dimmed().to_string());
     }
 
     /// Print a note line with every known secret masked.
-    ///
-    /// Notes that echo user content (a local `bash -c` body, an rsync
-    /// argv) must go through here: `note` renders raw text, so a literal
-    /// secret in a playbook would otherwise leak at `-vv` even though the
-    /// payload preview two lines above shows `***`.
     pub(crate) fn masked_note(&self, text: &str) {
-        self.log_line(self.mask(text).dimmed().to_string());
+        self.log_line(redact(text).dimmed().to_string());
     }
 
     /// Print the plan preview shown at `-v` and above.
-    pub(crate) fn plan_preview(&self, plan: &ExecutionPlan) {
+    ///
+    /// The step numbering follows the *selected* steps, so the preview and
+    /// the step headers agree — including when `--only`/`--skip` filtered
+    /// the plan.
+    ///
+    /// `selected` pairs each step with its index in the *unfiltered* plan;
+    /// the number shown here is the step's position in the selected list, not
+    /// that plan index. Numbering by the plan index would give the preview
+    /// and the step headers two different numbering spaces in the same run.
+    pub(crate) fn plan_preview(&self, plan: &ExecutionPlan, selected: &[(usize, Step)]) {
         if !self.verbose.info() {
             return;
         }
         self.log_line("Plan:".dimmed().to_string());
         for (name, spec) in &plan.servers {
-            self.log_line(format!("  server  {name:>12} -> {spec:?}").dimmed().to_string());
+            self.log_line(
+                format!("  server  {name:>12} -> {}", redact(&format!("{spec:?}")))
+                    .dimmed()
+                    .to_string(),
+            );
         }
         for (name, members) in &plan.groups {
             self.log_line(
-                format!("  group   {name:>12} -> {}", members.join(",")).dimmed().to_string(),
+                format!("  group   {name:>12} -> {}", redact(&members.join(",")))
+                    .dimmed()
+                    .to_string(),
             );
         }
-        for (idx, step) in plan.steps.iter().enumerate() {
+        for (pos, (_plan_index, step)) in selected.iter().enumerate() {
             let target = step.target_text().map_or_default(|t| format!(" -> {t}"));
             let name = step.name().map_or_default(|n| format!(" ({n})"));
             self.log_line(
-                format!("  step    {:>2}: {}{}{}", idx + 1, step.kind(), name, target)
+                format!("  step    {:>2}: {}{}{}", pos + 1, step.kind(), name, target)
                     .dimmed()
                     .to_string(),
             );
@@ -265,30 +364,28 @@ impl Ui {
             OutputModeState::Stream => self.emit_host_line(host, stream, &masked),
             OutputModeState::Grouped { buf } => {
                 let mut buf = buf.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                buf.push(OutLine { host: host.to_string(), stream, text: masked });
+                buf.push(host, OutLine { host: host.to_string(), stream, text: masked });
             }
         }
     }
 
     /// Redact one line of host output with the masker for this host+stream.
     fn mask_host_line(&mut self, host: &str, stream: Stream, line: &str) -> String {
-        let masks = Arc::clone(&self.masks);
-        let shorts = Arc::clone(&self.shorts);
+        let set = mask_set().read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         self.maskers
             .entry((host.to_string(), stream))
-            .or_insert_with(|| SecretMasker::new(masks, shorts))
+            .or_insert_with(|| SecretMasker::new(Arc::clone(&set.masks), Arc::clone(&set.shorts)))
             .redact_line(line)
     }
 
-    /// Flush grouped host buffers to stdout. No-op in stream mode.
+    /// Flush one host's grouped block: the host has finished.
     ///
-    /// The critical section is drained without awaiting, so the blocking lock
-    /// is safe even inside the async runtime.
-    pub(crate) fn flush_grouped(&self) {
+    /// No-op in stream mode.
+    pub(crate) fn host_finished(&self, host: &str) {
         if let OutputModeState::Grouped { buf } = &self.output {
             let lines = {
                 let mut buf = buf.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                std::mem::take(&mut *buf)
+                buf.take_host(host)
             };
             for line in lines {
                 self.emit_host_line(&line.host, line.stream, &line.text);
@@ -296,10 +393,32 @@ impl Ui {
         }
     }
 
+    /// Flush every remaining grouped host buffer to stdout. No-op in stream
+    /// mode.
+    ///
+    /// The critical section is drained without awaiting, so the blocking lock
+    /// is safe even inside the async runtime.
+    pub(crate) fn flush_grouped(&self) {
+        if let OutputModeState::Grouped { buf } = &self.output {
+            let hosts = {
+                let mut buf = buf.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                buf.take_all()
+            };
+            for lines in hosts {
+                for line in lines {
+                    self.emit_host_line(&line.host, line.stream, &line.text);
+                }
+            }
+        }
+    }
+
     fn emit_host_line(&self, host: &str, stream: Stream, text: &str) {
         let prefix = format!("[{host}]").blue().bold();
         let rendered = match stream {
-            Stream::Stdout => format!("{prefix} {text}"),
+            Stream::Stdout => {
+                let text = colorize_itemize(text);
+                format!("{prefix} {text}")
+            }
             Stream::Stderr if self.verbose.trace() => {
                 format!("{} {}", prefix.yellow(), text.yellow())
             }
@@ -323,24 +442,42 @@ impl Ui {
             let line = format!("[{host}] {marker} {text}\n");
             // Short critical section; the lock is released immediately.
             let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _ = file.write_all(line.as_bytes());
+            if file.write_all(line.as_bytes()).is_err() {
+                AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
-    fn mask(&self, line: &str) -> String {
-        self.text_masker.redact_text(line)
+    /// Write one line to stdout and the audit log (if configured).
+    ///
+    /// Private to this module on purpose: every render path goes through a
+    /// method that redacts its content, so a caller cannot bypass the mask
+    /// by reaching for the raw sink.
+    fn log_line(&self, text: String) {
+        print_line(text, &self.log_file);
     }
 
     /// Print a note line (dimmed), routed through the log file if configured.
     pub(crate) fn note(&self, text: &str) {
-        print_line(text.dimmed().to_string(), &self.log_file);
+        self.log_line(redact(text).dimmed().to_string());
     }
+}
 
-    /// Write one line to stdout and the audit log (if configured), using the
-    /// Ui's own log_file handle — for methods like `plan_preview` that need to
-    /// emit multiple lines without threading the handle through each call.
-    pub(crate) fn log_line(&self, text: String) {
-        print_line(text, &self.log_file);
+/// Colorize an rsync itemize line by its change symbol.
+///
+/// `--diff` filters the transfer output down to the itemized changes, and
+/// design §8.2 promises they are "color-coded by symbol": a new file, a
+/// deletion and a timestamp-only change must be distinguishable at a glance.
+fn colorize_itemize(text: &str) -> String {
+    let Some(symbol) = text.chars().next() else {
+        return text.to_string();
+    };
+    match symbol {
+        '>' | 'c' => text.green().to_string(),
+        '*' => text.red().to_string(),
+        '<' => text.yellow().to_string(),
+        '.' => text.dimmed().to_string(),
+        _ => text.to_string(),
     }
 }
 
@@ -354,8 +491,9 @@ fn print_line(text: String, log_file: &Option<Arc<std::sync::Mutex<std::fs::File
     let _ = writeln!(out, "{text}");
     if let Some(file) = log_file {
         let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = file.write_all(text.as_bytes());
-        let _ = file.write_all(b"\n");
+        if file.write_all(text.as_bytes()).is_err() || file.write_all(b"\n").is_err() {
+            AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -376,17 +514,17 @@ pub(crate) fn step_header(
     let target = step.target_text().map_or_default(|t| format!(" -> {t}"));
     let name = step.name().map_or_default(|n| format!(" {n}"));
     let label = format!("[STEP {index}/{total}]{name} {kind_colored}{target}").bold();
-    print_line(format!("\n{label}"), log_file);
+    print_line(format!("\n{}", redact(&label)), log_file);
 }
 
 /// Print a note line (dimmed).
 pub(crate) fn note(text: &str, log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>) {
-    print_line(text.dimmed().to_string(), log_file);
+    print_line(redact(text).dimmed().to_string(), log_file);
 }
 
 /// Print a warning line (yellow, prefixed with `!`).
 pub(crate) fn warn(text: &str, log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>) {
-    print_line(format!("  ! {text}").yellow().to_string(), log_file);
+    print_line(format!("  ! {}", redact(text)).yellow().to_string(), log_file);
 }
 
 /// Print a dry-run banner (magenta, bold).
@@ -439,7 +577,7 @@ pub(crate) fn step_failed(
     message: &str,
     log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>,
 ) {
-    print_line(format!("Step {index} failed: {message}").red().to_string(), log_file);
+    print_line(format!("Step {index} failed: {}", redact(message)).red().to_string(), log_file);
 }
 
 #[cfg(test)]
@@ -481,7 +619,7 @@ mod tests {
             .append(true)
             .open(&log_path)
             .expect("open log file");
-        let mut ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, None);
+        let mut ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, None).expect("ui");
         ui.log_file = Some(Arc::new(std::sync::Mutex::new(file)));
         ui.log_line("test line".to_string());
         drop(ui);
@@ -495,10 +633,26 @@ mod tests {
         colored::control::set_override(false);
         let dir = tempfile::tempdir().expect("temp dir");
         let log_path = dir.path().join("audit.log");
-        let ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, Some(log_path.clone()));
+        let ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, Some(log_path.clone()))
+            .expect("ui");
         drop(ui);
         let mode = std::fs::metadata(&log_path).expect("log file").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the audit log must not be readable by other users");
+    }
+
+    #[test]
+    fn an_unopenable_log_file_is_a_hard_error() {
+        // A run that was asked to keep an audit trail and silently keeps none
+        // is worse than a run that refuses to start.
+        colored::control::set_override(false);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("no-such-dir").join("audit.log");
+        let outcome =
+            super::Ui::new(0, true, crate::cli::OutputMode::Stream, Some(missing.clone()));
+        let Err(err) = outcome else {
+            panic!("an unopenable audit log must fail the run");
+        };
+        assert!(err.to_string().contains("audit log"), "unexpected error: {err}");
     }
 
     #[test]
@@ -510,16 +664,51 @@ mod tests {
         std::fs::write(&log_path, "old line\n").expect("seed log");
         std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o644))
             .expect("loosen log");
-        let ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, Some(log_path.clone()));
+        let ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, Some(log_path.clone()))
+            .expect("ui");
         drop(ui);
         let mode = std::fs::metadata(&log_path).expect("log file").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "an existing log must be tightened, not left world-readable");
+        assert_eq!(mode, 0o600, "the audit log must be tightened to owner-only");
     }
 
     #[test]
     fn log_line_without_log_file_writes_to_stdout_only() {
         colored::control::set_override(false);
-        let ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, None);
-        ui.log_line("stdout only".to_string());
+        let ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, None).expect("ui");
+        assert!(ui.log_file().is_none(), "no audit log was requested");
+    }
+
+    #[test]
+    fn every_render_path_redacts_a_registered_secret() {
+        // The masking guarantee is structural: the free functions have no
+        // `Ui` handle and still redact, so no call site can leak by
+        // forgetting to ask for masking.
+        colored::control::set_override(false);
+        super::install_masks(vec!["s3cr3tvalue".to_string()], Vec::new());
+        assert_eq!(super::redact("value s3cr3tvalue here"), "value *** here");
+        assert!(!super::redact("value s3cr3tvalue here").contains("s3cr3tvalue"));
+    }
+
+    #[test]
+    fn a_secret_split_across_two_preview_lines_is_redacted_as_a_whole() {
+        // The preview is a multi-line render of user content, so it must use
+        // the *stateful* masker: two fragments that would reassemble into the
+        // secret must not survive separately.
+        colored::control::set_override(false);
+        super::install_masks(vec!["s3cr3tvalue".to_string()], Vec::new());
+        let mut ui = super::Ui::new(0, true, crate::cli::OutputMode::Stream, None).expect("ui");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("audit.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open log file");
+        ui.log_file = Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
+        ui.payload_preview("Local Payload", "printf '%s' \"s3cr3t\nvalue\"");
+        drop(ui);
+        let content = std::fs::read_to_string(&log_path).expect("read log file");
+        assert!(!content.contains("s3cr3tvalue"), "the secret leaked: {content}");
+        assert!(!content.contains("value\""), "the tail leaked: {content}");
     }
 }

@@ -3,14 +3,44 @@
 
 use std::{path::Path, sync::Arc};
 
-use eyre::{Context as _, Result, bail};
+use eyre::{Context as _, Result};
 use shellflow_core::{EnvEntry, LocalStep, RunState};
 use tokio::{fs, process::Command, sync::Mutex};
 
 use super::{
-    ArcUi, CaptureFile, HostOutcome, LocalBlockArgs, LogFile, StepConfig,
-    process::{GroupGuard, isolate},
+    ArcUi, Cancel, CaptureFile, HostOutcome, LocalBlockArgs, LogFile, RunError, StepConfig,
+    process::isolate,
 };
+
+/// Why a local block did not complete successfully.
+///
+/// The distinction matters: a timeout is a `TIMEOUT` status, a broken payload
+/// pipe is a transport failure (exit 3), and anything else is a script
+/// failure (exit 4).
+pub(crate) enum LocalFailure {
+    /// The block exceeded its timeout.
+    Timeout,
+    /// The block's script could not be delivered to the shell.
+    PipeBroken,
+    /// The block failed for any other reason.
+    Failed(eyre::Report),
+}
+
+impl From<eyre::Report> for LocalFailure {
+    fn from(report: eyre::Report) -> Self {
+        Self::Failed(report)
+    }
+}
+
+/// The outcome of an `@only_if` guard evaluation.
+pub(crate) enum GuardOutcome {
+    /// The guard succeeded: run the block.
+    Pass,
+    /// The guard failed: skip the block.
+    Fail,
+    /// The guard could not be evaluated.
+    Failed(RunError),
+}
 
 pub(super) async fn build_env(
     run_state: &Arc<Mutex<RunState>>,
@@ -29,6 +59,10 @@ pub(super) async fn build_env(
                 if !state.vars.contains_key(key) &&
                     let Ok(value) = std::env::var(key)
                 {
+                    // A repeated `@env KEY` must not inject the key twice: the
+                    // child would see one value, but the payload env block
+                    // would carry two.
+                    env.retain(|(k, _)| k != key);
                     env.push((key.clone(), value));
                 }
             }
@@ -53,6 +87,8 @@ fn append_capture(script: &str, vars: &[String]) -> String {
     for var in vars {
         // `printf` interprets `\0` as NUL in the format string; the values are
         // passed as arguments, so `%`/backslash in them are never re-scanned.
+        // The variable name is validated by the parser
+        // (`is_valid_var_name`), so it cannot break out of the quotes.
         out.push_str(&format!(
             "printf '%s=%s\\0' \"{var}\" \"${{{var}}}\" >> \"$SHELLFLOW_CAPTURE\"\n"
         ));
@@ -103,7 +139,7 @@ pub(crate) fn create_capture_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn run_local_block(args: &LocalBlockArgs<'_>) -> Result<()> {
+pub(super) async fn run_local_block(args: &LocalBlockArgs<'_>) -> Result<(), LocalFailure> {
     if args.config.check || args.config.dry_run {
         run_bash_n(args.script, args.log_file).await?;
         crate::ui::note("  local syntax check (bash -n): OK", args.log_file);
@@ -148,15 +184,24 @@ pub(super) async fn run_local_block(args: &LocalBlockArgs<'_>) -> Result<()> {
         args.ui.lock().await.masked_note(&format!("  local command: bash -c {body:?}"));
     }
 
-    let status =
-        run_bash_streamed(args.ui, "localhost", cmd, args.config.timeout, args.log_file).await?;
+    let status = run_bash_streamed(
+        args.ui,
+        "localhost",
+        cmd,
+        args.config.timeout,
+        args.log_file,
+        &args.cancel,
+    )
+    .await?;
 
     if !status.success() {
-        bail!("local script exited with status {status}");
+        return Err(LocalFailure::Failed(eyre::eyre!("local script exited with status {status}")));
     }
 
     if let Some(capture) = &capture {
-        capture_exports(args.run_state, args.capture, capture).await?;
+        capture_exports(args.run_state, args.capture, capture)
+            .await
+            .map_err(LocalFailure::Failed)?;
     }
     Ok(())
 }
@@ -166,6 +211,7 @@ pub(crate) async fn run_local_step(
     run_state: &Arc<Mutex<RunState>>,
     local: &LocalStep,
     config: StepConfig,
+    cancel: &Cancel,
 ) -> Result<Vec<(String, HostOutcome)>> {
     let log_file = ui.lock().await.log_file();
 
@@ -174,13 +220,27 @@ pub(crate) async fn run_local_step(
     let env = build_env(run_state, &local.env).await;
 
     if let Some(guard) = &local.guard {
-        if run_local_guard(guard, &env, config.timeout).await {
-            if config.verbose >= 2 {
-                ui.lock().await.masked_note(&format!("  guard passed: {guard}"));
-            }
+        // A dry run must not change anything, so the guard is reported rather
+        // than evaluated — a guard is a command like any other, and it runs
+        // with the block's environment (design §8.2).
+        if config.dry_run || config.check {
+            crate::ui::note(&format!("  guard not evaluated in dry-run/check: {guard}"), &log_file);
         } else {
-            crate::ui::note("  local guard failed — skipping block", &log_file);
-            return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
+            match evaluate_guard(ui, guard, &env, config.timeout, cancel, &log_file).await {
+                GuardOutcome::Pass => {
+                    if config.verbose >= 2 {
+                        ui.lock().await.masked_note(&format!("  guard passed: {guard}"));
+                    }
+                }
+                GuardOutcome::Fail => {
+                    crate::ui::note("  local guard failed — skipping block", &log_file);
+                    return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
+                }
+                GuardOutcome::Failed(err) => {
+                    crate::ui::warn(&format!("local guard failed: {err}"), &log_file);
+                    return Ok(vec![("localhost".to_string(), HostOutcome::Failed(err))]);
+                }
+            }
         }
     }
 
@@ -197,18 +257,36 @@ pub(crate) async fn run_local_step(
         capture: &local.export,
         extra: &[],
         log_file: &log_file,
+        cancel: cancel.clone(),
     };
-    match run_local_block(&args).await {
-        Ok(()) => Ok(vec![("localhost".to_string(), HostOutcome::Ok)]),
-        Err(err) => Err(err),
-    }
+    // Every failure mode is reported as a *status* rather than an error, so
+    // the step summary still lists the host (and can say `TIMEOUT`).
+    let outcome = match run_local_block(&args).await {
+        Ok(()) => HostOutcome::Ok,
+        Err(LocalFailure::Timeout) => HostOutcome::TimedOut,
+        Err(LocalFailure::PipeBroken) => HostOutcome::Failed(RunError::Transport),
+        Err(LocalFailure::Failed(err)) => {
+            crate::ui::warn(&format!("local step failed: {err:#}"), &log_file);
+            HostOutcome::Failed(RunError::Script)
+        }
+    };
+    Ok(vec![("localhost".to_string(), outcome)])
 }
 
-pub(super) async fn run_local_guard(
+/// Evaluate an `@only_if` guard on the controller.
+///
+/// The guard's output is forwarded through the UI like any other block
+/// output: it is masked, prefixed with the host alias, and written to the
+/// audit log. A guard runs with the block's environment, so its output can
+/// contain a secret.
+pub(crate) async fn evaluate_guard(
+    ui: &ArcUi,
     guard: &str,
     env: &[(String, String)],
     timeout: Option<u64>,
-) -> bool {
+    cancel: &Cancel,
+    log_file: &LogFile,
+) -> GuardOutcome {
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(format!("set -e\n{guard}"));
     // Same env layer as the block: run-state/`@env` pairs overlay the process
@@ -216,30 +294,32 @@ pub(super) async fn run_local_guard(
     cmd.envs(env.iter().cloned());
     cmd.kill_on_drop(true);
     isolate(&mut cmd);
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(_) => return false,
+
+    let args = super::stream::PipedArgs {
+        ui,
+        host: "localhost",
+        payload: None,
+        timeout,
+        diff_filter: None,
+        log_file,
+        cancel: cancel.clone(),
+        quiet: false,
     };
-    let mut guard = GroupGuard::new(&child);
-    let status = match timeout {
-        Some(secs) => {
-            match tokio::time::timeout(std::time::Duration::from_secs(secs), child.wait()).await {
-                Ok(Ok(status)) => status,
-                Ok(Err(_)) => return false,
-                Err(_) => {
-                    super::process::terminate(&mut child).await;
-                    guard.disarm();
-                    return false;
-                }
+    match super::stream::run_piped_child(args, cmd).await {
+        Ok(super::stream::PipedRun::Completed(status)) => {
+            if status.success() {
+                GuardOutcome::Pass
+            } else {
+                GuardOutcome::Fail
             }
         }
-        None => match child.wait().await {
-            Ok(status) => status,
-            Err(_) => return false,
-        },
-    };
-    guard.disarm();
-    status.success()
+        Ok(super::stream::PipedRun::TimedOut | super::stream::PipedRun::Cancelled) => {
+            GuardOutcome::Failed(RunError::Script)
+        }
+        Ok(super::stream::PipedRun::PipeBroken) | Err(_) => {
+            GuardOutcome::Failed(RunError::Transport)
+        }
+    }
 }
 
 async fn run_bash_streamed(
@@ -248,34 +328,44 @@ async fn run_bash_streamed(
     cmd: Command,
     timeout: Option<u64>,
     log_file: &LogFile,
-) -> Result<std::process::ExitStatus> {
-    match super::stream::run_piped_child(Arc::clone(ui), host, cmd, None, timeout, None, log_file)
-        .await?
-    {
+    cancel: &Cancel,
+) -> Result<std::process::ExitStatus, LocalFailure> {
+    let args = super::stream::PipedArgs {
+        ui,
+        host,
+        payload: None,
+        timeout,
+        diff_filter: None,
+        log_file,
+        cancel: cancel.clone(),
+        quiet: false,
+    };
+    match super::stream::run_piped_child(args, cmd).await.map_err(LocalFailure::Failed)? {
         super::stream::PipedRun::Completed(status) => Ok(status),
-        super::stream::PipedRun::TimedOut => {
-            bail!("local step timed out");
-        }
+        super::stream::PipedRun::TimedOut => Err(LocalFailure::Timeout),
         // The local child died before reading its script: a spawn-level or
         // script-delivery failure, not a timeout.
-        super::stream::PipedRun::PipeBroken => {
-            bail!("local script could not be delivered to bash");
+        super::stream::PipedRun::PipeBroken => Err(LocalFailure::PipeBroken),
+        super::stream::PipedRun::Cancelled => {
+            Err(LocalFailure::Failed(eyre::eyre!("local step cancelled")))
         }
     }
 }
 
-async fn run_bash_n(script: &str, log_file: &LogFile) -> Result<()> {
+async fn run_bash_n(script: &str, log_file: &LogFile) -> Result<(), LocalFailure> {
     let output = Command::new("bash")
         .arg("-n")
         .arg("-c")
         .arg(script)
         .output()
         .await
-        .wrap_err("failed to run bash -n")?;
+        .map_err(|err| LocalFailure::Failed(eyre::eyre!("failed to run bash -n: {err}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // `bash -n` echoes the offending source line, which can contain a
+        // secret: the warning goes through the masked render path.
         crate::ui::warn(&format!("syntax error: {stderr}"), log_file);
-        bail!("bash -n failed");
+        return Err(LocalFailure::Failed(eyre::eyre!("bash -n failed")));
     }
     Ok(())
 }

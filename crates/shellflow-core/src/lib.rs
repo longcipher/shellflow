@@ -26,14 +26,14 @@ pub mod template;
 
 pub use env::{
     CAPTURE_SEPARATOR, MASK, SecretMasker, mask_keyed, mask_line, mask_token,
-    parse_capture_records, prepare_masks, render_env, shell_quote_single,
+    parse_capture_records, prepare_masks, render_env, shell_quote_single, strip_surrounding_quotes,
 };
-pub use error::{CaptureError, InterpolateError, ParseError};
+pub use error::{CaptureError, InterpolateError, ParseError, RenderEnvError};
 pub use heredoc::{Heredoc, HeredocTracker};
 pub use parser::parse_script;
 pub use plan::{
     CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, ResolvedHost, RunState, SecretEntry,
-    Step, Target, WaitStep, interpolate, resolve_hosts,
+    Step, Target, WaitStep, interpolate, is_valid_var_name, resolve_hosts,
 };
 pub use ssh_spec::SshSpec;
 pub use template::{render_template, template_keys};

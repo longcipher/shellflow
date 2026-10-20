@@ -39,11 +39,11 @@ Design constraints:
 - Concurrent multi-host execution with live, host-prefixed, color-coded output.
 - `-v / -vv / -vvv` realtime debugging with zero extra architecture.
 - `--dry-run` / `--diff` idempotent previews before any change.
-- Lean, auditable codebase: 2 crates, on the order of 1500–2000 lines. The
-  target is clarity and test coverage, not line-count gymnastics — "lightweight"
-  means a single static binary with no runtime dependencies, not minimal source
-  lines.
-- Production-safe lifecycle: global and per-step timeouts, Ctrl-C/SIGTERM
+- Lean, auditable codebase: three crates (`shellflow-core`, `shellflow-secrets`,
+  `bin/shellflow`) of roughly 4.8k / 1.2k / 8.9k lines, of which about a
+  third is tests. The target is clarity and test coverage, not line-count
+  gymnastics — "lightweight" means a single static binary with no runtime
+  dependencies, not minimal source lines.- Production-safe lifecycle: global and per-step timeouts, Ctrl-C/SIGTERM
   handling that never leaves orphan processes, and a friendly preflight check.
 - TDD with unit tests + `proptest` in the normal `cargo test` loop, plus
   `cargo-mutants` for mutation coverage (`just mutation`).
@@ -116,6 +116,7 @@ All other lines (including plain comments) belong to the current block.
 | `@timeout` | `# @timeout <seconds>` | Cap the next block per host; on expiry the child is SIGTERM'd, then SIGKILL'd after a grace period (§7.5) |
 | `@name` | `# @name <label>` | Label the next block (for `--only`/`--skip` filtering and reporting) |
 | `@only_if` | `# @only_if <command>` | Guard: run next block only where `<command>` succeeds (exit 0); otherwise report `SKIPPED` |
+| `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active <unit>` on every target host until it reports active or the budget expires (default 300s). Replaces the hand-rolled `for`/`sleep`/`ss` poll loops that differ in every playbook. A host that never reports active is `FAILED` (script class); an unreachable host is a transport failure (§6) |
 
 **Rules:**
 
@@ -124,9 +125,15 @@ All other lines (including plain comments) belong to the current block.
 2. A block that contains no executable statement (only comments/blank lines) is
    dropped.
 3. Blocks default to `local` until an explicit `@remote`/`@copy`/`@local`.
+   `@copy` is a self-contained step that carries its own target, and it returns
+   the block mode to `local` — the lines that follow are not streamed to the
+   copy's remote target.
 4. `@env`, `@only_if`, `@timeout`, and `@name` apply to the *next* block that
    contains statements. `@export` applies to the *preceding* local block and is
-   an error after a remote block (remote variables cannot be captured).
+   an error after a remote block (remote variables cannot be captured). Because
+   every directive flushes the pending block, the preceding local block may
+   already have been emitted when `@export` is read; `@export` therefore binds
+   to the last emitted local step, not only to the pending one.
 5. The shebang `#!/usr/bin/env shellflow` is ignored, as is any line before the
    first directive that only contains comments/blank lines.
 6. CRLF line endings are tolerated (`\r` stripped).
@@ -135,6 +142,8 @@ All other lines (including plain comments) belong to the current block.
    lexically and every line up to the exact terminator is script content,
    exempt from directive detection. Bodies are consumed FIFO because one
    line may open several here-documents.
+9. A directive keyword must be a whole word: `# @server-web x` is an unknown
+   directive, not `@server` with the name `-web`.
 
 ### 4.2 Reference example
 
@@ -185,10 +194,13 @@ pub struct SshSpec {
 }
 
 /// Target of a remote/copy step: a server alias, a group, or a literal spec.
+///
+/// The raw text is kept verbatim and classified lazily in `resolve_hosts`, so
+/// a step may target a group that is declared later in the script.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Target {
-    Alias(String),
-    Raw(String),
+pub struct Target {
+    /// The raw target text from the script (`web`, `deploy@host`…).
+    pub text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +246,21 @@ pub enum Step {
     Local(LocalStep),
     Remote(RemoteStep),
     Copy(CopyStep),
+    Wait(WaitStep),
+}
+
+/// A wait-for-active step (`@wait_active`).
+#[derive(Clone, Debug)]
+pub struct WaitStep {
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// systemd unit name (`foo` or `foo.service`).
+    pub unit: String,
+    /// Wait budget in seconds (`@timeout` or `--timeout N`, else 300).
+    pub timeout: Option<u64>,
+    /// Poll interval in seconds (fixed at 5: kind to systemd, not a knob).
+    pub interval_secs: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -241,7 +268,15 @@ pub struct ExecutionPlan {
     /// Deterministic ordering (BTreeMap) for stable plan summaries.
     pub servers: BTreeMap<String, SshSpec>,
     pub groups: BTreeMap<String, Vec<String>>,
-    pub env: Vec<(String, String)>, // from @env directives, in order
+    /// All `@env` entries, in declaration order.
+    ///
+    /// Copy-on-write behind an `Arc`: every step holds an `Arc` clone of the
+    /// snapshot that was current when it was declared, so snapshotting the
+    /// environment into every step costs one pointer copy rather than a deep
+    /// copy of every key/value pair.
+    pub env: Arc<Vec<EnvEntry>>,
+    /// All `@secrets` file references, in declaration order.
+    pub secrets: Vec<SecretEntry>,
     pub steps: Vec<Step>,
 }
 
@@ -316,6 +351,7 @@ shellflow/
 │       │   │   ├── local.rs   # bash -c, guard, @export capture
 │       │   │   ├── remote.rs  # ssh streaming, login-shell probe, guards
 │       │   │   ├── copy.rs    # rsync + scp fallback, staged --delete swap
+│       │   │   ├── cancel.rs  # cooperative cancellation for the interrupt path
 │       │   │   ├── process.rs # process groups, terminate, GroupGuard
 │       │   │   └── stream.rs  # piped-output forwarding, timeout, drain
 │       │   ├── secrets.rs     # @secrets resolution -> run-state env + mask list
@@ -350,6 +386,7 @@ shellflow/
             ├── identity.rs    # X25519 identity resolution and generation
             ├── crypto.rs      # age encrypt/decrypt
             ├── env.rs         # KEY=VALUE env file parser
+            ├── fsx.rs         # atomic writes with an explicit mode
             └── error.rs
 ```
 
@@ -364,11 +401,16 @@ shellflow/
 - Renders the payload env header (escaping + `set -x` ordering), parses the
   NUL-delimited `@export` capture records, and masks known secret values — all
   pure string logic, unit- and proptest-able.
-- Exposes `ParseError` / `InterpolateError` / `CaptureError` (with line
-  numbers where applicable) via `thiserror`.
+- Owns the workspace-wide definitions that more than one crate needs: the
+  shell-identifier check (`is_valid_var_name`) and the quote-stripping rule
+  (`strip_surrounding_quotes`). `shellflow-secrets` depends on this crate for
+  them, so the two copies that used to drift cannot.
+- Exposes `ParseError` / `InterpolateError` / `CaptureError` / `RenderEnvError`
+  (with line numbers where applicable) via `thiserror`.
 - No tokio, no stdio, no network, **no filesystem access**. `ExecutionPlan.env`
-  is copy-on-write (`Arc<Vec<_>>`) so snapshotting the env into every step does
-  not make plan construction quadratic. Everything is unit- and proptest-able.
+  is copy-on-write (`Arc<Vec<_>>`), so snapshotting the env into every step
+  does not make plan construction quadratic. Everything is unit- and
+  proptest-able.
 
 **`shellflow-secrets`** — age wrapper.
 
@@ -376,14 +418,17 @@ shellflow/
   generation, file encrypt/decrypt, and recipient read-back.
 - Resolves the identity path (`-i` / `$SHELLFLOW_AGE_IDENTITY` /
   `~/.config/age/keys.txt`). An empty or unset `$HOME` is treated as *absent*
-  rather than as the current directory, so a planted `./.config/age/keys.txt`
-  can never be adopted as the operator's identity.
+  rather than as the current directory: the default location is then
+  undefined, and resolving it to a *relative* path would adopt a planted
+  `./.config/age/keys.txt` as the operator's identity. The resolver fails
+  closed with a clear message instead.
 - Parses `KEY=VALUE` env files (blank lines and `#` comments ignored; first
   `=` splits the key; a repeated key keeps its last value and appears once,
   matching `source` semantics).
 - Library-only: no `tokio`, no `std::process`. It does perform its own file
   I/O (identity load, env-file read), which is exactly its stated job (§S7);
-  it has no network or subprocess surface.
+  it has no network or subprocess surface. `fsx` owns the atomic-write
+  primitive (staged temp file + rename) that every secret-bearing file uses.
 - `shellflow-core` stays free of async, I/O, and crypto.
 
 **`bin/shellflow`** — the I/O boundary.
@@ -484,12 +529,23 @@ SUBCOMMANDS (the bare positional `shellflow deploy.sh` == `shellflow run`):
 
 EXIT CODES:
   0   success (skipped blocks and dry-runs with no errors)
-  1   plan/parse error (bad script, unresolved @export variable)
+  1   plan/parse error (bad script, unresolved @export variable, an
+      unresolvable target, a syntax error found by a dry-run/check)
   2   CLI usage error (clap)
   3   transport/setup failure (missing ssh/rsync/bash, ssh exit 255, a broken
       payload pipe, rsync I/O error)
   4   script execution failure (a local/remote step exited non-zero)
   130 interrupted by SIGINT/SIGTERM (see §7.5)
+
+The distinction between 1 and 4 is deliberate: 1 means "the playbook is
+wrong" (nothing was attempted), 4 means "the deployment failed". A CI gate
+can therefore tell the two apart without parsing the output.
+
+The subcommands use the same classes: a failure that means "the request could
+not even be attempted" — a missing `ssh` in `service check`, an unreachable
+host — is a transport/setup failure (3), and everything else is 1. `service
+check` therefore agrees with the `run` path about the same missing tool
+instead of reporting it as a generic error.
 ```
 
 Example invocations:
@@ -573,6 +629,12 @@ Key points:
   and probe failures fall back to plain `bash -l -s` with no injected PATH, and
   `--check`/`--dry-run` stay on `bash -n -s` (no probe, no login env). An
   explicit `@env PATH=…`/`@export PATH` always wins over the probe.
+  > The probe's **completion marker**, not its exit status, is the success
+  > criterion. The probe also reports whether the target has `rsync`, and a
+  > host without `rsync` makes that check fail — so if the exit status were
+  > the criterion, the whole probe result (the login shell *and* the
+  > rc-extended PATH) would be discarded on exactly the minimal hosts that
+  > need it most. Each field degrades independently instead.
 - `set -eu` by default (crash on unset vars and errors); `-vvv` upgrades to
   `set -ex` for live tracing.
 - `@env`/captured variables are injected as a `export KEY='value';` block at
@@ -617,6 +679,17 @@ instead of performing a materially different transfer than the playbook
 requested — an excluded file would land on the target and stale files would
 survive, while the step reported success. `--allow-unfiltered-copy` is the
 explicit opt-out; the downgrade is then reported in the step output.
+
+**Dry-run still probes the target — deliberately.** §7.2's "no probe, no login
+env" rule governs *remote blocks*: in `--check`/`--dry-run` they stay on
+`bash -n -s` and never open a second connection. A copy step is different: the
+whole point of `rsync --dry-run -i` is to compute the *real* local↔remote
+delta, so the target must be reached anyway, and the `rsync`-or-`scp` decision
+has to be made before the transfer starts. The probe is therefore the
+mechanism that answers that question (§7.3), and it is cached per host per
+run, so a playbook with several copy steps still opens one connection per
+host. `--check` is the mode that stays entirely offline: it skips the copy
+step altogether rather than touching the target.
 
 ### 7.4 Concurrency & output integrity
 
@@ -665,9 +738,25 @@ explicit opt-out; the downgrade is then reported in the step output.
   expiry it tears the group down as above and records the host as `TIMEOUT` (a
   failure: abort or continue per `--continue-on-error`).
 - **Signals.** `tokio::signal` installs SIGINT/SIGTERM handlers. On receipt,
-  shellflow cancels all in-flight host tasks, the `GroupGuard`s tear down every
-  process group, shellflow prints a summary of completed/failed/pending steps,
-  and exits 130. No orphan processes survive.
+  the run is cancelled **cooperatively**: every in-flight host task observes
+  the signal, terminates its own process group (`SIGTERM`, a grace period,
+  then `SIGKILL`), and returns normally; the executor is then awaited to
+  completion before the process exits. shellflow prints a summary of
+  completed/failed/pending steps and exits 130. **No orphan processes
+  survive.**
+  > Cancelling by *dropping* the executor's future is not enough: the host
+  > tasks are aborted asynchronously, so their process-group guards may never
+  > run before the process exits — which is how an orphaned `ssh` survives a
+  > Ctrl-C. Cooperative cancellation makes the teardown a precondition of
+  > the exit, not a race against it.
+- **Preflight probes are isolated too.** The preflight probe leads its own
+  process group like every other child, so a PATH-shadowed wrapper that
+  backgrounds helpers cannot leave them behind when the probe is killed.
+- **A backgrounded descendant cannot hang a step.** A block that backgrounds
+  a process (`nohup svc &`) leaves the descendant holding the step's output
+  pipe. The drain of the reader tasks is therefore bounded: a group that
+  still holds the pipe past the grace period is killed rather than hanging
+  the run, and `--timeout` stays a real bound on the step.
 
 ### 7.6 Cross-step state (`@export`)
 
@@ -743,10 +832,26 @@ Nothing is written in either mode; both exit `1` if any `bash -n` finds a
 syntax error. This is the pyinfra "prove it before you change it" loop, achieved
 entirely with `rsync`/`bash` primitives (see D-4).
 
+**A copy that cannot be previewed is skipped, never performed.** `rsync
+--dry-run` is what produces the delta; the `scp` fallback (a target without
+`rsync`, §7.3) and the local `cp` have no dry-run mode at all — previewing
+them would mean performing them. So on such a host the copy step is skipped
+with a warning and the run reports the host as `SKIPPED`: a "dry run" that
+wrote to the target would be the most dangerous flag in the tool. The
+`--delete`/`--exclude` fail-closed rule (§7.3) applies to dry-runs too, so a
+playbook that asks for a filtered copy still refuses to run against a target
+that cannot honour it.
+
 **State in dry-run.** Local steps are *not* executed in dry-run, so
 `@export`ed variables are unknown there. A `@copy` path referencing an
 unresolved variable prints a warning and is skipped for itemization instead of
 guessing a path.
+
+**Guards are not evaluated in dry-run.** An `@only_if` guard is a command
+like any other, and it runs with the block's environment — so evaluating it
+could change the target. In `--dry-run`/`--check` the guard is *reported*
+rather than run. The same rule applies to a remote block resolved on the
+controller with `--local`.
 
 ### 8.3 Idempotency strategy
 
@@ -785,16 +890,33 @@ Three cooperating layers, deliberately *not* a state engine:
   only inside the payload streamed over stdin, placed *before* any `set -x` so
   the export lines themselves are never traced (§7.2). Known values are masked
   (`***`) in payload previews, trace output, and `--log-file`. The audit log is
-  created `0600` (and re-tightened when an existing file is appended to).
-  Redaction is **stateful across output lines**: a value that a target program
-  split across two lines (`fold`, a pager, a progress bar) is redacted as a
-  whole, because the two fragments would otherwise reassemble into the
-  original in the scrollback or in the audit trail. Values below the masking
-  threshold cannot use a global substring replace (it would shred unrelated
-  output), so they are redacted only where they stand alone as a token or
-  appear as `KEY=value`; the run names the affected keys so the exemption is
-  never silent. Residual caveat: redaction is a plaintext match, so a
-  base64/hex rendering of a value is never redacted.
+  created `0600` (and re-tightened when an existing file is appended to); a log
+  that cannot be opened is a **hard error**, not a warning — a run that was
+  asked to keep an audit trail and silently keeps none is worse than a run that
+  refuses to start.
+  > **Masking is applied by the sink, not requested by the caller.** Every
+  > byte that reaches the terminal or the audit log passes through the
+  > redactor, so there is no unmasked twin of any render function and a
+  > secret cannot leak because a call site forgot to ask for masking. The
+  > process-wide mask registry is what lets the free render functions — which
+  > have no `Ui` handle — redact exactly like the `Ui` methods do.
+  >
+  > Redaction is **stateful across output lines**: a value that a target
+  > program split across two lines (`fold`, a pager, a progress bar) is
+  > redacted as a whole, because the two fragments would otherwise reassemble
+  > into the original in the scrollback or in the audit trail. The payload
+  > preview uses the same stateful masker, so a value split across two lines
+  > of a block body is redacted there too. A prefix at the tail of a line is
+  > *always* remembered as a pending continuation, even when another range
+  > already covers those bytes, so the rest of the value cannot slip through
+  > on the next line. Every occurrence of a value is masked — a value that
+  > overlaps itself is masked whole, exactly like the stateless path. Values
+  > below the masking threshold
+  > cannot use a global substring replace (it would shred unrelated output),
+  > so they are redacted only where they stand alone as a token or appear as
+  > `KEY=value`; the run names the affected keys so the exemption is never
+  > silent. Residual caveat: redaction is a plaintext match, so a base64/hex
+  > rendering of a value is never redacted.
 - **Decrypted values in memory.** The plaintext buffer is zeroized when it is
   dropped, and the resolved values are scrubbed when the run ends. The
   residual is explicit: the values are also cloned into the run-state env map,
@@ -831,6 +953,13 @@ Example-based unit tests (colocated `#[cfg(test)]`):
 - env-block rendering: single-quote escaping, ordering before `set -x`,
   masking of known values; mask ordering is normalized once per run
   (`prepare_masks`), not once per output line;
+- the stateful masker: a value split across lines is redacted as a whole (two
+  and three lines, a split at a line end, a split at the first character), the
+  text around a masked value survives, every occurrence in a line is masked
+  (a value that overlaps itself is masked whole, like the stateless path),
+  and the longest secret wins a tie — the mask set is ordered longest-first
+  and then by value, so the ordering (and every tie it breaks) is the same on
+  every run and on every host;
 - `resolve_hosts`: alias / group / raw spec / `--target` restriction;
 - `SshSpec`: `user@host:port` → `["-p", "2222", "user@host"]` and rsync dest;
 - here-documents: quoted/escaped/plain/`<<-` delimiters, `<<<` here-strings,
@@ -856,13 +985,19 @@ End-to-end tests with **mock `ssh`/`rsync` shims** placed earlier on `PATH`
 - payload integrity: the exact script sent over stdin (mock `ssh` writes stdin
   to a file);
 - `-vvv` injects `set -ex` and adds `ssh -v`;
-- `--dry-run` sends `bash -n -s` and `rsync --dry-run -i`; nothing written;
+- `--dry-run` sends `bash -n -s` and `rsync --dry-run -i`; nothing written —
+  including through the `scp` fallback, which has no dry-run mode and is
+  therefore skipped rather than performed;
 - fail-fast aborts remaining steps vs `--continue-on-error` summary;
 - `--target`, `--only`, `--skip`, exit codes, `--no-color`;
 - timeout: a sleeping mock `ssh` is SIGTERM'd and reported `TIMEOUT`;
-- SIGINT: an in-flight mock `ssh` is killed and shellflow exits 130;
+- SIGINT: an in-flight mock `ssh` is killed and shellflow exits 130, and the
+  interrupt summary is recorded in the `--log-file` audit trail;
 - `--output grouped` emits per-host blocks; `--log-file` contains tagged lines;
+- the plan preview and the step headers share one numbering space, also when
+  `--only`/`--skip` filtered the plan;
 - preflight: PATH without `ssh` fails fast with exit 3 and a friendly message;
+  the `service check` subcommand reports the same failure class the same way;
 - `-vvv` with an `@env` secret: the mock's echoed payload shows the value
   masked as `***`, including in the local `bash -c` preview;
 - a `# @remote` line inside a here-document body: no `ssh` invocation at all,
@@ -1240,7 +1375,13 @@ The executor resolves all `SecretEntry` values once, before the first step:
 4. insert every key into run-state env (same layer as `@export`, so explicit
    `@env` still wins on conflicts);
 5. register every value in the `Ui` mask set (see §S5.3);
-6. export `LT_SECRET_KEYS` into run-state env.
+6. export `LT_SECRET_KEYS` into run-state env — **only when there are shared
+   keys**. The variable is a *set* of key names; an empty value would be
+   indistinguishable from "this service has no credentials", which
+   `cred-env credstore-install` acts on by clearing the credential store. A
+   playbook whose every entry is per-host therefore exports no variable at
+   all, and the store is left untouched; the per-host key names are added by
+   the executor, for the host it is about to talk to.
 
 #### S5.3 Masking
 
@@ -1325,7 +1466,10 @@ stays free of async, I/O, and crypto.
   re-writing an existing file. The `@export` capture file is owned by an RAII
   guard and deleted on every exit path, including a failed step.
 - **Masked everywhere**: previews, `-vv/-vvv` traces, and `--log-file` redact
-  every `@secrets` value (subject to the min-length guard).
+  every `@secrets` value (subject to the min-length guard). The redaction is
+  applied by the output sink, so every render path is covered by
+  construction — including error messages, `bash -n` diagnostics, and the
+  audit trail.
 - **Fail fast**: missing identity, decrypt failure, or malformed env aborts
   before any step executes.
 - **Recipient safety**: `secret edit` requires explicit `-r`/`--recipients-dir`
