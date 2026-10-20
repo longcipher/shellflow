@@ -792,7 +792,15 @@ const PROBE_SCRIPT: &str = r#"
     elif [ -n "$BASH_VERSION" ]; then
         . "$HOME/.bashrc" >/dev/null 2>&1 || true
     fi
-    printf '%s\n' "$PATH";
+    # A shell rc can pollute $PATH with noise (an npm shim's error message
+    # lands in the value), which splits it into entries that are not
+    # directories and breaks the PATH injected into the payload. Only real
+    # directories are reported, one per line, between sentinels.
+    printf '%s\n' 'SHELLFLOW_PATH_BEGIN';
+    printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do
+        if [ -n "$d" ] && [ -d "$d" ]; then printf '%s\n' "$d"; fi
+    done;
+    printf '%s\n' 'SHELLFLOW_PATH_END';
 }
 "#;
 
@@ -818,8 +826,21 @@ async fn probe_remote_env(host: &ResolvedHost) -> RemoteEnv {
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines();
     let shell = RemoteShell::detect(lines.next().unwrap_or_default());
-    let path = lines.next().filter(|p| !p.is_empty()).map(ToOwned::to_owned);
-    let has_rsync = lines.any(|l| l == "SHELLFLOW_HAS_RSYNC");
+    // The PATH is reported between sentinels, one directory per line, so a
+    // polluted $PATH cannot split the value.
+    let mut dirs: Vec<&str> = Vec::new();
+    let mut in_path = false;
+    let mut has_rsync = false;
+    for line in lines {
+        match line.trim() {
+            "SHELLFLOW_PATH_BEGIN" => in_path = true,
+            "SHELLFLOW_PATH_END" => in_path = false,
+            "SHELLFLOW_HAS_RSYNC" => has_rsync = true,
+            other if in_path && !other.is_empty() => dirs.push(other),
+            _ => {}
+        }
+    }
+    let path = if dirs.is_empty() { None } else { Some(dirs.join(":")) };
     RemoteEnv { shell, path, has_rsync }
 }
 
