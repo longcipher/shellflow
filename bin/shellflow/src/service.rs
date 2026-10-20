@@ -43,6 +43,15 @@ const CONTAINER_ENV_TEMPLATE: &str = include_str!("../assets/service-container-e
 /// The systemd unit, oneshot variant (token `__SVC__`).
 const UNIT_ONESHOT_TEMPLATE: &str = include_str!("../assets/service-unit-oneshot.tmpl");
 
+/// The systemd unit, readiness-over-notify variant (token `__SVC__`).
+const UNIT_NOTIFY_TEMPLATE: &str = include_str!("../assets/service-unit-notify.tmpl");
+
+/// The systemd socket unit, socket-activated variant (token `__SVC__`).
+const SOCKET_TEMPLATE: &str = include_str!("../assets/service-socket.tmpl");
+
+/// The systemd unit, socket-activated variant (token `__SVC__`).
+const UNIT_SOCKET_TEMPLATE: &str = include_str!("../assets/service-unit-socket.tmpl");
+
 /// The systemd timer (tokens `__SVC__`, `__SCHEDULE__`).
 const TIMER_TEMPLATE: &str = include_str!("../assets/service-timer.tmpl");
 
@@ -60,6 +69,9 @@ const PLAYBOOK_ONESHOT_TEMPLATE: &str = include_str!("../assets/service-playbook
 
 /// The deploy playbook, no-start variant.
 const PLAYBOOK_NOSTART_TEMPLATE: &str = include_str!("../assets/service-playbook-nostart.tmpl");
+
+/// The deploy playbook, socket-activated variant.
+const PLAYBOOK_SOCKET_TEMPLATE: &str = include_str!("../assets/service-playbook-socket.tmpl");
 
 /// Files generated for one pattern: (repo path, content).
 struct Scaffold {
@@ -234,6 +246,36 @@ fn build_scaffold(
                 format!("{{ printf 'KEY=...\\n'; }} | shellflow secret encrypt -r \"$(cat keys/recipients/*.pub)\" -o services/{service}/{host}.env.age"),
                 format!("shellflow secret keys-check services/{service}"),
                 format!("shellflow secret creds --store-dir /etc/credstore.encrypted/{service} services/{service}/{host}.env.age"),
+            ],
+        },
+        ServicePattern::Notify => Scaffold {
+            files: vec![
+                (dir.join(format!("{service}.json5.tmpl")), render(CONFIG_TEMPLATE), false),
+                (dir.join(format!("{service}.service")), render(UNIT_NOTIFY_TEMPLATE), false),
+                (playbook, playbook_body(PLAYBOOK_TEMPLATE, service, hosts), true),
+            ],
+            next_steps: vec![
+                format!("{{ printf 'KEY=...\\n'; }} | shellflow secret encrypt -r \"$(cat keys/recipients/*.pub)\" -o services/{service}/{host}.env.age"),
+                format!("shellflow secret keys-check services/{service}"),
+                format!("shellflow template check services/{service}/{service}.json5.tmpl services/{service}/{host}.env.age"),
+                format!("shellflow template render --format toml services/{service}/{service}.json5.tmpl services/{service}/{host}.env.age"),
+                format!("shellflow secret creds --store-dir /etc/credstore.encrypted/{service} services/{service}/{host}.env.age"),
+                "the service must send READY=1 (sd_notify) and publish progress with `shellflow systemd notify status ...`".to_string(),
+            ],
+        },
+        ServicePattern::Socket => Scaffold {
+            files: vec![
+                (dir.join(format!("{service}.json5.tmpl")), render(CONFIG_TEMPLATE), false),
+                (dir.join(format!("{service}.socket")), render(SOCKET_TEMPLATE), false),
+                (dir.join(format!("{service}.service")), render(UNIT_SOCKET_TEMPLATE), false),
+                (playbook, playbook_body(PLAYBOOK_SOCKET_TEMPLATE, service, hosts), true),
+            ],
+            next_steps: vec![
+                format!("{{ printf 'KEY=...\\n'; }} | shellflow secret encrypt -r \"$(cat keys/recipients/*.pub)\" -o services/{service}/{host}.env.age"),
+                format!("shellflow secret keys-check services/{service}"),
+                format!("shellflow template check services/{service}/{service}.json5.tmpl services/{service}/{host}.env.age"),
+                format!("shellflow secret creds --store-dir /etc/credstore.encrypted/{service} services/{service}/{host}.env.age"),
+                "set the real ListenStream address/port in the .socket unit".to_string(),
             ],
         },
         ServicePattern::NoSecret => Scaffold {
@@ -481,6 +523,35 @@ mod tests {
         .collect::<Vec<_>>();
         assert!(f.iter().any(|p| p.ends_with("myapp.timer")));
         assert!(f.iter().any(|p| p.ends_with("myapp.service")));
+    }
+
+    /// The content of the scaffolded file whose path ends with `suffix`.
+    fn content(pattern: ServicePattern, suffix: &str) -> String {
+        build_scaffold(pattern, "myapp", &["api".to_string()], None)
+            .expect("scaffold")
+            .files
+            .into_iter()
+            .find(|(p, _, _)| p.to_string_lossy().ends_with(suffix))
+            .map(|(_, c, _)| c)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn notify_pattern_generates_a_notify_unit() {
+        let unit = content(ServicePattern::Notify, "myapp.service");
+        assert!(unit.contains("Type=notify"), "{unit}");
+        assert!(unit.contains("NotifyAccess=main"), "{unit}");
+        assert!(unit.contains("ExecReload="), "{unit}");
+    }
+
+    #[test]
+    fn socket_pattern_generates_a_socket_and_a_service() {
+        let files = files(ServicePattern::Socket);
+        assert!(files.iter().any(|f| f.ends_with(".socket")), "{files:?}");
+        assert!(files.iter().any(|f| f.ends_with(".service")), "{files:?}");
+        let socket = content(ServicePattern::Socket, "myapp.socket");
+        assert!(socket.contains("ListenStream="), "{socket}");
+        assert!(socket.contains("Service=myapp.service"), "{socket}");
     }
 
     #[test]
