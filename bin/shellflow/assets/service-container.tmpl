@@ -1,0 +1,27 @@
+[Unit]
+Description=__SVC__ container (infra managed, credentials via systemd-creds)
+
+[Container]
+Image=localhost/__SVC__:latest
+# TODO: set the real image. For upstream images keep the tag + AutoUpdate;
+# for local builds pin the digest and preload via the playbook (Pull=never).
+ContainerName=__SVC__
+# TODO: PublishPort=127.0.0.1:8080:8080
+EnvironmentFile=/run/__SVC__/container.env
+AutoUpdate=registry
+
+[Service]
+Restart=always
+TimeoutStartSec=900
+# Env file rendered at unit start into tmpfs (0600); the template
+# (/opt/__SVC__/etc/container.env.tmpl) carries no secrets.
+RuntimeDirectory=__SVC__
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/local/bin/shellflow cred-env render /opt/__SVC__/etc/container.env.tmpl /run/__SVC__/container.env
+# Per-key import from per-service credstore (regenerate this section):
+#   shellflow secret creds --store-dir /etc/credstore.encrypted/__SVC__ \
+#     services/__SVC__/<host>.env.age
+# LoadCredentialEncrypted=API_KEY:/etc/credstore.encrypted/__SVC__/API_KEY
+
+[Install]
+WantedBy=multi-user.target

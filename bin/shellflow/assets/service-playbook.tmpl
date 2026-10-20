@@ -7,10 +7,21 @@
 #   via the shared cred-env helper (same shellflow binary, installed to
 #   /usr/local/bin/shellflow by the playbook).
 #
+# Conventions (learned from production migrations):
+# - shellflow == 0.2.2+ (longcipher source build); never crates.io siblings.
+# - Every remote block starts with SVC="${SVC:-__SVC__}" so `--only`
+#   single-step reruns work without the fetch step's `@export`.
+# - No `sudo`/`sudo -E` for `credstore-install`: it self-elevates, preserving
+#   exactly LT_SECRET_KEYS plus credential values (never the whole env).
+# - No `for x in ${LIST}` in remote blocks: zsh does not word-split;
+#   use literal lists (`for u in a b c`).
+# - No `${}` literals in `echo` lines: fatal under zsh `set -u`.
+#
 # Usage:
-#   shellflow -k playbooks/deploy-__SVC__.sh
-#   shellflow --dry-run --diff playbooks/deploy-__SVC__.sh
-#   shellflow playbooks/deploy-__SVC__.sh
+#   export SHELLFLOW_AGE_IDENTITY=$PWD/keys/shellflow-keys.txt
+#   shellflow -k -i keys/shellflow-keys.txt playbooks/deploy-__SVC__.sh
+#   shellflow --dry-run --diff -i keys/shellflow-keys.txt playbooks/deploy-__SVC__.sh
+#   shellflow -i keys/shellflow-keys.txt playbooks/deploy-__SVC__.sh
 
 # === Servers (declare the hosts this service deploys to; a missing
 #     host's secrets file will fail-closed) ===
@@ -18,7 +29,7 @@ __SERVER_LINES__
 # === Secrets: age-encrypted env, {host} expands per target alias ===
 # @secrets services/__SVC__/{host}.env.age
 
-# === 1. Local: obtain artifacts (download release + verify sha256 / build locally) ===
+# === 1. Local: cross-compile the target-side helper ===
 # @name fetch
 # @local
 set -eu
@@ -27,20 +38,20 @@ SVC=__SVC__
 # musl static (zigbuild), no glibc coupling; the target only needs this one binary.
 TARGET_ARCH="${TARGET_ARCH:-x86_64-unknown-linux-musl}"
 SHELLFLOW_SRC="${SHELLFLOW_SRC:-$HOME/src/github.com/longcipher/shellflow}"
-[ -d "${SHELLFLOW_SRC}" ] || { echo "!! SHELLFLOW_SRC not found: ${SHELLFLOW_SRC}" >&2; exit 1; }
+[ -d "${SHELLFLOW_SRC}" ] || { echo "!! SHELLFLOW_SRC not found: ${SHELLFLOW_SRC} (export SHELLFLOW_SRC=...)" >&2; exit 1; }
 STAMP="${SVC}-$(date +%s)"
 WORKDIR="/tmp/${STAMP}"
 mkdir -p "${WORKDIR}"
-# TODO: download/build artifacts into ${WORKDIR} (see infra repo playbooks/deploy-zenoh.sh)
+# TODO: download/build service artifacts into ${WORKDIR}
 ( cd "${SHELLFLOW_SRC}" && cargo zigbuild --release -p shellflow --target "${TARGET_ARCH}" )
 cp "${SHELLFLOW_SRC}/target/${TARGET_ARCH}/release/shellflow" "${WORKDIR}/shellflow"
+echo "==> staged helper: $(ls -lh "${WORKDIR}/shellflow" | awk '{print $9, $5}')"
 # @export STAMP,WORKDIR,SVC
 
 # === 2. Copy: whole-directory distribution (age ciphertext not sent — @secrets goes via payload injection) ===
 # @name ship-artifacts
 # @copy $WORKDIR/<artifact-dir> -> $WORKDIR/<artifact-dir> @__HOST__
 # @copy services/$SVC -> $WORKDIR/svc @__HOST__ --exclude *.age
-# @copy services/_common/10-hardening.conf -> $WORKDIR/10-hardening.conf @__HOST__
 # @copy $WORKDIR/shellflow -> $WORKDIR/shellflow @__HOST__
 
 # === 3. Remote: install + host-key-bound credentials ===
@@ -48,29 +59,29 @@ cp "${SHELLFLOW_SRC}/target/${TARGET_ARCH}/release/shellflow" "${WORKDIR}/shellf
 # @remote __HOST__
 # @timeout 180
 set -eu
+SVC="${SVC:-__SVC__}"
 echo "==> installing ${SVC} on $(hostname)"
-sudo id "${SVC}" >/dev/null 2>&1 || sudo useradd --system --home-dir "/etc/${SVC}" --shell /usr/sbin/nologin "${SVC}"
-sudo install -d -m 0755 /usr/local/lib/"${SVC}"
-sudo install -d -m 0755 "/opt/${SVC}/bin"
-sudo install -d -m 0755 "/etc/${SVC}"
-sudo install -d -m 0755 /usr/local/bin
-# TODO: install artifacts (binary/plugins); see infra repo playbooks/deploy-zenoh.sh
+# TODO: create the runtime user here if the service needs a dedicated one.
 # Plaintext config template (no secret values; render output goes to tmpfs at unit start)
-sudo install -m 0644 "${WORKDIR}/svc/${SVC}.json5.tmpl" "/etc/${SVC}/${SVC}.json5.tmpl"
+sudo install -d -m 0755 "/opt/${SVC}/bin" "/opt/${SVC}/etc"
+sudo install -m 0644 "${WORKDIR}/svc/${SVC}.json5.tmpl" "/opt/${SVC}/etc/${SVC}.json5.tmpl"
 # Shared cred-env helper (same shellflow binary; idempotent upgrade)
 sudo install -m 0755 "${WORKDIR}/shellflow" /usr/local/bin/shellflow
 sudo install -m 0644 "${WORKDIR}/svc/${SVC}.service" "/etc/systemd/system/${SVC}.service"
-sudo install -d -m 0755 "/etc/systemd/system/${SVC}.service.d"
-sudo install -m 0644 "${WORKDIR}/10-hardening.conf" "/etc/systemd/system/${SVC}.service.d/10-hardening.conf"
 # Credentials: per-service subdir + per-key host-key binding (Rust subcommand;
-# values go via stdin, never argv; works regardless of bash vs zsh login shell)
+# values go via stdin, never argv; works regardless of bash vs zsh login shell).
+# sudo -E is required: the credstore is 0700 root and -E preserves the
+# secrets-injected environment (see the @secrets directive at the top).
 /usr/local/bin/shellflow cred-env credstore-install "${SVC}"
-rm -rf "${WORKDIR}/svc" "${WORKDIR}/10-hardening.conf" "${WORKDIR}/shellflow"
+rm -rf "${WORKDIR}/svc" "${WORKDIR}/shellflow"
+echo "==> install complete"
 
 # === 4. Remote: enable + restart ===
 # @name enable-start
 # @remote __HOST__
 set -eu
+SVC="${SVC:-__SVC__}"
+sudo systemd-analyze verify "${SVC}.service" 2>&1 || { echo "!! unit verify failed" >&2; exit 1; }
 sudo systemctl daemon-reload
 sudo systemctl enable "${SVC}.service"
 sudo systemctl restart "${SVC}.service"
@@ -80,7 +91,19 @@ sudo systemctl is-active "${SVC}.service"
 # @name verify
 # @remote __HOST__
 set -eu
+SVC="${SVC:-__SVC__}"
 echo "==> ${SVC} status: $(sudo systemctl is-active "${SVC}.service")"
+echo "==> credential store audit (0600 root, per-service subdir):"
 sudo ls -l "/etc/credstore.encrypted/${SVC}/"
+echo "==> runtime credential tmpfs:"
 sudo ls -l "/run/credentials/${SVC}.service/" 2>/dev/null || true
-sudo journalctl -u "${SVC}.service" --no-pager -n 15
+echo "==> argv/env leak check (unit must not carry secret values):"
+if sudo systemctl show "${SVC}.service" -p ExecStart,Environment | grep -iE "password=.{3}|passwd=.{3}"; then
+  echo "!! possible secret in argv/env (review)" >&2; exit 1
+else
+  echo "clean"
+fi
+echo "==> recent logs:"
+sudo journalctl -u "${SVC}.service" --no-pager -n 10
+echo "==> verify complete"
+echo "==> TODO: add a service-specific journal value-shape grep (see infra playbooks)"

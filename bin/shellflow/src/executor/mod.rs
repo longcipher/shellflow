@@ -87,6 +87,8 @@ pub(crate) struct StepConfig {
     pub(crate) timeout: Option<u64>,
     /// Execute remote blocks/copies on the local machine (`--local`).
     pub(crate) local: bool,
+    /// Reuse SSH connections within a run (ControlMaster).
+    pub(crate) ssh_reuse: bool,
 }
 
 impl StepConfig {
@@ -98,6 +100,7 @@ impl StepConfig {
             verbose: run.flags.verbose,
             timeout,
             local: run.flags.local,
+            ssh_reuse: run.flags.ssh_reuse,
         }
     }
 }

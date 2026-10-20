@@ -1,0 +1,95 @@
+#!/usr/bin/env shellflow
+
+# ============================================================
+# shellflow playbook: deploy/upgrade __SVC__ (quadlet container)
+# ============================================================
+# Quadlet unit + env-file render into tmpfs. Image strategy (pick one):
+# - Upstream image: keep tag + AutoUpdate (no preload needed).
+# - Local build: pin digest + `podman load` in install (Pull=never).
+#
+# Usage:
+#   shellflow -k playbooks/deploy-__SVC__.sh
+#   shellflow --dry-run --diff playbooks/deploy-__SVC__.sh
+#   shellflow playbooks/deploy-__SVC__.sh
+
+# === Servers ===
+__SERVER_LINES__
+# @secrets services/__SVC__/{host}.env.age
+
+# === 1. Local: cross-compile the target-side helper (idempotent) ===
+# @name fetch
+# @local
+set -eu
+SVC=__SVC__
+TARGET_ARCH="${TARGET_ARCH:-x86_64-unknown-linux-musl}"
+SHELLFLOW_SRC="${SHELLFLOW_SRC:-$HOME/src/github.com/longcipher/shellflow}"
+[ -d "${SHELLFLOW_SRC}" ] || { echo "!! SHELLFLOW_SRC not found: ${SHELLFLOW_SRC}" >&2; exit 1; }
+STAMP="${SVC}-$(date +%s)"
+WORKDIR="/tmp/${STAMP}"
+mkdir -p "${WORKDIR}"
+( cd "${SHELLFLOW_SRC}" && cargo zigbuild --release -p shellflow --target "${TARGET_ARCH}" )
+cp "${SHELLFLOW_SRC}/target/${TARGET_ARCH}/release/shellflow" "${WORKDIR}/shellflow"
+echo "==> staged helper: $(ls -lh "${WORKDIR}/shellflow" | awk '{print $9, $5}')"
+# @export STAMP,WORKDIR,SVC
+
+# === 2. Copy ===
+# @name ship-artifacts
+# @copy services/$SVC -> $WORKDIR/svc @__HOST__ --exclude *.age
+# @copy $WORKDIR/shellflow -> $WORKDIR/shellflow @__HOST__
+
+# === 3. Remote: install ===
+# @name install
+# @remote __HOST__
+# @timeout 300
+set -eu
+SVC="${SVC:-__SVC__}"
+echo "==> installing ${SVC} on $(hostname)"
+BACKUP_DIR="/root/${SVC}-backup-$(date +%Y%m%d-%H%M%S)"
+sudo install -d -m 0700 "${BACKUP_DIR}"
+if [ -f /etc/containers/systemd/"${SVC}".container ]; then
+  sudo cp -a /etc/containers/systemd/"${SVC}".container "${BACKUP_DIR}/"
+  echo "==> backed up container file"
+fi
+echo "==> backup dir: ${BACKUP_DIR}"
+sudo install -d -m 0755 /etc/containers/systemd
+sudo install -m 0644 "${WORKDIR}/svc/${SVC}.container" "/etc/containers/systemd/${SVC}.container"
+sudo install -d -m 0755 "/opt/${SVC}/etc"
+sudo install -m 0644 "${WORKDIR}/svc/container.env.tmpl" "/opt/${SVC}/etc/container.env.tmpl"
+sudo install -m 0755 "${WORKDIR}/shellflow" /usr/local/bin/shellflow
+# sudo -E is required: the credstore is 0700 root and -E preserves the
+# @secrets-injected environment.
+/usr/local/bin/shellflow cred-env credstore-install "${SVC}"
+rm -rf "${WORKDIR}/svc" "${WORKDIR}/shellflow"
+echo "==> install complete (backup: ${BACKUP_DIR})"
+
+# === 4. Remote: reload + restart ===
+# @name enable-start
+# @remote __HOST__
+# @timeout 600
+set -eu
+SVC="${SVC:-__SVC__}"
+sudo systemctl daemon-reload
+# Quadlet passthrough assertion: the generated unit must carry credentials.
+if ! sudo systemctl cat "${SVC}.service" 2>/dev/null | grep -q "LoadCredentialEncrypted"; then
+  echo "!! LoadCredentialEncrypted missing in generated unit (quadlet passthrough failed)" >&2
+  sudo systemctl cat "${SVC}.service" 2>&1 | head -30 || true
+  exit 1
+fi
+echo "==> quadlet passthrough OK"
+sudo systemctl restart "${SVC}.service"
+sudo systemctl is-active "${SVC}.service"
+
+# === 5. Remote: verify ===
+# @name verify
+# @remote __HOST__
+set -eu
+SVC="${SVC:-__SVC__}"
+echo "==> ${SVC} status: $(sudo systemctl is-active "${SVC}.service")"
+echo "==> credential store audit (0600 root, per-service subdir):"
+sudo ls -l "/etc/credstore.encrypted/${SVC}/"
+echo "==> runtime credential tmpfs:"
+sudo ls -l "/run/credentials/${SVC}.service/" 2>/dev/null || true
+echo "==> recent logs:"
+sudo journalctl -u "${SVC}.service" --no-pager -n 10
+echo "==> verify complete"
+echo "==> TODO: add a service-specific readiness probe (HTTP/port) above"

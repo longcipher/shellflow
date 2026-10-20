@@ -1,0 +1,5 @@
+# infra managed container env template (plaintext, no secret values).
+# Placeholders are substituted at unit start into tmpfs (/run/__SVC__/).
+# Self-check: shellflow template check services/__SVC__/container.env.tmpl \
+#             services/__SVC__/<host>.env.age
+API_KEY=${API_KEY}

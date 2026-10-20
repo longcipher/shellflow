@@ -33,7 +33,7 @@ pub use heredoc::{Heredoc, HeredocTracker};
 pub use parser::parse_script;
 pub use plan::{
     CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, ResolvedHost, RunState, SecretEntry,
-    Step, Target, interpolate, resolve_hosts,
+    Step, Target, WaitStep, interpolate, resolve_hosts,
 };
 pub use ssh_spec::SshSpec;
 pub use template::{render_template, template_keys};

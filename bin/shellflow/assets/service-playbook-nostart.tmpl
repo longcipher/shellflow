@@ -1,0 +1,78 @@
+#!/usr/bin/env shellflow
+
+# ============================================================
+# shellflow playbook: take over __SVC__ (NO-START sealed)
+# ============================================================
+# SAFETY RULE: this playbook NEVER starts the unit. Dormant strategies,
+# broken units, and anything whose start has side effects (live trading,
+# validators, timers owned elsewhere) are managed as files only:
+# backup + install + daemon-reload + loadability check. Starting is a
+# separate, explicit, human-approved action.
+#
+# Usage:
+#   shellflow -k playbooks/deploy-__SVC__.sh
+#   shellflow --dry-run --diff playbooks/deploy-__SVC__.sh
+#   shellflow playbooks/deploy-__SVC__.sh
+
+# === Servers ===
+__SERVER_LINES__
+# === No @secrets in the NO-START path: if the dormant unit needs
+#     credentials at a future first start, add @secrets + credstore-install
+#     then (see the `full` pattern). ===
+
+# === 1. Local: cross-compile the target-side helper (idempotent) ===
+# @name fetch
+# @local
+set -eu
+SVC=__SVC__
+TARGET_ARCH="${TARGET_ARCH:-x86_64-unknown-linux-musl}"
+SHELLFLOW_SRC="${SHELLFLOW_SRC:-$HOME/src/github.com/longcipher/shellflow}"
+[ -d "${SHELLFLOW_SRC}" ] || { echo "!! SHELLFLOW_SRC not found: ${SHELLFLOW_SRC}" >&2; exit 1; }
+STAMP="${SVC}-$(date +%s)"
+WORKDIR="/tmp/${STAMP}"
+mkdir -p "${WORKDIR}"
+( cd "${SHELLFLOW_SRC}" && cargo zigbuild --release -p shellflow --target "${TARGET_ARCH}" )
+cp "${SHELLFLOW_SRC}/target/${TARGET_ARCH}/release/shellflow" "${WORKDIR}/shellflow"
+echo "==> staged helper: $(ls -lh "${WORKDIR}/shellflow" | awk '{print $9, $5}')"
+# @export STAMP,WORKDIR,SVC
+
+# === 2. Copy ===
+# @name ship-artifacts
+# @copy services/$SVC -> $WORKDIR/svc @__HOST__ --exclude *.age
+# @copy $WORKDIR/shellflow -> $WORKDIR/shellflow @__HOST__
+
+# === 3. Remote: install (NO-START) ===
+# @name install
+# @remote __HOST__
+# @timeout 180
+set -eu
+SVC="${SVC:-__SVC__}"
+echo "==> installing ${SVC} (NO-START) on $(hostname)"
+BACKUP_DIR="/root/${SVC}-backup-$(date +%Y%m%d-%H%M%S)"
+sudo install -d -m 0700 "${BACKUP_DIR}"
+if [ -f /etc/systemd/system/"${SVC}".service ]; then
+  sudo cp -a /etc/systemd/system/"${SVC}".service "${BACKUP_DIR}/"
+  echo "==> backed up unit -> ${BACKUP_DIR}/"
+fi
+echo "==> backup dir: ${BACKUP_DIR}"
+sudo install -m 0755 "${WORKDIR}/shellflow" /usr/local/bin/shellflow
+sudo install -m 0644 "${WORKDIR}/svc/${SVC}.service" "/etc/systemd/system/${SVC}.service"
+rm -rf "${WORKDIR}/svc" "${WORKDIR}/shellflow"
+echo "==> install complete (backup: ${BACKUP_DIR})"
+
+# === 4. Remote: reload only (NEVER start) ===
+# @name enable-start
+# @remote __HOST__
+set -eu
+SVC="${SVC:-__SVC__}"
+sudo systemd-analyze verify "${SVC}.service" 2>&1 || echo "!! verify WARNING (kept as-is, see header)"
+sudo systemctl daemon-reload
+echo "==> unit loadable, LEFT AS-IS by design (no start/restart)"
+
+# === 5. Remote: verify ===
+# @name verify
+# @remote __HOST__
+set -eu
+SVC="${SVC:-__SVC__}"
+echo "==> ${SVC}: $(sudo systemctl is-active "${SVC}.service") (left as-is)"
+echo "==> verify complete (NO-START honored)"

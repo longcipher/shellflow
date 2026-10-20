@@ -1,0 +1,10 @@
+[Unit]
+Description=__SVC__ schedule (infra managed)
+
+[Timer]
+OnCalendar=__SCHEDULE__
+Persistent=true
+Unit=__SVC__.service
+
+[Install]
+WantedBy=timers.target

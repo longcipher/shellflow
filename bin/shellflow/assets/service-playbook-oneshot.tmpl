@@ -1,0 +1,81 @@
+#!/usr/bin/env shellflow
+
+# ============================================================
+# shellflow playbook: install __SVC__ (oneshot task, no secrets)
+# ============================================================
+# One-shot task (+ optional timer). Installs the unit, runs it once,
+# verifies the effect. Binary lives at /opt/__SVC__/bin/ (moved once,
+# hash-verified); daily runs do NOT re-upload it.
+#
+# Usage:
+#   shellflow -k playbooks/deploy-__SVC__.sh
+#   shellflow --dry-run --diff playbooks/deploy-__SVC__.sh
+#   shellflow playbooks/deploy-__SVC__.sh
+
+# === Servers ===
+__SERVER_LINES__
+# === No @secrets: this task has no credentials ===
+
+# === 1. Local: cross-compile the target-side helper (idempotent) ===
+# @name fetch
+# @local
+set -eu
+SVC=__SVC__
+TARGET_ARCH="${TARGET_ARCH:-x86_64-unknown-linux-musl}"
+SHELLFLOW_SRC="${SHELLFLOW_SRC:-$HOME/src/github.com/longcipher/shellflow}"
+[ -d "${SHELLFLOW_SRC}" ] || { echo "!! SHELLFLOW_SRC not found: ${SHELLFLOW_SRC}" >&2; exit 1; }
+STAMP="${SVC}-$(date +%s)"
+WORKDIR="/tmp/${STAMP}"
+mkdir -p "${WORKDIR}"
+( cd "${SHELLFLOW_SRC}" && cargo zigbuild --release -p shellflow --target "${TARGET_ARCH}" )
+cp "${SHELLFLOW_SRC}/target/${TARGET_ARCH}/release/shellflow" "${WORKDIR}/shellflow"
+echo "==> staged helper: $(ls -lh "${WORKDIR}/shellflow" | awk '{print $9, $5}')"
+# @export STAMP,WORKDIR,SVC
+
+# === 2. Copy ===
+# @name ship-artifacts
+# @copy services/$SVC -> $WORKDIR/svc @__HOST__ --exclude *.age
+# @copy $WORKDIR/shellflow -> $WORKDIR/shellflow @__HOST__
+
+# === 3. Remote: install ===
+# @name install
+# @remote __HOST__
+# @timeout 120
+set -eu
+SVC="${SVC:-__SVC__}"
+echo "==> installing ${SVC} on $(hostname)"
+BACKUP_DIR="/root/${SVC}-backup-$(date +%Y%m%d-%H%M%S)"
+sudo install -d -m 0700 "${BACKUP_DIR}"
+if [ -f /etc/systemd/system/"${SVC}".service ]; then
+  sudo cp -a /etc/systemd/system/"${SVC}".service "${BACKUP_DIR}/"
+  echo "==> backed up unit -> ${BACKUP_DIR}/"
+fi
+echo "==> backup dir: ${BACKUP_DIR}"
+sudo install -m 0755 "${WORKDIR}/shellflow" /usr/local/bin/shellflow
+sudo install -m 0644 "${WORKDIR}/svc/${SVC}.service" "/etc/systemd/system/${SVC}.service"
+__TIMER_INSTALL__
+rm -rf "${WORKDIR}/svc" "${WORKDIR}/shellflow"
+echo "==> install complete (backup: ${BACKUP_DIR})"
+
+# === 4. Remote: enable + run once ===
+# @name enable-start
+# @remote __HOST__
+set -eu
+SVC="${SVC:-__SVC__}"
+sudo systemd-analyze verify "${SVC}.service" 2>&1 || { echo "!! unit verify failed" >&2; exit 1; }
+sudo systemctl daemon-reload
+sudo systemctl enable "${SVC}.service"
+__TIMER_ENABLE__
+sudo systemctl restart "${SVC}.service"
+sudo systemctl is-active "${SVC}.service"
+
+# === 5. Remote: verify (effect goes here) ===
+# @name verify
+# @remote __HOST__
+set -eu
+SVC="${SVC:-__SVC__}"
+echo "==> ${SVC} status: $(sudo systemctl is-active "${SVC}.service")"
+echo "==> recent logs:"
+sudo journalctl -u "${SVC}.service" --no-pager -n 8
+echo "==> verify complete"
+echo "==> TODO: add an effect assertion above (governor value, file state, …)"

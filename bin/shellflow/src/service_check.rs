@@ -1,0 +1,269 @@
+//! `shellflow service check` — read-only systemd audit over SSH.
+//!
+//! Automates the post-deploy audit that is otherwise done by hand dozens of
+//! times per migration: unit state, argv/env secret exposure, credential
+//! wiring (`LoadCredentialEncrypted=` vs plaintext), listening sockets, and
+//! a journal scan for secret-value shapes. Everything runs through the
+//! system `ssh` (read-only commands only); findings print as `ok`/`WARN`
+//! lines and the process exits non-zero when any `FAIL` fires.
+
+use std::process::Command;
+
+use eyre::{Context, Result, bail};
+
+use crate::cli::ServiceCheckArgs;
+
+/// Run `service check`.
+///
+/// # Errors
+///
+/// Returns when the SSH transport fails or when any check reports `FAIL`.
+pub(crate) fn check(args: &ServiceCheckArgs) -> Result<()> {
+    validate_service_name(&args.service)?;
+    let unit = format!("{}.service", args.service);
+    let mut failures = 0;
+
+    let active = ssh(&args.host, &["systemctl", "is-active", &unit])?;
+    report(
+        &format!("unit {unit} is {active}"),
+        if active.trim() == "active" {
+            Check::Ok
+        } else {
+            Check::Warn
+        },
+        &mut failures,
+    );
+
+    let show = ssh(
+        &args.host,
+        &[
+            "sudo",
+            "systemctl",
+            "show",
+            &unit,
+            "-p",
+            "ExecStart,Environment,EnvironmentFile,LoadCredentialEncrypted,ImportCredential,User",
+        ],
+    )?;
+    // argv / Environment secret values (ferriskey class): `--password VALUE`
+    // and `KEY=VALUE` forms. Key *names* are fine; values are not.
+    if has_argv_secret(&show) {
+        report("secret value in ExecStart argv or Environment= (`ps` visible)", Check::Fail, &mut failures);
+    } else {
+        report("no secret values in argv/Environment", Check::Ok, &mut failures);
+    }
+    // NOTE: `systemctl show` prints credential paths as `[unprintable]`, so
+    // import lines are counted from the unit file text instead.
+    let cat = ssh(&args.host, &["sudo", "systemctl", "cat", &unit])?;
+    let n_creds = cat
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("LoadCredentialEncrypted=") && !t.ends_with('=')
+        })
+        .count();
+    report(
+        &format!("{n_creds} LoadCredentialEncrypted= import(s)"),
+        Check::Ok,
+        &mut failures,
+    );
+    if show.lines().any(|l| {
+        l.starts_with("EnvironmentFile=") && !l.ends_with('=') && !l.contains("/dev/null")
+    }) {
+        report("EnvironmentFile= referenced (verify it carries no secrets)", Check::Warn, &mut failures);
+    }
+    if show.lines().any(|l| l == "User=" || l == "User=root") {
+        report("runs as root (least-privilege follow-up)", Check::Warn, &mut failures);
+    }
+
+    let creds = ssh(
+        &args.host,
+        &["sudo", "ls", "-l", &format!("/etc/credstore.encrypted/{}/", args.service)],
+    )?;
+    if creds.contains("total 0") || creds.trim().is_empty() {
+        report("credential store is empty", Check::Warn, &mut failures);
+    } else {
+        report("credential store present (0600 root expected)", Check::Ok, &mut failures);
+    }
+
+    let journal = ssh(
+        &args.host,
+        &[
+            "sudo",
+            "journalctl",
+            "-u",
+            &unit,
+            "--no-pager",
+            "-n",
+            &args.journal_lines.to_string(),
+        ],
+    )?;
+    let leaks: Vec<&str> = journal
+        .lines()
+        .filter(|l| looks_like_leak(l, &args.service))
+        .take(3)
+        .collect();
+    if leaks.is_empty() {
+        report(
+            &format!("no secret-value shapes in last {} journal lines", args.journal_lines),
+            Check::Ok,
+            &mut failures,
+        );
+    } else {
+        report(
+            &format!("possible secret values in journal ({} line(s), review)", leaks.len()),
+            Check::Fail,
+            &mut failures,
+        );
+    }
+
+    if failures > 0 {
+        bail!("service check: {failures} FAIL finding(s) for `{}`", args.service);
+    }
+    println!("service check: {} clean", args.service);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    Ok,
+    Warn,
+    Fail,
+}
+
+fn report(message: &str, status: Check, failures: &mut usize) {
+    let tag = match status {
+        Check::Ok => "ok",
+        Check::Warn => "WARN",
+        Check::Fail => "FAIL",
+    };
+    if status == Check::Fail {
+        *failures += 1;
+    }
+    println!("[{tag}] {message}");
+}
+
+/// Run one remote command over the system `ssh` and return stdout.
+fn ssh(host: &str, argv: &[&str]) -> Result<String> {
+    let output = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=15")
+        .arg(host)
+        .args(argv)
+        .output()
+        .wrap_err_with(|| format!("failed to run ssh {host}"))?;
+    if !output.status.success() {
+        // `systemctl is-active` exits non-zero for inactive units and
+        // `ls` fails for a missing credstore — both are findings, not
+        // transport errors. Return combined output either way.
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        return Ok(combined);
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|err| eyre::eyre!("non-UTF8 output from ssh {host}: {err}"))
+}
+
+/// True when `systemctl show` output carries a secret *value* in argv or
+/// `Environment=`: `--password VALUE`, `--token VALUE`, or `KEY=VALUE`
+/// where the key name suggests a credential and the value is non-trivial.
+fn has_argv_secret(show: &str) -> bool {
+    for line in show.lines() {
+        let lower = line.to_lowercase();
+        // `--flag VALUE` forms (argv-visible to every local user via ps).
+        for flag in ["--database-password ", "--password ", "--token ", "--api-key ", "--secret "] {
+            if lower.contains(flag) {
+                return true;
+            }
+        }
+        // `Environment=` entries: KEY=VALUE with a credential-ish name and
+        // a value long enough to be real (names alone are fine).
+        if line.starts_with("Environment=") {
+            for pair in line.strip_prefix("Environment=").unwrap_or_default().split(' ') {
+                let Some((name, value)) = pair.split_once('=') else {
+                    continue;
+                };
+                let name = name.to_uppercase();
+                if value.len() >= 8
+                    && (name.contains("PASSWORD")
+                        || name.contains("SECRET")
+                        || name.ends_with("_TOKEN")
+                        || name.ends_with("_KEY"))
+                {
+                    // Import paths and template references are not values.
+                    if value.starts_with('/') || value.contains("${") {
+                        continue;
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// True when a journal line looks like it carries a secret value:
+/// `KEY=<8+ chars>` for credential-ish key names. Names alone, hashes, and
+/// short flags never match.
+fn looks_like_leak(line: &str, _service: &str) -> bool {
+    let upper = line.to_uppercase();
+    for key in ["PASSWORD=", "SECRET=", "_TOKEN=", "PRIVATE_KEY=", "API_KEY="] {
+        if let Some(pos) = upper.find(key) {
+            let after = &line[pos + key.len()..];
+            let value: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+            if value.len() >= 12 && !value.contains("${") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn validate_service_name(service: &str) -> Result<()> {
+    let valid = !service.is_empty()
+        && service.starts_with(|c: char| c.is_ascii_lowercase())
+        && service.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !service.contains("--");
+    if !valid {
+        bail!("invalid service name `{service}` (want [a-z][a-z0-9-]*)");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_argv_secret, looks_like_leak};
+
+    #[test]
+    fn detects_argv_password() {
+        let show = "ExecStart={ path=/bin/x ; argv[]=/bin/x --database-password s3cret-value-here ; ignore_errors=no }";
+        assert!(has_argv_secret(show));
+    }
+
+    #[test]
+    fn key_names_alone_are_clean() {
+        let show = "Environment=RUST_LOG=info DATABASE_URL";
+        assert!(!has_argv_secret(show));
+    }
+
+    #[test]
+    fn short_values_are_clean() {
+        let show = "Environment=PORT=8080 MODE=prod";
+        assert!(!has_argv_secret(show));
+    }
+
+    #[test]
+    fn env_password_value_is_flagged() {
+        let show = "Environment=FOO=1 BAR_PASSWORD=supersecretvalue123";
+        assert!(has_argv_secret(show));
+    }
+
+    #[test]
+    fn journal_value_shapes_are_flagged() {
+        assert!(looks_like_leak("config: DATABASE_PASSWORD=supersecretvalue123", "x"));
+        assert!(!looks_like_leak("credentials KEK loaded; nothing to see", "x"));
+        assert!(!looks_like_leak("listening on 127.0.0.1:8080", "x"));
+    }
+}

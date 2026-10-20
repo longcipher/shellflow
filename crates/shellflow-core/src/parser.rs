@@ -8,7 +8,7 @@ use crate::{
     heredoc::HeredocTracker,
     plan::{
         CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, SecretEntry, Step, Target,
-        is_valid_var_name,
+        WaitStep, is_valid_var_name,
     },
     ssh_spec::SshSpec,
 };
@@ -153,6 +153,10 @@ impl State {
             "copy" => {
                 self.flush();
                 self.add_copy(payload, line)
+            }
+            "wait_active" => {
+                self.flush();
+                self.add_wait(payload, line)
             }
             "export" => self.declare_export(payload, line),
             "timeout" => {
@@ -489,6 +493,91 @@ impl State {
         }));
         Ok(())
     }
+
+    /// Parse `# @wait_active <unit> @<target> [--timeout SECS]`.
+    ///
+    /// The unit accepts `foo` or `foo.service`. Like `@copy`, `@only_if` is
+    /// rejected (a wait has no script context to evaluate a guard in) while
+    /// `@name` and `@timeout` apply.
+    fn add_wait(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "wait_active".to_string(),
+                reason: "`@only_if` is not supported on `@wait_active`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let pending_timeout = self.pending_timeout.take();
+        let mut tokens: Vec<&str> = payload.split_whitespace().collect();
+        let timeout = if tokens.len() >= 2 && tokens[tokens.len() - 2] == "--timeout" {
+            // Peel an optional trailing `--timeout SECS`.
+            let secs_str = tokens.pop().unwrap_or_default();
+            let flag = tokens.pop().unwrap_or_default();
+            debug_assert_eq!(flag, "--timeout");
+            let secs: u64 = secs_str.parse().map_err(|_| ParseError::InvalidDirective {
+                line,
+                directive: "wait_active".to_string(),
+                reason: format!("invalid seconds `{secs_str}`"),
+            })?;
+            if secs == 0 {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "wait_active".to_string(),
+                    reason: "must be greater than zero".to_string(),
+                });
+            }
+            Some(secs)
+        } else {
+            pending_timeout
+        };
+        if tokens.len() != 2 {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "wait_active".to_string(),
+                reason: "expected `<unit> @<target> [--timeout SECS]`".to_string(),
+            });
+        }
+        let mut unit = tokens[0].trim().to_string();
+        if unit.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "wait_active".to_string(),
+                reason: "missing unit name".to_string(),
+            });
+        }
+        if !unit.ends_with(".service") {
+            unit.push_str(".service");
+        }
+        if !unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
+            || unit.starts_with('.')
+            || unit.contains("..")
+        {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "wait_active".to_string(),
+                reason: format!("unsafe unit name `{unit}`"),
+            });
+        }
+        let target = tokens[1].trim_start_matches('@').trim();
+        if target.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "wait_active".to_string(),
+                reason: "missing target".to_string(),
+            });
+        }
+        self.plan.steps.push(Step::Wait(WaitStep {
+            name,
+            target: Target::new(target),
+            unit,
+            timeout,
+            interval_secs: 5,
+        }));
+        Ok(())
+    }
 }
 
 /// Strip one layer of surrounding `"` or `'` quotes.
@@ -590,7 +679,7 @@ mod tests {
     use super::{directive, parse_script};
     use crate::{
         error::ParseError,
-        plan::{CopyStep, EnvEntry, LocalStep, RemoteStep, Step},
+        plan::{CopyStep, EnvEntry, LocalStep, RemoteStep, Step, WaitStep},
     };
 
     fn parse(input: &str) -> Result<crate::plan::ExecutionPlan, String> {
@@ -616,6 +705,55 @@ mod tests {
             Step::Copy(s) => Ok(s),
             other => Err(format!("expected copy step, got {other:?}")),
         }
+    }
+
+    fn as_wait(step: &Step) -> Result<&WaitStep, String> {
+        match step {
+            Step::Wait(s) => Ok(s),
+            other => Err(format!("expected wait step, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn wait_active_parses_unit_and_target() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @wait_active zenoh.service @api\n")?;
+        let step = as_wait(&plan.steps[0])?;
+        assert_eq!(step.unit, "zenoh.service");
+        assert_eq!(step.target.text, "api");
+        assert_eq!(step.interval_secs, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn wait_active_appends_service_suffix_and_timeout() -> Result<(), String> {
+        let plan =
+            parse("# @server api api\n# @wait_active sws @api --timeout 60\n")?;
+        let step = as_wait(&plan.steps[0])?;
+        assert_eq!(step.unit, "sws.service");
+        assert_eq!(step.timeout, Some(60));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_active_rejects_bad_shapes() {
+        for script in [
+            "# @server api api\n# @wait_active @api\n",
+            "# @server api api\n# @wait_active ../evil @api\n",
+            "# @server api api\n# @wait_active sws @api --timeout 0\n",
+            "# @server api api\n# @wait_active sws\n",
+        ] {
+            parse_script(script).expect_err("malformed wait_active must fail");
+        }
+    }
+
+    #[test]
+    fn wait_active_takes_pending_name() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n# @name ready\n# @wait_active sws @api\n",
+        )?;
+        let step = as_wait(&plan.steps[0])?;
+        assert_eq!(step.name.as_deref(), Some("ready"));
+        Ok(())
     }
 
     #[test]
