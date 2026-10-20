@@ -35,6 +35,25 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
         &mut failures,
     );
 
+    // A socket-activated service is enabled through its `.socket` unit: the
+    // socket owns the port and the service inherits the fd. Auditing only the
+    // `.service` would miss a service that is simply never started.
+    let socket_unit = format!("{}.socket", args.service);
+    let socket_state = ssh(&args.host, &["systemctl", "is-active", &socket_unit])?;
+    let socket_known = !socket_state.contains("Failed to find")
+        && !socket_state.contains("could not be found")
+        && !socket_state.trim().is_empty();
+    if socket_known {
+        report(
+            &format!(
+                "socket unit {socket_unit} is {} (the port is systemd's)",
+                socket_state.trim()
+            ),
+            if socket_state.trim() == "active" { Check::Ok } else { Check::Warn },
+            &mut failures,
+        );
+    }
+
     let show = ssh(
         &args.host,
         &[
