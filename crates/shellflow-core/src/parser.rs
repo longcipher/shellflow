@@ -7,8 +7,8 @@ use crate::{
     error::ParseError,
     heredoc::HeredocTracker,
     plan::{
-        CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep, RemoteStep, SecretEntry, Step,
-        Target, WaitStep, is_valid_var_name,
+        AssertStep, Assertion, CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep, RemoteStep,
+        SecretEntry, Step, Target, WaitStep, is_valid_var_name,
     },
     ssh_spec::SshSpec,
 };
@@ -38,6 +38,9 @@ struct State {
     pending_timeout: Option<u64>,
     /// `@export` variables for the pending local block.
     pending_export: Vec<String>,
+    /// The target of the most recent step, inherited by an assertion that
+    /// does not name one.
+    last_target: Option<String>,
     /// Line number of each group declaration (for validation errors).
     group_lines: BTreeMap<String, usize>,
     /// Here-document bodies opened by earlier lines and not yet terminated.
@@ -57,6 +60,7 @@ impl State {
             pending_export: Vec::new(),
             group_lines: BTreeMap::new(),
             heredocs: HeredocTracker::default(),
+            last_target: None,
         }
     }
 
@@ -104,6 +108,9 @@ impl State {
                 env,
             }),
         };
+        if matches!(step, Step::Remote(_)) {
+            self.last_target = Some(self.target.clone());
+        }
         self.plan.steps.push(step);
     }
 
@@ -169,6 +176,14 @@ impl State {
             "reload" => {
                 self.flush();
                 self.add_reload(payload, line)
+            }
+            "assert" => {
+                self.flush();
+                self.add_assert(payload, line)
+            }
+            "assert_health" => {
+                self.flush();
+                self.add_assert_health(payload, line)
             }
             "export" => self.declare_export(payload, line),
             "timeout" => {
@@ -513,6 +528,7 @@ impl State {
             });
         }
 
+        self.last_target = Some(target.to_string());
         self.plan.steps.push(Step::Copy(CopyStep {
             name,
             src: src.to_string(),
@@ -602,6 +618,7 @@ impl State {
                 reason: "missing target".to_string(),
             });
         }
+        self.last_target = Some(target.to_string());
         self.plan.steps.push(Step::Wait(WaitStep {
             name,
             target: Target::new(target),
@@ -610,6 +627,256 @@ impl State {
             interval_secs: 5,
         }));
         Ok(())
+    }
+
+    /// Parse `# @assert <unit> [@<target>] [<state>]`.
+    ///
+    /// The unit accepts `foo` or `foo.service`. The expected `ActiveState`
+    /// defaults to `active` — the state a deployed service is supposed to
+    /// be in — and the target is inherited from the previous step when it is
+    /// not given, so the common case is one short line.
+    ///
+    /// Like `@wait_active`, `@only_if` is rejected (an assertion has no
+    /// script context to evaluate a guard in) while `@name` and `@timeout`
+    /// apply.
+    fn add_assert(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert".to_string(),
+                reason: "`@only_if` is not supported on `@assert`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let mut unit: Option<String> = None;
+        let mut state: Option<String> = None;
+        let mut target: Option<String> = None;
+        for token in payload.split_whitespace() {
+            if let Some(name) = token.strip_prefix('@') {
+                if name.is_empty() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert".to_string(),
+                        reason: "missing target".to_string(),
+                    });
+                }
+                if target.is_some() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert".to_string(),
+                        reason: "more than one target".to_string(),
+                    });
+                }
+                target = Some(name.to_string());
+            } else if unit.is_none() {
+                unit = Some(token.to_string());
+            } else if state.is_none() {
+                state = Some(token.to_string());
+            } else {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "assert".to_string(),
+                    reason: "expected `<unit> [@<target>] [<state>]`".to_string(),
+                });
+            }
+        }
+
+        let Some(unit) = unit else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert".to_string(),
+                reason: "missing unit name".to_string(),
+            });
+        };
+        let unit = normalize_unit(&unit);
+        if !is_safe_unit(&unit) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert".to_string(),
+                reason: format!("unsafe unit name `{unit}`"),
+            });
+        }
+        let state = state.unwrap_or_else(|| "active".to_string());
+        if !state.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert".to_string(),
+                reason: format!("unsafe state `{state}`"),
+            });
+        }
+        let target = self.resolve_assert_target(target, "assert", line)?;
+        self.push_assertion(
+            name,
+            target,
+            Assertion::UnitState { unit, state },
+            timeout,
+        );
+        Ok(())
+    }
+
+    /// Parse `# @assert_health <url> [@<target>] [--expect CODES]`.
+    ///
+    /// The URL must be an `http`/`https` address. The accepted status codes
+    /// default to any 2xx or 3xx; `--expect 200,204` narrows them.
+    fn add_assert_health(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_health".to_string(),
+                reason: "`@only_if` is not supported on `@assert_health`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let mut url: Option<String> = None;
+        let mut target: Option<String> = None;
+        let mut expect: Vec<u16> = Vec::new();
+        let mut tokens = payload.split_whitespace();
+        while let Some(token) = tokens.next() {
+            match token {
+                "--expect" => {
+                    let Some(codes) = tokens.next() else {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_health".to_string(),
+                            reason: "`--expect` requires a list of status codes".to_string(),
+                        });
+                    };
+                    for code in codes.split(',') {
+                        let Ok(code) = code.trim().parse::<u16>() else {
+                            return Err(ParseError::InvalidDirective {
+                                line,
+                                directive: "assert_health".to_string(),
+                                reason: format!("invalid status code `{code}`"),
+                            });
+                        };
+                        if !(100..600).contains(&code) {
+                            return Err(ParseError::InvalidDirective {
+                                line,
+                                directive: "assert_health".to_string(),
+                                reason: format!("status code `{code}` is out of range"),
+                            });
+                        }
+                        expect.push(code);
+                    }
+                }
+                other if other.starts_with("--") => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_health".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+                other if let Some(name) = other.strip_prefix('@') => {
+                    if name.is_empty() {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_health".to_string(),
+                            reason: "missing target".to_string(),
+                        });
+                    }
+                    if target.is_some() {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_health".to_string(),
+                            reason: "more than one target".to_string(),
+                        });
+                    }
+                    target = Some(name.to_string());
+                }
+                other => {
+                    if url.is_some() {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_health".to_string(),
+                            reason: "expected `<url> [@<target>] [--expect CODES]`".to_string(),
+                        });
+                    }
+                    url = Some(other.to_string());
+                }
+            }
+        }
+
+        let Some(url) = url else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_health".to_string(),
+                reason: "missing URL".to_string(),
+            });
+        };
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_health".to_string(),
+                reason: format!("only http and https URLs can be probed (got `{url}`)"),
+            });
+        }
+        if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_health".to_string(),
+                reason: "the URL must not contain whitespace".to_string(),
+            });
+        }
+        let target = self.resolve_assert_target(target, "assert_health", line)?;
+        self.push_assertion(
+            name,
+            target,
+            Assertion::Health { url, expect },
+            timeout,
+        );
+        Ok(())
+    }
+
+    /// The target an assertion runs against: the explicit one, or the
+    /// target of the previous step.
+    fn resolve_assert_target(
+        &self,
+        explicit: Option<String>,
+        directive: &str,
+        line: usize,
+    ) -> Result<String, ParseError> {
+        if let Some(target) = explicit {
+            return Ok(target);
+        }
+        self.last_target.clone().ok_or_else(|| ParseError::InvalidDirective {
+            line,
+            directive: directive.to_string(),
+            reason: "missing target (no previous step to inherit it from)".to_string(),
+        })
+    }
+
+    /// Add an assertion to the plan.
+    ///
+    /// Consecutive assertions that share a target are one step: the whole
+    /// group then costs a single round trip.
+    fn push_assertion(
+        &mut self,
+        name: Option<String>,
+        target: String,
+        check: Assertion,
+        timeout: Option<u64>,
+    ) {
+        let mergeable = name.is_none() &&
+            self.plan.steps.last().is_some_and(
+                |step| matches!(step, Step::Assert(existing) if existing.target.text == target),
+            );
+        if mergeable
+            && let Some(Step::Assert(existing)) = self.plan.steps.last_mut()
+        {
+            existing.checks.push(check);
+            return;
+        }
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Assert(AssertStep {
+            name,
+            target: Target::new(target),
+            checks: vec![check],
+            timeout,
+        }));
     }
 
     /// Parse `# @reload <unit> @<target> [--signal SIG] [--wait] [--timeout SECS]`.
@@ -733,6 +1000,7 @@ impl State {
                 reason: "missing target".to_string(),
             });
         }
+        self.last_target = Some(target.to_string());
         self.plan.steps.push(Step::Reload(ReloadStep {
             name,
             target: Target::new(target),
@@ -743,6 +1011,32 @@ impl State {
         }));
         Ok(())
     }
+}
+
+/// Normalize a unit name: `foo` becomes `foo.service`.
+///
+/// A bare name is the common case in a playbook, and writing `.service`
+/// every time is noise the reader has to skip.
+fn normalize_unit(unit: &str) -> String {
+    let unit = unit.trim();
+    if unit.ends_with(".service") {
+        unit.to_string()
+    } else {
+        format!("{unit}.service")
+    }
+}
+
+/// Whether a unit name is safe to hand to `systemctl`.
+///
+/// The name ends up inside a remote shell command, so it must not be able to
+/// carry shell syntax.
+fn is_safe_unit(unit: &str) -> bool {
+    !unit.is_empty() &&
+        !unit.starts_with('.') &&
+        !unit.contains("..") &&
+        unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
 }
 
 /// Strip one layer of surrounding `"` or `'` quotes.
@@ -848,7 +1142,7 @@ mod tests {
     use super::{directive, parse_script};
     use crate::{
         error::ParseError,
-        plan::{CopyStep, EnvEntry, LocalStep, RemoteStep, Step, WaitStep},
+        plan::{AssertStep, Assertion, CopyStep, EnvEntry, LocalStep, RemoteStep, Step, WaitStep},
     };
 
     fn parse(input: &str) -> Result<crate::plan::ExecutionPlan, String> {
@@ -881,6 +1175,142 @@ mod tests {
             Step::Wait(s) => Ok(s),
             other => Err(format!("expected wait step, got {other:?}")),
         }
+    }
+
+    fn as_assert(step: &Step) -> Result<&AssertStep, String> {
+        match step {
+            Step::Assert(s) => Ok(s),
+            other => Err(format!("expected assert step, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn assert_parses_unit_and_target() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert dufs @api\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(step.target.text, "api");
+        assert_eq!(
+            step.checks,
+            vec![Assertion::UnitState {
+                unit: "dufs.service".to_string(),
+                state: "active".to_string(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assert_inherits_the_target_of_the_previous_step() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @remote api\n\
+             sudo systemctl restart dufs\n\
+             # @assert dufs\n",
+        )?;
+        let step = plan.steps.last().ok_or("no step")?;
+        let assert = as_assert(step)?;
+        assert_eq!(assert.target.text, "api");
+        Ok(())
+    }
+
+    #[test]
+    fn assert_accepts_an_explicit_state() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert dufs failed @api\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(
+            step.checks,
+            vec![Assertion::UnitState {
+                unit: "dufs.service".to_string(),
+                state: "failed".to_string(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn consecutive_assertions_share_one_step() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @assert dufs @api\n\
+             # @assert_health http://127.0.0.1:8080/health @api\n",
+        )?;
+        // Two checks, one step: the group costs one round trip.
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.steps);
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(step.checks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_assertion_with_its_own_name_stays_its_own_step() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @assert dufs @api\n\
+             # @name second\n\
+             # @assert dufs @api\n",
+        )?;
+        assert_eq!(plan.steps.len(), 2, "{:?}", plan.steps);
+        Ok(())
+    }
+
+    #[test]
+    fn assert_health_parses_the_url_and_the_expected_codes() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @assert_health http://127.0.0.1:8080/health --expect 200,204 @api\n",
+        )?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(
+            step.checks,
+            vec![Assertion::Health {
+                url: "http://127.0.0.1:8080/health".to_string(),
+                expect: vec![200, 204],
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assert_health_defaults_to_any_2xx_or_3xx() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert_health http://x/health @api\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(
+            step.checks,
+            vec![Assertion::Health { url: "http://x/health".to_string(), expect: Vec::new() }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assert_rejects_bad_shapes() {
+        for script in [
+            // No unit.
+            "# @server api api\n# @assert @api\n",
+            // No target and nothing to inherit from.
+            "# @server api api\n# @assert dufs\n",
+            // A unit name that could carry shell syntax.
+            "# @server api api\n# @assert 'dufs; rm -rf /' @api\n",
+            // A state that could carry shell syntax.
+            "# @server api api\n# @assert dufs 'a b' @api\n",
+            // Two targets.
+            "# @server api api\n# @assert dufs @api @api2\n",
+            // A URL that is not http.
+            "# @server api api\n# @assert_health file:///etc/passwd @api\n",
+            // A malformed status code.
+            "# @server api api\n# @assert_health http://x/ --expect abc @api\n",
+        ] {
+            assert!(
+                parse(script).is_err(),
+                "expected an error for:\n{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn assert_rejects_only_if() {
+        let err = parse("# @server api api\n# @only_if true\n# @assert dufs @api\n")
+            .expect_err("should fail");
+        assert!(err.contains("@only_if"), "{err}");
     }
 
     #[test]

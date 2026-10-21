@@ -142,6 +142,53 @@ impl Batch {
             .wait_with_output()
             .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
 
+        self.finish(host, output)
+    }
+
+    /// Run the batch against one host, asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Transport`] when the SSH transport is
+    /// unavailable or when the host answered with nothing that looks like a
+    /// batch.
+    pub(crate) async fn run_async(
+        &self,
+        host: &str,
+    ) -> Result<BTreeMap<String, Section>, ServiceError> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut child = tokio::process::Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=15")
+            .arg(host)
+            .arg("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|err| ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}")))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(self.script().as_bytes()).await;
+        }
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
+
+        self.finish(host, output)
+    }
+
+    /// Turn the raw output of a batch into its answers.
+    fn finish(
+        &self,
+        host: &str,
+        output: std::process::Output,
+    ) -> Result<BTreeMap<String, Section>, ServiceError> {
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if output.status.code() == Some(255) {
