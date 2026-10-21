@@ -356,15 +356,16 @@ async fn run_single_step(
             match shellflow_core::resolve_hosts(plan, &assert.target, &setup.restrict) {
                 Ok(hosts) => (
                     None,
-                    super::assert_step::run_assert_step(
-                        &setup.ui,
+                    super::assert_step::run_assert_step(super::assert_step::AssertStepArgs {
+                        ui: &setup.ui,
                         assert,
                         hosts,
                         config,
-                        &setup.semaphore,
-                        &setup.log_file,
-                        &setup.cancel,
-                    )
+                        semaphore: &setup.semaphore,
+                        log_file: &setup.log_file,
+                        cancel: &setup.cancel,
+                        run_state: &setup.run_state,
+                    })
                     .await,
                 ),
                 Err(err) => {

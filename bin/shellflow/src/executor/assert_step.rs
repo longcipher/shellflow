@@ -46,15 +46,22 @@ const DEFAULT_PORT_TIMEOUT_SECS: u64 = 60;
 ///
 /// Returns an error only when the fan-out itself cannot be set up; a
 /// failed *assertion* is reported per host as a failed step.
+/// The shared handles of an assertion step.
+pub(super) struct AssertStepArgs<'a> {
+    pub ui: &'a ArcUi,
+    pub assert: &'a AssertStep,
+    pub hosts: Vec<ResolvedHost>,
+    pub config: StepConfig,
+    pub semaphore: &'a Option<Arc<Semaphore>>,
+    pub log_file: &'a LogFile,
+    pub cancel: &'a Cancel,
+    pub run_state: &'a Arc<tokio::sync::Mutex<shellflow_core::RunState>>,
+}
+
 pub(super) async fn run_assert_step(
-    ui: &ArcUi,
-    assert: &AssertStep,
-    hosts: Vec<ResolvedHost>,
-    config: StepConfig,
-    semaphore: &Option<Arc<Semaphore>>,
-    log_file: &LogFile,
-    cancel: &Cancel,
+    args: AssertStepArgs<'_>,
 ) -> eyre::Result<Vec<(String, HostOutcome)>> {
+    let AssertStepArgs { ui, assert, hosts, config, semaphore, log_file, cancel, run_state } = args;
     if config.check || config.dry_run {
         crate::ui::note(
             &format!(
@@ -66,6 +73,23 @@ pub(super) async fn run_assert_step(
         return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
     }
 
+    // A path or URL may reference a captured variable (`/run/${SVC}/…`),
+    // exactly like a `@copy` path does.
+    let checks = {
+        let state = run_state.lock().await;
+        let mut resolved = Vec::with_capacity(assert.checks.len());
+        for check in &assert.checks {
+            match interpolate_check(check, &state) {
+                Ok(check) => resolved.push(check),
+                Err(err) => {
+                    crate::ui::step_failed(0, &err.to_string(), log_file);
+                    return Err(err);
+                }
+            }
+        }
+        resolved
+    };
+
     // Each check picks its own default budget; an explicit `@timeout`
     // overrides them all.
     let step_timeout = config.timeout;
@@ -75,7 +99,7 @@ pub(super) async fn run_assert_step(
     let mut tasks = tokio::task::JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(ui);
-        let checks = assert.checks.clone();
+        let checks = checks.clone();
         let semaphore = semaphore.clone();
         let log_file = log_file.clone();
         let cancel = cancel.clone();
@@ -166,6 +190,30 @@ async fn run_on_host(
     } else {
         HostOutcome::Ok
     }
+}
+
+/// Resolve the run-state references in one check.
+///
+/// A path or a URL may name a captured variable (`/run/${SVC}/config.toml`):
+/// the assertion runs on the target, where that variable does not exist.
+fn interpolate_check(
+    check: &Assertion,
+    state: &shellflow_core::RunState,
+) -> eyre::Result<Assertion> {
+    let resolved = match check {
+        Assertion::Rendered { path } => Assertion::Rendered {
+            path: shellflow_core::interpolate(path, state).map_err(eyre::Error::from)?,
+        },
+        Assertion::Health { url, expect, method, body, headers } => Assertion::Health {
+            url: shellflow_core::interpolate(url, state).map_err(eyre::Error::from)?,
+            expect: expect.clone(),
+            method: method.clone(),
+            body: body.clone(),
+            headers: headers.clone(),
+        },
+        other => other.clone(),
+    };
+    Ok(resolved)
 }
 
 /// The remote command that checks one condition.
