@@ -128,9 +128,7 @@ fn validate_unit(unit: &str) -> Result<(), SystemdError> {
     if unit.starts_with('.') || unit.contains("..") {
         return Err(SystemdError::usage(format!("invalid unit name `{unit}`")));
     }
-    if !unit
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
+    if !unit.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
     {
         return Err(SystemdError::usage(format!("invalid unit name `{unit}`")));
     }
@@ -186,14 +184,13 @@ fn parse_show_output(text: &str) -> UnitState {
 ///
 /// The rules, in order:
 ///
-/// 1. `ActiveState=active` → **ready**. For a `Type=notify` unit systemd only
-///    reports `active` after the service sent `READY=1`, so a notify service
-///    that never signalled is never "ready" here — exactly the property the
-///    notify protocol exists to provide.
+/// 1. `ActiveState=active` → **ready**. For a `Type=notify` unit systemd only reports `active`
+///    after the service sent `READY=1`, so a notify service that never signalled is never "ready"
+///    here — exactly the property the notify protocol exists to provide.
 /// 2. `ActiveState=failed` → **failed**.
-/// 3. A `Type=oneshot` that finished with `Result=success` → **ready**. A
-///    oneshot without `RemainAfterExit=yes` reports `inactive` once it is
-///    done, so rule 1 alone would never fire for it.
+/// 3. A `Type=oneshot` that finished with `Result=success` → **ready**. A oneshot without
+///    `RemainAfterExit=yes` reports `inactive` once it is done, so rule 1 alone would never fire
+///    for it.
 /// 4. A failing `Result=` while the unit is not active → **failed**.
 /// 5. Anything else → **pending**.
 pub(crate) fn verdict(state: &UnitState) -> Verdict {
@@ -220,9 +217,16 @@ fn is_failure_result(result: &str) -> bool {
 /// The human-readable reason for a failure.
 fn failure_reason(state: &UnitState) -> String {
     if state.result.is_empty() || state.result == "success" || state.result == "none" {
-        return format!("unit is {}", if state.active.is_empty() { "not active" } else { &state.active });
+        return format!(
+            "unit is {}",
+            if state.active.is_empty() { "not active" } else { &state.active }
+        );
     }
-    format!("unit is {} (result: {})", if state.active.is_empty() { "not active" } else { &state.active }, state.result)
+    format!(
+        "unit is {} (result: {})",
+        if state.active.is_empty() { "not active" } else { &state.active },
+        state.result
+    )
 }
 
 /// Render a state as the machine-readable line the controller parses.
@@ -295,7 +299,9 @@ fn notify(args: &SystemdNotifyArgs) -> Result<(), SystemdError> {
 }
 
 /// Build the notification states from the CLI arguments.
-fn notify_states(args: &SystemdNotifyArgs) -> Result<Vec<sd_notify::NotifyState<'_>>, SystemdError> {
+fn notify_states(
+    args: &SystemdNotifyArgs,
+) -> Result<Vec<sd_notify::NotifyState<'_>>, SystemdError> {
     let mut states: Vec<sd_notify::NotifyState<'_>> = Vec::new();
     if args.ready {
         states.push(sd_notify::NotifyState::Ready);
@@ -303,10 +309,9 @@ fn notify_states(args: &SystemdNotifyArgs) -> Result<Vec<sd_notify::NotifyState<
     if args.reloading {
         // systemd >= 253 requires MONOTONIC_USEC with RELOADING=1.
         states.push(sd_notify::NotifyState::Reloading);
-        states.push(
-            sd_notify::NotifyState::monotonic_usec_now()
-                .map_err(|err| SystemdError::internal(format!("cannot read the monotonic clock: {err}")))?,
-        );
+        states.push(sd_notify::NotifyState::monotonic_usec_now().map_err(|err| {
+            SystemdError::internal(format!("cannot read the monotonic clock: {err}"))
+        })?);
     }
     if args.stopping {
         states.push(sd_notify::NotifyState::Stopping);
@@ -322,9 +327,7 @@ fn notify_states(args: &SystemdNotifyArgs) -> Result<Vec<sd_notify::NotifyState<
     }
     for raw in &args.raw {
         if !raw.contains('=') {
-            return Err(SystemdError::usage(format!(
-                "`--raw` expects KEY=VALUE, got `{raw}`"
-            )));
+            return Err(SystemdError::usage(format!("`--raw` expects KEY=VALUE, got `{raw}`")));
         }
         states.push(sd_notify::NotifyState::Custom(raw));
     }
@@ -388,8 +391,7 @@ fn wait(args: &SystemdWaitArgs) -> Result<(), SystemdError> {
             return Err(SystemdError {
                 message: format!(
                     "`{}` did not reach the wanted state within {}s",
-                    args.unit,
-                    args.timeout
+                    args.unit, args.timeout
                 ),
                 code: EXIT_TIMEOUT,
             });
@@ -418,10 +420,9 @@ fn status(args: &SystemdStatusArgs) -> Result<(), SystemdError> {
 /// The ladder mirrors what a unit can offer:
 ///
 /// 1. the unit declares `ExecReload=` → `systemctl reload`;
-/// 2. `--signal` is given → `systemctl kill --signal <sig>` (the
-///    nginx/USR1 convention);
-/// 3. otherwise → refuse, because a silent fallback to `restart` would drop
-///    connections the operator explicitly asked not to drop.
+/// 2. `--signal` is given → `systemctl kill --signal <sig>` (the nginx/USR1 convention);
+/// 3. otherwise → refuse, because a silent fallback to `restart` would drop connections the
+///    operator explicitly asked not to drop.
 fn reload(args: &SystemdReloadArgs) -> Result<(), SystemdError> {
     validate_unit(&args.unit)?;
     let has_exec_reload = unit_has_property(&args.unit, "ExecReload");
@@ -443,7 +444,11 @@ fn reload(args: &SystemdReloadArgs) -> Result<(), SystemdError> {
     if !args.wait {
         return Ok(());
     }
-    wait_for_reload(&args.unit, Duration::from_secs(args.timeout), Duration::from_secs(args.interval.max(1)))
+    wait_for_reload(
+        &args.unit,
+        Duration::from_secs(args.timeout),
+        Duration::from_secs(args.interval.max(1)),
+    )
 }
 
 /// Run `systemctl`, elevating when the caller is not root.
@@ -558,7 +563,10 @@ async fn watch(args: &SystemdWatchArgs) -> Result<(), SystemdError> {
             }
             if Instant::now() >= deadline {
                 return Err(SystemdError {
-                    message: format!("`{}` did not become ready within {}s", args.unit, args.timeout),
+                    message: format!(
+                        "`{}` did not become ready within {}s",
+                        args.unit, args.timeout
+                    ),
                     code: EXIT_TIMEOUT,
                 });
             }
@@ -625,14 +633,8 @@ mod tests {
     fn a_notify_unit_is_only_ready_after_ready_1() {
         // systemd keeps a Type=notify unit in `activating` until it sends
         // READY=1; that is the whole point of the protocol.
-        assert_eq!(
-            verdict(&state("notify", "activating", "start", "success")),
-            Verdict::Pending
-        );
-        assert_eq!(
-            verdict(&state("notify", "active", "running", "success")),
-            Verdict::Ready
-        );
+        assert_eq!(verdict(&state("notify", "activating", "start", "success")), Verdict::Pending);
+        assert_eq!(verdict(&state("notify", "active", "running", "success")), Verdict::Ready);
     }
 
     #[test]
@@ -653,10 +655,7 @@ mod tests {
     #[test]
     fn a_oneshot_that_finished_successfully_is_ready() {
         // A oneshot without RemainAfterExit=yes reports `inactive` once done.
-        assert_eq!(
-            verdict(&state("oneshot", "inactive", "exited", "success")),
-            Verdict::Ready
-        );
+        assert_eq!(verdict(&state("oneshot", "inactive", "exited", "success")), Verdict::Ready);
     }
 
     #[test]
@@ -669,10 +668,7 @@ mod tests {
 
     #[test]
     fn a_starting_unit_is_pending() {
-        assert_eq!(
-            verdict(&state("simple", "activating", "start", "")),
-            Verdict::Pending
-        );
+        assert_eq!(verdict(&state("simple", "activating", "start", "")), Verdict::Pending);
     }
 
     #[test]
@@ -686,10 +682,7 @@ mod tests {
     #[test]
     fn a_successful_result_while_inactive_is_pending() {
         // The unit has not been started yet — keep waiting, do not fail.
-        assert_eq!(
-            verdict(&state("simple", "inactive", "dead", "success")),
-            Verdict::Pending
-        );
+        assert_eq!(verdict(&state("simple", "inactive", "dead", "success")), Verdict::Pending);
     }
 
     #[test]
