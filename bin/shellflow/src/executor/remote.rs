@@ -352,6 +352,27 @@ async fn run_single_step(
                 }
             }
         }
+        shellflow_core::Step::Assert(assert) => {
+            match shellflow_core::resolve_hosts(plan, &assert.target, &setup.restrict) {
+                Ok(hosts) => (
+                    None,
+                    super::assert_step::run_assert_step(
+                        &setup.ui,
+                        assert,
+                        hosts,
+                        config,
+                        &setup.semaphore,
+                        &setup.log_file,
+                        &setup.cancel,
+                    )
+                    .await,
+                ),
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
         shellflow_core::Step::Reload(reload) => {
             match shellflow_core::resolve_hosts(plan, &reload.target, &setup.restrict) {
                 Ok(hosts) => (
@@ -639,6 +660,7 @@ fn target_host_aliases(
             shellflow_core::Step::Copy(copy) => &copy.target,
             shellflow_core::Step::Wait(wait) => &wait.target,
             shellflow_core::Step::Reload(reload) => &reload.target,
+            shellflow_core::Step::Assert(assert) => &assert.target,
             shellflow_core::Step::Local(_) => continue,
         };
         match shellflow_core::resolve_hosts(plan, target, restrict) {

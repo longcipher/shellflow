@@ -117,6 +117,16 @@ All other lines (including plain comments) belong to the current block.
 | `@name` | `# @name <label>` | Label the next block (for `--only`/`--skip` filtering and reporting) |
 | `@only_if` | `# @only_if <command>` | Guard: run next block only where `<command>` succeeds (exit 0); otherwise report `SKIPPED` |
 | `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active <unit>` on every target host until it reports active or the budget expires (default 300s). Replaces the hand-rolled `for`/`sleep`/`ss` poll loops that differ in every playbook. A host that never reports active is `FAILED` (script class); an unreachable host is a transport failure (§6) |
+| `@assert` | `# @assert <unit> [@<target>] [<state>]` | Assert the unit's `ActiveState` on the target (default `active`). The target is inherited from the previous step when it is not given. A failed assertion fails the step (script class) |
+| `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default). The target is inherited from the previous step |
+
+**Assertion steps.** Consecutive `@assert`/`@assert_health` lines that share a
+target are merged into **one** step: the whole group travels in a single SSH
+round trip, and the operator sees which condition failed. The target may be
+omitted, in which case it is inherited from the previous step — the common
+case is therefore a single short line. An assertion step replaces the
+hand-written `systemctl is-active && curl -f` tail that every playbook used
+to end with, and that every playbook spelled differently.
 
 **Rules:**
 

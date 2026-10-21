@@ -147,6 +147,12 @@ lines belong to the current block.
 | `@name` | `# @name <label>` | Name the next block (for `--only`/`--skip` and reporting) |
 | `@only_if` | `# @only_if <command>` | Skip the next block where `<command>` fails |
 | `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active <unit>` until the unit reports active or the budget expires (default 300s). Replaces hand-rolled `for/sleep/ss` loops; a timeout is a script-class failure |
+| `@assert` | `# @assert <unit> [@<target>] [<state>]` | Assert the unit's `ActiveState` on the target (default state `active`). The target is inherited from the previous step when it is not given. A failed assertion fails the step |
+| `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default, `--expect 200,204` to narrow). The target is inherited from the previous step |
+
+Consecutive `@assert`/`@assert_health` lines that share a target are **one**
+step: the whole group travels in a single SSH round trip, and the operator
+sees which condition failed.
 
 Key rules:
 

@@ -10,6 +10,7 @@
 //! child traps or blocks `SIGTERM`. `kill_on_drop(true)` remains set as a
 //! last-resort net for paths that drop a child without awaiting `terminate`.
 
+mod assert_step;
 mod cancel;
 mod copy;
 mod local;

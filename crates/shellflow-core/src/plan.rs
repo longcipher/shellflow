@@ -169,6 +169,45 @@ pub struct ReloadStep {
     pub timeout: Option<u64>,
 }
 
+/// One condition an `@assert` step checks on the target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Assertion {
+    /// The systemd unit's `ActiveState` must equal the expected state.
+    UnitState {
+        /// The systemd unit name (`foo.service`).
+        unit: String,
+        /// The expected `ActiveState` (`active`).
+        state: String,
+    },
+    /// The URL must answer with an accepted HTTP status.
+    Health {
+        /// The URL to probe.
+        url: String,
+        /// The accepted status codes (2xx/3xx by default).
+        expect: Vec<u16>,
+    },
+}
+
+/// A step that asserts conditions on the target hosts.
+///
+/// Assertions replace the hand-written `systemctl is-active && curl -f`
+/// tails that every playbook ends with — the part that differs in every
+/// playbook and that silently stops being checked when somebody edits it.
+///
+/// Consecutive assertions that share a target are **one** step, so a
+/// playbook that checks three things still costs one round trip.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssertStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// The conditions to check, in declaration order.
+    pub checks: Vec<Assertion>,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
 /// One executable unit of the plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Step {
@@ -182,6 +221,8 @@ pub enum Step {
     Wait(WaitStep),
     /// Reload a systemd unit gracefully.
     Reload(ReloadStep),
+    /// Assert conditions on the target hosts.
+    Assert(AssertStep),
 }
 
 impl Step {
@@ -194,6 +235,7 @@ impl Step {
             Self::Copy(s) => s.name.as_deref(),
             Self::Wait(s) => s.name.as_deref(),
             Self::Reload(s) => s.name.as_deref(),
+            Self::Assert(s) => s.name.as_deref(),
         }
     }
 
@@ -207,6 +249,7 @@ impl Step {
             Self::Copy(_) => "copy",
             Self::Wait(_) => "wait_active",
             Self::Reload(_) => "reload",
+            Self::Assert(_) => "assert",
         }
     }
 
@@ -219,6 +262,7 @@ impl Step {
             Self::Copy(s) => Some(&s.target.text),
             Self::Wait(s) => Some(&s.target.text),
             Self::Reload(s) => Some(&s.target.text),
+            Self::Assert(s) => Some(&s.target.text),
         }
     }
 
@@ -229,7 +273,7 @@ impl Step {
             Self::Local(s) => s.guard.as_deref(),
             Self::Remote(s) => s.guard.as_deref(),
             Self::Copy(s) => s.guard.as_deref(),
-            Self::Wait(_) | Self::Reload(_) => None,
+            Self::Wait(_) | Self::Reload(_) | Self::Assert(_) => None,
         }
     }
 
@@ -242,6 +286,7 @@ impl Step {
             Self::Copy(s) => s.timeout,
             Self::Wait(s) => s.timeout,
             Self::Reload(s) => s.timeout,
+            Self::Assert(s) => s.timeout,
         }
     }
 }
