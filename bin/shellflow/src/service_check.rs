@@ -41,7 +41,8 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
     // `is-active` reports "inactive" for a unit that does not exist at all,
     // so the unit's load state decides whether it is really there.
     let socket_unit = format!("{}.socket", args.service);
-    let load_state = ssh(&args.host, &["systemctl", "show", &socket_unit, "-p", "LoadState", "--value"])?;
+    let load_state =
+        ssh(&args.host, &["systemctl", "show", &socket_unit, "-p", "LoadState", "--value"])?;
     if load_state.trim() != "not-found" && !load_state.trim().is_empty() {
         let socket_state = ssh(&args.host, &["systemctl", "is-active", &socket_unit])?;
         report(
@@ -282,19 +283,18 @@ fn looks_like_leak(line: &str, _service: &str) -> bool {
 /// `journal` is the unit's recent journal. The rules are the ones that
 /// actually break a notify service, in the order systemd itself reports them:
 ///
-/// * `Type=notify` with `NotifyAccess=none` — the unit can never become
-///   ready; systemd kills it at `TimeoutStartSec`.
-/// * `Type=notify-reload` without `ExecReload=` — the reload is a no-op, so
-///   a graceful-restart playbook silently degrades to "nothing happened".
-/// * A configured `WatchdogSec=` with a watchdog timeout in the journal — the
-///   service never pings, so systemd killed it. This is a silent production
-///   failure that only the journal shows.
-/// * "no READY=1 notification received" in the journal — the service started
-///   but never signalled readiness.
-/// * A notify unit that is still activating with no `STATUS=` — the operator
-///   has no progress signal, which is exactly what the notify protocol is for.
-/// * A notify unit with a very short `TimeoutStartSec=` — the service is
-///   killed before it can finish initialising.
+/// * `Type=notify` with `NotifyAccess=none` — the unit can never become ready; systemd kills it at
+///   `TimeoutStartSec`.
+/// * `Type=notify-reload` without `ExecReload=` — the reload is a no-op, so a graceful-restart
+///   playbook silently degrades to "nothing happened".
+/// * A configured `WatchdogSec=` with a watchdog timeout in the journal — the service never pings,
+///   so systemd killed it. This is a silent production failure that only the journal shows.
+/// * "no READY=1 notification received" in the journal — the service started but never signalled
+///   readiness.
+/// * A notify unit that is still activating with no `STATUS=` — the operator has no progress
+///   signal, which is exactly what the notify protocol is for.
+/// * A notify unit with a very short `TimeoutStartSec=` — the service is killed before it can
+///   finish initialising.
 fn notify_findings(show: &str, journal: &str) -> Vec<(String, Check)> {
     let mut findings = Vec::new();
     let props = parse_show_props(show);
@@ -487,7 +487,8 @@ mod tests {
     #[test]
     fn a_missing_ready_notification_is_reported() {
         let show = "Type=notify\nNotifyAccess=main\nActiveState=inactive\n";
-        let journal = "systemd[1]: foo.service: Startup finished, but no READY=1 notification received.";
+        let journal =
+            "systemd[1]: foo.service: Startup finished, but no READY=1 notification received.";
         let findings = notify_findings(show, journal);
         assert!(
             findings.iter().any(|(m, s)| m.contains("READY=1") && *s == Check::Fail),
