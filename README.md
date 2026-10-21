@@ -148,13 +148,18 @@ lines belong to the current block.
 | `@only_if` | `# @only_if <command>` | Skip the next block where `<command>` fails |
 | `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active <unit>` until the unit reports active or the budget expires (default 300s). Replaces hand-rolled `for/sleep/ss` loops; a timeout is a script-class failure |
 | `@assert` | `# @assert <unit> [@<target>] [<state>]` | Assert the unit's `ActiveState` on the target (default state `active`). The target is inherited from the previous step when it is not given. A failed assertion fails the step |
-| `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default, `--expect 200,204` to narrow). The target is inherited from the previous step |
-| `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>]` | Assert that the ports are listening on the target, waiting up to the step's timeout. Replaces the hand-rolled `for i in $(seq 1 12); do ss … ; sleep 5; done` loops |
+| `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES] [--method M] [--body D] [--header H]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default; `--expect 200,204` or `--expect 2xx,3xx,4xx` to narrow). `--method`/`--body`/`--header` cover endpoints that only answer POST. The probe **waits** (up to the step's timeout) — a service that was just started needs a moment. The target is inherited from the previous step |
+| `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>] [--udp]` | Assert that the ports are listening on the target, waiting up to the step's timeout. Replaces the hand-rolled `for i in $(seq 1 12); do ss … ; sleep 5; done` loops. `--udp` checks the UDP sockets |
 | `@assert_rendered` | `# @assert_rendered <path> [@<target>]` | Assert that the file exists and holds no unexpanded `${…}` placeholder — a rendered config that still carries a placeholder was never rendered |
 
-Consecutive `@assert`/`@assert_health` lines that share a target are **one**
-step: the whole group travels in a single SSH round trip, and the operator
-sees which condition failed.
+Consecutive assertions that share a target are **one** step: the whole group
+travels in a single SSH round trip, and the operator sees which condition
+failed. A *named* assertion (`@name`) is its own step, so it can be selected
+on its own with `--only`.
+
+The path/URL of an assertion may name a captured variable
+(`/run/${SVC}/config.toml`): it is resolved from the run state, exactly like
+a `@copy` path.
 
 Key rules:
 

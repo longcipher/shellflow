@@ -1019,7 +1019,7 @@ impl State {
                     reason: "expected `<path> [@<target>]`".to_string(),
                 });
             }
-            path = Some(token.to_string());
+            path = Some(strip_surrounding_quotes(token));
         }
         let Some(path) = path else {
             return Err(ParseError::InvalidDirective {
