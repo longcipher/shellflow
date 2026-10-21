@@ -33,6 +33,19 @@ use crate::{
 /// reason.
 const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 60;
 
+/// The margin the transport gets on top of the checks' own budgets.
+const TRANSPORT_MARGIN_SECS: u64 = 15;
+
+/// The budget one check may spend waiting.
+fn check_budget(check: &Assertion, step_timeout: Option<u64>) -> u64 {
+    match check {
+        Assertion::Port { .. } => step_timeout.unwrap_or(DEFAULT_PORT_TIMEOUT_SECS),
+        Assertion::Health { .. } => step_timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS),
+        // The unit-state and the rendered checks answer at once.
+        Assertion::UnitState { .. } | Assertion::Rendered { .. } => 0,
+    }
+}
+
 /// The default budget for waiting for a port, in seconds.
 ///
 /// A service that is restarting is not listening *yet*: the wait is the
@@ -93,9 +106,15 @@ pub(super) async fn run_assert_step(
     // Each check picks its own default budget; an explicit `@timeout`
     // overrides them all.
     let step_timeout = config.timeout;
-    let wait_budget = step_timeout
-        .unwrap_or(DEFAULT_PORT_TIMEOUT_SECS)
-        .max(DEFAULT_HEALTH_TIMEOUT_SECS);
+    // The transport budget must cover *every* wait: the checks run one after
+    // another on the target, so their budgets add up. A budget that only
+    // covered the longest one would cut a group of checks short.
+    let wait_budget: u64 = assert
+        .checks
+        .iter()
+        .map(|check| check_budget(check, step_timeout))
+        .sum::<u64>()
+        + TRANSPORT_MARGIN_SECS;
     let mut tasks = tokio::task::JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(ui);
@@ -152,7 +171,7 @@ async fn run_on_host(
     }
 
     let run = batch.run_async(&host.alias);
-    let sections = match tokio::time::timeout(Duration::from_secs(wait_budget + 15), run).await {
+    let sections = match tokio::time::timeout(Duration::from_secs(wait_budget), run).await {
         Ok(Ok(sections)) => sections,
         Ok(Err(err)) => {
             crate::ui::warn(
