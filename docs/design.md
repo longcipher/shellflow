@@ -118,13 +118,16 @@ All other lines (including plain comments) belong to the current block.
 | `@only_if` | `# @only_if <command>` | Guard: run next block only where `<command>` succeeds (exit 0); otherwise report `SKIPPED` |
 | `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active <unit>` on every target host until it reports active or the budget expires (default 300s). Replaces the hand-rolled `for`/`sleep`/`ss` poll loops that differ in every playbook. A host that never reports active is `FAILED` (script class); an unreachable host is a transport failure (§6) |
 | `@assert` | `# @assert <unit> [@<target>] [<state>]` | Assert the unit's `ActiveState` on the target (default `active`). The target is inherited from the previous step when it is not given. A failed assertion fails the step (script class) |
-| `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default). The target is inherited from the previous step |
-| `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>]` | Assert that the ports are listening, waiting up to the step's timeout (in one round trip, not one per poll). The target is inherited from the previous step |
+| `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES] [--method M] [--body D] [--header H]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default; `--expect` takes exact codes and classes such as `2xx`). `--method`/`--body`/`--header` cover endpoints that only answer POST. The probe waits (up to the step's timeout) on the target, so a service that was just started is not failed for the wrong reason. The target is inherited from the previous step |
+| `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>] [--udp]` | Assert that the ports are listening, waiting up to the step's timeout (in one round trip, not one per poll). `--udp` checks the UDP sockets. The target is inherited from the previous step |
 | `@assert_rendered` | `# @assert_rendered <path> [@<target>]` | Assert that the file exists and holds no unexpanded `${…}` placeholder. The target is inherited from the previous step |
 
-**Assertion steps.** Consecutive `@assert`/`@assert_health` lines that share a
-target are merged into **one** step: the whole group travels in a single SSH
-round trip, and the operator sees which condition failed. The target may be
+**Assertion steps.** Consecutive assertions that share a target are merged
+into **one** step: the whole group travels in a single SSH round trip, and the
+operator sees which condition failed. A *named* assertion is its own step, so
+it can be selected on its own with `--only`. An assertion's path or URL may
+name a captured variable (`/run/${SVC}/config.toml`); it is resolved from
+the run state, like a `@copy` path. The target may be
 omitted, in which case it is inherited from the previous step — the common
 case is therefore a single short line. An assertion step replaces the
 hand-written `systemctl is-active && curl -f` tail that every playbook used
