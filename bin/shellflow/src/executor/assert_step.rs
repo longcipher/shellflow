@@ -29,6 +29,13 @@ use crate::{
 /// The default budget for one health probe, in seconds.
 const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 10;
 
+/// The default budget for waiting for a port, in seconds.
+///
+/// A service that is restarting is not listening *yet*: the wait is the
+/// point of the check, and it used to be a hand-written `for`/`sleep` loop
+/// in every playbook.
+const DEFAULT_PORT_TIMEOUT_SECS: u64 = 60;
+
 /// Run an assertion step on every host.
 ///
 /// # Errors
@@ -55,11 +62,15 @@ pub(super) async fn run_assert_step(
         return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
     }
 
-    let timeout_secs = config.timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS);
+    // Each check picks its own default budget; an explicit `@timeout`
+    // overrides them all.
+    let step_timeout = config.timeout;
+    let wait_budget = step_timeout.unwrap_or(DEFAULT_PORT_TIMEOUT_SECS);
     let mut tasks = tokio::task::JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(ui);
         let checks = assert.checks.clone();
+        let step_timeout = step_timeout;
         let semaphore = semaphore.clone();
         let log_file = log_file.clone();
         let cancel = cancel.clone();
@@ -76,7 +87,8 @@ pub(super) async fn run_assert_step(
             if cancel.is_cancelled() {
                 return (host.alias.clone(), HostOutcome::Cancelled);
             }
-            let outcome = run_on_host(&ui, &host, &checks, timeout_secs, &log_file).await;
+            let outcome = run_on_host(&ui, &host, &checks, step_timeout, wait_budget, &log_file)
+                .await;
             (host.alias.clone(), outcome)
         });
     }
@@ -101,16 +113,17 @@ async fn run_on_host(
     ui: &ArcUi,
     host: &ResolvedHost,
     checks: &[Assertion],
-    timeout_secs: u64,
+    step_timeout: Option<u64>,
+    wait_budget: u64,
     log_file: &LogFile,
 ) -> HostOutcome {
     let mut batch = Batch::new();
     for (idx, check) in checks.iter().enumerate() {
-        batch.section(&format!("c{idx}"), &command_for(check, timeout_secs));
+        batch.section(&format!("c{idx}"), &command_for(check, step_timeout));
     }
 
     let run = batch.run_async(&host.alias);
-    let sections = match tokio::time::timeout(Duration::from_secs(timeout_secs + 15), run).await {
+    let sections = match tokio::time::timeout(Duration::from_secs(wait_budget + 15), run).await {
         Ok(Ok(sections)) => sections,
         Ok(Err(err)) => {
             crate::ui::warn(
@@ -121,7 +134,7 @@ async fn run_on_host(
         }
         Err(_) => {
             crate::ui::warn(
-                &format!("[{}] assert timed out after {timeout_secs}s", host.alias),
+                &format!("[{}] assert timed out after {wait_budget}s", host.alias),
                 log_file,
             );
             return HostOutcome::Failed(RunError::Script);
@@ -154,7 +167,7 @@ async fn run_on_host(
 ///
 /// The command exits `0` when the condition holds and `1` when it does
 /// not, and prints a one-line verdict either way.
-fn command_for(check: &Assertion, timeout_secs: u64) -> String {
+fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
     match check {
         Assertion::UnitState { unit, state } => format!(
             "s=$(systemctl is-active {unit} 2>/dev/null); \
@@ -167,7 +180,7 @@ fn command_for(check: &Assertion, timeout_secs: u64) -> String {
             // The wait happens on the target: one round trip covers the
             // whole budget, not one round trip per poll.
             let list: Vec<String> = ports.iter().map(u16::to_string).collect();
-            let budget = timeout_secs;
+            let budget = step_timeout.unwrap_or(DEFAULT_PORT_TIMEOUT_SECS);
             let checks: Vec<String> = list
                 .iter()
                 .map(|port| {
@@ -203,6 +216,7 @@ fn command_for(check: &Assertion, timeout_secs: u64) -> String {
             )
         }
         Assertion::Health { url, expect } => {
+            let timeout_secs = step_timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS);
             let accepted = if expect.is_empty() {
                 // Any 2xx or 3xx is a healthy answer. The pattern must stay
                 // unquoted: inside `case` a quoted pattern is a literal
@@ -265,7 +279,7 @@ mod tests {
     fn a_unit_check_asks_systemd_for_the_state() {
         let cmd = command_for(
             &Assertion::UnitState { unit: "dufs.service".to_string(), state: "active".to_string() },
-            10,
+            Some(10),
         );
         assert!(cmd.contains("systemctl is-active 'dufs.service'"), "{cmd}");
         assert!(cmd.contains("'active'"), "{cmd}");
@@ -280,7 +294,7 @@ mod tests {
                 url: "http://127.0.0.1:8080/health".to_string(),
                 expect: Vec::new(),
             },
-            5,
+            Some(5),
         );
         assert!(cmd.contains("http://127.0.0.1:8080/health"), "{cmd}");
         assert!(cmd.contains("curl"), "{cmd}");
@@ -292,10 +306,30 @@ mod tests {
     fn a_health_check_with_explicit_codes_accepts_only_those() {
         let cmd = command_for(
             &Assertion::Health { url: "http://x/".to_string(), expect: vec![200, 204] },
-            5,
+            Some(5),
         );
         assert!(cmd.contains("200|204"), "{cmd}");
         assert!(!cmd.contains("2??"), "{cmd}");
+    }
+
+    #[test]
+    fn a_port_check_waits_on_the_target() {
+        let cmd = command_for(&Assertion::Port { ports: vec![5000] }, Some(90));
+        assert!(cmd.contains("sfw_wait_port 5000 90"), "{cmd}");
+        assert!(cmd.contains("ss -tln"), "{cmd}");
+    }
+
+    #[test]
+    fn a_port_check_has_its_own_default_budget() {
+        let cmd = command_for(&Assertion::Port { ports: vec![5000] }, None);
+        assert!(cmd.contains("sfw_wait_port 5000 60"), "{cmd}");
+    }
+
+    #[test]
+    fn a_rendered_check_looks_for_placeholders() {
+        let cmd = command_for(&Assertion::Rendered { path: "/run/app/config.toml".to_string() }, None);
+        assert!(cmd.contains("/run/app/config.toml"), "{cmd}");
+        assert!(cmd.contains("[A-Z_]"), "{cmd}");
     }
 
     #[test]
