@@ -2,21 +2,22 @@
 default:
   @just --list
 
-# Format all code
+# The fuzz crates are detached workspaces, so `cargo fmt --all` skips them.
+#
+# Format markdown, TOML and Rust sources
 format:
   rumdl fmt .
   cargo sort -w -g
   cargo +nightly fmt --all
-  # The fuzz crates are detached workspaces, so `cargo fmt --all` skips them.
   rustfmt --edition 2024 crates/shellflow-core/fuzz/fuzz_targets/*.rs
   rustfmt --edition 2024 crates/shellflow-secrets/fuzz/fuzz_targets/*.rs
 
-# Auto-fix linting issues
+# Auto-fix what `format` cannot: markdown lints and clippy findings
 fix:
   rumdl check --fix .
   RUSTC_WRAPPER= cargo +nightly clippy --fix --all --allow-dirty
 
-# Run all lints
+# Run all lints (every tool used here is installed by .github/workflows/ci.yml)
 lint:
   typos
   rumdl check .
@@ -25,10 +26,13 @@ lint:
   RUSTC_WRAPPER= cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
   RUSTC_WRAPPER= cargo shear
 
-# Run tests
+# Run the workspace test suite
 test:
   cargo test --all-features
 
+# .cargo/mutants.toml excludes the binary and example crates: cargo-mutants
+# only runs each crate's own test target.
+#
 # Run mutation tests with cargo-mutants
 mutation:
   cargo mutants
@@ -60,13 +64,19 @@ check:
 publish-check:
   cargo publish --workspace --dry-run --allow-dirty
 
-# Publish all crates to crates.io
+# Publish all crates to crates.io (irreversible: run only with a registry token)
 publish:
   cargo publish --workspace
 
-# Check for Chinese characters (fail when any are found)
+# Fail if Chinese characters are present in tracked files
 check-cn:
-  ! rg --line-number --column "\p{Han}"
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if rg --line-number --column "\p{Han}" . ; then
+    echo "error: Chinese characters found" >&2
+    exit 1
+  fi
+  echo "ok: no Chinese characters found"
 
 # Full CI check
 ci: lint test build
@@ -86,7 +96,39 @@ setup:
   cargo install cargo-sort
   cargo install typos-cli
   cargo install rumdl
+  cargo install cargo-tarpaulin
+  cargo install cargo-nextest
+  cargo install cargo-fuzz
+  cargo install cargo-audit
+  cargo install cargo-outdated
 
 # Generate documentation for the workspace
 docs:
   cargo doc --no-deps --open
+
+# Run security audit
+audit:
+  cargo audit
+
+# Check for outdated dependencies
+outdated:
+  cargo outdated
+
+# Run clippy with all lints
+clippy-all:
+  RUSTC_WRAPPER= cargo +nightly clippy --all-targets --all-features -- -W clippy::pedantic -W clippy::nursery -W clippy::cargo
+
+# Run tests with nextest
+test-nextest:
+  cargo nextest run --all-features
+
+# Check for unused dependencies
+unused-deps:
+  cargo shear --check
+
+# Update all dependencies
+update-deps:
+  cargo update
+
+# Full check (lint + test + build + audit)
+full-check: lint test build audit
