@@ -31,6 +31,15 @@ pub(crate) fn default_mask_min_len() -> usize {
         .unwrap_or(DEFAULT_MASK_MIN_LEN)
 }
 
+/// The default number of hosts a step may fan out to at once.
+///
+/// A fleet of sixty machines must not open sixty SSH connections at once:
+/// that exhausts the server's `MaxStartups`, the operator's file
+/// descriptors, and the target's process table, and the resulting failures
+/// look like flaky hosts rather than a self-inflicted stampede. `0` (an
+/// explicit `--parallel 0`) still means unlimited.
+pub(crate) const DEFAULT_PARALLEL: usize = 16;
+
 /// Output mode for concurrent host logs.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum OutputMode {
@@ -71,7 +80,12 @@ pub(crate) struct RunFlags {
     pub skip: Vec<String>,
 
     /// Max concurrent hosts per step.
-    #[arg(short = 'p', long, value_name = "N", default_value_t = 0)]
+    ///
+    /// `0` means unlimited. The default is a bounded fan-out: a fleet of
+    /// sixty machines must not open sixty SSH connections at once, which
+    /// exhausts the server's `MaxStartups` and the operator's file
+    /// descriptors alike.
+    #[arg(short = 'p', long, value_name = "N", default_value_t = DEFAULT_PARALLEL)]
     pub parallel: usize,
 
     /// Continue after a failed host/step; print a summary.

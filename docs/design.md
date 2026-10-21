@@ -500,7 +500,7 @@ OPTIONS:
   -t, --target <TARGET>       Restrict to these servers/groups (comma-separated)
   -o, --only <STEP>           Run only matching blocks (by name or 1-based index)
   -s, --skip <STEP>           Skip matching blocks (repeatable)
-  -p, --parallel <N>          Max concurrent hosts per step [default: all]
+  -p, --parallel <N>          Max concurrent hosts per step [default: 16; 0 = all]
   -c, --continue-on-error     Continue after a failed host/step; print summary
   -k, --check                 Syntax-check only: local `bash -n`, remote
                               `ssh host bash -n -s`; no execution
@@ -694,7 +694,7 @@ step altogether rather than touching the target.
 ### 7.4 Concurrency & output integrity
 
 - Each step fans out over hosts with `tokio::task::JoinSet`, bounded by
-  `--parallel N` via `tokio::sync::Semaphore` (default: unbounded).
+  `--parallel N` via `tokio::sync::Semaphore` (default: 16; `0` = unbounded).
 - **Correctness fix over the naive sketch:** the common `tokio::select!` over two
   infinite read-loops is wrong — when one stream hits EOF the `select!` returns
   and the other reader is dropped, silently truncating stderr/stdout. Instead,
