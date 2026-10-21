@@ -7,8 +7,8 @@ use crate::{
     error::ParseError,
     heredoc::HeredocTracker,
     plan::{
-        AssertStep, Assertion, CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep, RemoteStep,
-        SecretEntry, Step, Target, WaitStep, is_valid_var_name,
+        AssertStep, Assertion, CopyEntry, CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep,
+        RemoteStep, SecretEntry, Step, Target, WaitStep, is_valid_var_name,
     },
     ssh_spec::SshSpec,
 };
@@ -529,10 +529,27 @@ impl State {
         }
 
         self.last_target = Some(target.to_string());
+        let entry = CopyEntry { src: src.to_string(), dst };
+        // Consecutive copies that share a target *and* their options travel
+        // in one transfer: a playbook that ships five templates to the same
+        // directory costs one round trip instead of five.
+        let mergeable = name.is_none() &&
+            self.plan.steps.last().is_some_and(
+                |step| matches!(step, Step::Copy(existing)
+                    if existing.target.text == target
+                        && existing.delete == delete
+                        && existing.excludes == excludes
+                        && existing.timeout == timeout),
+            );
+        if mergeable
+            && let Some(Step::Copy(existing)) = self.plan.steps.last_mut()
+        {
+            existing.entries.push(entry);
+            return Ok(());
+        }
         self.plan.steps.push(Step::Copy(CopyStep {
             name,
-            src: src.to_string(),
-            dst,
+            entries: vec![entry],
             target: Target::new(target),
             delete,
             excludes,
@@ -1142,7 +1159,10 @@ mod tests {
     use super::{directive, parse_script};
     use crate::{
         error::ParseError,
-        plan::{AssertStep, Assertion, CopyStep, EnvEntry, LocalStep, RemoteStep, Step, WaitStep},
+        plan::{
+            AssertStep, Assertion, CopyStep, EnvEntry, LocalStep, RemoteStep, Step,
+            WaitStep,
+        },
     };
 
     fn parse(input: &str) -> Result<crate::plan::ExecutionPlan, String> {
@@ -1460,8 +1480,8 @@ mod tests {
         let plan = parse("# @copy a/b -> /srv/c @web --delete\n")?;
         assert_eq!(plan.steps.len(), 1);
         let copy = as_copy(&plan.steps[0])?;
-        assert_eq!(copy.src, "a/b");
-        assert_eq!(copy.dst, "/srv/c");
+        assert_eq!(copy.entries[0].src, "a/b");
+        assert_eq!(copy.entries[0].dst, "/srv/c");
         assert_eq!(copy.target.text, "web");
         assert!(copy.delete);
         Ok(())
@@ -1471,7 +1491,7 @@ mod tests {
     fn copy_with_at_prefixed_target_and_path() -> Result<(), String> {
         let plan = parse("# @copy out -> /tmp/@deploy/app @web\n")?;
         let copy = as_copy(&plan.steps[0])?;
-        assert_eq!(copy.dst, "/tmp/@deploy/app");
+        assert_eq!(copy.entries[0].dst, "/tmp/@deploy/app");
         assert_eq!(copy.target.text, "web");
         assert!(!copy.delete);
         Ok(())
@@ -1481,8 +1501,8 @@ mod tests {
     fn copy_step_parses_exclude_globs() -> Result<(), String> {
         let plan = parse("# @copy services/app -> /opt/app @web --exclude *.env.age\n")?;
         let copy = as_copy(&plan.steps[0])?;
-        assert_eq!(copy.src, "services/app");
-        assert_eq!(copy.dst, "/opt/app");
+        assert_eq!(copy.entries[0].src, "services/app");
+        assert_eq!(copy.entries[0].dst, "/opt/app");
         assert_eq!(copy.excludes, vec!["*.env.age"]);
         assert!(!copy.delete);
         Ok(())
@@ -1501,7 +1521,7 @@ mod tests {
     fn copy_exclude_keeps_destination_with_spaces() -> Result<(), String> {
         let plan = parse("# @copy a -> /srv/my app @web --exclude *.tmp\n")?;
         let copy = as_copy(&plan.steps[0])?;
-        assert_eq!(copy.dst, "/srv/my app");
+        assert_eq!(copy.entries[0].dst, "/srv/my app");
         assert_eq!(copy.excludes, vec!["*.tmp"]);
         Ok(())
     }

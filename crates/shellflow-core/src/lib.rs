@@ -32,7 +32,7 @@ pub use error::{CaptureError, InterpolateError, ParseError, RenderEnvError};
 pub use heredoc::{Heredoc, HeredocTracker};
 pub use parser::parse_script;
 pub use plan::{
-    AssertStep, Assertion, CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep, RemoteStep,
+    AssertStep, Assertion, CopyEntry, CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep, RemoteStep,
     ResolvedHost, RunState, SecretEntry, Step, Target, WaitStep, interpolate, is_valid_var_name,
     resolve_hosts,
 };
