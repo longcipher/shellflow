@@ -70,7 +70,6 @@ pub(super) async fn run_assert_step(
     for host in hosts {
         let ui = Arc::clone(ui);
         let checks = assert.checks.clone();
-        let step_timeout = step_timeout;
         let semaphore = semaphore.clone();
         let log_file = log_file.clone();
         let cancel = cancel.clone();
