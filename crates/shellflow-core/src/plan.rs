@@ -99,15 +99,27 @@ pub struct RemoteStep {
     pub env: Arc<Vec<EnvEntry>>,
 }
 
-/// A local-to-remote file sync step.
+/// One file or directory to transfer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CopyStep {
-    /// Optional label from `@name`.
-    pub name: Option<String>,
+pub struct CopyEntry {
     /// Local source path (supports `$VAR`/`${VAR}` interpolation).
     pub src: String,
     /// Remote destination path (supports `$VAR`/`${VAR}` interpolation).
     pub dst: String,
+}
+
+/// A local-to-remote file sync step.
+///
+/// A step may carry **several** entries: consecutive `@copy` directives
+/// that share a target and the same options travel in one transfer, so a
+/// playbook that ships five templates to the same directory costs one
+/// round trip instead of five.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CopyStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// The files to transfer, in declaration order.
+    pub entries: Vec<CopyEntry>,
     /// Target server/group/spec.
     pub target: Target,
     /// Mirror deletions on the remote side (`--delete`).

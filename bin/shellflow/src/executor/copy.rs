@@ -68,42 +68,56 @@ pub(crate) async fn run_copy_step(
     hosts: Vec<ResolvedHost>,
     config: StepConfig,
 ) -> (Option<super::RunError>, eyre::Result<Vec<(String, HostOutcome)>>) {
-    let (src, dst) = {
+    let entries = {
         let state = args.run_state.lock().await;
-        let interpolated = shellflow_core::interpolate(&copy.src, &state)
-            .and_then(|src| shellflow_core::interpolate(&copy.dst, &state).map(|dst| (src, dst)));
-        drop(state);
-        match interpolated {
-            Ok(pair) => pair,
-            Err(err) => {
-                if config.dry_run || config.check {
-                    crate::ui::warn(
-                        &format!("{err} — copy skipped (no run state in dry-run/check)"),
-                        &args.log_file,
-                    );
-                    return (None, Ok(Vec::new()));
+        let interpolated = copy.entries.iter().map(|entry| {
+            shellflow_core::interpolate(&entry.src, &state).and_then(|src| {
+                shellflow_core::interpolate(&entry.dst, &state).map(|dst| (src, dst))
+            })
+        });
+        let mut out = Vec::new();
+        for pair in interpolated {
+            match pair {
+                Ok(pair) => out.push(pair),
+                Err(err) => {
+                    drop(state);
+                    if config.dry_run || config.check {
+                        crate::ui::warn(
+                            &format!("{err} — copy skipped (no run state in dry-run/check)"),
+                            &args.log_file,
+                        );
+                        return (None, Ok(Vec::new()));
+                    }
+                    // An unresolved `$VAR` in a copy path is a plan error: design
+                    // §6 assigns it to exit 1, not to the script-failure exit 4.
+                    crate::ui::step_failed(0, &err.to_string(), &args.log_file);
+                    return (Some(super::RunError::Plan), Ok(Vec::new()));
                 }
-                // An unresolved `$VAR` in a copy path is a plan error: design
-                // §6 assigns it to exit 1, not to the script-failure exit 4.
-                crate::ui::step_failed(0, &err.to_string(), &args.log_file);
-                return (Some(super::RunError::Plan), Ok(Vec::new()));
             }
         }
+        out
     };
 
     if config.local {
-        let outcome = run_copy_step_local(LocalCopyArgs {
-            ui: &args.ui,
-            src: &src,
-            dst: &dst,
-            delete: copy.delete,
-            excludes: &copy.excludes,
-            config,
-            log_file: &args.log_file,
-            cancel: &args.cancel,
-        })
-        .await;
-        return (None, outcome);
+        let mut outcomes = Vec::new();
+        for (src, dst) in &entries {
+            let outcome = run_copy_step_local(LocalCopyArgs {
+                ui: &args.ui,
+                src,
+                dst,
+                delete: copy.delete,
+                excludes: &copy.excludes,
+                config,
+                log_file: &args.log_file,
+                cancel: &args.cancel,
+            })
+            .await;
+            if let Err(err) = outcome {
+                return (Some(super::RunError::Script), Err(err));
+            }
+            outcomes.extend(outcome.unwrap_or_default());
+        }
+        return (None, Ok(outcomes));
     }
 
     if config.check {
@@ -111,19 +125,27 @@ pub(crate) async fn run_copy_step(
         return (None, Ok(Vec::new()));
     }
 
+    // Files that keep their name and land in the same directory travel in
+    // one rsync invocation: five templates to one directory cost one round
+    // trip, not five.
+    let transfers = group_transfers(&entries).await;
+
     if config.dry_run || config.verbose >= 2 {
-        args.ui
-            .lock()
-            .await
-            .masked_note(&format!("  rsync {src} -> {dst} ({} hosts)", hosts.len()));
+        for transfer in &transfers {
+            args.ui.lock().await.masked_note(&format!(
+                "  rsync {} -> {} ({} hosts)",
+                transfer.srcs.join(" "),
+                transfer.dst,
+                hosts.len()
+            ));
+        }
     }
 
     let mut tasks = JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(&args.ui);
         let semaphore = args.semaphore.clone();
-        let src = src.clone();
-        let dst = dst.clone();
+        let transfers = transfers.clone();
         let delete = copy.delete;
         let excludes = copy.excludes.clone();
         let shell_cache = Arc::clone(&args.shell_cache);
@@ -134,22 +156,117 @@ pub(crate) async fn run_copy_step(
             let _permit = fanout_slot!(&semaphore, &log_file, host);
             let has_rsync = resolve_remote_env(&host, &shell_cache, &cancel).await.has_rsync;
             let opts = CopyOpts { delete, excludes: &excludes };
-            let host_args = RsyncHostArgs {
-                ui,
-                host: &host,
-                src: &src,
-                dst: &dst,
-                opts,
-                config,
-                has_rsync,
-                log_file: &log_file,
-                cancel: cancel.clone(),
-            };
-            run_rsync_host(host_args).await
+            for transfer in &transfers {
+                let host_args = RsyncHostArgs {
+                    ui: Arc::clone(&ui),
+                    host: &host,
+                    srcs: &transfer.srcs,
+                    dst: &transfer.dst,
+                    opts,
+                    config,
+                    has_rsync,
+                    log_file: &log_file,
+                    cancel: cancel.clone(),
+                };
+                let (alias, outcome) = run_rsync_host(host_args).await;
+                if !matches!(outcome, HostOutcome::Ok) {
+                    return (alias, outcome);
+                }
+            }
+            (host.alias.clone(), HostOutcome::Ok)
         });
     }
 
     (None, Ok(stream::collect_hosts(&args.ui, tasks).await))
+}
+
+/// A group of files that travel in one rsync invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Transfer {
+    /// The local sources.
+    srcs: Vec<String>,
+    /// The remote destination: the exact path for a single source, the
+    /// directory (with a trailing slash) for several.
+    dst: String,
+}
+
+/// Group the entries into transfers.
+///
+/// A file that keeps its name and lands in the same directory as another
+/// such file travels with it: rsync copies several sources into one
+/// destination directory. A file that is *renamed*, and a directory source
+/// (whose contents are copied rather than the directory itself), each need
+/// their own invocation.
+async fn group_transfers(entries: &[(String, String)]) -> Vec<Transfer> {
+    let mut transfers: Vec<Transfer> = Vec::new();
+    // The index of the group per destination directory.
+    let mut by_dir: Vec<(String, usize)> = Vec::new();
+    for (src, dst) in entries {
+        let is_dir_src = tokio::fs::metadata(src).await.is_ok_and(|meta| meta.is_dir());
+        let dest = Destination::parse(dst);
+        let base_src = src.rsplit('/').next().unwrap_or(src);
+        // A directory source copies its *contents*, and a file that is
+        // renamed lands under a name of its own: neither can share a
+        // transfer with another file.
+        let keeps_its_name = match &dest {
+            Destination::Dir { .. } => !is_dir_src,
+            Destination::File { base, .. } => base_src == base,
+        };
+        if is_dir_src || !keeps_its_name {
+            transfers.push(Transfer { srcs: vec![src.clone()], dst: dst.clone() });
+            continue;
+        }
+        let dir = dest.dir().to_string();
+        if let Some(pos) = by_dir.iter().position(|(candidate, _)| *candidate == dir) {
+            let idx = by_dir[pos].1;
+            transfers[idx].srcs.push(src.clone());
+            transfers[idx].dst = format!("{dir}/");
+        } else {
+            by_dir.push((dir.clone(), transfers.len()));
+            transfers.push(Transfer { srcs: vec![src.clone()], dst: dst.clone() });
+        }
+    }
+    transfers
+}
+
+/// A copy destination: either a file path or a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Destination {
+    /// A file path: the file is renamed to it.
+    File {
+        /// The directory that holds it.
+        dir: String,
+        /// Its last component.
+        base: String,
+    },
+    /// A directory (the path ends with `/`): the file keeps its name.
+    Dir {
+        /// The directory itself.
+        dir: String,
+    },
+}
+
+impl Destination {
+    /// Parse a destination path.
+    fn parse(dst: &str) -> Self {
+        if dst.ends_with('/') {
+            let trimmed = dst.trim_end_matches('/');
+            return Self::Dir { dir: if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() } };
+        }
+        match dst.rsplit_once('/') {
+            Some((dir, base)) if !base.is_empty() => {
+                Self::File { dir: dir.to_string(), base: base.to_string() }
+            }
+            _ => Self::File { dir: "/".to_string(), base: dst.to_string() },
+        }
+    }
+
+    /// The directory the destination lives in.
+    fn dir(&self) -> &str {
+        match self {
+            Self::File { dir, .. } | Self::Dir { dir } => dir,
+        }
+    }
 }
 
 /// The parameters of a local (`--local`) copy step.
@@ -320,7 +437,7 @@ async fn run_command_status(
 struct RsyncHostArgs<'a> {
     ui: ArcUi,
     host: &'a ResolvedHost,
-    src: &'a str,
+    srcs: &'a [String],
     dst: &'a str,
     opts: CopyOpts<'a>,
     config: StepConfig,
@@ -330,7 +447,7 @@ struct RsyncHostArgs<'a> {
 }
 
 async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
-    let RsyncHostArgs { ui, host, src, dst, opts, config, has_rsync, log_file, cancel } = args;
+    let RsyncHostArgs { ui, host, srcs, dst, opts, config, has_rsync, log_file, cancel } = args;
     let remote_shell = host.spec.rsync_remote_shell().unwrap_or_else(|| "ssh".to_string());
 
     if config.verbose >= 2 {
@@ -377,7 +494,7 @@ async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
         let transfer = RsyncTransferArgs {
             ui: ui.clone(),
             host,
-            src,
+            srcs,
             dst,
             opts,
             remote_shell: &remote_shell,
@@ -402,7 +519,7 @@ async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
         );
         return (host.alias.clone(), HostOutcome::Skipped);
     } else {
-        run_scp_transfer(ui.clone(), host, src, dst, config, log_file, cancel.clone()).await
+        run_scp_transfer(ui.clone(), host, srcs, dst, config, log_file, cancel.clone()).await
     };
 
     match outcome {
@@ -416,18 +533,27 @@ async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
 
 /// `src` with a trailing slash when it is a directory, so rsync copies the
 /// directory *contents* into `dst` rather than nesting it.
-async fn normalize_copy_paths(src: &str, dst: &str) -> (String, String) {
-    if tokio::fs::metadata(src).await.is_ok_and(|meta| meta.is_dir()) {
-        (format!("{}/", src.trim_end_matches('/')), format!("{}/", dst.trim_end_matches('/')))
-    } else {
-        (src.to_string(), dst.to_string())
+///
+/// Several sources travel as they are: the grouping only puts files that
+/// keep their name into one transfer, and a directory source always travels
+/// alone.
+async fn normalize_copy_paths(srcs: &[String], dst: &str) -> (Vec<String>, String) {
+    if srcs.len() == 1 {
+        let src = &srcs[0];
+        if tokio::fs::metadata(src).await.is_ok_and(|meta| meta.is_dir()) {
+            return (
+                vec![format!("{}/", src.trim_end_matches('/'))],
+                format!("{}/", dst.trim_end_matches('/')),
+            );
+        }
     }
+    (srcs.to_vec(), dst.to_string())
 }
 
 struct RsyncTransferArgs<'a> {
     ui: ArcUi,
     host: &'a ResolvedHost,
-    src: &'a str,
+    srcs: &'a [String],
     dst: &'a str,
     opts: CopyOpts<'a>,
     remote_shell: &'a str,
@@ -448,7 +574,7 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<
     if args.config.dry_run {
         cmd.args(["--dry-run", "-i"]);
     }
-    let (src, dst) = normalize_copy_paths(args.src, args.dst).await;
+    let (srcs, dst) = normalize_copy_paths(args.srcs, args.dst).await;
     let dir = if dst.ends_with('/') {
         dst.as_str()
     } else {
@@ -461,7 +587,12 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<
     let mkdir_rsync = format!("mkdir -p '{quoted}' && rsync");
     cmd.args(["--rsync-path", &mkdir_rsync, "-e", args.remote_shell]);
     let dest = format!("{}:{dst}", args.host.spec.dest());
-    cmd.arg(&src).arg(&dest);
+    // Several sources land in one destination directory; rsync keeps each
+    // source's own name there.
+    for src in &srcs {
+        cmd.arg(src);
+    }
+    cmd.arg(&dest);
     cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
@@ -534,17 +665,22 @@ fn scp_remote_dir(dst: &str, is_dir_src: bool) -> (String, bool) {
 async fn run_scp_transfer(
     ui: ArcUi,
     host: &ResolvedHost,
-    src: &str,
+    srcs: &[String],
     dst: &str,
     config: StepConfig,
     log_file: &LogFile,
     cancel: super::Cancel,
 ) -> std::result::Result<(), CopyFailure> {
     if config.verbose >= 2 {
-        ui.lock().await.masked_note(&format!("  [{}] scp fallback: {src} -> {dst}", host.alias));
+        ui.lock().await.masked_note(&format!(
+            "  [{}] scp fallback: {} -> {dst}",
+            host.alias,
+            srcs.join(" ")
+        ));
     }
 
-    let is_dir_src = tokio::fs::metadata(src).await.is_ok_and(|meta| meta.is_dir());
+    let first = srcs.first().map(String::as_str).unwrap_or_default();
+    let is_dir_src = tokio::fs::metadata(first).await.is_ok_and(|meta| meta.is_dir());
     // A directory source always lands *in* a directory. A file source may
     // name a file: the destination is then used verbatim, so the artifact
     // keeps the name the playbook asked for. Copying into the parent
@@ -552,7 +688,13 @@ async fn run_scp_transfer(
     // playbook said `/srv/app.tar.gz` — a materially different transfer,
     // reported as a success.
     let (dir, dst_is_dir) = scp_remote_dir(dst, is_dir_src);
-    let scp_src = if is_dir_src { format!("{src}/.") } else { src.to_string() };
+    // Several sources land in the destination directory; each keeps its own
+    // name. A single directory source copies its *contents*.
+    let scp_srcs: Vec<String> = if srcs.len() == 1 && is_dir_src {
+        vec![format!("{first}/.")]
+    } else {
+        srcs.to_vec()
+    };
 
     let quoted_dir = dir.replace('\'', "'\\''");
     let mut mkdir = Command::new("ssh");
@@ -588,7 +730,10 @@ async fn run_scp_transfer(
     if is_dir_src {
         scp.arg("-r");
     }
-    scp.arg(&scp_src).arg(&dest);
+    for src in &scp_srcs {
+        scp.arg(src);
+    }
+    scp.arg(&dest);
     scp.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     scp.kill_on_drop(true);
     isolate(&mut scp);
@@ -632,7 +777,7 @@ async fn run_scp_transfer(
 
 #[cfg(test)]
 mod tests {
-    use super::scp_remote_dir;
+    use super::{Destination, group_transfers, scp_remote_dir};
 
     #[test]
     fn file_destinations_keep_their_parent_dir() {
@@ -646,6 +791,64 @@ mod tests {
         // and nest the file inside it; `mkdir -p .` is a no-op and the
         // file is transferred verbatim.
         assert_eq!(scp_remote_dir("app.tar.gz", false), (".".to_string(), false));
+    }
+
+    /// Run a future to completion on a throwaway runtime.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(fut)
+    }
+
+    #[test]
+    fn files_that_keep_their_name_share_one_transfer() {
+        let entries = vec![
+            ("a/one.toml".to_string(), "/srv/cfg/one.toml".to_string()),
+            ("a/two.toml".to_string(), "/srv/cfg/two.toml".to_string()),
+        ];
+        let transfers = block_on(group_transfers(&entries));
+        assert_eq!(transfers.len(), 1, "{transfers:?}");
+        assert_eq!(transfers[0].srcs.len(), 2);
+        assert_eq!(transfers[0].dst, "/srv/cfg/");
+    }
+
+    #[test]
+    fn a_renamed_file_travels_alone() {
+        let entries = vec![
+            ("a/one.toml".to_string(), "/srv/cfg/one.toml".to_string()),
+            ("a/two.toml".to_string(), "/srv/cfg/renamed.toml".to_string()),
+        ];
+        let transfers = block_on(group_transfers(&entries));
+        assert_eq!(transfers.len(), 2, "{transfers:?}");
+        assert_eq!(transfers[1].dst, "/srv/cfg/renamed.toml");
+    }
+
+    #[test]
+    fn files_for_different_directories_do_not_share_a_transfer() {
+        let entries = vec![
+            ("a/one.toml".to_string(), "/srv/a/one.toml".to_string()),
+            ("b/two.toml".to_string(), "/srv/b/two.toml".to_string()),
+        ];
+        let transfers = block_on(group_transfers(&entries));
+        assert_eq!(transfers.len(), 2, "{transfers:?}");
+    }
+
+    #[test]
+    fn a_destination_is_split_into_its_directory_and_its_name() {
+        assert_eq!(
+            Destination::parse("/srv/cfg/x.toml"),
+            Destination::File { dir: "/srv/cfg".to_string(), base: "x.toml".to_string() }
+        );
+        assert_eq!(
+            Destination::parse("/srv/cfg/"),
+            Destination::Dir { dir: "/srv/cfg".to_string() }
+        );
+        assert_eq!(
+            Destination::parse("x.toml"),
+            Destination::File { dir: "/".to_string(), base: "x.toml".to_string() }
+        );
     }
 
     #[test]
