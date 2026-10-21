@@ -25,6 +25,16 @@ use eyre::Result;
 const SECRET_MODE: u32 = 0o600;
 /// Owner-runnable, for helper scripts installed on targets.
 const EXECUTABLE_MODE: u32 = 0o755;
+/// World-readable, the mode a report must have.
+const PUBLIC_MODE: u32 = 0o644;
+
+/// Write `bytes` to `path` with mode 0644, atomically.
+///
+/// Used for the integrity manifest: it is a list of hashes and paths, holds
+/// no secret, and must stay readable for whoever verifies it.
+pub(crate) fn write_public_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic(path, bytes, PUBLIC_MODE)
+}
 
 /// Write `bytes` to `path` with mode 0600, atomically.
 pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {

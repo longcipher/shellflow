@@ -239,6 +239,19 @@ shellflow secret keys-check [-i PATH] <dir>  all <host>.env.age in <dir> must
 shellflow service init <svc> [--host H]…   scaffold services/<svc>/ +
                                              playbooks/deploy-<svc>.sh (flat
                                              layout, shared-helper unit)
+shellflow service check <svc> --host H     read-only audit of a deployed unit
+                                             (one ssh round trip): state,
+                                             argv/env secrets, credential
+                                             wiring, referenced paths,
+                                             journal leak scan
+shellflow service diff [<svc>] --host H    compare the repository's unit with
+        [--local P --remote P]…            the deployed one; exits non-zero on
+                                             drift and prints a unified diff
+shellflow service manifest --host H       print the sha256 manifest of a
+        --path P [--output F]              deployed tree
+shellflow service verify --host H         verify a deployed tree against a
+        --manifest F                       saved manifest; exits non-zero on
+                                             drift
 ```
 
 Exit codes: `0` success · `1` plan/parse/config error · `2` CLI usage · `3`

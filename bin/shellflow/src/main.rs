@@ -17,16 +17,20 @@
 mod audit;
 mod cli;
 mod cred_env;
+mod diffutil;
 mod emit;
 mod executor;
 mod fsx;
 mod keys;
 mod lint;
 mod preflight;
+mod rbatch;
 mod secret;
 mod secrets;
 mod service;
 mod service_check;
+mod service_diff;
+mod service_manifest;
 mod systemd;
 #[cfg(feature = "dbus")]
 mod systemd_dbus;

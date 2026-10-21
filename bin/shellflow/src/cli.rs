@@ -657,6 +657,14 @@ pub(crate) enum ServiceCmd {
     /// Audit a deployed systemd unit over SSH (read-only): argv/env secret
     /// exposure, credential wiring, listening sockets, journal leak scan.
     Check(ServiceCheckArgs),
+    /// Compare a file in the repository with the file the target runs;
+    /// exits non-zero when they differ (drift).
+    Diff(ServiceDiffArgs),
+    /// Print the sha256 manifest of a deployed tree.
+    Manifest(ServiceManifestArgs),
+    /// Verify a deployed tree against a saved sha256 manifest; exits
+    /// non-zero when the host drifted from it.
+    Verify(ServiceVerifyArgs),
 }
 
 /// Scaffold pattern: which credential/deployment shape to generate.
@@ -715,6 +723,69 @@ pub(crate) struct ServiceCheckArgs {
     /// Also grep this many journal lines for secret-value shapes (default 50).
     #[arg(long, value_name = "N", default_value_t = 50)]
     pub journal_lines: usize,
+}
+
+/// Arguments for `service diff`.
+#[derive(Debug, Args)]
+pub(crate) struct ServiceDiffArgs {
+    /// Service name: compares the repository's unit with the deployed one.
+    ///
+    /// Omit it and give `--local`/`--remote` pairs instead.
+    #[arg(value_name = "SVC")]
+    pub service: Option<String>,
+
+    /// SSH target (alias, `[user@]host[:port]`, or `~/.ssh/config` entry).
+    #[arg(long = "host", value_name = "HOST")]
+    pub host: String,
+
+    /// Local file to compare (pair with `--remote`, in order).
+    #[arg(long = "local", value_name = "PATH")]
+    pub local: Vec<String>,
+
+    /// Remote file to compare (pair with `--local`, in order).
+    #[arg(long = "remote", value_name = "PATH")]
+    pub remote: Vec<String>,
+
+    /// Repository root that holds `services/<svc>/` (default: current
+    /// directory).
+    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
+    pub repo: PathBuf,
+
+    /// Report the drift without printing the diff.
+    #[arg(long)]
+    pub quiet: bool,
+}
+
+/// Arguments for `service manifest`.
+#[derive(Debug, Args)]
+pub(crate) struct ServiceManifestArgs {
+    /// SSH target (alias, `[user@]host[:port]`, or `~/.ssh/config` entry).
+    #[arg(long = "host", value_name = "HOST")]
+    pub host: String,
+
+    /// Remote directory or file to fingerprint (repeatable).
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
+
+    /// Write the manifest here instead of stdout.
+    #[arg(long = "output", value_name = "PATH")]
+    pub output: Option<PathBuf>,
+}
+
+/// Arguments for `service verify`.
+#[derive(Debug, Args)]
+pub(crate) struct ServiceVerifyArgs {
+    /// SSH target (alias, `[user@]host[:port]`, or `~/.ssh/config` entry).
+    #[arg(long = "host", value_name = "HOST")]
+    pub host: String,
+
+    /// The manifest to verify against.
+    #[arg(long = "manifest", value_name = "PATH")]
+    pub manifest: PathBuf,
+
+    /// Also verify these paths even if the manifest does not list them.
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
 }
 
 /// Flags that apply to every subcommand.
@@ -1013,7 +1084,10 @@ mod tests {
                     assert_eq!(i.service, "myapp");
                     assert_eq!(i.hosts, vec!["api".to_string(), "trade".to_string()]);
                 }
-                super::ServiceCmd::Check(_) => {
+                super::ServiceCmd::Check(_)
+                | super::ServiceCmd::Diff(_)
+                | super::ServiceCmd::Manifest(_)
+                | super::ServiceCmd::Verify(_) => {
                     panic!("expected init subcommand")
                 }
             },
@@ -1031,7 +1105,10 @@ mod tests {
                     assert_eq!(a.host, "api");
                     assert_eq!(a.journal_lines, 50);
                 }
-                super::ServiceCmd::Init(_) => {
+                super::ServiceCmd::Init(_)
+                | super::ServiceCmd::Diff(_)
+                | super::ServiceCmd::Manifest(_)
+                | super::ServiceCmd::Verify(_) => {
                     panic!("expected check subcommand")
                 }
             },
@@ -1056,7 +1133,10 @@ mod tests {
                 super::ServiceCmd::Init(i) => {
                     assert!(matches!(i.pattern, super::ServicePattern::Container));
                 }
-                super::ServiceCmd::Check(_) => {
+                super::ServiceCmd::Check(_)
+                | super::ServiceCmd::Diff(_)
+                | super::ServiceCmd::Manifest(_)
+                | super::ServiceCmd::Verify(_) => {
                     panic!("expected init subcommand")
                 }
             },
