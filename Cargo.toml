@@ -19,6 +19,7 @@ readme = "README.md"
 [workspace.dependencies]
 # local crates
 shellflow-core = { path = "crates/shellflow-core", version = "0.3.1" }
+shellflow-dsl = { path = "crates/shellflow-dsl", version = "0.3.1" }
 shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.3.1" }
 
 # external crates

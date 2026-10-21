@@ -405,7 +405,7 @@ fn allowed_aliases(plan: &ExecutionPlan, restrict: &[String]) -> HashSet<String>
 /// True for `[A-Za-z_][A-Za-z0-9_]*`.
 ///
 /// This is the single definition of a shell identifier across the workspace:
-/// the parser validates `@env`/`@export` names with it, [`crate::env::render_env`]
+/// the parser validates `@env`/`@export` names with it, the payload renderer
 /// refuses to emit an `export` statement for anything else, and the secrets
 /// crate reuses it for the keys of a sealed env file.
 #[must_use]
@@ -498,7 +498,7 @@ pub fn interpolate(template: &str, state: &RunState) -> Result<String, Interpola
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{env::render_env, error::ParseError, parser::parse_script};
+    use crate::{error::ParseError, parser::parse_script};
 
     #[test]
     fn resolve_group_expands_to_members() -> Result<(), String> {
@@ -654,17 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn run_state_feeds_payload_env() -> Result<(), String> {
-        let mut state = RunState::default();
-        state.vars.insert("VERSION".to_string(), "abc123".to_string());
-        let entries =
-            vec![EnvEntry::Literal { key: "VERSION".to_string(), value: "abc123".to_string() }];
-        let rendered = render_env(&resolved(&entries)).map_err(|e| e.to_string())?;
-        assert!(rendered.contains("export VERSION='abc123';"));
-        Ok(())
-    }
-
-    #[test]
     fn step_guard_and_timeout_accessors() -> Result<(), String> {
         let plan = parse_script(
             "# @name restart\n\
@@ -722,16 +711,6 @@ mod tests {
         let unbraced = interpolate("$_REV-$DEPLOY_TAG", &state).map_err(|e| e.to_string())?;
         assert_eq!(unbraced, "abc123-v1.2");
         Ok(())
-    }
-
-    fn resolved(entries: &[EnvEntry]) -> Vec<(String, String)> {
-        entries
-            .iter()
-            .filter_map(|e| match e {
-                EnvEntry::Literal { key, value } => Some((key.clone(), value.clone())),
-                EnvEntry::Passthrough { .. } => None,
-            })
-            .collect()
     }
 
     proptest::proptest! {

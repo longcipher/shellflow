@@ -39,9 +39,9 @@ Design constraints:
 - Concurrent multi-host execution with live, host-prefixed, color-coded output.
 - `-v / -vv / -vvv` realtime debugging with zero extra architecture.
 - `--dry-run` / `--diff` idempotent previews before any change.
-- Lean, auditable codebase: three crates (`shellflow-core`, `shellflow-secrets`,
-  `bin/shellflow`) of roughly 4.8k / 1.2k / 8.9k lines, of which about a
-  third is tests. The target is clarity and test coverage, not line-count
+- Lean, auditable codebase: four crates (`shellflow-dsl`, `shellflow-core`,
+  `shellflow-secrets`, `bin/shellflow`) of roughly 4.2k / 1.4k / 1.2k / 13.5k
+  lines, of which about a third is tests. The target is clarity and test coverage, not line-count
   gymnastics — "lightweight" means a single static binary with no runtime
   dependencies, not minimal source lines.- Production-safe lifecycle: global and per-step timeouts, Ctrl-C/SIGTERM
   handling that never leaves orphan processes, and a friendly preflight check.
@@ -378,17 +378,23 @@ shellflow/
 │           ├── service_init.rs# service init + secret keys-check
 │           └── mockbin/       # fake ssh/rsync/scp (Bash shims recording argv)
 └── crates/
-    ├── shellflow-core/        # parser + plan types (pure, no I/O)
+    ├── shellflow-dsl/         # the grammar + the plan model (pure, no I/O)
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs
-    │       ├── plan.rs        # data model (§4.3), resolve_hosts, interpolate
-    │       ├── env.rs         # env rendering, @export capture parser, masking
     │       ├── parser.rs      # line scanner -> ExecutionPlan
+    │       ├── plan.rs        # data model (§4.3), resolve_hosts, interpolate
     │       ├── heredoc.rs     # here-document body tracking (§4.1 rule 8)
-    │       ├── template.rs    # ${KEY} placeholder scanner + render_template (S12)
     │       ├── ssh_spec.rs    # SshSpec parse / to_args / rsync dest
-    │       └── error.rs       # ParseError / InterpolateError / CaptureError
+    │       ├── text.rs        # shell quoting + quote stripping
+    │       └── error.rs       # ParseError / InterpolateError
+    ├── shellflow-core/        # runtime helpers (pure, no I/O)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs
+    │       ├── env.rs         # env rendering, @export capture parser, masking
+    │       ├── template.rs    # ${KEY} placeholder scanner + render_template (S12)
+    │       └── error.rs       # CaptureError / RenderEnvError
     └── shellflow-secrets/     # age wrapper (encrypt/decrypt, env parser)
         ├── Cargo.toml
         └── src/
@@ -401,6 +407,16 @@ shellflow/
 ```
 
 ### 5.2 Crate responsibilities
+
+**`shellflow-dsl`** — the grammar, pure, synchronous, dependency-light.
+
+- Owns the deploy-script language: the scanner, the plan model, the target
+  resolution, the ssh-destination model, and the errors the scanner reports.
+  It is a leaf crate (`thiserror` only), so the grammar can be read, tested
+  and fuzzed without the runtime — and the runtime cannot grow a second
+  opinion about what a script means.
+- `shellflow-core` re-exports its public API, so a consumer of the runtime
+  helpers does not have to know which crate owns which half of the language.
 
 **`shellflow-core`** — pure, synchronous, dependency-light.
 
@@ -485,7 +501,8 @@ cargo add tempfile -p shellflow-secrets --workspace --dev
 | `tracing-subscriber` | bin | env-filtered logging init |
 | `colored` | bin | host-prefix and step-header ANSI styling |
 | `age` | secrets | embedded X25519 encryption (no `rage` binary) |
-| `shellflow-core` | bin | local path dependency (parser + plan) |
+| `shellflow-dsl` | bin | local path dependency (the grammar + the plan model) |
+| `shellflow-core` | bin | local path dependency (runtime helpers; re-exports the DSL) |
 | `shellflow-secrets` | bin | local path dependency (crypto + env parser) |
 | `proptest` (dev) | core/secrets | property tests in the normal test loop |
 | `tempfile` (dev) | secrets | temp-file fixtures in tests |

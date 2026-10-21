@@ -1061,10 +1061,10 @@ fn is_safe_unit(unit: &str) -> bool {
 /// A directive is a comment line, so no shell quoting applies and quotes are
 /// literal characters; stripping them lets `--exclude '*.key'` read naturally.
 ///
-/// The rule lives in [`crate::env::strip_surrounding_quotes`] so the parser
+/// The rule lives in [`crate::text::strip_surrounding_quotes`] so the parser
 /// and the secrets crate share one definition.
 fn strip_surrounding_quotes(raw: &str) -> String {
-    crate::env::strip_surrounding_quotes(raw)
+    crate::text::strip_surrounding_quotes(raw)
 }
 
 /// Extract `(keyword, payload)` from a possible directive line.
