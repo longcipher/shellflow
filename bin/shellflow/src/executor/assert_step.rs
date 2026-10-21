@@ -27,7 +27,11 @@ use crate::{
 };
 
 /// The default budget for one health probe, in seconds.
-const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 10;
+///
+/// The probe *waits*: a service that was just started needs a moment before
+/// it answers, and a single probe would fail the deploy for the wrong
+/// reason.
+const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 60;
 
 /// The default budget for waiting for a port, in seconds.
 ///
@@ -65,7 +69,9 @@ pub(super) async fn run_assert_step(
     // Each check picks its own default budget; an explicit `@timeout`
     // overrides them all.
     let step_timeout = config.timeout;
-    let wait_budget = step_timeout.unwrap_or(DEFAULT_PORT_TIMEOUT_SECS);
+    let wait_budget = step_timeout
+        .unwrap_or(DEFAULT_PORT_TIMEOUT_SECS)
+        .max(DEFAULT_HEALTH_TIMEOUT_SECS);
     let mut tasks = tokio::task::JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(ui);
@@ -175,11 +181,14 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
             unit = quote(unit),
             state = quote(state),
         ),
-        Assertion::Port { ports } => {
+        Assertion::Port { ports, udp } => {
             // The wait happens on the target: one round trip covers the
             // whole budget, not one round trip per poll.
             let list: Vec<String> = ports.iter().map(u16::to_string).collect();
             let budget = step_timeout.unwrap_or(DEFAULT_PORT_TIMEOUT_SECS);
+            // `-u` asks for the UDP sockets; a UDP service listens on a
+            // different socket family than a TCP one.
+            let sockets = if *udp { "-uln" } else { "-tln" };
             let checks: Vec<String> = list
                 .iter()
                 .map(|port| {
@@ -192,10 +201,11 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
             format!(
                 "sfw_wait_port() {{ p=\"$1\"; d=$(( $(date +%s) + $2 )); \
                  while :; do \
-                 if ss -tln 2>/dev/null | grep -qE \":${{p}}[[:space:]]\"; then return 0; fi; \
+                 if ss {sockets} 2>/dev/null | grep -qE \":${{p}}[[:space:]]\"; then return 0; fi; \
                  if [ \"$(date +%s)\" -ge \"$d\" ]; then return 1; fi; \
                  sleep 2; \
                  done; }}; {checks}",
+                sockets = sockets,
                 checks = checks.join("; "),
             )
         }
@@ -214,28 +224,39 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
                 path = path,
             )
         }
-        Assertion::Health { url, expect } => {
+        Assertion::Health { url, expect, method, body, headers } => {
             let timeout_secs = step_timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS);
+            // The accepted patterns become `case` globs. The pattern must
+            // stay unquoted: inside `case` a quoted pattern is a literal
+            // string, so `2??` would never match `200`.
             let accepted = if expect.is_empty() {
-                // Any 2xx or 3xx is a healthy answer. The pattern must stay
-                // unquoted: inside `case` a quoted pattern is a literal
-                // string, so `2??` would never match `200`.
+                // Any 2xx or 3xx is a healthy answer.
                 "2??|3??".to_string()
             } else {
-                let codes: Vec<String> = expect.iter().map(u16::to_string).collect();
-                codes.join("|")
+                expect.iter().map(|code| status_glob(code)).collect::<Vec<_>>().join("|")
             };
+            // The probe *waits*: a service that was just started is not
+            // answering yet, and a single probe would fail the deploy for
+            // the wrong reason. The wait happens on the target, so the
+            // whole budget costs one round trip.
             format!(
-                "c=$( {probe} ); \
-                 case \"$c\" in {accepted}) echo \"{url} answered $c\" ;; \
-                 *) echo \"{url} answered $c (want {want})\"; false ;; esac",
-                probe = http_probe(url, timeout_secs),
+                "sfw_http() {{ d=$(( $(date +%s) + $1 )); \
+                 while :; do \
+                 c=$( {probe} ); \
+                 case \"$c\" in {accepted}) echo \"$c\"; return 0 ;; esac; \
+                 if [ \"$(date +%s)\" -ge \"$d\" ]; then echo \"$c\"; return 1; fi; \
+                 sleep 2; \
+                 done; }}; \
+                 if c=$(sfw_http {timeout_secs}); then echo \"{url} answered $c\"; \
+                 else echo \"{url} answered $c (want {want})\"; false; fi",
+                probe = http_probe(url, timeout_secs, method.as_deref(), body.as_deref(), headers),
                 accepted = accepted,
+                timeout_secs = timeout_secs,
                 url = url,
                 want = if expect.is_empty() {
                     "2xx/3xx".to_string()
                 } else {
-                    expect.iter().map(u16::to_string).collect::<Vec<_>>().join("|")
+                    expect.join("|")
                 },
             )
         }
@@ -246,18 +267,46 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
 ///
 /// `curl` is preferred; `wget` is the fallback for hosts without it. A
 /// host with neither reports `000`, which never matches an accepted code.
-fn http_probe(url: &str, timeout_secs: u64) -> String {
+fn http_probe(
+    url: &str,
+    timeout_secs: u64,
+    method: Option<&str>,
+    body: Option<&str>,
+    headers: &[String],
+) -> String {
     let quoted = quote(url);
+    // `curl` is the only probe that can carry a method, a body and headers;
+    // `wget` is the fallback for a plain GET.
+    let mut curl = format!("curl -s -o /dev/null -w '%{{http_code}}' --max-time {timeout_secs}");
+    if let Some(method) = method {
+        curl.push_str(&format!(" -X {}", quote(method)));
+    }
+    for header in headers {
+        curl.push_str(&format!(" -H {}", quote(header)));
+    }
+    if let Some(body) = body {
+        curl.push_str(&format!(" --data {}", quote(body)));
+    }
     format!(
         "if command -v curl >/dev/null 2>&1; then \
-         curl -s -o /dev/null -w '%{{http_code}}' --max-time {timeout_secs} {quoted} 2>/dev/null; \
+         {curl} {quoted} 2>/dev/null; \
          elif command -v wget >/dev/null 2>&1; then \
          if wget -q -O /dev/null --timeout={timeout_secs} {quoted} 2>/dev/null; then echo 200; \
          else echo 000; fi; \
          else echo 000; fi",
+        curl = curl,
         timeout_secs = timeout_secs,
         quoted = quoted,
     )
+}
+
+/// The `case` glob for a status pattern: `200` stays `200`, `2xx` becomes
+/// `2??`.
+fn status_glob(pattern: &str) -> String {
+    if pattern.len() == 3 && pattern.ends_with("xx") {
+        return format!("{}??", &pattern[..1]);
+    }
+    pattern.to_string()
 }
 
 /// Quote a value for the remote shell.
@@ -287,11 +336,30 @@ mod tests {
     }
 
     #[test]
+    fn a_health_check_waits_rather_than_probes_once() {
+        let cmd = command_for(
+            &Assertion::Health {
+                url: "http://127.0.0.1:8080/health".to_string(),
+                expect: Vec::new(),
+                method: None,
+                body: None,
+                headers: Vec::new(),
+            },
+            Some(30),
+        );
+        assert!(cmd.contains("sfw_http 30"), "{cmd}");
+        assert!(cmd.contains("sleep 2"), "{cmd}");
+    }
+
+    #[test]
     fn a_health_check_probes_the_url() {
         let cmd = command_for(
             &Assertion::Health {
                 url: "http://127.0.0.1:8080/health".to_string(),
                 expect: Vec::new(),
+                method: None,
+                body: None,
+                headers: Vec::new(),
             },
             Some(5),
         );
@@ -304,7 +372,13 @@ mod tests {
     #[test]
     fn a_health_check_with_explicit_codes_accepts_only_those() {
         let cmd = command_for(
-            &Assertion::Health { url: "http://x/".to_string(), expect: vec![200, 204] },
+            &Assertion::Health {
+                url: "http://x/".to_string(),
+                expect: vec!["200".to_string(), "204".to_string()],
+                method: None,
+                body: None,
+                headers: Vec::new(),
+            },
             Some(5),
         );
         assert!(cmd.contains("200|204"), "{cmd}");
@@ -313,14 +387,14 @@ mod tests {
 
     #[test]
     fn a_port_check_waits_on_the_target() {
-        let cmd = command_for(&Assertion::Port { ports: vec![5000] }, Some(90));
+        let cmd = command_for(&Assertion::Port { ports: vec![5000], udp: false }, Some(90));
         assert!(cmd.contains("sfw_wait_port 5000 90"), "{cmd}");
         assert!(cmd.contains("ss -tln"), "{cmd}");
     }
 
     #[test]
     fn a_port_check_has_its_own_default_budget() {
-        let cmd = command_for(&Assertion::Port { ports: vec![5000] }, None);
+        let cmd = command_for(&Assertion::Port { ports: vec![5000], udp: false }, None);
         assert!(cmd.contains("sfw_wait_port 5000 60"), "{cmd}");
     }
 
@@ -332,8 +406,38 @@ mod tests {
     }
 
     #[test]
+    fn a_udp_port_check_asks_for_udp_sockets() {
+        let cmd = command_for(&Assertion::Port { ports: vec![9900], udp: true }, Some(30));
+        assert!(cmd.contains("ss -uln"), "{cmd}");
+    }
+
+    #[test]
+    fn a_status_class_becomes_a_glob() {
+        assert_eq!(super::status_glob("2xx"), "2??");
+        assert_eq!(super::status_glob("200"), "200");
+    }
+
+    #[test]
+    fn a_health_check_carries_its_method_body_and_headers() {
+        let cmd = command_for(
+            &Assertion::Health {
+                url: "http://127.0.0.1:8645/".to_string(),
+                expect: vec!["2xx".to_string()],
+                method: Some("POST".to_string()),
+                body: Some("{\"jsonrpc\":\"2.0\"}".to_string()),
+                headers: vec!["Content-Type: application/json".to_string()],
+            },
+            Some(10),
+        );
+        assert!(cmd.contains("-X 'POST'"), "{cmd}");
+        assert!(cmd.contains("--data "), "{cmd}");
+        assert!(cmd.contains("Content-Type: application/json"), "{cmd}");
+        assert!(cmd.contains("2??"), "{cmd}");
+    }
+
+    #[test]
     fn a_url_is_quoted() {
-        let cmd = http_probe("http://x/a b", 3);
+        let cmd = http_probe("http://x/a b", 3, None, None, &[]);
         assert!(cmd.contains("'http://x/a b'"), "{cmd}");
     }
 

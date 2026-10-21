@@ -195,13 +195,22 @@ pub enum Assertion {
     Health {
         /// The URL to probe.
         url: String,
-        /// The accepted status codes (2xx/3xx by default).
-        expect: Vec<u16>,
+        /// The accepted status codes: an exact code (`200`) or a class
+        /// (`2xx`). Any 2xx or 3xx by default.
+        expect: Vec<String>,
+        /// The HTTP method (`GET` by default).
+        method: Option<String>,
+        /// The request body, for a method that takes one.
+        body: Option<String>,
+        /// Extra request headers (`Name: value`).
+        headers: Vec<String>,
     },
     /// The ports must be listening on the target.
     Port {
-        /// The TCP ports that must be listening.
+        /// The ports that must be listening.
         ports: Vec<u16>,
+        /// Whether the ports are UDP rather than TCP.
+        udp: bool,
     },
     /// The file must exist and hold no unexpanded `${…}` placeholder.
     Rendered {

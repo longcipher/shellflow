@@ -758,7 +758,10 @@ impl State {
 
         let mut url: Option<String> = None;
         let mut target: Option<String> = None;
-        let mut expect: Vec<u16> = Vec::new();
+        let mut expect: Vec<String> = Vec::new();
+        let mut method: Option<String> = None;
+        let mut body: Option<String> = None;
+        let mut headers: Vec<String> = Vec::new();
         let mut tokens = payload.split_whitespace();
         while let Some(token) = tokens.next() {
             match token {
@@ -771,22 +774,61 @@ impl State {
                         });
                     };
                     for code in codes.split(',') {
-                        let Ok(code) = code.trim().parse::<u16>() else {
+                        let code = code.trim();
+                        if !is_status_pattern(code) {
                             return Err(ParseError::InvalidDirective {
                                 line,
                                 directive: "assert_health".to_string(),
                                 reason: format!("invalid status code `{code}`"),
                             });
-                        };
-                        if !(100..600).contains(&code) {
-                            return Err(ParseError::InvalidDirective {
-                                line,
-                                directive: "assert_health".to_string(),
-                                reason: format!("status code `{code}` is out of range"),
-                            });
                         }
-                        expect.push(code);
+                        expect.push(code.to_string());
                     }
+                }
+                "--method" => {
+                    let Some(raw) = tokens.next() else {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_health".to_string(),
+                            reason: "`--method` requires an HTTP method".to_string(),
+                        });
+                    };
+                    let raw = raw.to_ascii_uppercase();
+                    if !raw.chars().all(|c| c.is_ascii_alphabetic()) {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_health".to_string(),
+                            reason: format!("invalid HTTP method `{raw}`"),
+                        });
+                    }
+                    method = Some(raw);
+                }
+                "--body" => {
+                    let Some(raw) = tokens.next() else {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_health".to_string(),
+                            reason: "`--body` requires a request body".to_string(),
+                        });
+                    };
+                    body = Some(strip_surrounding_quotes(raw));
+                }
+                "--header" => {
+                    let Some(raw) = tokens.next() else {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_health".to_string(),
+                            reason: "`--header` requires a `Name: value` pair".to_string(),
+                        });
+                    };
+                    if !raw.contains(':') {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_health".to_string(),
+                            reason: format!("invalid header `{raw}` (want `Name:value`)"),
+                        });
+                    }
+                    headers.push(strip_surrounding_quotes(raw));
                 }
                 other if other.starts_with("--") => {
                     return Err(ParseError::InvalidDirective {
@@ -820,7 +862,7 @@ impl State {
                             reason: "expected `<url> [@<target>] [--expect CODES]`".to_string(),
                         });
                     }
-                    url = Some(other.to_string());
+                    url = Some(strip_surrounding_quotes(other));
                 }
             }
         }
@@ -850,7 +892,7 @@ impl State {
         self.push_assertion(
             name,
             target,
-            Assertion::Health { url, expect },
+            Assertion::Health { url, expect, method, body, headers },
             timeout,
         );
         Ok(())
@@ -875,7 +917,12 @@ impl State {
 
         let mut ports: Vec<u16> = Vec::new();
         let mut target: Option<String> = None;
+        let mut udp = false;
         for token in payload.split_whitespace() {
+            if token == "--udp" {
+                udp = true;
+                continue;
+            }
             if let Some(alias) = token.strip_prefix('@') {
                 if alias.is_empty() {
                     return Err(ParseError::InvalidDirective {
@@ -924,7 +971,7 @@ impl State {
             });
         }
         let target = self.resolve_assert_target(target, "assert_port", line)?;
-        self.push_assertion(name, target, Assertion::Port { ports }, timeout);
+        self.push_assertion(name, target, Assertion::Port { ports, udp }, timeout);
         Ok(())
     }
 
@@ -1173,6 +1220,14 @@ impl State {
         }));
         Ok(())
     }
+}
+
+/// Whether a status pattern is an exact code (`200`) or a class (`2xx`).
+fn is_status_pattern(pattern: &str) -> bool {
+    if pattern.len() == 3 && pattern.ends_with("xx") {
+        return pattern.starts_with(|c: char| c.is_ascii_digit());
+    }
+    pattern.parse::<u16>().is_ok_and(|code| (100..600).contains(&code))
 }
 
 /// Normalize a unit name: `foo` becomes `foo.service`.
@@ -1429,7 +1484,10 @@ mod tests {
             step.checks,
             vec![Assertion::Health {
                 url: "http://127.0.0.1:8080/health".to_string(),
-                expect: vec![200, 204],
+                expect: vec!["200".to_string(), "204".to_string()],
+                method: None,
+                body: None,
+                headers: Vec::new(),
             }]
         );
         Ok(())
@@ -1441,7 +1499,13 @@ mod tests {
         let step = as_assert(&plan.steps[0])?;
         assert_eq!(
             step.checks,
-            vec![Assertion::Health { url: "http://x/health".to_string(), expect: Vec::new() }]
+            vec![Assertion::Health {
+                url: "http://x/health".to_string(),
+                expect: Vec::new(),
+                method: None,
+                body: None,
+                headers: Vec::new(),
+            }]
         );
         Ok(())
     }
@@ -1475,7 +1539,10 @@ mod tests {
     fn assert_port_parses_the_ports() -> Result<(), String> {
         let plan = parse("# @server api api\n# @assert_port 5000 8080,9090 @api\n")?;
         let step = as_assert(&plan.steps[0])?;
-        assert_eq!(step.checks, vec![Assertion::Port { ports: vec![5000, 8080, 9090] }]);
+        assert_eq!(
+            step.checks,
+            vec![Assertion::Port { ports: vec![5000, 8080, 9090], udp: false }]
+        );
         Ok(())
     }
 
