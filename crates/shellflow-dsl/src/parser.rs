@@ -185,6 +185,14 @@ impl State {
                 self.flush();
                 self.add_assert_health(payload, line)
             }
+            "assert_port" => {
+                self.flush();
+                self.add_assert_port(payload, line)
+            }
+            "assert_rendered" => {
+                self.flush();
+                self.add_assert_rendered(payload, line)
+            }
             "export" => self.declare_export(payload, line),
             "timeout" => {
                 self.flush();
@@ -848,6 +856,143 @@ impl State {
         Ok(())
     }
 
+    /// Parse `# @assert_port <port>[,<port>…] [@<target>]`.
+    ///
+    /// The ports must be listening on the target. The check waits for the
+    /// step's budget (`@timeout`), which is what the hand-rolled
+    /// `for i in $(seq 1 12); do ss … ; sleep 5; done` loop did — in one
+    /// round trip instead of one per poll.
+    fn add_assert_port(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_port".to_string(),
+                reason: "`@only_if` is not supported on `@assert_port`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let mut ports: Vec<u16> = Vec::new();
+        let mut target: Option<String> = None;
+        for token in payload.split_whitespace() {
+            if let Some(alias) = token.strip_prefix('@') {
+                if alias.is_empty() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_port".to_string(),
+                        reason: "missing target".to_string(),
+                    });
+                }
+                if target.is_some() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_port".to_string(),
+                        reason: "more than one target".to_string(),
+                    });
+                }
+                target = Some(alias.to_string());
+                continue;
+            }
+            for part in token.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let Ok(port) = part.parse::<u16>() else {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_port".to_string(),
+                        reason: format!("invalid port `{part}`"),
+                    });
+                };
+                if port == 0 {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_port".to_string(),
+                        reason: "port 0 is not a listening port".to_string(),
+                    });
+                }
+                ports.push(port);
+            }
+        }
+        if ports.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_port".to_string(),
+                reason: "missing port".to_string(),
+            });
+        }
+        let target = self.resolve_assert_target(target, "assert_port", line)?;
+        self.push_assertion(name, target, Assertion::Port { ports }, timeout);
+        Ok(())
+    }
+
+    /// Parse `# @assert_rendered <path> [@<target>]`.
+    ///
+    /// The file must exist and hold no unexpanded `${…}` placeholder: a
+    /// rendered config that still carries a placeholder is a config that
+    /// was never rendered.
+    fn add_assert_rendered(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_rendered".to_string(),
+                reason: "`@only_if` is not supported on `@assert_rendered`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let mut path: Option<String> = None;
+        let mut target: Option<String> = None;
+        for token in payload.split_whitespace() {
+            if let Some(alias) = token.strip_prefix('@') {
+                if alias.is_empty() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_rendered".to_string(),
+                        reason: "missing target".to_string(),
+                    });
+                }
+                if target.is_some() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_rendered".to_string(),
+                        reason: "more than one target".to_string(),
+                    });
+                }
+                target = Some(alias.to_string());
+                continue;
+            }
+            if path.is_some() {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "assert_rendered".to_string(),
+                    reason: "expected `<path> [@<target>]`".to_string(),
+                });
+            }
+            path = Some(token.to_string());
+        }
+        let Some(path) = path else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_rendered".to_string(),
+                reason: "missing path".to_string(),
+            });
+        };
+        if !path.starts_with('/') {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_rendered".to_string(),
+                reason: format!("the path must be absolute (got `{path}`)"),
+            });
+        }
+        let target = self.resolve_assert_target(target, "assert_rendered", line)?;
+        self.push_assertion(name, target, Assertion::Rendered { path }, timeout);
+        Ok(())
+    }
+
     /// The target an assertion runs against: the explicit one, or the
     /// target of the previous step.
     fn resolve_assert_target(
@@ -1324,6 +1469,62 @@ mod tests {
                 "expected an error for:\n{script}"
             );
         }
+    }
+
+    #[test]
+    fn assert_port_parses_the_ports() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert_port 5000 8080,9090 @api\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(step.checks, vec![Assertion::Port { ports: vec![5000, 8080, 9090] }]);
+        Ok(())
+    }
+
+    #[test]
+    fn assert_rendered_parses_the_path() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert_rendered /run/app/config.toml @api\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(
+            step.checks,
+            vec![Assertion::Rendered { path: "/run/app/config.toml".to_string() }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assert_port_and_rendered_inherit_the_target() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @remote api\n\
+             sudo systemctl restart app\n\
+             # @assert_port 8080\n\
+             # @assert_rendered /run/app/config.toml\n",
+        )?;
+        let step = plan.steps.last().ok_or("no step")?;
+        let assert = as_assert(step)?;
+        assert_eq!(assert.target.text, "api");
+        assert_eq!(assert.checks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn assert_port_rejects_bad_shapes() {
+        for script in [
+            // No port.
+            "# @server api api\n# @assert_port @api\n",
+            // A port that is not a number.
+            "# @server api api\n# @assert_port http @api\n",
+            // Port zero.
+            "# @server api api\n# @assert_port 0 @api\n",
+        ] {
+            assert!(parse(script).is_err(), "expected an error for:\n{script}");
+        }
+    }
+
+    #[test]
+    fn assert_rendered_rejects_a_relative_path() {
+        let script = "# @server api api\n# @assert_rendered config.toml @api\n";
+        let err = parse(script).expect_err("should fail");
+        assert!(err.contains("absolute"), "{err}");
     }
 
     #[test]

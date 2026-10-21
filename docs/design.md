@@ -119,6 +119,8 @@ All other lines (including plain comments) belong to the current block.
 | `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active <unit>` on every target host until it reports active or the budget expires (default 300s). Replaces the hand-rolled `for`/`sleep`/`ss` poll loops that differ in every playbook. A host that never reports active is `FAILED` (script class); an unreachable host is a transport failure (§6) |
 | `@assert` | `# @assert <unit> [@<target>] [<state>]` | Assert the unit's `ActiveState` on the target (default `active`). The target is inherited from the previous step when it is not given. A failed assertion fails the step (script class) |
 | `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default). The target is inherited from the previous step |
+| `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>]` | Assert that the ports are listening, waiting up to the step's timeout (in one round trip, not one per poll). The target is inherited from the previous step |
+| `@assert_rendered` | `# @assert_rendered <path> [@<target>]` | Assert that the file exists and holds no unexpanded `${…}` placeholder. The target is inherited from the previous step |
 
 **Assertion steps.** Consecutive `@assert`/`@assert_health` lines that share a
 target are merged into **one** step: the whole group travels in a single SSH
