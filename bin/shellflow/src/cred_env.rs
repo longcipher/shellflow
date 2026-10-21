@@ -245,6 +245,91 @@ pub(crate) fn credstore_install(service: &str, store_dir: Option<&Path>) -> Resu
     seal_into_store(service, store_dir, &keys)
 }
 
+/// The file inside the credential store that records the fingerprint of the
+/// values last sealed into it.
+///
+/// It lives *inside* the store: a store that was removed (or replaced) takes
+/// its fingerprint with it, so the next install re-seals instead of trusting
+/// a fingerprint that describes a store that no longer exists.
+const FINGERPRINT_FILE: &str = ".seal-fingerprint";
+
+/// systemd's host key: the credential store is sealed with it, so a store
+/// sealed with a *different* host key is unreadable whatever the values are.
+const HOST_KEY_PATH: &str = "/etc/systemd/credentials.secret";
+
+/// A fingerprint of the credentials about to be sealed.
+///
+/// It covers three things, because any of them changing invalidates the
+/// store:
+///
+/// * the values themselves (a rotated value must be re-sealed),
+/// * the host key (a store sealed with another host key cannot be read),
+/// * the names of the files in the store (a store that lost a file must be
+///   rebuilt, not trusted).
+fn seal_fingerprint(keys: &[String]) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for key in keys {
+        let value = std::env::var(key).unwrap_or_default();
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\n");
+    }
+    if let Ok(host_key) = fs::read(HOST_KEY_PATH) {
+        hasher.update(b"host-key:");
+        hasher.update(Sha256::digest(&host_key));
+    }
+    // The credentials the store is *supposed* to hold, sorted so the order
+    // does not matter. The store's actual contents are compared separately:
+    // a store that lost a file must be rebuilt, not trusted.
+    let mut names: Vec<String> = keys.to_vec();
+    names.sort();
+    for name in names {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    Ok(out)
+}
+
+/// Whether the store already holds exactly these credentials.
+///
+/// The recorded fingerprint says the values did not change; the file listing
+/// says the store was not tampered with. Both must hold.
+fn store_is_current(store: &Path, keys: &[String], fingerprint: &str) -> bool {
+    if !fs::read_to_string(store.join(FINGERPRINT_FILE))
+        .is_ok_and(|current| current.trim() == fingerprint)
+    {
+        return false;
+    }
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(store) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name != FINGERPRINT_FILE {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    let mut expected: Vec<String> = keys.to_vec();
+    expected.sort();
+    names == expected
+}
+
+/// Record the fingerprint of the values now in the store.
+fn record_fingerprint(store: &Path, fingerprint: &str) {
+    // A failure here only costs the next install one extra seal.
+    let _ = crate::fsx::write_secret_file(&store.join(FINGERPRINT_FILE), fingerprint.as_bytes());
+}
+
 /// Atomic staging-swap installer shared by the env path
 /// (`credstore-install`) and the piped-bundle path (`__seal-bundle`).
 fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> Result<()> {
@@ -262,6 +347,16 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
     ));
 
     sudo(&["install", "-d", "-m", "0700", &store.to_string_lossy()])?;
+
+    // Sealing is the expensive part of an install: one host-key crypto
+    // operation per credential. When the store already holds exactly these
+    // credentials, re-sealing it would burn that work to produce the same
+    // result, so the install is skipped.
+    let fingerprint = seal_fingerprint(keys)?;
+    if store_is_current(&store, keys, &fingerprint) {
+        return Ok(());
+    }
+
     let _ = fs::remove_dir_all(&staging);
     sudo(&["install", "-d", "-m", "0700", &staging.to_string_lossy()])?;
 
@@ -282,6 +377,7 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
     // rather than a data-loss risk.
     if exchange_dirs(&staging, &store) {
         let _ = fs::remove_dir_all(&staging);
+        record_fingerprint(&store, &fingerprint);
         return Ok(());
     }
 
@@ -307,6 +403,7 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
         );
     }
     let _ = fs::remove_dir_all(&retired);
+    record_fingerprint(&store, &fingerprint);
     Ok(())
 }
 
