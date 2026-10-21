@@ -665,6 +665,8 @@ pub(crate) enum ServiceCmd {
     /// Verify a deployed tree against a saved sha256 manifest; exits
     /// non-zero when the host drifted from it.
     Verify(ServiceVerifyArgs),
+    /// The fleet view: the state of every service on every host.
+    Status(ServiceStatusArgs),
 }
 
 /// Scaffold pattern: which credential/deployment shape to generate.
@@ -770,6 +772,28 @@ pub(crate) struct ServiceManifestArgs {
     /// Write the manifest here instead of stdout.
     #[arg(long = "output", value_name = "PATH")]
     pub output: Option<PathBuf>,
+}
+
+/// Arguments for `service status`.
+#[derive(Debug, Args)]
+pub(crate) struct ServiceStatusArgs {
+    /// Every host the repository's playbooks declare (with `--all`).
+    #[arg(long)]
+    pub all: bool,
+
+    /// Host to report on (repeatable).
+    #[arg(long = "host", value_name = "HOST")]
+    pub hosts: Vec<String>,
+
+    /// Service to report on (repeatable); default: every service in
+    /// `services/`.
+    #[arg(long = "service", value_name = "SVC")]
+    pub services: Vec<String>,
+
+    /// Repository root that describes the fleet (default: current
+    /// directory).
+    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
+    pub repo: PathBuf,
 }
 
 /// Arguments for `service verify`.
@@ -1087,7 +1111,8 @@ mod tests {
                 super::ServiceCmd::Check(_)
                 | super::ServiceCmd::Diff(_)
                 | super::ServiceCmd::Manifest(_)
-                | super::ServiceCmd::Verify(_) => {
+                | super::ServiceCmd::Verify(_)
+                | super::ServiceCmd::Status(_) => {
                     panic!("expected init subcommand")
                 }
             },
@@ -1108,7 +1133,8 @@ mod tests {
                 super::ServiceCmd::Init(_)
                 | super::ServiceCmd::Diff(_)
                 | super::ServiceCmd::Manifest(_)
-                | super::ServiceCmd::Verify(_) => {
+                | super::ServiceCmd::Verify(_)
+                | super::ServiceCmd::Status(_) => {
                     panic!("expected check subcommand")
                 }
             },
@@ -1136,7 +1162,8 @@ mod tests {
                 super::ServiceCmd::Check(_)
                 | super::ServiceCmd::Diff(_)
                 | super::ServiceCmd::Manifest(_)
-                | super::ServiceCmd::Verify(_) => {
+                | super::ServiceCmd::Verify(_)
+                | super::ServiceCmd::Status(_) => {
                     panic!("expected init subcommand")
                 }
             },

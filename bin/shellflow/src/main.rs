@@ -31,6 +31,7 @@ mod service;
 mod service_check;
 mod service_diff;
 mod service_manifest;
+mod service_status;
 mod systemd;
 #[cfg(feature = "dbus")]
 mod systemd_dbus;
