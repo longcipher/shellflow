@@ -26,6 +26,7 @@ futures-util = { workspace = true, optional = true }
 nix = { workspace = true, features = ["process", "signal", "user", "fs"] }
 sd-notify = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 shellflow-core = { workspace = true }
 shellflow-secrets = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
