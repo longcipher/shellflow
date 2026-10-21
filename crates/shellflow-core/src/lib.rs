@@ -18,23 +18,22 @@
 
 pub mod env;
 pub mod error;
-pub mod heredoc;
-pub mod parser;
-pub mod plan;
-pub mod ssh_spec;
 pub mod template;
 
 pub use env::{
     CAPTURE_SEPARATOR, MASK, SecretMasker, mask_keyed, mask_line, mask_token,
-    parse_capture_records, prepare_masks, render_env, shell_quote_single, strip_surrounding_quotes,
+    parse_capture_records, prepare_masks, render_env,
 };
-pub use error::{CaptureError, InterpolateError, ParseError, RenderEnvError};
-pub use heredoc::{Heredoc, HeredocTracker};
-pub use parser::parse_script;
-pub use plan::{
-    AssertStep, Assertion, CopyEntry, CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep, RemoteStep,
-    ResolvedHost, RunState, SecretEntry, Step, Target, WaitStep, interpolate, is_valid_var_name,
-    resolve_hosts,
+
+// The deploy-script grammar and the plan model live in `shellflow-dsl`.
+// They are re-exported here so that a consumer of the runtime helpers does
+// not have to know which of the two crates owns which half of the language.
+pub use shellflow_dsl::{
+    AssertStep, Assertion, CopyEntry, CopyStep, EnvEntry, ExecutionPlan, InterpolateError,
+    LocalStep, ParseError, ReloadStep, RemoteStep, ResolvedHost, RunState, SecretEntry, SshSpec,
+    Step, Target, WaitStep, interpolate, is_valid_var_name, parse_script, shell_quote_single,
+    strip_surrounding_quotes,
 };
-pub use ssh_spec::SshSpec;
+pub use error::{CaptureError, RenderEnvError};
+pub use shellflow_dsl::{Heredoc, HeredocTracker, resolve_hosts};
 pub use template::{render_template, template_keys};

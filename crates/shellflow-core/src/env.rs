@@ -10,6 +10,11 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::error::{CaptureError, RenderEnvError};
 
+// The two text rules and the shell-identifier rule live in the DSL crate,
+// which owns the grammar that reads them. They are re-exported here so the
+// runtime and the grammar cannot drift apart.
+pub use shellflow_dsl::{is_valid_var_name, shell_quote_single, strip_surrounding_quotes};
+
 /// The placeholder used when redacting known secret values.
 pub const MASK: &str = "***";
 
@@ -49,46 +54,6 @@ pub fn parse_capture_records(bytes: &[u8]) -> Result<BTreeMap<String, String>, C
     Ok(out)
 }
 
-/// Single-quote a value for safe inclusion in a `bash` export line.
-///
-/// A literal `'` is escaped as `'\''`, which is valid inside single quotes.
-#[must_use]
-pub fn shell_quote_single(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
-}
-
-/// Strip one layer of surrounding `"` or `'` quotes.
-///
-/// A directive or an env-file line is plain text, so no shell quoting applies
-/// and quotes are literal characters; stripping them lets `--exclude '*.key'`
-/// and `KEY="value"` read naturally.
-///
-/// This is the single definition of the rule across the workspace: the parser
-/// uses it for directive payloads and the secrets crate uses it for the values
-/// of a sealed env file.
-#[must_use]
-pub fn strip_surrounding_quotes(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.len() >= 2 {
-        let bytes = trimmed.as_bytes();
-        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
-        if first == last && (first == b'"' || first == b'\'') {
-            return trimmed[1..trimmed.len() - 1].to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
 /// Render already-resolved `(key, value)` pairs as `export` lines.
 ///
 /// The returned string is the payload header that precedes any `set -x`
@@ -106,7 +71,7 @@ pub fn strip_surrounding_quotes(raw: &str) -> String {
 pub fn render_env(entries: &[(String, String)]) -> Result<String, RenderEnvError> {
     let mut out = String::new();
     for (key, value) in entries {
-        if !crate::plan::is_valid_var_name(key) {
+        if !is_valid_var_name(key) {
             return Err(RenderEnvError::InvalidKey { name: key.clone() });
         }
         out.push_str("export ");
