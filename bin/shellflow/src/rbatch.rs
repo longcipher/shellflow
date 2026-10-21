@@ -27,7 +27,28 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use shellflow_core::SshSpec;
+
 use crate::service::ServiceError;
+
+/// Where a batch is sent.
+#[derive(Clone, Debug)]
+pub(crate) enum SshDest {
+    /// A plain destination: an alias from `~/.ssh/config` or a hostname.
+    Host(String),
+    /// A full spec (user, host, port).
+    Spec(SshSpec),
+}
+
+impl SshDest {
+    /// The `ssh` arguments that address the destination.
+    fn args(&self) -> Vec<String> {
+        match self {
+            Self::Host(host) => vec![host.clone()],
+            Self::Spec(spec) => spec.to_ssh_args(),
+        }
+    }
+}
 
 /// One query's answer from a remote batch.
 #[derive(Debug, Clone, Default)]
@@ -119,12 +140,27 @@ impl Batch {
     /// unavailable (a missing `ssh`, an unreachable host) or when the host
     /// answered with nothing that looks like a batch.
     pub(crate) fn run(&self, host: &str) -> Result<BTreeMap<String, Section>, ServiceError> {
+        self.run_dest(&SshDest::Host(host.to_string()))
+    }
+
+    /// Run the batch against one destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Transport`] when the SSH transport is
+    /// unavailable or when the host answered with nothing that looks like a
+    /// batch.
+    pub(crate) fn run_dest(
+        &self,
+        dest: &SshDest,
+    ) -> Result<BTreeMap<String, Section>, ServiceError> {
+        let host = dest_label(dest);
         let mut child = Command::new("ssh")
             .arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
             .arg("ConnectTimeout=15")
-            .arg(host)
+            .args(dest.args())
             .arg("sh")
             .arg("-s")
             .stdin(Stdio::piped())
@@ -142,7 +178,7 @@ impl Batch {
             .wait_with_output()
             .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
 
-        self.finish(host, output)
+        self.finish(&host, output)
     }
 
     /// Run the batch against one host, asynchronously.
@@ -156,14 +192,29 @@ impl Batch {
         &self,
         host: &str,
     ) -> Result<BTreeMap<String, Section>, ServiceError> {
+        self.run_async_dest(&SshDest::Host(host.to_string())).await
+    }
+
+    /// Run the batch against one destination, asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Transport`] when the SSH transport is
+    /// unavailable or when the host answered with nothing that looks like a
+    /// batch.
+    pub(crate) async fn run_async_dest(
+        &self,
+        dest: &SshDest,
+    ) -> Result<BTreeMap<String, Section>, ServiceError> {
         use tokio::io::AsyncWriteExt as _;
 
+        let host = dest_label(dest);
         let mut child = tokio::process::Command::new("ssh")
             .arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
             .arg("ConnectTimeout=15")
-            .arg(host)
+            .args(dest.args())
             .arg("sh")
             .arg("-s")
             .stdin(Stdio::piped())
@@ -180,7 +231,7 @@ impl Batch {
             .await
             .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
 
-        self.finish(host, output)
+        self.finish(&host, output)
     }
 
     /// Turn the raw output of a batch into its answers.
@@ -224,6 +275,14 @@ fn flush(
         sections.insert(id, Section { rc, body: body.join("\n") });
     }
     body.clear();
+}
+
+/// A human-readable label for a destination (used in error messages).
+fn dest_label(dest: &SshDest) -> String {
+    match dest {
+        SshDest::Host(host) => host.clone(),
+        SshDest::Spec(spec) => spec.dest(),
+    }
 }
 
 /// A per-run token that makes the frame markers unforgeable by content.

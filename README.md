@@ -258,6 +258,9 @@ shellflow service manifest --host H       print the sha256 manifest of a
 shellflow service verify --host H         verify a deployed tree against a
         --manifest F                       saved manifest; exits non-zero on
                                              drift
+shellflow service status --all           the fleet view: every service of
+        [--host H]… [--service S]…        every host the repository
+                                             declares, in one table
 ```
 
 Exit codes: `0` success · `1` plan/parse/config error · `2` CLI usage · `3`
