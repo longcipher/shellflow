@@ -138,6 +138,9 @@ pub(crate) fn run(cmd: &ServiceCmd) -> Result<(), ServiceError> {
     match cmd {
         ServiceCmd::Init(args) => init(args).map_err(ServiceError::Other),
         ServiceCmd::Check(args) => crate::service_check::check(args),
+        ServiceCmd::Diff(args) => crate::service_diff::diff(args),
+        ServiceCmd::Manifest(args) => crate::service_manifest::manifest(args),
+        ServiceCmd::Verify(args) => crate::service_manifest::verify(args),
     }
 }
 

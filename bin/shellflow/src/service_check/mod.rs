@@ -20,7 +20,9 @@ use eyre::{Result, bail};
 
 use crate::{cli::ServiceCheckArgs, service::ServiceError};
 
-use remote::{Probe, Section};
+use crate::rbatch::Section;
+
+use remote::Probe;
 
 /// Run `service check`.
 ///
@@ -38,7 +40,7 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
     let mut failures = 0;
 
     let probe = Probe::new(&unit, &args.service, args.journal_lines);
-    let sections = remote::run(&args.host, &probe)?;
+    let sections = probe.run(&args.host)?;
     let show = body(&sections, "props");
     let journal = body(&sections, "journal");
 
