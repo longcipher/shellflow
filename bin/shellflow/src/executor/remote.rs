@@ -393,10 +393,7 @@ pub(super) async fn run_reload_step(
 ) -> eyre::Result<Vec<(String, HostOutcome)>> {
     use tokio::time::Duration;
     if config.check || config.dry_run {
-        crate::ui::note(
-            &format!("  reload {} (no-op in check/dry-run)", reload.unit),
-            log_file,
-        );
+        crate::ui::note(&format!("  reload {} (no-op in check/dry-run)", reload.unit), log_file);
         return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
     }
     let timeout = Duration::from_secs(reload.timeout.unwrap_or(DEFAULT_RELOAD_SECS));
@@ -427,9 +424,12 @@ pub(super) async fn run_reload_step(
             let mut cmd = Command::new("ssh");
             // Fail closed on an unknown host key or a missing key: never prompt.
             cmd.args(["-o", "BatchMode=yes"]);
-            cmd.args(host.spec.to_ssh_args())
-                .arg("-T")
-                .arg(reload_command(&unit, signal.as_deref(), wait, timeout.as_secs()));
+            cmd.args(host.spec.to_ssh_args()).arg("-T").arg(reload_command(
+                &unit,
+                signal.as_deref(),
+                wait,
+                timeout.as_secs(),
+            ));
             let args = stream::PipedArgs {
                 ui: &ui,
                 host: &host.alias,
@@ -452,18 +452,16 @@ pub(super) async fn run_reload_step(
                     let code = status.code().unwrap_or(-1);
                     match code {
                         0 => {
-                            ui.lock().await.masked_note(&format!(
-                                "[{}] {unit} reloaded",
-                                host.alias
-                            ));
+                            ui.lock()
+                                .await
+                                .masked_note(&format!("[{}] {unit} reloaded", host.alias));
                             (host.alias.clone(), HostOutcome::Ok)
                         }
                         255 => (host.alias.clone(), HostOutcome::Failed(RunError::Transport)),
                         3 => {
-                            ui.lock().await.masked_note(&format!(
-                                "[{}] {unit} reload failed",
-                                host.alias
-                            ));
+                            ui.lock()
+                                .await
+                                .masked_note(&format!("[{}] {unit} reload failed", host.alias));
                             (host.alias.clone(), HostOutcome::Failed(RunError::Script))
                         }
                         4 => {
@@ -486,9 +484,7 @@ pub(super) async fn run_reload_step(
                 stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken => {
                     (host.alias.clone(), HostOutcome::Failed(RunError::Transport))
                 }
-                stream::PipedRun::Cancelled => {
-                    (host.alias.clone(), HostOutcome::Cancelled)
-                }
+                stream::PipedRun::Cancelled => (host.alias.clone(), HostOutcome::Cancelled),
             }
         });
     }
@@ -809,9 +805,7 @@ pub(super) async fn run_wait_step(
             let mut cmd = Command::new("ssh");
             // Fail closed on an unknown host key or a missing key: never prompt.
             cmd.args(["-o", "BatchMode=yes"]);
-            cmd.args(host.spec.to_ssh_args())
-                .arg("-T")
-                .arg(wait_command(&unit, budget.as_secs()));
+            cmd.args(host.spec.to_ssh_args()).arg("-T").arg(wait_command(&unit, budget.as_secs()));
             let args = stream::PipedArgs {
                 ui: &ui,
                 host: &host.alias,
@@ -836,20 +830,14 @@ pub(super) async fn run_wait_step(
                     let code = status.code().unwrap_or(-1);
                     match code {
                         0 => {
-                            ui.lock().await.masked_note(&format!(
-                                "[{}] {unit} active",
-                                host.alias
-                            ));
+                            ui.lock().await.masked_note(&format!("[{}] {unit} active", host.alias));
                             (host.alias.clone(), HostOutcome::Ok)
                         }
                         // ssh exits 255 when the connection itself failed:
                         // that is a transport failure, not an inactive unit.
                         255 => (host.alias.clone(), HostOutcome::Failed(RunError::Transport)),
                         3 => {
-                            ui.lock().await.masked_note(&format!(
-                                "[{}] {unit} failed",
-                                host.alias
-                            ));
+                            ui.lock().await.masked_note(&format!("[{}] {unit} failed", host.alias));
                             (host.alias.clone(), HostOutcome::Failed(RunError::Script))
                         }
                         4 => {
@@ -861,10 +849,9 @@ pub(super) async fn run_wait_step(
                             (host.alias.clone(), HostOutcome::Failed(RunError::Script))
                         }
                         5 => {
-                            ui.lock().await.masked_note(&format!(
-                                "[{}] {unit} does not exist",
-                                host.alias
-                            ));
+                            ui.lock()
+                                .await
+                                .masked_note(&format!("[{}] {unit} does not exist", host.alias));
                             (host.alias.clone(), HostOutcome::Failed(RunError::Script))
                         }
                         other => {
@@ -879,9 +866,7 @@ pub(super) async fn run_wait_step(
                 stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken => {
                     (host.alias.clone(), HostOutcome::Failed(RunError::Transport))
                 }
-                stream::PipedRun::Cancelled => {
-                    (host.alias.clone(), HostOutcome::Cancelled)
-                }
+                stream::PipedRun::Cancelled => (host.alias.clone(), HostOutcome::Cancelled),
             }
         });
     }
@@ -1497,7 +1482,7 @@ async fn run_ssh_child(
 
 #[cfg(test)]
 mod tests {
-    use super::{wait_command, wait_collector};
+    use super::{wait_collector, wait_command};
 
     #[test]
     fn the_wait_command_prefers_the_target_side_helper() {
@@ -1538,7 +1523,10 @@ mod tests {
         let collector = wait_collector("foo.service");
         let line = "SFW\tnotify\tactivating\tstart\tsuccess\t";
         let rendered = collector.record(line).expect("renders");
-        assert_eq!(rendered, "waiting foo.service: type=notify active=activating sub=start result=success");
+        assert_eq!(
+            rendered,
+            "waiting foo.service: type=notify active=activating sub=start result=success"
+        );
     }
 
     #[test]
