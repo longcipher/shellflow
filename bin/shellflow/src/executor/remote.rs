@@ -1307,8 +1307,14 @@ async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
     // The probe races the timeout *and* cancellation: a hung probe must not
     // eat the whole interrupt grace period, and its group must not survive
     // the run.
+    //
+    // The budget must exceed ssh's own ConnectTimeout (15s in the operator's
+    // ~/.ssh/config). With the two equal, a slow TCP connect (a dropped SYN
+    // on a long-haul link) has ssh give up at the same moment the probe does,
+    // and the probe is cut off mid-flight: the host looks like it has no
+    // rsync, and a perfectly good deploy fails with a misleading message.
     let mut cancel_probe = cancel.clone();
-    let status = super::process::wait_child(&mut child, Some(15), &mut cancel_probe).await;
+    let status = super::process::wait_child(&mut child, Some(30), &mut cancel_probe).await;
     let output = match status {
         super::process::ChildOutcome::Finished(Ok(status)) if status.success() => {
             group.disarm();
