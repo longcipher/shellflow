@@ -7,8 +7,8 @@ use crate::{
     error::ParseError,
     heredoc::HeredocTracker,
     plan::{
-        CopyStep, EnvEntry, ExecutionPlan, LocalStep, RemoteStep, SecretEntry, Step, Target,
-        ReloadStep, WaitStep, is_valid_var_name,
+        CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep, RemoteStep, SecretEntry, Step,
+        Target, WaitStep, is_valid_var_name,
     },
     ssh_spec::SshSpec,
 };
@@ -654,11 +654,12 @@ impl State {
                     tokens.pop();
                     let flag = tokens.pop().unwrap_or_default();
                     if flag == "--timeout" {
-                        let secs: u64 = value.parse().map_err(|_| ParseError::InvalidDirective {
-                            line,
-                            directive: "reload".to_string(),
-                            reason: format!("invalid seconds `{value}`"),
-                        })?;
+                        let secs: u64 =
+                            value.parse().map_err(|_| ParseError::InvalidDirective {
+                                line,
+                                directive: "reload".to_string(),
+                                reason: format!("invalid seconds `{value}`"),
+                            })?;
                         if secs == 0 {
                             return Err(ParseError::InvalidDirective {
                                 line,
