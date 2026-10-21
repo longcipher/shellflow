@@ -4,6 +4,14 @@
 //! plaintext template, playbook, doc, or config: URL-embedded
 //! `user:password@` values, non-empty `password/secret/token` assignments,
 //! well-known token shapes (`sk-`, `ghp_`, ...), and PEM private-key blocks.
+//!
+//! The key and the value are matched **together**: an assignment is only a
+//! finding when the token immediately left of the `=` (or the `--flag`
+//! immediately left of the value) is itself a secret-bearing name. A line
+//! that merely *mentions* a secret word — `grep -iE "database-password"`,
+//! `LoadCredentialEncrypted=API_KEY:/etc/credstore.encrypted/…` — is not a
+//! finding, and neither is a value that is a path or a redaction marker.
+//!
 //! Placeholders (`${KEY}`), empty values, and `user:password` documentation
 //! literals are ignored. Age-encrypted (`*.age`) files are never read.
 //!
@@ -122,7 +130,7 @@ fn scan_line(line: &str) -> Option<String> {
         return Some("PEM private key block".to_string());
     }
     // password=/secret=/token= assignments with non-trivial quoted values.
-    if let Some(message) = assignment_secret(line, &lower) {
+    if let Some(message) = assignment_secret(line) {
         return Some(message);
     }
     None
@@ -158,27 +166,212 @@ fn url_credential(line: &str, lower: &str) -> Option<String> {
     Some(format!("URL-embedded credential for user `{user}`"))
 }
 
+/// Words that make an assignment key secret-bearing.
+///
+/// Matched two ways: an *exact* match on the normalized key (`pass`,
+/// `dbpass`, `requirepass`, ...) and a *substring* match for the unambiguous
+/// ones (`password`, `secret`, `token`, ...). A bare `pass` is only matched
+/// exactly, so `bypass` / `compass` do not trip it.
+///
+/// `credential` / `credentials` are exact-match only: they are substrings of
+/// systemd's own `LoadCredentialEncrypted=`, which names a *path*, not a
+/// secret.
+const SECRET_KEY_WORDS: &[&str] = &[
+    "password",
+    "passwd",
+    "requirepass",
+    "secret",
+    "token",
+    "apikey",
+    "privatekey",
+    "credential",
+    "pass",
+    "dbpass",
+    "userpass",
+    "adminpass",
+];
+
+/// Substrings that mark a compound key (`db_password`, `DUFS_AUTH_PASSWORD`).
+const SECRET_KEY_SUBSTRINGS: &[&str] =
+    &["password", "passwd", "secret", "token", "apikey", "privatekey"];
+
+/// The secret word a key carries, if any.
+///
+/// `key` is the token immediately left of the `=` (or the flag name). The
+/// token is normalized by dropping every non-alphanumeric character, so
+/// `DUFS_AUTH_PASSWORD`, `db-password`, and `apiKey` all reduce to forms
+/// this can recognize.
+fn secret_word(key: &str) -> Option<&'static str> {
+    let norm: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let norm = norm.to_lowercase();
+    if norm.is_empty() {
+        return None;
+    }
+    if let Some(word) = SECRET_KEY_WORDS.iter().find(|w| norm == **w) {
+        return Some(word);
+    }
+    SECRET_KEY_SUBSTRINGS.iter().find(|w| norm.contains(*w)).copied()
+}
+
+/// The identifier-ish run immediately left of `pos`.
+///
+/// This is what separates a real assignment from a line that merely
+/// *mentions* a secret word: in `LoadCredentialEncrypted=API_KEY:/etc/...`
+/// the run is `LoadCredentialEncrypted` (not a secret), while in
+/// `DUFS_AUTH_PASSWORD=x` it is `DUFS_AUTH_PASSWORD` (a secret). Returns an
+/// empty slice when the character before `pos` cannot be part of a key.
+fn key_token_before(line: &str, pos: usize) -> &str {
+    // The key and the `=` may be separated by spaces (`password = "x"`).
+    let lhs = line[..pos].trim_end();
+    let start = lhs
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .last()
+        .map_or(lhs.len(), |(i, _)| i);
+    &lhs[start..]
+}
+
+/// The value text that follows an `=` at `pos`.
+///
+/// A quoted value is taken up to its closing quote. An angle-bracketed
+/// value (`<redacted: ...>`) is taken up to its closing `>`, so that a
+/// redaction marker containing spaces stays one value instead of being
+/// truncated at the first space.
+fn value_after_eq(line: &str, pos: usize) -> &str {
+    let rest = line[pos..].trim_start();
+    if let Some(inner) = rest.strip_prefix('"') {
+        return inner.split('"').next().unwrap_or("");
+    }
+    if let Some(inner) = rest.strip_prefix('\'') {
+        return inner.split('\'').next().unwrap_or("");
+    }
+    if rest.starts_with('<') {
+        return match rest.find('>') {
+            Some(end) => &rest[..=end],
+            None => rest,
+        };
+    }
+    // `}` must NOT terminate the value: it closes a `${PLACEHOLDER}`, and
+    // cutting there would turn `${SECRET}` into `${SECRET` — no longer a
+    // placeholder, so the exemption below would never fire.
+    rest.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ')' | ']' | '|' | '`'))
+        .next()
+        .unwrap_or("")
+}
+
+/// The byte ranges of the line covered by a quoted string.
+///
+/// A candidate inside a quoted region is prose or a pattern, not an
+/// assignment: `grep -iE 'password='` and `echo "must have NO --token flag"`
+/// both *look* like a secret and are not one.
+fn quoted_spans(line: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let quote = bytes[i];
+        if quote != b'"' && quote != b'\'' {
+            i += 1;
+            continue;
+        }
+        // A single quote that never closes is an apostrophe in prose
+        // (`don't`), not a quoting context — so it must not swallow the
+        // rest of the line.
+        let close = line[i + 1..].find(quote as char).map(|idx| i + 1 + idx);
+        let Some(close) = close else {
+            i += 1;
+            continue;
+        };
+        spans.push((i, close + 1));
+        i = close + 1;
+    }
+    spans
+}
+
+/// Whether a byte position falls inside a quoted region.
+fn in_quoted(spans: &[(usize, usize)], pos: usize) -> bool {
+    spans.iter().any(|(start, end)| pos >= *start && pos < *end)
+}
+
+/// The `--flag value` shape: a secret-ish flag followed by its value.
+///
+/// Only flags that stand outside a quoted region count: inside quotes the
+/// same text is prose (`must have NO --token flag`).
+fn flag_value<'a>(line: &'a str, quoted: &[(usize, usize)]) -> Option<(&'static str, &'a str)> {
+    let mut previous: Option<(usize, &str)> = None;
+    let mut rest = line;
+    let mut offset = 0usize;
+    while !rest.is_empty() {
+        let trimmed = rest.trim_start();
+        offset += rest.len() - trimmed.len();
+        if trimmed.is_empty() {
+            break;
+        }
+        let (word, tail) = match trimmed.find(char::is_whitespace) {
+            Some(idx) => (&trimmed[..idx], &trimmed[idx..]),
+            None => (trimmed, ""),
+        };
+        rest = tail;
+        if let Some((prev_pos, prev)) = previous &&
+            prev.starts_with('-') &&
+            !prev.contains('=') &&
+            !in_quoted(quoted, prev_pos) &&
+            let Some(word_key) = secret_word(prev.trim_start_matches('-')) &&
+            !word.starts_with('-') &&
+            !in_quoted(quoted, offset)
+        {
+            let value = word.trim_matches(|c| c == '"' || c == '\'');
+            return Some((word_key, value));
+        }
+        previous = Some((offset, word));
+    }
+    None
+}
+
 /// `password|secret|token|api_key = "VALUE"` with a non-empty, non-example value.
-fn assignment_secret(line: &str, lower: &str) -> Option<String> {
-    // URLs are handled by url_credential (their `user:password@` shape has
-    // its own documentation-literal rules).
-    if lower.contains("://") {
+///
+/// The key must be the token immediately left of the `=` — not merely
+/// mentioned somewhere on the line. Matching key and value independently is
+/// what produced the false positives: `grep -iE "database-password"` and
+/// `LoadCredentialEncrypted=API_KEY:/etc/...` both *mention* a secret word
+/// while assigning something that is not a secret.
+fn assignment_secret(line: &str) -> Option<String> {
+    let quoted = quoted_spans(line);
+    // Every `=` on the line is a candidate: a line can hold more than one
+    // assignment, and the secret one is not necessarily the first.
+    for (idx, ch) in line.char_indices() {
+        if ch != '=' || in_quoted(&quoted, idx) {
+            continue;
+        }
+        let Some(word) = secret_word(key_token_before(line, idx)) else {
+            continue;
+        };
+        if let Some(message) = live_value(word, value_after_eq(line, idx + 1)) {
+            return Some(message);
+        }
+    }
+    // `--flag VALUE` — how a command-line password actually shows up.
+    if let Some((word, value)) = flag_value(line, &quoted) &&
+        let Some(message) = live_value(word, value)
+    {
+        return Some(message);
+    }
+    None
+}
+
+/// Whether a value looks like a live credential, and the message to report.
+fn live_value(word: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
         return None;
     }
-    let keys = ["password", "passwd", "secret", "token", "api_key", "apikey", "private_key"];
-    let key = keys.iter().find(|k| lower.contains(*k))?;
-    // Split on the first `=` and inspect the value.
-    let (_, value) = line.split_once('=')?;
-    let value = value.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-    if value.is_empty() || value == "\"\"" || value == "''" {
-        return None;
-    }
-    let vl = value.to_lowercase();
-    // Short values are shell fragments (`cut -d=`), versions, or counters —
+    // Short values are shell fragments (`cut -d=`), versions, or counters --
     // never credentials (mirrors the `@secrets` masking threshold).
     if value.len() < 6 {
         return None;
     }
+    let vl = value.to_lowercase();
     // Placeholder-shaped values are skipped. The list names *shapes* that are
     // conventionally placeholders, not specific credential values: a real
     // default (a database superuser password, for instance) must be flagged
@@ -192,15 +385,45 @@ fn assignment_secret(line: &str, lower: &str) -> Option<String> {
     {
         return None;
     }
+    // A value that *says* it is a placeholder (`shadow-placeholder`,
+    // `REDACTED`, `TODO`) is a placeholder, whatever its key is called.
+    if ["placeholder", "redacted", "todo", "fixme"].iter().any(|w| vl.contains(w)) {
+        return None;
+    }
     // A value that is *only* a shell placeholder is the *mechanism*, not a
     // leak. The exemption is scoped to the whole value: a value that merely
-    // mentions `${…}` — `password = "Hunt3r!${v}"` — still carries a literal
-    // credential and must be reported, because the literal prefix is exactly
-    // the kind of hard-coded secret this scan exists to find.
+    // mentions `${...}` — `password = "Hunt3r!${v}"` — still carries a
+    // literal credential and must be reported, because the literal prefix is
+    // exactly the kind of hard-coded secret this scan exists to find.
     if is_placeholder_only(value) {
         return None;
     }
-    Some(format!("live-looking `{key}` assignment"))
+    // A *reference* to a secret is not a secret: a path (`password=/run/
+    // creds/DB_PASSWORD`) and a redaction marker (`<redacted: ...>`) are
+    // documentation, not a leak.
+    if is_path_like(value) || is_redaction_marker(value) {
+        return None;
+    }
+    // A URL's own credentials are handled by `url_credential`; do not
+    // double-report the whole URL as if it were a password value.
+    if value.contains("://") {
+        return None;
+    }
+    Some(format!("live-looking `{word}` assignment"))
+}
+
+/// Whether the value is a filesystem path (a reference to where a secret
+/// lives, not the secret itself).
+fn is_path_like(value: &str) -> bool {
+    value.starts_with('/') ||
+        value.starts_with("./") ||
+        value.starts_with("../") ||
+        value.starts_with("~/")
+}
+
+/// Whether the value is a redaction marker (`<redacted: ...>`, `<see ...>`).
+fn is_redaction_marker(value: &str) -> bool {
+    value.starts_with('<') && value.ends_with('>')
 }
 
 /// Whether the value consists of nothing but shell placeholder references.
@@ -319,6 +542,94 @@ mod tests {
         assert_eq!(hits("password = \"${1PASSWORD}\""), 1);
         assert_eq!(hits("password = \"${DB-PASSWORD}\""), 1);
         assert_eq!(hits("password = \"${UNTERMINATED\""), 1);
+    }
+
+    #[test]
+    fn a_mention_is_not_an_assignment() {
+        // The key must be the token immediately left of the `=`. These lines
+        // all *mention* a secret word while assigning something else.
+        assert_eq!(hits("LoadCredentialEncrypted=API_KEY:/etc/credstore.encrypted/x/API_KEY"), 0);
+        assert_eq!(
+            hits(
+                "LoadCredentialEncrypted=DUFS_AUTH_PASSWORD:/etc/credstore.encrypted/dufs/DUFS_AUTH_PASSWORD"
+            ),
+            0
+        );
+        assert_eq!(hits("secret creds --store-dir /etc/credstore.encrypted/x"), 0);
+        assert_eq!(hits("grep -iE \"database-password\""), 0);
+        assert_eq!(hits("| 4 | **meme token plaintext** | `Environment=` | risk |"), 0);
+        assert_eq!(hits("shellflow >= 0.3.0 (needs secret creds)"), 0);
+    }
+
+    #[test]
+    fn template_placeholders_are_exempt() {
+        // The repo's own config templates: a secret-ish KEY whose value is a
+        // placeholder. This is the *mechanism*, not a leak.
+        assert_eq!(hits("TOKEN=${BROWSERLESS_TOKEN}"), 0);
+        assert_eq!(hits("--requirepass=${DFLY_PASSWORD}"), 0);
+        assert_eq!(hits("API_KEY=${API_KEY}"), 0);
+    }
+
+    #[test]
+    fn a_quoted_pattern_is_not_a_secret() {
+        // A `=` (or a secret-ish flag) inside a quoted string is a pattern or
+        // prose, not an assignment.
+        assert_eq!(hits("sudo grep -iE 'password='"), 0);
+        assert_eq!(hits(r#"sudo grep -E "requirepass=\\$\{DFLY_PASSWORD\}" file"#), 0);
+        assert_eq!(hits("echo \"==> effective ExecStart (must have NO --token flag):\""), 0);
+        // An apostrophe in prose is not a quoting context.
+        assert_eq!(hits("it's fine: password = \"hunter2\""), 1);
+    }
+
+    #[test]
+    fn a_value_that_says_it_is_a_placeholder_is_one() {
+        // The repo's archived strategy templates carry `shadow-placeholder`.
+        assert_eq!(hits("api_key = \"shadow-placeholder\""), 0);
+        assert_eq!(hits("api_secret = \"shadow-placeholder\""), 0);
+        assert_eq!(hits("passphrase = \"shadow-placeholder\""), 0);
+        // ... but a real value next to the same key is still a finding.
+        assert_eq!(hits("api_key = \"3Gyxtb1VtZbf\""), 1);
+    }
+
+    #[test]
+    fn a_selector_key_is_not_a_secret() {
+        // `credentials = "bitget"` names a venue, not a secret.
+        assert_eq!(hits("credentials = \"bitget\""), 0);
+        assert_eq!(hits("[credentials.bitget]"), 0);
+    }
+
+    #[test]
+    fn a_reference_to_a_secret_is_not_a_secret() {
+        // A path says *where* the secret lives; a redaction marker says the
+        // value was removed on purpose. Neither is the secret itself.
+        assert_eq!(hits("DB_PASSWORD=/etc/credstore.encrypted/x/DB_PASSWORD"), 0);
+        assert_eq!(hits("password=/run/creds/db/password"), 0);
+        assert_eq!(hits("--requirepass=<redacted: see /etc/credstore.encrypted/x>"), 0);
+        assert_eq!(hits("requirepass=<redacted>"), 0);
+    }
+
+    #[test]
+    fn a_real_value_next_to_a_secret_key_is_still_found() {
+        // The tightened key matching must not lose the real thing.
+        assert_eq!(hits("FERRISKEY_DB_PASSWORD=3Gyxtb1VtZbf"), 1);
+        assert_eq!(hits("requirepass=3Gyxtb1VtZbf"), 1);
+        assert_eq!(
+            hits(
+                "ExecStart=/home/akagi201/ferriskey/bin/ferriskey-api --database-password 3Gyxtb1VtZbf"
+            ),
+            1
+        );
+        assert_eq!(hits("dufs.service: DUFS_AUTH_PASSWORD=3Gyxtb1VtZbf"), 1);
+    }
+
+    #[test]
+    fn the_bare_pass_family_does_not_swallow_english() {
+        // `bypass` / `compass` end in "pass" but are not credentials.
+        assert_eq!(hits("bypass=3Gyxtb1VtZbf"), 0);
+        assert_eq!(hits("compass=3Gyxtb1VtZbf"), 0);
+        // ... but a key that really is a password still is one.
+        assert_eq!(hits("pass=3Gyxtb1VtZbf"), 1);
+        assert_eq!(hits("db_pass=3Gyxtb1VtZbf"), 1);
     }
 
     #[test]
