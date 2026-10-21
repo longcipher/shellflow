@@ -149,6 +149,8 @@ lines belong to the current block.
 | `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active <unit>` until the unit reports active or the budget expires (default 300s). Replaces hand-rolled `for/sleep/ss` loops; a timeout is a script-class failure |
 | `@assert` | `# @assert <unit> [@<target>] [<state>]` | Assert the unit's `ActiveState` on the target (default state `active`). The target is inherited from the previous step when it is not given. A failed assertion fails the step |
 | `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default, `--expect 200,204` to narrow). The target is inherited from the previous step |
+| `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>]` | Assert that the ports are listening on the target, waiting up to the step's timeout. Replaces the hand-rolled `for i in $(seq 1 12); do ss … ; sleep 5; done` loops |
+| `@assert_rendered` | `# @assert_rendered <path> [@<target>]` | Assert that the file exists and holds no unexpanded `${…}` placeholder — a rendered config that still carries a placeholder was never rendered |
 
 Consecutive `@assert`/`@assert_health` lines that share a target are **one**
 step: the whole group travels in a single SSH round trip, and the operator

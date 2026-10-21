@@ -163,6 +163,45 @@ fn command_for(check: &Assertion, timeout_secs: u64) -> String {
             unit = quote(unit),
             state = quote(state),
         ),
+        Assertion::Port { ports } => {
+            // The wait happens on the target: one round trip covers the
+            // whole budget, not one round trip per poll.
+            let list: Vec<String> = ports.iter().map(u16::to_string).collect();
+            let budget = timeout_secs;
+            let checks: Vec<String> = list
+                .iter()
+                .map(|port| {
+                    format!(
+                        "if sfw_wait_port {port} {budget}; then echo 'port {port} is listening'; \
+                         else echo 'port {port} is not listening after {budget}s'; false; fi"
+                    )
+                })
+                .collect();
+            format!(
+                "sfw_wait_port() {{ p=\"$1\"; d=$(( $(date +%s) + $2 )); \
+                 while :; do \
+                 if ss -tln 2>/dev/null | grep -qE \":${{p}}[[:space:]]\"; then return 0; fi; \
+                 if [ \"$(date +%s)\" -ge \"$d\" ]; then return 1; fi; \
+                 sleep 2; \
+                 done; }}; {checks}",
+                checks = checks.join("; "),
+            )
+        }
+        Assertion::Rendered { path } => {
+            let quoted = quote(path);
+            // The pattern is passed as an argument, so the format string
+            // never has to escape the braces itself.
+            let pattern = r"\$\{[A-Z_][A-Z0-9_]*\}";
+            format!(
+                "if [ -f {quoted} ] && ! grep -qE '{pattern}' {quoted} 2>/dev/null; then \
+                 echo '{path} is fully rendered'; \
+                 else echo '{path} is missing or still carries unexpanded placeholders'; \
+                 false; fi",
+                quoted = quoted,
+                pattern = pattern,
+                path = path,
+            )
+        }
         Assertion::Health { url, expect } => {
             let accepted = if expect.is_empty() {
                 // Any 2xx or 3xx is a healthy answer. The pattern must stay

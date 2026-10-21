@@ -198,6 +198,16 @@ pub enum Assertion {
         /// The accepted status codes (2xx/3xx by default).
         expect: Vec<u16>,
     },
+    /// The ports must be listening on the target.
+    Port {
+        /// The TCP ports that must be listening.
+        ports: Vec<u16>,
+    },
+    /// The file must exist and hold no unexpanded `${…}` placeholder.
+    Rendered {
+        /// The remote path of the rendered file.
+        path: String,
+    },
 }
 
 /// A step that asserts conditions on the target hosts.
