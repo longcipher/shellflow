@@ -1254,7 +1254,55 @@ const PROBE_SCRIPT: &str = r#"
 /// criterion, and every field degrades independently.
 const PROBE_END_MARKER: &str = "SHELLFLOW_PROBE_END";
 
+/// How long a single probe attempt may spend connecting.
+///
+/// The probe sets this explicitly instead of inheriting the operator's
+/// `~/.ssh/config`: a probe is a *cheap* question, and a dropped SYN on a
+/// long-haul link must not stall the whole run.
+const PROBE_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// The wall-clock budget of one probe attempt.
+///
+/// The budget must exceed [`PROBE_CONNECT_TIMEOUT_SECS`]: with the two
+/// equal, a slow TCP connect has `ssh` give up at the same moment the probe
+/// does, and the probe is cut off mid-flight — the host looks like it has no
+/// rsync, and a perfectly good deploy fails with a misleading message.
+const PROBE_ATTEMPT_BUDGET_SECS: u64 = 15;
+
+/// How many times a failed probe is retried.
+///
+/// A dropped SYN, a proxy hiccup or a half-open connection is transient;
+/// writing the host off on the first failure turns a network blip into a
+/// failed deploy.
+const PROBE_ATTEMPTS: usize = 2;
+
+/// Probe the remote host, retrying a transient failure once.
+///
+/// # Errors
+///
+/// Never fails: an unreachable host yields the default environment, which
+/// the caller treats as "probe did not complete".
 async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
+    for attempt in 1..=PROBE_ATTEMPTS {
+        if let Some(env) = probe_once(host, cancel).await {
+            return env;
+        }
+        if cancel.is_cancelled() {
+            break;
+        }
+        if attempt < PROBE_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    RemoteEnv::default()
+}
+
+/// One probe attempt.
+///
+/// Returns `None` when the probe did not run to completion (a truncated
+/// connection, an unreachable host): the caller retries rather than acting
+/// on a partial result.
+async fn probe_once(host: &ResolvedHost, cancel: &Cancel) -> Option<RemoteEnv> {
     use tokio::io::AsyncReadExt as _;
     // The rsync check is separated from the report by a `;` and its result is
     // carried in the marker line, so a host without `rsync` still returns a
@@ -1267,6 +1315,10 @@ async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
     let mut cmd = Command::new("ssh");
     // Fail closed on an unknown host key or a missing key: never prompt.
     cmd.args(["-o", "BatchMode=yes"]);
+    // The probe bounds its own connect phase instead of inheriting the
+    // operator's `ConnectTimeout` (15s by convention): a probe is a cheap
+    // question and must not stall the run.
+    cmd.args(["-o", &format!("ConnectTimeout={PROBE_CONNECT_TIMEOUT_SECS}")]);
     cmd.args(host.spec.to_ssh_args()).arg("-T");
     cmd.arg(script);
     cmd.stdin(std::process::Stdio::null())
@@ -1276,7 +1328,7 @@ async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
     isolate(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(_) => return RemoteEnv::default(),
+        Err(_) => return None,
     };
     let mut group = super::process::GroupGuard::new(&child);
     // Collect stdout concurrently: waiting before reading deadlocks once the
@@ -1292,20 +1344,16 @@ async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
     // The probe races the timeout *and* cancellation: a hung probe must not
     // eat the whole interrupt grace period, and its group must not survive
     // the run.
-    //
-    // The budget must exceed ssh's own ConnectTimeout (15s in the operator's
-    // ~/.ssh/config). With the two equal, a slow TCP connect (a dropped SYN
-    // on a long-haul link) has ssh give up at the same moment the probe does,
-    // and the probe is cut off mid-flight: the host looks like it has no
-    // rsync, and a perfectly good deploy fails with a misleading message.
     let mut cancel_probe = cancel.clone();
-    let status = super::process::wait_child(&mut child, Some(30), &mut cancel_probe).await;
+    let status =
+        super::process::wait_child(&mut child, Some(PROBE_ATTEMPT_BUDGET_SECS), &mut cancel_probe)
+            .await;
     let output = match status {
         super::process::ChildOutcome::Finished(Ok(status)) if status.success() => {
             group.disarm();
             match tokio::time::timeout(Duration::from_secs(2), reader).await {
                 Ok(Ok(buf)) => buf,
-                _ => return RemoteEnv::default(),
+                _ => return None,
             }
         }
         super::process::ChildOutcome::Finished(Ok(_)) => {
@@ -1315,14 +1363,14 @@ async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
             group.disarm();
             match tokio::time::timeout(Duration::from_secs(2), reader).await {
                 Ok(Ok(buf)) => buf,
-                _ => return RemoteEnv::default(),
+                _ => return None,
             }
         }
         _ => {
             super::process::terminate(&mut child).await;
             group.disarm();
             reader.abort();
-            return RemoteEnv::default();
+            return None;
         }
     };
     let text = String::from_utf8_lossy(&output);
@@ -1347,10 +1395,10 @@ async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
     if !completed {
         // The probe did not run to completion (a truncated connection, an
         // unreachable host): fall back rather than act on a partial result.
-        return RemoteEnv::default();
+        return None;
     }
     let path = if dirs.is_empty() { None } else { Some(dirs.join(":")) };
-    RemoteEnv { shell, path, has_rsync }
+    Some(RemoteEnv { shell, path, has_rsync })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

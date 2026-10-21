@@ -196,7 +196,7 @@ OPTIONS:
   -t, --target <TARGET>       Restrict to these servers/groups (comma-separated)
   -o, --only <STEP>           Run only matching blocks (by name or 1-based index)
   -s, --skip <STEP>           Skip matching blocks (repeatable)
-  -p, --parallel <N>          Max concurrent hosts per step [default: all]
+  -p, --parallel <N>          Max concurrent hosts per step [default: 16; 0 = all]
   -c, --continue-on-error     Continue after a failed host/step; print summary
   -k, --check                 Syntax-check only: local bash -n, remote bash -n -s
       --timeout <SECS>        Per-step timeout for all steps

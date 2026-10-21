@@ -2,16 +2,25 @@
 //!
 //! Automates the post-deploy audit that is otherwise done by hand dozens of
 //! times per migration: unit state, argv/env secret exposure, credential
-//! wiring (`LoadCredentialEncrypted=` vs plaintext), listening sockets, and
-//! a journal scan for secret-value shapes. Everything runs through the
-//! system `ssh` (read-only commands only); findings print as `ok`/`WARN`
-//! lines and the process exits non-zero when any `FAIL` fires.
+//! wiring (`LoadCredentialEncrypted=` vs plaintext), the paths the unit
+//! references (a missing `ReadWritePaths=` target fails the unit with
+//! `226/NAMESPACE` while leaving it *enabled*), listening sockets, and a
+//! journal scan for secret-value shapes.
+//!
+//! Every question is asked in **one** SSH round trip (see
+//! [`remote`]); the audit of a service costs one connection instead of
+//! seven. Findings print as `ok`/`WARN`/`FAIL` lines and the process exits
+//! non-zero when any `FAIL` fires.
 
-use std::process::Command;
+mod remote;
+
+use std::collections::BTreeMap;
 
 use eyre::{Result, bail};
 
 use crate::{cli::ServiceCheckArgs, service::ServiceError};
+
+use remote::{Probe, Section};
 
 /// Run `service check`.
 ///
@@ -28,9 +37,14 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
     let unit = format!("{}.service", args.service);
     let mut failures = 0;
 
-    let active = ssh(&args.host, &["systemctl", "is-active", &unit])?;
+    let probe = Probe::new(&unit, &args.service, args.journal_lines);
+    let sections = remote::run(&args.host, &probe)?;
+    let show = body(&sections, "props");
+    let journal = body(&sections, "journal");
+
+    let active = body(&sections, "unit_state");
     report(
-        &format!("unit {unit} is {active}"),
+        &format!("unit {unit} is {}", active.trim()),
         if active.trim() == "active" { Check::Ok } else { Check::Warn },
         &mut failures,
     );
@@ -41,10 +55,9 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
     // `is-active` reports "inactive" for a unit that does not exist at all,
     // so the unit's load state decides whether it is really there.
     let socket_unit = format!("{}.socket", args.service);
-    let load_state =
-        ssh(&args.host, &["systemctl", "show", &socket_unit, "-p", "LoadState", "--value"])?;
+    let load_state = body(&sections, "socket_load");
     if load_state.trim() != "not-found" && !load_state.trim().is_empty() {
-        let socket_state = ssh(&args.host, &["systemctl", "is-active", &socket_unit])?;
+        let socket_state = body(&sections, "socket_state");
         report(
             &format!(
                 "socket unit {socket_unit} is {} (the port is systemd's)",
@@ -55,17 +68,6 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
         );
     }
 
-    let show = ssh(
-        &args.host,
-        &[
-            "sudo",
-            "systemctl",
-            "show",
-            &unit,
-            "-p",
-            "ExecStart,Environment,EnvironmentFile,LoadCredentialEncrypted,ImportCredential,User,Type,NotifyAccess,WatchdogUSec,TimeoutStartSec,ExecReload,StatusText,ActiveState,Result",
-        ],
-    )?;
     // argv / Environment secret values (ferriskey class): `--password VALUE`
     // and `KEY=VALUE` forms. Key *names* are fine; values are not.
     if has_argv_secret(&show) {
@@ -79,8 +81,8 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
     }
     // NOTE: `systemctl show` prints credential paths as `[unprintable]`, so
     // import lines are counted from the unit file text instead.
-    let cat = ssh(&args.host, &["sudo", "systemctl", "cat", &unit])?;
-    let n_creds = cat
+    let unit_file = body(&sections, "unit_file");
+    let n_creds = unit_file
         .lines()
         .filter(|l| {
             let t = l.trim_start();
@@ -98,24 +100,31 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
             &mut failures,
         );
     }
-    if show.lines().any(|l| l == "User=" || l == "User=root") {
+    if show.lines().any(|l| l == "User=root") {
         report("runs as root (least-privilege follow-up)", Check::Warn, &mut failures);
     }
 
-    let creds = ssh(
-        &args.host,
-        &["sudo", "ls", "-l", &format!("/etc/credstore.encrypted/{}/", args.service)],
-    )?;
-    if creds.contains("total 0") || creds.trim().is_empty() {
+    // Path-existence preflight: a unit that names a path systemd must find
+    // (WorkingDirectory=, ReadWritePaths=, a non-optional EnvironmentFile=)
+    // fails to start with `226/NAMESPACE` — and stays enabled, so the
+    // breakage is invisible until the unit is started.
+    let missing = missing_paths(&body(&sections, "paths"));
+    if missing.is_empty() {
+        report("every path the unit references exists", Check::Ok, &mut failures);
+    } else {
+        for path in &missing {
+            report(&format!("unit references a missing path: {path}"), Check::Fail, &mut failures);
+        }
+    }
+
+    let credstore = sections.get("credstore");
+    let credstore_missing = credstore.is_none_or(|s| s.rc != 0 || s.body.trim().is_empty());
+    if credstore_missing {
         report("credential store is empty", Check::Warn, &mut failures);
     } else {
         report("credential store present (0600 root expected)", Check::Ok, &mut failures);
     }
 
-    let journal = ssh(
-        &args.host,
-        &["sudo", "journalctl", "-u", &unit, "--no-pager", "-n", &args.journal_lines.to_string()],
-    )?;
     let leaks: Vec<&str> =
         journal.lines().filter(|l| looks_like_leak(l, &args.service)).take(3).collect();
     if leaks.is_empty() {
@@ -153,6 +162,34 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// The body of one section of the batch.
+fn body(sections: &BTreeMap<String, Section>, id: &str) -> String {
+    sections.get(id).map_or_else(String::new, |s| s.body.clone())
+}
+
+/// The paths the unit references that do not exist on the target.
+///
+/// The remote half of the preflight prints one `ok <property> <path>` or
+/// `missing <property> <path>` line per referenced path.
+fn missing_paths(paths: &str) -> Vec<String> {
+    paths
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let status = parts.next()?;
+            if status != "missing" {
+                return None;
+            }
+            let property = parts.next().unwrap_or_default();
+            let path = parts.next().unwrap_or_default();
+            if path.is_empty() {
+                return None;
+            }
+            Some(format!("{property}={path}"))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Check {
     Ok,
@@ -170,45 +207,6 @@ fn report(message: &str, status: Check, failures: &mut usize) {
         *failures += 1;
     }
     println!("[{tag}] {message}");
-}
-
-/// Run one remote command over the system `ssh` and return stdout.
-///
-/// # Errors
-///
-/// Returns [`ServiceError::Transport`] when `ssh` itself fails (the binary
-/// could not be started, or the connection was refused — `ssh` exits 255).
-/// A remote command that ran and failed is *not* a transport error: its
-/// output is the finding.
-fn ssh(host: &str, argv: &[&str]) -> Result<String, ServiceError> {
-    let output = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=15")
-        .arg(host)
-        .args(argv)
-        .output()
-        .map_err(|err| ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}")))?;
-    if !output.status.success() {
-        // `systemctl is-active` exits non-zero for inactive units and
-        // `ls` fails for a missing credstore — both are findings, not
-        // transport errors. Return combined output either way.
-        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
-        // `ssh` exits 255 when the *connection* failed (auth refused, host
-        // key rejected, unreachable). That is the transport class of §6, not
-        // a finding about the unit.
-        if output.status.code() == Some(255) {
-            return Err(ServiceError::Transport(eyre::eyre!(
-                "ssh {host} could not connect: {}",
-                combined.trim()
-            )));
-        }
-        return Ok(combined);
-    }
-    String::from_utf8(output.stdout)
-        .map_err(|err| eyre::eyre!("non-UTF8 output from ssh {host}: {err}").into())
 }
 
 /// Verify that `ssh` is available before the first remote check.
@@ -403,7 +401,7 @@ fn validate_service_name(service: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Check, has_argv_secret, journal_contains, looks_like_leak, notify_findings,
+        Check, has_argv_secret, journal_contains, looks_like_leak, missing_paths, notify_findings,
         parse_show_props, timeout_start_is_short,
     };
 
@@ -445,6 +443,22 @@ mod tests {
         assert_eq!(props.get("ActiveState").map(String::as_str), Some("active"));
         assert_eq!(props.get("ExecStart").map(String::as_str), Some("{ path=/bin/x }"));
         assert!(!props.contains_key("Missing"));
+    }
+
+    #[test]
+    fn missing_paths_are_listed_with_their_property() {
+        let out = "ok WorkingDirectory /srv/app\nmissing ReadWritePaths /var/lib/app\n\
+                   missing EnvironmentFile /etc/app/secrets.env\n";
+        let missing = missing_paths(out);
+        assert_eq!(missing.len(), 2);
+        assert!(missing.iter().any(|m| m == "ReadWritePaths=/var/lib/app"));
+        assert!(missing.iter().any(|m| m == "EnvironmentFile=/etc/app/secrets.env"));
+    }
+
+    #[test]
+    fn every_path_present_reports_nothing_missing() {
+        assert!(missing_paths("ok WorkingDirectory /srv/app\nok ReadWritePaths /var/lib/app\n")
+            .is_empty());
     }
 
     #[test]
