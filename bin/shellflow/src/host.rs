@@ -350,8 +350,9 @@ fn backup(args: &HostBackupArgs) -> Result<(), HostError> {
     }
 
     // The guarantee the shell spelling could not make: every file in the
-    // snapshot is either a unit file or an encrypted copy.
-    let unexpected: Vec<String> = list_dir(&dir_path)?
+    // snapshot is either a unit file or an encrypted copy. The snapshot
+    // directory is root-owned, so the listing is elevated.
+    let unexpected: Vec<String> = list_dir_elevated(&dir_path)?
         .into_iter()
         .filter(|entry| {
             let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or_default();
