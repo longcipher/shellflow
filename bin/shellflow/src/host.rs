@@ -575,7 +575,13 @@ fn declared_credential_keys(service: &str) -> BTreeSet<String> {
 /// Every unit file and drop-in on the system.
 fn all_unit_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for root in ["/etc/systemd/system", "/usr/lib/systemd/system", "/run/systemd/system"] {
+    // Quadlet's own directory holds the container units.
+    for root in [
+        "/etc/systemd/system",
+        "/usr/lib/systemd/system",
+        "/run/systemd/system",
+        "/etc/containers/systemd",
+    ] {
         let Ok(entries) = list_dir(Path::new(root)) else {
             continue;
         };
