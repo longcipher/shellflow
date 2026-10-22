@@ -427,21 +427,19 @@ fn seal_file(source: &Path, target: &Path) -> Result<(), HostError> {
 fn prune_snapshots(dir: &str, service: &str, keep: u32) -> Result<(), HostError> {
     let parent = Path::new(dir).parent().unwrap_or_else(|| Path::new("/root"));
     let prefix = format!("{service}-backup-");
-    let mut snapshots: Vec<(SystemTime, PathBuf)> = Vec::new();
-    for entry in list_dir(parent)? {
+    let mut snapshots: Vec<(u64, PathBuf)> = Vec::new();
+    // The snapshot directory is root-owned: listing it, and reading the
+    // timestamps of what is in it, need elevation. The name carries the
+    // timestamp anyway, so the sort does not need the mtime.
+    for entry in list_dir_elevated(parent)? {
         let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
         if !name.starts_with(&prefix) {
             continue;
         }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
-        snapshots.push((modified, entry));
+        let stamp = name.trim_start_matches(&prefix).parse::<u64>().unwrap_or(0);
+        snapshots.push((stamp, entry));
     }
-    snapshots.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    snapshots.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
     if snapshots.len() <= keep as usize {
         return Ok(());
     }
@@ -454,6 +452,35 @@ fn prune_snapshots(dir: &str, service: &str, keep: u32) -> Result<(), HostError>
 
 /// Overwrite a file with random data, then remove it.
 fn shred_and_remove(path: &Path) -> Result<(), HostError> {
+    if !nix::unistd::Uid::effective().is_root() {
+        // The snapshot belongs to root: shredding it in place needs root.
+        // An unelevated pass would fail to write the file and would leave
+        // the old credential copies on disk -- the opposite of the point.
+        let quoted = path.to_str().unwrap_or_default();
+        let out = Command::new("sudo")
+            .arg("-n")
+            .arg("sh")
+            .arg("-c")
+            .arg(format!(
+                "find {quoted} -type f -exec shred -u {{}} + 2>/dev/null; rm -rf {quoted}"
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| {
+                HostError::internal(format!("cannot remove `{}`: {err}", path.display()))
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(HostError::failed(format!(
+                "cannot remove `{}`: {}",
+                path.display(),
+                stderr.trim()
+            )));
+        }
+        return Ok(());
+    }
     if path.is_dir() {
         for entry in list_dir(path)? {
             shred_and_remove(&entry)?;
