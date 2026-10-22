@@ -184,12 +184,20 @@ fn verify_unit(unit: &str) -> Result<(), HostError> {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+    // `systemd-analyze verify` reports on every unit it can see, not only on
+    // the one it was asked about. A complaint about another unit is that
+    // unit's business; only the ones about this unit decide the deploy.
+    let about: Vec<&str> =
+        detail.lines().filter(|line| line.contains(unit.trim_end_matches(".service"))).collect();
     // A unit that names a file which is not in place yet is not an invalid
     // unit: the rendered configuration and the binary may only appear when
-    // the service starts. Every complaint has to be about a missing file
-    // for this to be one.
-    if !detail.lines().all(is_a_missing_file) {
+    // the service starts. Every complaint about this unit has to be about a
+    // missing file for this to be one.
+    if !about.iter().all(|line| is_a_missing_file(line)) {
         return Err(HostError::failed(format!("`systemd-analyze verify {unit}` failed: {detail}")));
+    }
+    for line in &about {
+        println!("==> {unit}: {line}");
     }
     println!("==> {unit}: the unit is valid, some of the files it names are not in place yet");
     Ok(())
