@@ -184,7 +184,26 @@ fn verify_unit(unit: &str) -> Result<(), HostError> {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
-    Err(HostError::failed(format!("`systemd-analyze verify {unit}` failed: {detail}")))
+    // A unit that names a file which is not in place yet is not an invalid
+    // unit: the rendered configuration and the binary may only appear when
+    // the service starts. Every complaint has to be about a missing file
+    // for this to be one.
+    if !detail.lines().all(is_a_missing_file) {
+        return Err(HostError::failed(format!("`systemd-analyze verify {unit}` failed: {detail}")));
+    }
+    println!("==> {unit}: the unit is valid, some of the files it names are not in place yet");
+    Ok(())
+}
+
+/// Whether a complaint is about a file that is not in place.
+///
+/// `systemd-analyze verify` reports both a malformed unit and a unit that
+/// names a missing file, and it exits non-zero for either. Only the first
+/// is a reason to abort a deploy.
+fn is_a_missing_file(line: &str) -> bool {
+    line.contains("is not executable") ||
+        line.contains("No such file or directory") ||
+        line.trim().is_empty()
 }
 
 /// Whether the unit is currently active.
