@@ -101,16 +101,12 @@ pub(crate) fn render(manifest: &ServiceManifest, credential_keys: &[String]) -> 
         ));
     }
 
-    // The version status line. Only a notify unit can report: on a
-    // `Type=simple` unit there is no notify socket, the call fails, and a
-    // failing `ExecStartPost` takes the service down with it.
-    if manifest.service_type == "notify" &&
-        let Some(binary) = &manifest.binary
-    {
-        text.push_str(&format!(
-            "ExecStartPost=/bin/sh -c 'systemd-notify --status=\"Version: $({binary} -V 2>&1)\"'\n"
-        ));
-    }
+    // No version status line: reporting it needs `systemd-notify`, and the
+    // notify socket is not there for an `ExecStartPost` -- not on a
+    // `Type=simple` unit and, as a live deploy proved, not on a `Type=notify`
+    // unit either. The call fails, and a failing control process takes the
+    // just-started service down with it. The version stays one command away
+    // (`<binary> -V`); the drop-in does not try to be clever.
 
     RenderedUnit { text, credential_keys: keys }
 }
@@ -156,20 +152,19 @@ mod tests {
             "{}",
             rendered.text
         );
-        assert!(
-            rendered.text.contains("systemd-notify --status=\"Version: $(/opt/dufs/bin/dufs -V"),
-            "{}",
-            rendered.text
-        );
+        assert!(!rendered.text.contains("ExecStartPost"), "{}", rendered.text);
     }
 
     #[test]
-    fn a_simple_unit_does_not_report_its_version() {
-        // A `Type=simple` unit has no notify socket: the status call fails,
-        // and a failing `ExecStartPost` takes the service down with it.
+    fn no_unit_reports_its_version_through_the_dropin() {
+        // Reporting needs `systemd-notify`, and the notify socket is not
+        // there for an `ExecStartPost` -- a live deploy proved it fails on a
+        // `Type=notify` unit too, and a failing control process takes the
+        // just-started service down with it.
         let manifest = manifest(
             "host = \"api\"\nunit = \"dufs.service\"\n\
-             binary = \"/opt/dufs/bin/dufs\"\n",
+             binary = \"/opt/dufs/bin/dufs\"\n\
+             type = \"notify\"\n",
         );
         let rendered = render(&manifest, &[]);
         assert!(!rendered.text.contains("systemd-notify"), "{}", rendered.text);
