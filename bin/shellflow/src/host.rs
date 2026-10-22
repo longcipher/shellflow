@@ -163,7 +163,13 @@ fn service(args: &HostServiceArgs) -> Result<(), HostError> {
     }
 
     if args.wait {
-        wait_for_ready(&unit, Duration::from_secs(args.timeout))?;
+        if was_active || args.force_start {
+            wait_for_ready(&unit, Duration::from_secs(args.timeout))?;
+        } else {
+            // The unit was left stopped on purpose; waiting for it to
+            // become ready would wait for nothing.
+            println!("==> {unit} was left stopped: not waiting for readiness");
+        }
     }
     Ok(())
 }
