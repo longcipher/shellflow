@@ -95,6 +95,22 @@ fi
 # Persist whatever was piped to us so tests can assert on the payload.
 cat > "$MOCK_DIR/ssh-stdin-$host.txt"
 
+# A framed batch (`shellflow host …` / `service check` / `service diff`):
+# the script asks several questions and frames each answer between markers.
+# Answer every question, so the batch transport (which parses the answers
+# as they stream in) is exercised end to end.
+if grep -q '__SFW_' "$MOCK_DIR/ssh-stdin-$host.txt" 2>/dev/null; then
+  grep -o '__SFW_[A-Za-z0-9_]*_B_[A-Za-z0-9_.-]*' "$MOCK_DIR/ssh-stdin-$host.txt" \
+    | sort -u | while IFS= read -r beg; do
+        end="${beg/_B_/_E_}"
+        id="${beg##*_B_}"
+        printf '%s 0\n' "$beg"
+        printf 'mock answer for %s\n' "$id"
+        printf '%s\n' "$end"
+      done
+  exit 0
+fi
+
 case "$host" in
   *norsync*)
     # Host without rsync: the rsync probe (`command -v rsync`) must fail,

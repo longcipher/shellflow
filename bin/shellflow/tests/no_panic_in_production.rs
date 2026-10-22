@@ -23,14 +23,8 @@ use std::{
 };
 
 /// The constructs that turn an error into a panic.
-const PANIC_MARKERS: &[&str] = &[
-    ".unwrap()",
-    ".expect(",
-    "panic!(",
-    "unreachable!(",
-    "todo!(",
-    "unimplemented!",
-];
+const PANIC_MARKERS: &[&str] =
+    &[".unwrap()", ".expect(", "panic!(", "unreachable!(", "todo!(", "unimplemented!"];
 
 /// The workspace root (the directory holding the workspace `Cargo.toml`).
 fn workspace_root() -> PathBuf {

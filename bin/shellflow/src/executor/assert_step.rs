@@ -18,7 +18,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use shellflow_core::{Assertion, AssertStep, ResolvedHost};
+use shellflow_core::{AssertStep, Assertion, ResolvedHost};
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -42,7 +42,11 @@ fn check_budget(check: &Assertion, step_timeout: Option<u64>) -> u64 {
         Assertion::Port { .. } => step_timeout.unwrap_or(DEFAULT_PORT_TIMEOUT_SECS),
         Assertion::Health { .. } => step_timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS),
         // The unit-state and the rendered checks answer at once.
-        Assertion::UnitState { .. } | Assertion::Rendered { .. } => 0,
+        Assertion::UnitState { .. } |
+        Assertion::Rendered { .. } |
+        Assertion::NoLeak { .. } |
+        Assertion::Digest { .. } |
+        Assertion::Credstore { .. } => 0,
     }
 }
 
@@ -77,10 +81,7 @@ pub(super) async fn run_assert_step(
     let AssertStepArgs { ui, assert, hosts, config, semaphore, log_file, cancel, run_state } = args;
     if config.check || config.dry_run {
         crate::ui::note(
-            &format!(
-                "  assert {} check(s) (no-op in check/dry-run)",
-                assert.checks.len()
-            ),
+            &format!("  assert {} check(s) (no-op in check/dry-run)", assert.checks.len()),
             log_file,
         );
         return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
@@ -109,12 +110,9 @@ pub(super) async fn run_assert_step(
     // The transport budget must cover *every* wait: the checks run one after
     // another on the target, so their budgets add up. A budget that only
     // covered the longest one would cut a group of checks short.
-    let wait_budget: u64 = assert
-        .checks
-        .iter()
-        .map(|check| check_budget(check, step_timeout))
-        .sum::<u64>()
-        + TRANSPORT_MARGIN_SECS;
+    let wait_budget: u64 =
+        assert.checks.iter().map(|check| check_budget(check, step_timeout)).sum::<u64>() +
+            TRANSPORT_MARGIN_SECS;
     let mut tasks = tokio::task::JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(ui);
@@ -135,8 +133,8 @@ pub(super) async fn run_assert_step(
             if cancel.is_cancelled() {
                 return (host.alias.clone(), HostOutcome::Cancelled);
             }
-            let outcome = run_on_host(&ui, &host, &checks, step_timeout, wait_budget, &log_file)
-                .await;
+            let outcome =
+                run_on_host(&ui, &host, &checks, step_timeout, wait_budget, &log_file).await;
             (host.alias.clone(), outcome)
         });
     }
@@ -204,11 +202,7 @@ async fn run_on_host(
             ui.lock().await.masked_note(&format!("[{}] FAIL: {message}", host.alias));
         }
     }
-    if failed > 0 {
-        HostOutcome::Failed(RunError::Script)
-    } else {
-        HostOutcome::Ok
-    }
+    if failed > 0 { HostOutcome::Failed(RunError::Script) } else { HostOutcome::Ok }
 }
 
 /// Resolve the run-state references in one check.
@@ -222,6 +216,15 @@ fn interpolate_check(
     let resolved = match check {
         Assertion::Rendered { path } => Assertion::Rendered {
             path: shellflow_core::interpolate(path, state).map_err(eyre::Error::from)?,
+        },
+        Assertion::NoLeak { unit, lines } => Assertion::NoLeak {
+            unit: shellflow_core::interpolate(unit, state).map_err(eyre::Error::from)?,
+            lines: *lines,
+        },
+        Assertion::Digest { path, sha256, local } => Assertion::Digest {
+            path: shellflow_core::interpolate(path, state).map_err(eyre::Error::from)?,
+            sha256: sha256.clone(),
+            local: local.clone(),
         },
         Assertion::Health { url, expect, method, body, headers } => Assertion::Health {
             url: shellflow_core::interpolate(url, state).map_err(eyre::Error::from)?,
@@ -292,8 +295,7 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
             )
         }
         Assertion::Health { url, expect, method, body, headers } => {
-            let timeout_secs = step_timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS);
-            // The accepted patterns become `case` globs. The pattern must
+            let timeout_secs = step_timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS); // The accepted patterns become `case` globs. The pattern must
             // stay unquoted: inside `case` a quoted pattern is a literal
             // string, so `2??` would never match `200`.
             let accepted = if expect.is_empty() {
@@ -320,13 +322,46 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
                 accepted = accepted,
                 timeout_secs = timeout_secs,
                 url = url,
-                want = if expect.is_empty() {
-                    "2xx/3xx".to_string()
-                } else {
-                    expect.join("|")
-                },
+                want = if expect.is_empty() { "2xx/3xx".to_string() } else { expect.join("|") },
             )
         }
+        Assertion::NoLeak { unit, lines } => {
+            // The helper compares the *real* credential values, so no
+            // per-service regular expression is needed and the plaintext never
+            // reaches the script or the command line.
+            let mut args = vec![quote(unit)];
+            args.push("--lines".to_string());
+            args.push(lines.unwrap_or(200).to_string());
+            format!(
+                "if [ -x {helper} ]; then exec {helper} host assert-no-leak {args}; fi; \
+                 echo 'the target-side shellflow helper is required for @assert_no_leak'; false",
+                helper = quote(crate::executor::host::HELPER_PATH),
+                args = args.join(" "),
+            )
+        }
+        Assertion::Digest { path, sha256, local } => {
+            let mut args = vec![quote(path)];
+            if let Some(digest) = sha256 {
+                args.push("--sha256".to_string());
+                args.push(quote(digest));
+            }
+            if let Some(local) = local {
+                args.push("--local".to_string());
+                args.push(quote(local));
+            }
+            format!(
+                "if [ -x {helper} ]; then exec {helper} host assert-digest {args}; fi; \
+                 echo 'the target-side shellflow helper is required for @assert_digest'; false",
+                helper = quote(crate::executor::host::HELPER_PATH),
+                args = args.join(" "),
+            )
+        }
+        Assertion::Credstore { service } => format!(
+            "if [ -x {helper} ]; then exec {helper} host assert-credstore {service}; fi; \
+             echo 'the target-side shellflow helper is required for @assert_credstore'; false",
+            helper = quote(crate::executor::host::HELPER_PATH),
+            service = quote(service),
+        ),
     }
 }
 
@@ -387,8 +422,9 @@ fn quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_for, http_probe, quote};
     use shellflow_core::Assertion;
+
+    use super::{command_for, http_probe, quote};
 
     #[test]
     fn a_unit_check_asks_systemd_for_the_state() {
@@ -467,7 +503,8 @@ mod tests {
 
     #[test]
     fn a_rendered_check_looks_for_placeholders() {
-        let cmd = command_for(&Assertion::Rendered { path: "/run/app/config.toml".to_string() }, None);
+        let cmd =
+            command_for(&Assertion::Rendered { path: "/run/app/config.toml".to_string() }, None);
         assert!(cmd.contains("/run/app/config.toml"), "{cmd}");
         assert!(cmd.contains("[A-Z_]"), "{cmd}");
     }

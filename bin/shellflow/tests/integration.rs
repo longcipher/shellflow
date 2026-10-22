@@ -615,9 +615,66 @@ fn parallel_default_fans_out_concurrently() -> TestResult<()> {
 }
 
 #[test]
+fn a_service_check_audits_over_one_framed_batch() -> TestResult<()> {
+    // The audit asks every question in one framed batch; the transport
+    // parses the answers as they stream in.
+    let sb = Sandbox::new("svccheck")?;
+    let script = sb.script("# @server ok ok\n")?;
+    let out = sb.run(&script, &["service", "check", "dufs", "--host", "ok"])?;
+    // The mock answers every question, so the audit finds no FAIL finding.
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("mock answer for"), "the batch must have run: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn a_managed_workdir_is_created_and_removed() -> TestResult<()> {
+    // The managed work directory is created before the first step, published
+    // to the run state as `WORKDIR`, and removed when the run ends — on every
+    // exit path. A playbook that leaves a cross-compiled helper binary in
+    // `/tmp` on every deploy is the bug this removes.
+    let sb = Sandbox::new("workdir")?;
+    let script = sb.script(
+        "# @server ok1 ok@h1\n\
+         # @workdir --prefix shellflow-test\n\
+         # @local\n\
+         echo \"$WORKDIR\"\n\
+         # @remote ok1\n\
+         echo remote\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let workdir = stdout
+        .split_whitespace()
+        .find(|token| token.starts_with("/tmp/") && token.contains("shellflow-test-"))
+        .unwrap_or_default()
+        .to_string();
+    assert!(!workdir.is_empty(), "the workdir must be published: {stdout}");
+    assert!(
+        workdir.starts_with("/tmp/"),
+        "the staging directory is a remote absolute path: {workdir}"
+    );
+    // The controller never creates the staging directory: a run must leave
+    // nothing behind on the machine that drives the deployment.
+    assert!(
+        !std::path::Path::new(&workdir).exists(),
+        "the controller must not create the staging directory: {workdir}"
+    );
+    Ok(())
+}
+
+#[test]
 fn guard_timeout_is_failure() -> TestResult<()> {
     // A hanging `@only_if` guard must be killed by --timeout and reported as a
-    // transport failure (exit 3), not hang forever.
+    // failure (exit 4, the script class), not hang forever.
+    //
+    // The guard runs *inside* the payload, so a guard that hangs is a step
+    // that hangs: the step's own timeout is what stops it, and a step that
+    // runs out of time is a script failure. (When the guard was a separate
+    // SSH invocation, a hanging guard was reported as a transport failure —
+    // an artifact of the extra round trip, not a property of the guard.)
     let sb = Sandbox::new("guardtimeout")?;
     let script = sb.script(
         "# @server hang1 hang@h1\n\
@@ -626,7 +683,7 @@ fn guard_timeout_is_failure() -> TestResult<()> {
          echo hi\n",
     )?;
     let out = sb.run(&script, &["--timeout", "1"])?;
-    assert_eq!(status_code(&out), 3, "guard timeout should be a transport failure");
+    assert_eq!(status_code(&out), 4, "a hanging guard must be a timeout failure");
     Ok(())
 }
 

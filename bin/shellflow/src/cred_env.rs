@@ -264,8 +264,7 @@ const HOST_KEY_PATH: &str = "/etc/systemd/credentials.secret";
 ///
 /// * the values themselves (a rotated value must be re-sealed),
 /// * the host key (a store sealed with another host key cannot be read),
-/// * the names of the files in the store (a store that lost a file must be
-///   rebuilt, not trusted).
+/// * the names of the files in the store (a store that lost a file must be rebuilt, not trusted).
 fn seal_fingerprint(keys: &[String]) -> Result<String> {
     use sha2::{Digest, Sha256};
 

@@ -415,10 +415,26 @@ fn live_value(word: &str, value: &str) -> Option<String> {
 /// Whether the value is a filesystem path (a reference to where a secret
 /// lives, not the secret itself).
 fn is_path_like(value: &str) -> bool {
-    value.starts_with('/') ||
+    if value.starts_with('/') ||
         value.starts_with("./") ||
         value.starts_with("../") ||
         value.starts_with("~/")
+    {
+        return true;
+    }
+    // A repository-relative path names where the secret lives, exactly like an
+    // absolute one does: a manifest's `secret_file = "services/dufs/{host}
+    // .env.age"` points at the *encrypted* env file, it is not a credential.
+    // The last segment must look like a file name, so a value that merely
+    // contains a slash is still a value.
+    if let Some((_dir, name)) = value.rsplit_once('/') &&
+        !name.is_empty() &&
+        name.contains('.') &&
+        !name.starts_with('.')
+    {
+        return true;
+    }
+    false
 }
 
 /// Whether the value is a redaction marker (`<redacted: ...>`, `<see ...>`).
@@ -606,6 +622,16 @@ mod tests {
         assert_eq!(hits("password=/run/creds/db/password"), 0);
         assert_eq!(hits("--requirepass=<redacted: see /etc/credstore.encrypted/x>"), 0);
         assert_eq!(hits("requirepass=<redacted>"), 0);
+    }
+
+    #[test]
+    fn a_repository_relative_path_is_not_a_secret() {
+        // A manifest names the encrypted env file that holds the credentials:
+        // that is a reference to where the secret lives, not the secret.
+        assert_eq!(hits("secret_file = \"services/dufs/{host}.env.age\""), 0);
+        assert_eq!(hits("secret_file = \"services/cidx/{host}.env.age\""), 0);
+        // A value that merely contains a slash is still a value.
+        assert_eq!(hits("secret_file = \"abc/def\""), 1);
     }
 
     #[test]

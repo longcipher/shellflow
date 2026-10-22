@@ -75,6 +75,20 @@ lines belong to the current block.
 | `@name` | `# @name <label>` | Name the next block (for `--only`/`--skip`/reporting) |
 | `@only_if` | `# @only_if <command>` | Skip the next block where `<command>` fails |
 | `@wait_active` | `# @wait_active <unit> @<target> [--timeout SECS]` | Poll `systemctl is-active` until active or budget expires (default 300s). Replaces hand-rolled `for/sleep/ss` loops; a timeout is a script-class failure |
+| `@assert` | `# @assert <unit> [@<target>] [<state>]` | Assert the unit's `ActiveState` (default `active`); the target is inherited from the previous step |
+| `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES] [--method M] [--body D] [--header H]` | Assert the URL answers with an accepted status (any 2xx/3xx by default). The probe **waits** (up to the step's timeout) |
+| `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>] [--udp]` | Assert the ports are listening, waiting up to the step's timeout |
+| `@assert_rendered` | `# @assert_rendered <path> [@<target>]` | Assert the file exists and holds no unexpanded `${…}` placeholder |
+| `@assert_no_leak` | `# @assert_no_leak <unit> [@<target>] [--lines N]` | Assert no credential **value** of the unit's store appears in its journal, command line, or environment. Value-based: the helper decrypts the store and compares |
+| `@assert_digest` | `# @assert_digest <path> [@<target>] [--sha256 HEX] [--local PATH]` | Assert the file matches a digest or the controller's copy — a real drift gate |
+| `@assert_credstore` | `# @assert_credstore <service> [@<target>]` | Assert the credential store is `0700`/`0600` and holds exactly the keys the unit declares |
+| `@workdir` | `# @workdir [--prefix NAME]` | Declare the run's remote staging directory (`$WORKDIR`). The controller never creates it; the target's copy is removed when the run ends |
+| `@helper` | `# @helper [@<target>] [--source DIR] [--triple T] [--install-path PATH]` | Build, cache, ship, and atomically install the target-side helper. The build is cached by source revision and target triple |
+| `@backup` | `# @backup <path>… @<target> [--keep N] [--seal] [--dir PATH] [--service S]` | Snapshot for rollback, keep the newest `N`, shred the rest. `--seal` encrypts with the host key. The "no plaintext left behind" guarantee is structural |
+| `@install` | `# @install <src> -> <dst> @<target> [--mode M] [--owner U:G] [--dir-mode M]` | Install on the target **atomically** (write beside the destination, then rename) |
+| `@credstore` | `# @credstore <service> @<target> [--require KEY,…]` | Seal the credential store and check it against the unit's declared keys |
+| `@service` | `# @service <unit> @<target> [--enable] [--restart] [--reload] [--wait] [--verify] [--force-start]` | Drive the unit's lifecycle. `--restart` restarts a unit that was **running** and leaves a stopped unit alone |
+| `@unit_inventory` | `# @unit_inventory [@<target>]` | List the units installed on the target. A report, not a gate |
 
 Behavioral rules to remember:
 
@@ -236,7 +250,49 @@ shellflow secret keys-check [-i PATH] <dir>   all <host>.env.age in <dir> must
                                             share the same key set
 shellflow secret find-duplicates [-i PATH] [dir]   identical values shared
                                             across files (rotation linkage)
-shellflow service init <svc> [--host H]… [--pattern full|exec|no-secret|container|oneshot|no-start] [--timer SCHEDULE]
+shellflow host service <unit> [--enable] [--restart] [--reload] [--wait]
+                             [--verify] [--force-start] [--timeout N]
+                                          [target] drive the unit's lifecycle;
+                                          a restart never *starts* a unit that
+                                          was not running
+shellflow host install <src> <dst> [--mode M] [--owner U:G] [--dir-mode M]
+                                          [target] atomic install (write beside
+                                          the destination, then rename)
+shellflow host backup <path>… [--keep N] [--seal] [--dir PATH] [--service S]
+                                          [target] snapshot for rollback
+shellflow host credstore <svc> [--require KEY,…]
+                                          [target] seal the store, check the
+                                          key set against the unit
+shellflow host assert-no-leak <unit> [--lines N]
+                                          [target] value-based leak check
+shellflow host assert-digest <path> [--sha256 HEX] [--local PATH]
+                                          [target] digest drift gate
+shellflow host assert-credstore <svc>
+                                          [target] store permissions + key set
+shellflow host inventory                [target] list the installed units
+shellflow systemd exec --ready-port N [--ready-url U] [--ready-file F]
+                         [--timeout N] [--watchdog] [--status TEXT] -- CMD…
+                                          [target] supervise a command under a
+                                          readiness contract (Type=notify)
+shellflow systemd watchdog [--interval N] [--timeout N]
+                                          [target] keep the unit's watchdog
+                                          alive
+shellflow unit render <svc> <unit> [--repo PATH] [--output PATH] [--check]
+                                          generate the unit's drop-in from the
+                                          service manifest (credential wiring,
+                                          render line, version status, shared
+                                          hardening); `--check` exits non-zero
+                                          when the drop-in is out of date
+shellflow unit manifest <svc> <unit> [--repo PATH]
+                                          print the service manifest
+shellflow unit verify [--repo PATH]      check the repository: the generated
+                                          drop-ins are up to date, every
+                                          install names a staged file, the
+                                          shared hardening reaches every
+                                          service that takes it, every
+                                          backup runs before the install it
+                                          protects
+shellflow service init <svc> [--host H]… [--pattern full|exec|no-secret|container|oneshot|no-start|notify|socket] [--timer SCHEDULE]
                                             scaffold services/<svc>/ +
                                             playbooks/deploy-<svc>.sh (flat
                                             layout, shared-helper unit)

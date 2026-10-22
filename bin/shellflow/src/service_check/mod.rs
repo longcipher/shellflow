@@ -17,12 +17,13 @@ mod remote;
 use std::collections::BTreeMap;
 
 use eyre::{Result, bail};
-
-use crate::{cli::ServiceCheckArgs, service::ServiceError};
-
-use crate::rbatch::Section;
-
 use remote::Probe;
+
+use crate::{
+    cli::ServiceCheckArgs,
+    rbatch::Section,
+    service::{ServiceError, ServiceError::Other},
+};
 
 /// Run `service check`.
 ///
@@ -32,23 +33,92 @@ use remote::Probe;
 /// (a missing `ssh`, an unreachable host) and [`ServiceError::Other`] when a
 /// check reports `FAIL` or the request itself is malformed.
 pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
-    validate_service_name(&args.service)?;
     // The same preflight the `run` path uses: a missing `ssh` is a
     // transport/setup failure (exit 3), not a generic error.
     preflight_ssh()?;
-    let unit = format!("{}.service", args.service);
     let mut failures = 0;
 
-    let probe = Probe::new(&unit, &args.service, args.journal_lines);
-    let sections = probe.run(&args.host)?;
-    let show = body(&sections, "props");
-    let journal = body(&sections, "journal");
+    if args.all {
+        let units = host_units(args)?;
+        if units.is_empty() {
+            return Err(Other(eyre::eyre!(
+                "service check --all: the repository declares no service for the host `{}`",
+                args.host
+            )));
+        }
+        // One batch: every question of every service travels together.
+        let probe = Probe::new_many(&units, args.journal_lines);
+        let sections = probe.run(&args.host)?;
+        for (service, unit) in &units {
+            check_unit(service, unit, &sections, &mut failures);
+        }
+        if failures > 0 {
+            return Err(Other(eyre::eyre!(
+                "service check --all: {failures} FAIL finding(s) on `{}`",
+                args.host
+            )));
+        }
+        println!("service check --all: {} clean", args.host);
+        return Ok(());
+    }
 
-    let active = body(&sections, "unit_state");
+    let Some(service) = args.service.as_deref() else {
+        return Err(Other(eyre::eyre!(
+            "service check: name a service, or pass --all to audit every service of the host"
+        )));
+    };
+    validate_service_name(service)?;
+    let unit = format!("{service}.service");
+
+    let probe = Probe::new(&unit, service, args.journal_lines);
+    let sections = probe.run(&args.host)?;
+    check_unit(service, &unit, &sections, &mut failures);
+
+    if failures > 0 {
+        return Err(ServiceError::Other(eyre::eyre!(
+            "service check: {failures} FAIL finding(s) for `{service}`"
+        )));
+    }
+    println!("service check: {service} clean");
+    Ok(())
+}
+
+/// The services of the audited host, from the repository's manifests.
+///
+/// The manifests state the host of every service outright, so the audit
+/// covers exactly the services the host is supposed to run.
+fn host_units(args: &ServiceCheckArgs) -> Result<Vec<(String, String)>, ServiceError> {
+    let manifests =
+        crate::manifest::load_all(&args.repo).map_err(|err| Other(eyre::eyre!("{err}")))?;
+    let mut units: Vec<(String, String)> = Vec::new();
+    for manifest in manifests.values() {
+        if manifest.host != args.host {
+            continue;
+        }
+        units.push((manifest.service.clone(), manifest.unit.clone()));
+    }
+    units.sort();
+    Ok(units)
+}
+
+/// Check one unit's answers.
+fn check_unit(
+    service: &str,
+    unit: &str,
+    sections: &BTreeMap<String, Section>,
+    failures: &mut usize,
+) {
+    let body = |kind: &str| {
+        sections.get(&remote::section_id(unit, kind)).map_or_else(String::new, |s| s.body.clone())
+    };
+    let show = body("props");
+    let journal = body("journal");
+
+    let active = body("unit_state");
     report(
         &format!("unit {unit} is {}", active.trim()),
         if active.trim() == "active" { Check::Ok } else { Check::Warn },
-        &mut failures,
+        failures,
     );
 
     // A socket-activated service is enabled through its `.socket` unit: the
@@ -56,17 +126,17 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
     // `.service` would miss a service that is simply never started.
     // `is-active` reports "inactive" for a unit that does not exist at all,
     // so the unit's load state decides whether it is really there.
-    let socket_unit = format!("{}.socket", args.service);
-    let load_state = body(&sections, "socket_load");
+    let socket_unit = format!("{}.socket", service);
+    let load_state = body("socket_load");
     if load_state.trim() != "not-found" && !load_state.trim().is_empty() {
-        let socket_state = body(&sections, "socket_state");
+        let socket_state = body("socket_state");
         report(
             &format!(
                 "socket unit {socket_unit} is {} (the port is systemd's)",
                 socket_state.trim()
             ),
             if socket_state.trim() == "active" { Check::Ok } else { Check::Warn },
-            &mut failures,
+            failures,
         );
     }
 
@@ -76,14 +146,14 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
         report(
             "secret value in ExecStart argv or Environment= (`ps` visible)",
             Check::Fail,
-            &mut failures,
+            failures,
         );
     } else {
-        report("no secret values in argv/Environment", Check::Ok, &mut failures);
+        report("no secret values in argv/Environment", Check::Ok, failures);
     }
     // NOTE: `systemctl show` prints credential paths as `[unprintable]`, so
     // import lines are counted from the unit file text instead.
-    let unit_file = body(&sections, "unit_file");
+    let unit_file = body("unit_file");
     let n_creds = unit_file
         .lines()
         .filter(|l| {
@@ -91,55 +161,47 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
             t.starts_with("LoadCredentialEncrypted=") && !t.ends_with('=')
         })
         .count();
-    report(&format!("{n_creds} LoadCredentialEncrypted= import(s)"), Check::Ok, &mut failures);
+    report(&format!("{n_creds} LoadCredentialEncrypted= import(s)"), Check::Ok, failures);
     if show
         .lines()
         .any(|l| l.starts_with("EnvironmentFile=") && !l.ends_with('=') && !l.contains("/dev/null"))
     {
-        report(
-            "EnvironmentFile= referenced (verify it carries no secrets)",
-            Check::Warn,
-            &mut failures,
-        );
+        report("EnvironmentFile= referenced (verify it carries no secrets)", Check::Warn, failures);
     }
     if show.lines().any(|l| l == "User=root") {
-        report("runs as root (least-privilege follow-up)", Check::Warn, &mut failures);
+        report("runs as root (least-privilege follow-up)", Check::Warn, failures);
     }
 
     // Path-existence preflight: a unit that names a path systemd must find
     // (WorkingDirectory=, ReadWritePaths=, a non-optional EnvironmentFile=)
     // fails to start with `226/NAMESPACE` — and stays enabled, so the
     // breakage is invisible until the unit is started.
-    let missing = missing_paths(&body(&sections, "paths"));
+    let missing = missing_paths(&body("paths"));
     if missing.is_empty() {
-        report("every path the unit references exists", Check::Ok, &mut failures);
+        report("every path the unit references exists", Check::Ok, failures);
     } else {
         for path in &missing {
-            report(&format!("unit references a missing path: {path}"), Check::Fail, &mut failures);
+            report(&format!("unit references a missing path: {path}"), Check::Fail, failures);
         }
     }
 
     let credstore = sections.get("credstore");
     let credstore_missing = credstore.is_none_or(|s| s.rc != 0 || s.body.trim().is_empty());
     if credstore_missing {
-        report("credential store is empty", Check::Warn, &mut failures);
+        report("credential store is empty", Check::Warn, failures);
     } else {
-        report("credential store present (0600 root expected)", Check::Ok, &mut failures);
+        report("credential store present (0600 root expected)", Check::Ok, failures);
     }
 
     let leaks: Vec<&str> =
-        journal.lines().filter(|l| looks_like_leak(l, &args.service)).take(3).collect();
+        journal.lines().filter(|l| looks_like_leak(l, service)).take(3).collect();
     if leaks.is_empty() {
-        report(
-            &format!("no secret-value shapes in last {} journal lines", args.journal_lines),
-            Check::Ok,
-            &mut failures,
-        );
+        report("no secret-value shapes in the last journal lines", Check::Ok, failures);
     } else {
         report(
             &format!("possible secret values in journal ({} line(s), review)", leaks.len()),
             Check::Fail,
-            &mut failures,
+            failures,
         );
     }
 
@@ -148,25 +210,22 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
     // make a notify unit unable to signal at all.
     let notify_findings = notify_findings(&show, &journal);
     if notify_findings.is_empty() {
-        report("notify/readiness wiring is sound", Check::Ok, &mut failures);
+        report("notify/readiness wiring is sound", Check::Ok, failures);
     }
     for (message, status) in notify_findings {
-        report(&message, status, &mut failures);
+        report(&message, status, failures);
     }
 
-    if failures > 0 {
-        return Err(ServiceError::Other(eyre::eyre!(
-            "service check: {failures} FAIL finding(s) for `{}`",
-            args.service
-        )));
+    // The unit-level invariants: the mistakes that cost an outage and that
+    // nothing else reports.
+    let fleet = body("fleet_dirs");
+    let invariants = unit_invariant_findings(&show, &fleet);
+    if invariants.is_empty() {
+        report("unit invariants hold", Check::Ok, failures);
     }
-    println!("service check: {} clean", args.service);
-    Ok(())
-}
-
-/// The body of one section of the batch.
-fn body(sections: &BTreeMap<String, Section>, id: &str) -> String {
-    sections.get(id).map_or_else(String::new, |s| s.body.clone())
+    for (message, status) in invariants {
+        report(&message, status, failures);
+    }
 }
 
 /// The paths the unit references that do not exist on the target.
@@ -355,6 +414,116 @@ fn notify_findings(show: &str, journal: &str) -> Vec<(String, Check)> {
     findings
 }
 
+/// The unit-level invariants the audit checks.
+///
+/// These are the mistakes that cost an outage and that nothing else reports:
+///
+/// * **A shared `RuntimeDirectory=`.** systemd removes and recreates the directory on every unit
+///   start, so two units that claim the same directory destroy each other's files — starting one
+///   wipes the rendered configuration of the other.
+/// * **A notify unit without a start timeout.** systemd's 90 s default kills a service that needs
+///   longer to initialise, and the failure looks like a crash rather than a timeout.
+/// * **A restart policy without a start limit.** `Restart=always` with the default burst (5
+///   restarts in 10 s) means a flapping service is killed and stays dead.
+/// * **No hardening at all.** A unit with neither `NoNewPrivileges=` nor `ProtectSystem=` nor
+///   `PrivateTmp=` runs with the full privileges of its user and the host's full filesystem.
+fn unit_invariant_findings(show: &str, fleet: &str) -> Vec<(String, Check)> {
+    let mut findings = Vec::new();
+    let props = parse_show_props(show);
+    let get = |key: &str| props.get(key).map_or("", String::as_str);
+
+    // A runtime directory that more than one unit claims.
+    let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut current = String::new();
+    for line in fleet.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "Id" => current = value.trim().to_string(),
+            "RuntimeDirectory" => {
+                let value = value.trim();
+                if value.is_empty() || current.is_empty() {
+                    continue;
+                }
+                for dir in value.split_whitespace() {
+                    owners.entry(dir.to_string()).or_default().push(current.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let own_dir = get("RuntimeDirectory").trim().to_string();
+    for (dir, units) in &owners {
+        if units.len() < 2 {
+            continue;
+        }
+        let severity =
+            if own_dir.split_whitespace().any(|d| d == dir) { Check::Fail } else { Check::Warn };
+        findings.push((
+            format!(
+                "RuntimeDirectory={dir} is claimed by {} units ({}): systemd removes and recreates \
+                 it on every start, so starting one wipes the files of the others",
+                units.len(),
+                units.join(", ")
+            ),
+            severity,
+        ));
+    }
+
+    let unit_type = get("Type");
+    let is_notify = unit_type == "notify" || unit_type == "notify-reload";
+    if is_notify && get("TimeoutStartUSec").trim().is_empty() {
+        findings.push((
+            format!(
+                "Type={unit_type} without TimeoutStartSec=: systemd's 90 s default kills a \
+                 service that needs longer to initialise"
+            ),
+            Check::Warn,
+        ));
+    }
+
+    let restart = get("Restart").trim();
+    if !restart.is_empty() && restart != "no" && get("StartLimitBurst").trim().is_empty() {
+        findings.push((
+            format!(
+                "Restart={restart} without StartLimitBurst=: systemd's default burst (5 restarts \
+                 in 10 s) kills a flapping service and leaves it dead"
+            ),
+            Check::Warn,
+        ));
+    }
+
+    if get("NoNewPrivileges").trim().is_empty() &&
+        get("ProtectSystem").trim().is_empty() &&
+        get("PrivateTmp").trim().is_empty()
+    {
+        findings.push((
+            "the unit has no hardening at all (no NoNewPrivileges=, ProtectSystem=, or \
+             PrivateTmp=)"
+                .to_string(),
+            Check::Warn,
+        ));
+    }
+
+    let protect_home = get("ProtectHome").trim();
+    if !protect_home.is_empty() &&
+        protect_home != "false" &&
+        protect_home != "no" &&
+        get("ReadWritePaths").split_whitespace().any(|p| p.starts_with("/home/"))
+    {
+        findings.push((
+            format!(
+                "ProtectHome={protect_home} with a ReadWritePaths= under /home: the path depends \
+                 on a home directory, which a home-directory cleanup silently breaks"
+            ),
+            Check::Warn,
+        ));
+    }
+
+    findings
+}
+
 /// Parse the `Key=Value` lines of `systemctl show` output.
 fn parse_show_props(show: &str) -> std::collections::BTreeMap<String, String> {
     let mut props = std::collections::BTreeMap::new();
@@ -404,8 +573,63 @@ fn validate_service_name(service: &str) -> Result<()> {
 mod tests {
     use super::{
         Check, has_argv_secret, journal_contains, looks_like_leak, missing_paths, notify_findings,
-        parse_show_props, timeout_start_is_short,
+        parse_show_props, timeout_start_is_short, unit_invariant_findings,
     };
+
+    #[test]
+    fn a_shared_runtime_directory_is_a_failure() {
+        // systemd removes and recreates `RuntimeDirectory=` on every start, so
+        // two units that claim it destroy each other's files.
+        let show = "RuntimeDirectory=cidx\nType=simple\n";
+        let fleet = "Id=cidx-bsc.service\nRuntimeDirectory=cidx\n\
+                     Id=cidx-sol.service\nRuntimeDirectory=cidx\n";
+        let findings = unit_invariant_findings(show, fleet);
+        let shared = findings
+            .iter()
+            .find(|(message, _)| message.contains("RuntimeDirectory=cidx"))
+            .expect("the shared runtime directory must be reported");
+        assert_eq!(shared.1, Check::Fail, "{findings:?}");
+    }
+
+    #[test]
+    fn a_runtime_directory_of_another_unit_is_only_a_warning() {
+        let show = "RuntimeDirectory=\nType=simple\n";
+        let fleet = "Id=cidx-bsc.service\nRuntimeDirectory=cidx\n\
+                     Id=cidx-sol.service\nRuntimeDirectory=cidx\n";
+        let findings = unit_invariant_findings(show, fleet);
+        let shared = findings
+            .iter()
+            .find(|(message, _)| message.contains("RuntimeDirectory=cidx"))
+            .expect("the shared runtime directory must be reported");
+        assert_eq!(shared.1, Check::Warn, "{findings:?}");
+    }
+
+    #[test]
+    fn a_notify_unit_without_a_start_timeout_is_a_warning() {
+        let show = "Type=notify\nNotifyAccess=main\n";
+        let findings = unit_invariant_findings(show, "");
+        assert!(
+            findings.iter().any(|(m, s)| m.contains("TimeoutStartSec") && *s == Check::Warn),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_restart_policy_without_a_start_limit_is_a_warning() {
+        let show = "Type=simple\nRestart=always\nRestartUSec=5s\n";
+        let findings = unit_invariant_findings(show, "");
+        assert!(
+            findings.iter().any(|(m, s)| m.contains("StartLimitBurst") && *s == Check::Warn),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_hardened_unit_has_no_hardening_finding() {
+        let show = "Type=simple\nNoNewPrivileges=yes\nProtectSystem=strict\nPrivateTmp=yes\n";
+        let findings = unit_invariant_findings(show, "");
+        assert!(!findings.iter().any(|(m, _)| m.contains("no hardening")), "{findings:?}");
+    }
 
     #[test]
     fn detects_argv_password() {
@@ -459,8 +683,10 @@ mod tests {
 
     #[test]
     fn every_path_present_reports_nothing_missing() {
-        assert!(missing_paths("ok WorkingDirectory /srv/app\nok ReadWritePaths /var/lib/app\n")
-            .is_empty());
+        assert!(
+            missing_paths("ok WorkingDirectory /srv/app\nok ReadWritePaths /var/lib/app\n")
+                .is_empty()
+        );
     }
 
     #[test]

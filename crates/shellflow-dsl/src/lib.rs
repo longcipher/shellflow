@@ -5,13 +5,13 @@
 //! that grammar:
 //!
 //! * [`parser`] — the single-pass scanner that turns a script into a plan.
-//! * [`plan`] — the plan model ([`Step`], [`ExecutionPlan`]) and the target
-//!   resolution that turns a step's target into concrete hosts.
+//! * [`plan`] — the plan model ([`Step`], [`ExecutionPlan`]) and the target resolution that turns a
+//!   step's target into concrete hosts.
 //! * [`ssh_spec`] — the ssh destination model the targets resolve to.
-//! * [`heredoc`] — the here-document tracker that keeps a `# @` line inside
-//!   a here-document body from being read as a directive.
-//! * [`text`] — the two text rules the grammar and the runtime share
-//!   (shell quoting, surrounding-quote stripping).
+//! * [`heredoc`] — the here-document tracker that keeps a `# @` line inside a here-document body
+//!   from being read as a directive.
+//! * [`text`] — the two text rules the grammar and the runtime share (shell quoting,
+//!   surrounding-quote stripping).
 //! * [`error`] — the errors the scanner and the interpolator report.
 //!
 //! The crate has no I/O and no dependencies beyond `thiserror`: it is
@@ -42,8 +42,9 @@ pub use error::{InterpolateError, ParseError};
 pub use heredoc::{Heredoc, HeredocTracker};
 pub use parser::parse_script;
 pub use plan::{
-    AssertStep, Assertion, CopyEntry, CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep,
-    RemoteStep, ResolvedHost, RunState, SecretEntry, Step, Target, WaitStep, interpolate,
+    AssertStep, Assertion, BackupStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry, ExecutionPlan,
+    HelperStep, InstallStep, LocalStep, ReloadStep, RemoteStep, ResolvedHost, RunState,
+    SecretEntry, ServiceStep, Step, Target, UnitInventoryStep, WaitStep, Workdir, interpolate,
     is_valid_var_name, resolve_hosts,
 };
 pub use ssh_spec::SshSpec;

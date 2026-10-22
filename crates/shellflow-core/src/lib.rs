@@ -24,16 +24,16 @@ pub use env::{
     CAPTURE_SEPARATOR, MASK, SecretMasker, mask_keyed, mask_line, mask_token,
     parse_capture_records, prepare_masks, render_env,
 };
-
+pub use error::{CaptureError, RenderEnvError};
 // The deploy-script grammar and the plan model live in `shellflow-dsl`.
 // They are re-exported here so that a consumer of the runtime helpers does
 // not have to know which of the two crates owns which half of the language.
 pub use shellflow_dsl::{
-    AssertStep, Assertion, CopyEntry, CopyStep, EnvEntry, ExecutionPlan, InterpolateError,
-    LocalStep, ParseError, ReloadStep, RemoteStep, ResolvedHost, RunState, SecretEntry, SshSpec,
-    Step, Target, WaitStep, interpolate, is_valid_var_name, parse_script, shell_quote_single,
+    AssertStep, Assertion, BackupStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry, ExecutionPlan,
+    HelperStep, InstallStep, InterpolateError, LocalStep, ParseError, ReloadStep, RemoteStep,
+    ResolvedHost, RunState, SecretEntry, ServiceStep, SshSpec, Step, Target, UnitInventoryStep,
+    WaitStep, Workdir, interpolate, is_valid_var_name, parse_script, shell_quote_single,
     strip_surrounding_quotes,
 };
-pub use error::{CaptureError, RenderEnvError};
 pub use shellflow_dsl::{Heredoc, HeredocTracker, resolve_hosts};
 pub use template::{render_template, template_keys};
