@@ -82,8 +82,12 @@ impl Batch {
     pub(crate) fn section(&mut self, id: &str, cmd: &str) {
         let beg = format!("__SFW_{}_B_{}", self.nonce, id);
         let end = format!("__SFW_{}_E_{}", self.nonce, id);
+        // The redirections must wrap the *whole* command: in
+        // `out=$(a; b </dev/null 2>&1)` they bind to `b` alone, and a command
+        // that replaces the shell (`exec`) would write past the capture --
+        // the answer would come back empty.
         self.script.push_str(&format!(
-            "out=$({cmd} </dev/null 2>&1); rc=$?; \
+            "out=$({{ {cmd}; }} </dev/null 2>&1); rc=$?; \
              printf '%s %s\\n' '{beg}' \"$rc\"; printf '%s\\n' \"$out\"; printf '%s\\n' '{end}'\n"
         ));
         self.count += 1;

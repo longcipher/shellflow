@@ -451,9 +451,12 @@ pub(crate) fn cached_helper(source: &Path, triple: &str) -> Result<PathBuf, Stri
 /// The build is the expensive part of a deploy, so it happens once per source
 /// revision and target triple and is then reused by every playbook.
 fn build_helper(source: &Path, triple: &str, out: &Path) -> Result<(), String> {
+    // `cargo zigbuild --version` is not a thing: cargo-zigbuild has no
+    // `--version` option and exits 2 on it. `--help` is the probe that
+    // actually answers "is cargo-zigbuild installed?".
     let zigbuild = std::process::Command::new("cargo")
         .arg("zigbuild")
-        .arg("--version")
+        .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -482,9 +485,13 @@ fn build_helper(source: &Path, triple: &str, out: &Path) -> Result<(), String> {
 
 /// The remote command that installs the helper atomically.
 pub(crate) fn helper_install_command(staged: &str, install_path: &str) -> String {
+    // The helper lands in a root-owned directory, so every step is
+    // elevated. The write goes to a temporary name beside the destination
+    // and is renamed into place: a reader of the destination sees either the
+    // old helper or the new one, never a half-written file.
     format!(
         "d=$(dirname {install}); t=\"$d/.$(basename {install}).shellflow-new\"; \
-         cat {staged} > \"$t\" && chmod 0755 \"$t\" && mv -f \"$t\" {install}",
+         sudo cp {staged} \"$t\" && sudo chmod 0755 \"$t\" && sudo mv -f \"$t\" {install}",
         install = quote(install_path),
         staged = quote(staged),
     )
@@ -736,5 +743,8 @@ mod tests {
         let cmd = helper_install_command("/tmp/.shellflow-helper-abc", "/usr/local/bin/shellflow");
         assert!(cmd.contains(".shellflow-new"), "{cmd}");
         assert!(cmd.contains("mv -f"), "{cmd}");
+        // the helper lands in a root-owned directory: every step is elevated
+        assert!(cmd.contains("sudo cp"), "{cmd}");
+        assert!(cmd.contains("sudo mv -f"), "{cmd}");
     }
 }

@@ -503,7 +503,7 @@ fn credstore(args: &HostCredstoreArgs) -> Result<(), HostError> {
 /// cryptic systemd error — this turns it into a readable failure.
 fn verify_credstore(service: &str, require: &[String]) -> Result<(), HostError> {
     let store = Path::new(CREDSTORE_ROOT).join(service);
-    if !store.exists() {
+    if !dir_exists_elevated(&store) {
         return Err(HostError::failed(format!(
             "the credential store {} does not exist",
             store.display()
@@ -576,7 +576,7 @@ fn declared_credential_keys(unit: &str) -> BTreeSet<String> {
 /// The credential keys the store holds.
 fn store_keys(store: &Path) -> Result<BTreeSet<String>, HostError> {
     let mut keys = BTreeSet::new();
-    for entry in list_dir(store)? {
+    for entry in list_dir_elevated(store)? {
         let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
@@ -879,6 +879,70 @@ fn sha256_file(path: &Path) -> Result<String, HostError> {
 /// The seconds since the Unix epoch.
 fn unix_timestamp() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// List a directory, sorted, elevating when the caller is not root.
+///
+/// The credential store is root-owned and 0700, so an unelevated read sees
+/// nothing -- and "nothing" reads as "the store does not exist".
+fn list_dir_elevated(path: &Path) -> Result<Vec<PathBuf>, HostError> {
+    // The plain listing first: it works when the caller may read the
+    // directory, and it is the cheap path. Only when it fails does the
+    // elevation matter.
+    match list_dir(path) {
+        Ok(entries) => return Ok(entries),
+        Err(err) => {
+            if nix::unistd::Uid::effective().is_root() {
+                return Err(err);
+            }
+        }
+    }
+    let out = Command::new("sudo")
+        .arg("-n")
+        .arg("ls")
+        .arg("-1A")
+        .arg("--")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| HostError::internal(format!("cannot list `{}`: {err}", path.display())))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(HostError::failed(format!(
+            "cannot list `{}`: {}",
+            path.display(),
+            stderr.trim()
+        )));
+    }
+    let mut entries: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| path.join(line))
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
+/// Whether a directory exists, elevating when the caller is not root.
+fn dir_exists_elevated(path: &Path) -> bool {
+    if path.is_dir() {
+        return true;
+    }
+    if nix::unistd::Uid::effective().is_root() {
+        return false;
+    }
+    Command::new("sudo")
+        .arg("-n")
+        .arg("test")
+        .arg("-d")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// List a directory, sorted.
