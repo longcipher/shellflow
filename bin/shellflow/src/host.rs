@@ -182,10 +182,33 @@ fn service(args: &HostServiceArgs) -> Result<(), HostError> {
 /// Validate a unit with `systemd-analyze verify`.
 ///
 /// The check is **fail closed**: a non-zero exit aborts the deploy.
+///
+/// The unit is validated through the file systemd actually loaded -- its
+/// fragment path -- rather than by name. A Quadlet container's unit exists
+/// only as generated output, so verifying it by name reports "not found"
+/// for a unit that is loaded and running. For a unit systemd has never
+/// loaded there is no fragment yet, and the name is all there is.
 fn verify_unit(unit: &str) -> Result<(), HostError> {
+    if let Some(fragment) = loaded_fragment(unit) {
+        return verify_unit_file(unit, &fragment);
+    }
+    verify_unit_file(unit, unit)
+}
+
+/// The fragment path of a loaded unit, if systemd knows one.
+fn loaded_fragment(unit: &str) -> Option<String> {
+    let out = systemctl_output(&["show", "-p", "FragmentPath", "--value", unit]).ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() || path == "/dev/null" {
+        return None;
+    }
+    Some(path)
+}
+
+fn verify_unit_file(unit: &str, path: &str) -> Result<(), HostError> {
     let out = Command::new("systemd-analyze")
         .arg("verify")
-        .arg(unit)
+        .arg(path)
         .stdin(Stdio::null())
         .output()
         .map_err(|err| HostError::internal(format!("cannot run `systemd-analyze`: {err}")))?;
