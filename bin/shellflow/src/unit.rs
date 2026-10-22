@@ -101,8 +101,12 @@ pub(crate) fn render(manifest: &ServiceManifest, credential_keys: &[String]) -> 
         ));
     }
 
-    // The version status line.
-    if let Some(binary) = &manifest.binary {
+    // The version status line. Only a notify unit can report: on a
+    // `Type=simple` unit there is no notify socket, the call fails, and a
+    // failing `ExecStartPost` takes the service down with it.
+    if manifest.service_type == "notify" &&
+        let Some(binary) = &manifest.binary
+    {
         text.push_str(&format!(
             "ExecStartPost=/bin/sh -c 'systemd-notify --status=\"Version: $({binary} -V 2>&1)\"'\n"
         ));
@@ -140,6 +144,7 @@ mod tests {
         let manifest = manifest(
             "host = \"api\"\nunit = \"dufs.service\"\n\
              binary = \"/opt/dufs/bin/dufs\"\n\
+             type = \"notify\"\n\
              [render]\ntemplate = \"/t.tmpl\"\ntarget = \"/run/dufs/c.yaml\"\n",
         );
         let rendered = render(&manifest, &[]);
@@ -156,6 +161,19 @@ mod tests {
             "{}",
             rendered.text
         );
+    }
+
+    #[test]
+    fn a_simple_unit_does_not_report_its_version() {
+        // A `Type=simple` unit has no notify socket: the status call fails,
+        // and a failing `ExecStartPost` takes the service down with it.
+        let manifest = manifest(
+            "host = \"api\"\nunit = \"dufs.service\"\n\
+             binary = \"/opt/dufs/bin/dufs\"\n",
+        );
+        let rendered = render(&manifest, &[]);
+        assert!(!rendered.text.contains("systemd-notify"), "{}", rendered.text);
+        assert!(!rendered.text.contains("ExecStartPost"), "{}", rendered.text);
     }
 
     #[test]

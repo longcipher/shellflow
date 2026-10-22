@@ -97,6 +97,13 @@ pub(crate) struct ServiceManifest {
     pub user: Option<String>,
     /// The runtime directory the unit owns.
     pub runtime_dir: Option<String>,
+    /// The systemd service type (`simple`, `notify`, `oneshot`, ...).
+    ///
+    /// The type decides whether the unit can report readiness: a
+    /// `Type=simple` unit has no notify socket, so a `systemd-notify` call
+    /// on it fails -- and a failing `ExecStartPost` takes the service down
+    /// with it. The default is `simple`.
+    pub service_type: String,
     /// Whether the unit gets the shared hardening drop-in.
     ///
     /// `true` by default: the hardening is a default, not an opt-in. A unit
@@ -161,6 +168,8 @@ impl ServiceManifest {
             health: optional_str(&doc, "health", service)?,
             user: optional_str(&doc, "user", service)?,
             runtime_dir: optional_str(&doc, "runtime_dir", service)?,
+            service_type: optional_str(&doc, "type", service)?
+                .unwrap_or_else(|| "simple".to_string()),
             hardening: optional_bool(&doc, "hardening", service)?,
         };
         Ok(manifest)
