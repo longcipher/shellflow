@@ -531,13 +531,13 @@ fn verify_credstore(service: &str, require: &[String]) -> Result<(), HostError> 
             undeclared.join(", ")
         )));
     }
-    // A key the store holds but the unit never asks for: usually a rotated
+    // A key the store holds but no unit asks for: usually a rotated
     // credential that nobody picked up.
     let unused: Vec<String> =
         store_keys.iter().filter(|key| !declared.contains(*key)).cloned().collect();
     if !unused.is_empty() {
         return Err(HostError::failed(format!(
-            "the credential store holds keys the unit never declares: {}",
+            "the credential store holds keys no unit imports: {}",
             unused.join(", ")
         )));
     }
@@ -546,9 +546,14 @@ fn verify_credstore(service: &str, require: &[String]) -> Result<(), HostError> 
 }
 
 /// The credential keys the unit declares.
-fn declared_credential_keys(unit: &str) -> BTreeSet<String> {
+fn declared_credential_keys(service: &str) -> BTreeSet<String> {
+    // The store names the place the keys live, and every unit that imports
+    // from it says so in its own path. The units are found by that path,
+    // not by name: the wiring lives in a drop-in, a service may own several
+    // units, and two services may share one store.
+    let store = format!("{CREDSTORE_ROOT}/{service}/");
     let mut keys = BTreeSet::new();
-    for file in unit_files(unit) {
+    for file in all_unit_files() {
         let Ok(text) = fs::read_to_string(&file) else {
             continue;
         };
@@ -556,21 +561,41 @@ fn declared_credential_keys(unit: &str) -> BTreeSet<String> {
             let Some(rest) = strip_directive(line, "LoadCredentialEncrypted=") else {
                 continue;
             };
-            let Some((key, _path)) = rest.split_once(':') else {
+            let Some((key, path)) = rest.split_once(':') else {
                 continue;
             };
-            keys.insert(key.trim().to_string());
-        }
-        for line in text.lines() {
-            if let Some(rest) = strip_directive(line, "ImportCredential=") {
-                let key = rest.split(':').next().unwrap_or_default().trim();
-                if !key.is_empty() {
-                    keys.insert(key.to_string());
-                }
+            if path.trim().starts_with(&store) {
+                keys.insert(key.trim().to_string());
             }
         }
     }
     keys
+}
+
+/// Every unit file and drop-in on the system.
+fn all_unit_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for root in ["/etc/systemd/system", "/usr/lib/systemd/system", "/run/systemd/system"] {
+        let Ok(entries) = list_dir(Path::new(root)) else {
+            continue;
+        };
+        for entry in entries {
+            let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            let is_unit = name.ends_with(".service") || name.ends_with(".timer");
+            let is_drop_in_dir = name.ends_with(".service.d") || name.ends_with(".timer.d");
+            if is_drop_in_dir {
+                for drop_in in list_dir(&entry).unwrap_or_default() {
+                    if drop_in.extension().is_some_and(|ext| ext == "conf") {
+                        files.push(drop_in);
+                    }
+                }
+            }
+            if is_unit {
+                files.push(entry);
+            }
+        }
+    }
+    files
 }
 
 /// The credential keys the store holds.
@@ -821,27 +846,6 @@ fn validate_unit(unit: &str) -> Result<(), HostError> {
         return Err(HostError::usage(format!("invalid unit name `{unit}`")));
     }
     Ok(())
-}
-
-/// The unit file and its drop-ins, in the order systemd reads them.
-fn unit_files(unit: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for root in ["/etc/systemd/system", "/usr/lib/systemd/system", "/run/systemd/system"] {
-        let path = Path::new(root).join(unit);
-        if path.exists() {
-            files.push(path);
-        }
-        let drop_in_dir = Path::new(root).join(format!("{unit}.d"));
-        let Ok(entries) = list_dir(&drop_in_dir) else {
-            continue;
-        };
-        for entry in entries {
-            if entry.extension().is_some_and(|ext| ext == "conf") {
-                files.push(entry);
-            }
-        }
-    }
-    files
 }
 
 /// The value of a systemd directive in a unit file line.
