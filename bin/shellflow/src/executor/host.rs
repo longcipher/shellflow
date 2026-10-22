@@ -153,6 +153,11 @@ pub(super) async fn run_target_command(
             let mut cmd = Command::new("ssh");
             cmd.args(["-o", "BatchMode=yes"]);
             cmd.args(host.spec.to_ssh_args()).arg("-T").arg(remote_env.shell.invoke(false));
+            // The command travels as the remote shell's standard input. With
+            // the default (inherited) stdin there is nothing to write to,
+            // the remote shell reads EOF, exits 0 -- and the step reports
+            // success without having done anything at all.
+            cmd.stdin(std::process::Stdio::piped());
             let args = stream::PipedArgs {
                 ui: &ui,
                 host: &host.alias,

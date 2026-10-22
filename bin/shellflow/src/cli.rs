@@ -655,6 +655,20 @@ pub(crate) struct HostServiceArgs {
     pub timeout: u64,
 }
 
+/// Parse a file mode, written in octal (`0644`).
+///
+/// A plain number parser reads `0644` as decimal 644 -- a mode of 0o1204,
+/// which is neither readable nor writable by anyone but the owner.
+fn parse_octal_mode(value: &str) -> Result<u32, String> {
+    let trimmed = value.trim();
+    let parsed = u32::from_str_radix(trimmed, 8)
+        .map_err(|err| format!("`{trimmed}` is not an octal file mode: {err}"))?;
+    if parsed > 0o7777 {
+        return Err(format!("`{trimmed}` is not a file mode"));
+    }
+    Ok(parsed)
+}
+
 /// Arguments for `host install`.
 #[derive(Debug, Args)]
 pub(crate) struct HostInstallArgs {
@@ -667,7 +681,7 @@ pub(crate) struct HostInstallArgs {
     pub dst: String,
 
     /// The file mode, in octal (e.g. `0644`).
-    #[arg(long, value_name = "MODE")]
+    #[arg(long, value_name = "MODE", value_parser = parse_octal_mode)]
     pub mode: Option<u32>,
 
     /// The `user:group` that owns the file.
@@ -675,7 +689,7 @@ pub(crate) struct HostInstallArgs {
     pub owner: Option<String>,
 
     /// The mode of the destination directory, created when missing.
-    #[arg(long, value_name = "MODE")]
+    #[arg(long, value_name = "MODE", value_parser = parse_octal_mode)]
     pub dir_mode: Option<u32>,
 }
 
