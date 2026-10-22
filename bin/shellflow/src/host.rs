@@ -374,8 +374,8 @@ fn backup(args: &HostBackupArgs) -> Result<(), HostError> {
         if args.seal && !is_unit_file(name) {
             seal_file(source, &target)?;
         } else {
-            let contents = fs::read(source)
-                .map_err(|err| HostError::internal(format!("cannot read `{path}`: {err}")))?;
+            let contents = read_file_maybe_elevated(source)
+                .map_err(|err| HostError::internal(format!("cannot back up `{path}`: {err}")))?;
             write_file_elevated(&target, &contents, 0o600)?;
         }
         written.push(target.clone());
@@ -414,8 +414,7 @@ fn backup(args: &HostBackupArgs) -> Result<(), HostError> {
 /// The value never reaches a command line: `systemd-creds encrypt` reads the
 /// plaintext from stdin.
 fn seal_file(source: &Path, target: &Path) -> Result<(), HostError> {
-    let contents = fs::read(source)
-        .map_err(|err| HostError::internal(format!("cannot read `{}`: {err}", source.display())))?;
+    let contents = read_file_maybe_elevated(source)?;
     let mut child = Command::new("sudo")
         .arg("-n")
         .arg("systemd-creds")
@@ -956,6 +955,48 @@ fn sha256_file(path: &Path) -> Result<String, HostError> {
 /// The seconds since the Unix epoch.
 fn unix_timestamp() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Read a file, elevating when the caller may not read it.
+///
+/// A backup snapshots files the service owns -- a rendered config can be
+/// root-owned 0600 -- so an unelevated read fails exactly where the backup
+/// matters most. The direct read comes first (it works for unit files and
+/// costs no fork); only a permission failure escalates. The contents are
+/// never printed, only written into the snapshot or sealed.
+fn read_file_maybe_elevated(path: &Path) -> Result<Vec<u8>, HostError> {
+    match fs::read(path) {
+        Ok(contents) => return Ok(contents),
+        Err(err) if err.kind() != std::io::ErrorKind::PermissionDenied => {
+            return Err(HostError::internal(format!("cannot read `{}`: {err}", path.display())));
+        }
+        Err(_) => {}
+    }
+    if nix::unistd::Uid::effective().is_root() {
+        return Err(HostError::failed(format!(
+            "cannot read `{}`: permission denied",
+            path.display()
+        )));
+    }
+    let out = Command::new("sudo")
+        .arg("-n")
+        .arg("cat")
+        .arg("--")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| HostError::internal(format!("cannot read `{}`: {err}", path.display())))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(HostError::failed(format!(
+            "cannot read `{}`: {}",
+            path.display(),
+            stderr.trim()
+        )));
+    }
+    Ok(out.stdout)
 }
 
 /// List a directory, sorted, elevating when the caller is not root.
