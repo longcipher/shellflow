@@ -143,8 +143,18 @@ fn service(args: &HostServiceArgs) -> Result<(), HostError> {
     run_systemctl(&["daemon-reload"])?;
 
     if args.enable {
-        run_systemctl(&["enable", &unit])?;
-        println!("==> enabled {unit}");
+        // A Quadlet container's unit is generated: `enable` refuses it
+        // ("transient or generated") while reporting it as enabled. Enabling
+        // what is already enabled is a no-op everywhere else, so ask first.
+        match unit_enabled_state(&unit)?.as_str() {
+            "enabled" | "enabled-runtime" | "generated" => {
+                println!("==> {unit} is already enabled");
+            }
+            _ => {
+                run_systemctl(&["enable", &unit])?;
+                println!("==> enabled {unit}");
+            }
+        }
     }
 
     if args.reload {
@@ -246,6 +256,26 @@ fn is_a_missing_file(line: &str) -> bool {
     line.contains("is not executable") ||
         line.contains("No such file or directory") ||
         line.trim().is_empty()
+}
+
+/// How the unit is enabled (`enabled`, `disabled`, `generated`, ...).
+///
+/// An unreadable state is reported as empty: the caller decides.
+fn unit_enabled_state(unit: &str) -> Result<String, HostError> {
+    let out = systemctl_output(&["is-enabled", unit])
+        .map_err(|err| HostError::internal(format!("cannot run `systemctl is-enabled`: {err}")))?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+    // A unit systemd has never heard of is not enabled; anything else the
+    // caller handles.
+    if detail.contains("No such file or directory") || detail.contains("not found") {
+        return Ok("missing".to_string());
+    }
+    Err(HostError::failed(format!("`systemctl is-enabled {unit}` failed: {detail}")))
 }
 
 /// The unit's activation state (`active`, `inactive`, `failed`, ...).
