@@ -581,8 +581,14 @@ fn all_unit_files() -> Vec<PathBuf> {
         };
         for entry in entries {
             let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
-            let is_unit = name.ends_with(".service") || name.ends_with(".timer");
-            let is_drop_in_dir = name.ends_with(".service.d") || name.ends_with(".timer.d");
+            // a Quadlet container carries the credential wiring of a
+            // container service, so it counts as a unit too
+            let is_unit = name.ends_with(".service") ||
+                name.ends_with(".timer") ||
+                name.ends_with(".container");
+            let is_drop_in_dir = name.ends_with(".service.d") ||
+                name.ends_with(".timer.d") ||
+                name.ends_with(".container.d");
             if is_drop_in_dir {
                 for drop_in in list_dir(&entry).unwrap_or_default() {
                     if drop_in.extension().is_some_and(|ext| ext == "conf") {
