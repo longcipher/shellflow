@@ -284,8 +284,11 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
             // The pattern is passed as an argument, so the format string
             // never has to escape the braces itself.
             let pattern = r"\$\{[A-Z_][A-Z0-9_]*\}";
+            // The rendered file belongs to the service: it is written to a
+            // root-owned tmpfs with mode 0600, so the check has to look with
+            // the same rights the service reads it with.
             format!(
-                "if [ -f {quoted} ] && ! grep -qE '{pattern}' {quoted} 2>/dev/null; then \
+                "if sudo test -f {quoted} && ! sudo grep -qE '{pattern}' {quoted} 2>/dev/null; then \
                  echo '{path} is fully rendered'; \
                  else echo '{path} is missing or still carries unexpanded placeholders'; \
                  false; fi",
