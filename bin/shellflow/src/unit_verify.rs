@@ -18,7 +18,7 @@
 //!    that never receives it runs unhardened.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
 };
@@ -184,6 +184,35 @@ fn read_dir_sorted(dir: &Path) -> Vec<String> {
     out
 }
 
+/// The path a source or destination names inside the staging directory.
+fn strip_workdir(path: &str) -> Option<&str> {
+    for prefix in ["${WORKDIR}/", "$WORKDIR/"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// The name of the directory a copy destination names.
+fn dst_name(dst: &str) -> String {
+    let path = strip_workdir(dst).unwrap_or(dst);
+    path.rsplit('/').next().unwrap_or(path).trim_matches('/').to_string()
+}
+
+/// The staging directory a copy destination fills.
+///
+/// A destination of `$WORKDIR/svc` is the directory `svc`; a destination of
+/// `$WORKDIR/svc/x.toml.tmpl` is a file inside `svc`; a destination directly
+/// under the staging root is the root itself.
+fn dst_dir(dst: &str) -> String {
+    let path = strip_workdir(dst).unwrap_or(dst);
+    match path.rsplit_once('/') {
+        Some((dir, _file)) => dir.to_string(),
+        None => String::new(),
+    }
+}
+
 /// Resolve the variables a path may name.
 ///
 /// A path in a playbook may name an exported variable (`${SVC}`,
@@ -224,8 +253,16 @@ struct PlaybookFacts {
     text: String,
     /// The service name the playbook exports (`SVC=`).
     service: String,
-    /// The file names the copy steps land in the staging directory.
-    staged: BTreeSet<String>,
+    /// The file names the copy steps land in each staging directory.
+    ///
+    /// The key is the directory's name under the staging root (`svc`,
+    /// `common`, ...). A directory whose contents cannot be known from the
+    /// repository (a copy of a locally built tree, say) is left out: the
+    /// check cannot say anything about it.
+    staged: BTreeMap<String, BTreeSet<String>>,
+    /// The staging directories a copy fills with files the repository cannot
+    /// name (a locally built tree, say). Nothing is checked about them.
+    opaque: BTreeSet<String>,
     /// The variables the local block assigns, resolved.
     variables: std::collections::BTreeMap<String, String>,
     /// The repository paths the copy steps read from.
@@ -284,7 +321,8 @@ fn playbook_facts(repo: &Path, path: &Path) -> Option<PlaybookFacts> {
         copies_common: false,
         service,
         text,
-        staged: BTreeSet::new(),
+        staged: BTreeMap::new(),
+        opaque: BTreeSet::new(),
         variables,
         copy_sources: Vec::new(),
         ordered: Vec::new(),
@@ -300,27 +338,44 @@ fn playbook_facts(repo: &Path, path: &Path) -> Option<PlaybookFacts> {
                     // destination's name.
                     if let Some(dir) = source.strip_prefix("services/") {
                         let dir = dir.trim_matches('/');
-                        if Path::new(dir).extension().is_none() {
+                        // a directory copy brings the directory's contents;
+                        // a file copy brings that one file
+                        if repo.join("services").join(dir).is_dir() {
                             facts.service_dirs.push(dir.to_string());
                             let service_dir = repo.join("services").join(dir);
+                            let mut files = BTreeSet::new();
                             for entry in read_dir_sorted(&service_dir) {
-                                facts.staged.insert(entry.clone());
+                                files.insert(entry.clone());
                                 // a drop-in directory lands its files too
                                 let nested = service_dir.join(&entry);
                                 if nested.is_dir() {
                                     for file in read_dir_sorted(&nested) {
-                                        facts.staged.insert(file);
+                                        files.insert(format!("{entry}/{file}"));
                                     }
                                 }
                             }
+                            facts.staged.insert(dst_name(&entry.dst), files);
                             continue;
                         }
+                        // a file out of the repository: the destination's
+                        // name is what lands in the staging directory
+                        if let Some(name) = entry.dst.rsplit('/').next() &&
+                            !name.is_empty()
+                        {
+                            facts
+                                .staged
+                                .entry(dst_dir(&entry.dst))
+                                .or_default()
+                                .insert(name.to_string());
+                        }
+                        continue;
                     }
-                    if let Some(name) = entry.dst.rsplit('/').next() &&
-                        !name.is_empty()
-                    {
-                        facts.staged.insert(name.to_string());
-                    }
+                    // a file or a tree built locally: what it holds is not
+                    // in the repository, so the check stays quiet about the
+                    // directory it lands in -- and about the name it lands
+                    // under
+                    facts.opaque.insert(dst_name(&entry.dst));
+                    facts.opaque.insert(dst_dir(&entry.dst));
                     // the copy's source is the service directory in the
                     // repository; its destination is the staging directory
                     if entry.src.contains("common") {
@@ -369,22 +424,42 @@ fn check_playbook(
     };
 
     // Every `@install` source must be a file the playbook actually stages.
+    // The source is read out of the staging directory, so the check asks
+    // which directory it names and whether a copy step fills that directory
+    // with that file.
     for (src, _dst) in &facts.installs {
-        let Some(rest) = src.strip_prefix("${WORKDIR}/svc/") else {
+        let Some(rest) = strip_workdir(src) else {
             continue;
         };
         let resolved = resolve(rest, &facts);
-        let name = resolved.rsplit('/').next().unwrap_or_default();
-        if name.is_empty() {
+        let (dir, name) = match resolved.split_once('/') {
+            Some((dir, name)) => (dir, name),
+            None => ("", resolved.as_str()),
+        };
+        if name.is_empty() || name.contains('*') {
             continue;
         }
-        if !facts.staged.contains(name) {
+        let Some(files) = facts.staged.get(dir) else {
+            if facts.opaque.contains(dir) {
+                // the directory is staged by a copy the repository cannot
+                // describe (a locally built tree); nothing to check
+                continue;
+            }
             report.problems.push(Problem {
                 location: playbook.display().to_string(),
                 message: format!(
-                    "`@install {src}` names a file the playbook never stages (the copy steps \
-                     stage: {})",
-                    facts.staged.iter().cloned().collect::<Vec<_>>().join(", ")
+                    "`@install {src}` reads from {dir}, but no copy step stages that directory"
+                ),
+            });
+            continue;
+        };
+        if !files.contains(name) {
+            report.problems.push(Problem {
+                location: playbook.display().to_string(),
+                message: format!(
+                    "`@install {src}` names a file the playbook never stages in {dir} (the copy \
+                     steps stage: {})",
+                    files.iter().cloned().collect::<Vec<_>>().join(", ")
                 ),
             });
             continue;
@@ -407,8 +482,8 @@ fn check_playbook(
     // rollback copy is worthless.
     check_backup_order(&facts, playbook, report);
 
-    // Every generated drop-in of a copied service must be installed, and the
-    // shared hardening must be installed too.
+    // Every drop-in of a copied service must be installed, and the shared
+    // hardening must be installed too.
     for service_dir in &facts.service_dirs {
         let service = service_dir.split('/').next().unwrap_or(service_dir);
         let units: Vec<String> = manifests
@@ -417,19 +492,33 @@ fn check_playbook(
             .map(|m| unit_stem(&m.unit).to_string())
             .collect();
         for unit in units {
-            let dropin = format!("/etc/systemd/system/{unit}.service.d/{}", unit::DROPIN_NAME);
             let hardening = format!("/etc/systemd/system/{unit}.service.d/{HARDENING_NAME}");
             // A multi-unit service installs its units in a shell loop, which
             // the plan cannot show. The loop names the drop-in by its
-            // suffix (`${u}.service.d/<file>`), so a mention of the suffix
-            // counts.
-            let mentions = |name: &str| facts.text.contains(&format!(".service.d/{name}"));
-            if !facts.installs.iter().any(|(_, dst)| dst == &dropin) && !mentions(unit::DROPIN_NAME)
-            {
-                report.problems.push(Problem {
-                    location: playbook.display().to_string(),
-                    message: format!("the generated drop-in {dropin} is never installed"),
-                });
+            // suffix (`${u}.service.d/<file>`), so an *install command* that
+            // mentions the file counts. A mere mention (a rollback path, say)
+            // does not: the file has to reach the target.
+            let mentions = |name: &str| {
+                let suffix = format!(".service.d/{name}");
+                facts.text.lines().any(|line| line.contains("install") && line.contains(&suffix))
+            };
+            // Every drop-in the repository holds for this unit: the
+            // generated one, the service's own override, and anything else
+            // the service needs. A drop-in the repository holds but the
+            // playbook never installs is a file the target never sees.
+            let dir = repo.join("services").join(service).join(format!("{unit}.service.d"));
+            let mut files = read_dir_sorted(&dir);
+            if files.is_empty() {
+                files.push(unit::DROPIN_NAME.to_string());
+            }
+            for file in files {
+                let dropin = format!("/etc/systemd/system/{unit}.service.d/{file}");
+                if !facts.installs.iter().any(|(_, dst)| dst == &dropin) && !mentions(&file) {
+                    report.problems.push(Problem {
+                        location: playbook.display().to_string(),
+                        message: format!("the drop-in {dropin} is never installed"),
+                    });
+                }
             }
             // A unit that cannot take the shared hardening says so in its
             // manifest; the check then stops asking for it.
@@ -532,6 +621,32 @@ mod tests {
     }
 
     #[test]
+    fn an_install_that_reads_from_an_unstaged_directory_is_reported() {
+        // The hardening is installed from the staging directory, so the
+        // playbook has to stage it there. A copy step that does not is a
+        // deploy that fails on the target.
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("playbooks")).expect("mkdir");
+        fs::create_dir_all(dir.path().join("services/dufs")).expect("mkdir");
+        fs::write(dir.path().join("services/dufs/dufs.service"), "[Service]\n").expect("write");
+        fs::write(
+            dir.path().join("playbooks/deploy.sh"),
+            "# @server api api\n\
+             # @copy services/dufs -> $WORKDIR/svc @api\n\
+             # @install $WORKDIR/common/10-hardening.conf -> /etc/systemd/system/dufs.service.d/10-hardening.conf @api\n",
+        )
+        .expect("write");
+        let report = verify(dir.path()).expect("verify");
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.message.contains("no copy step stages that directory")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
     fn a_backup_after_the_install_of_the_same_path_is_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(dir.path().join("playbooks")).expect("mkdir");
@@ -574,6 +689,10 @@ mod tests {
     fn the_facts_of_a_playbook_are_read_from_its_plan() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(dir.path().join("playbooks")).expect("mkdir");
+        // the service directory the copy step reads: a copy of a directory
+        // lands that directory's contents, so the check has to see it
+        fs::create_dir_all(dir.path().join("services/dufs")).expect("mkdir");
+        fs::write(dir.path().join("services/dufs/dufs.service"), "[Service]\n").expect("write");
         let path = dir.path().join("playbooks/deploy.sh");
         fs::write(
             &path,
