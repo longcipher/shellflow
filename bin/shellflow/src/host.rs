@@ -130,8 +130,13 @@ fn service(args: &HostServiceArgs) -> Result<(), HostError> {
         verify_unit(&unit)?;
     }
 
-    let was_active = unit_is_active(&unit);
-    println!("==> {unit} was {}", if was_active { "active" } else { "not active" });
+    let state = unit_state(&unit);
+    let was_active = !matches!(state.as_str(), "" | "inactive" | "unknown");
+    if state == "failed" {
+        println!("==> {unit} was failed: the deploy restarts it");
+    } else {
+        println!("==> {unit} was {}", if was_active { "active" } else { "not active" });
+    }
 
     // The unit file may have just been replaced, so the manager always needs
     // a reload before it can act on the new definition.
@@ -220,12 +225,14 @@ fn is_a_missing_file(line: &str) -> bool {
         line.trim().is_empty()
 }
 
-/// Whether the unit is currently active.
-fn unit_is_active(unit: &str) -> bool {
+/// The unit's activation state (`active`, `inactive`, `failed`, ...).
+///
+/// An empty string means the state could not be read at all.
+fn unit_state(unit: &str) -> String {
     let Ok(out) = systemctl_output(&["is-active", unit]) else {
-        return false;
+        return String::new();
     };
-    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "active"
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// Reload a unit through its own `ExecReload=`, or refuse.
