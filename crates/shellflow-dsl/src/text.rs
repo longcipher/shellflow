@@ -46,3 +46,36 @@ pub fn strip_surrounding_quotes(raw: &str) -> String {
     trimmed.to_string()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{shell_quote_single, strip_surrounding_quotes};
+
+    #[test]
+    fn a_quoted_value_is_wrapped_in_single_quotes() {
+        let quoted = shell_quote_single("hello");
+        assert!(quoted.starts_with('\''), "{quoted}");
+        assert!(quoted.ends_with('\''), "{quoted}");
+        assert!(quoted.contains("hello"), "{quoted}");
+    }
+
+    #[test]
+    fn a_quote_inside_the_value_is_escaped() {
+        let quoted = shell_quote_single("it's");
+        assert_eq!(quoted, "'it'\\''s'");
+    }
+
+    #[test]
+    fn an_empty_value_still_produces_a_quoted_pair() {
+        let quoted = shell_quote_single("");
+        assert_eq!(quoted, "''");
+    }
+
+    #[test]
+    fn one_layer_of_surrounding_quotes_is_removed() {
+        assert_eq!(strip_surrounding_quotes("\"x\""), "x");
+        assert_eq!(strip_surrounding_quotes("'x'"), "x");
+        assert_eq!(strip_surrounding_quotes("x"), "x");
+        assert_eq!(strip_surrounding_quotes("''"), "");
+        assert_eq!(strip_surrounding_quotes("\""), "\"");
+    }
+}

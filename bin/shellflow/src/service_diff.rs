@@ -14,12 +14,14 @@
 use std::path::{Path, PathBuf};
 
 use eyre::Result;
+use shellflow_core::env::shell_quote_single;
 
 use crate::{
-    cli::ServiceDiffArgs, diffutil::unified_diff, rbatch::Batch, service::ServiceError,
-    service::ServiceError::Other,
+    cli::ServiceDiffArgs,
+    diffutil::unified_diff,
+    rbatch::Batch,
+    service::{ServiceError, ServiceError::Other},
 };
-use shellflow_core::env::shell_quote_single;
 
 /// Run `service diff`.
 ///
@@ -131,18 +133,12 @@ fn local_unit_for(repo: &Path, service: &str) -> Result<PathBuf, ServiceError> {
             .filter(|path| path.extension().is_some_and(|ext| ext == "service"))
             .collect(),
         Err(err) => {
-            return Err(Other(eyre::eyre!(
-                "service diff: cannot read {}: {err}",
-                dir.display()
-            )));
+            return Err(Other(eyre::eyre!("service diff: cannot read {}: {err}", dir.display())));
         }
     };
     candidates.sort();
     candidates.into_iter().next().ok_or_else(|| {
-        Other(eyre::eyre!(
-            "service diff: no unit file for `{service}` under {}",
-            dir.display()
-        ))
+        Other(eyre::eyre!("service diff: no unit file for `{service}` under {}", dir.display()))
     })
 }
 
@@ -155,8 +151,7 @@ mod tests {
     fn the_conventional_unit_is_found() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("services/dufs")).expect("dirs");
-        std::fs::write(dir.path().join("services/dufs/dufs.service"), "[Unit]\n")
-            .expect("write");
+        std::fs::write(dir.path().join("services/dufs/dufs.service"), "[Unit]\n").expect("write");
         let found = local_unit_for(dir.path(), "dufs").expect("found");
         assert!(found.ends_with("services/dufs/dufs.service"), "{}", found.display());
     }
@@ -165,8 +160,7 @@ mod tests {
     fn a_differently_named_unit_is_found_too() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("services/rpxy")).expect("dirs");
-        std::fs::write(dir.path().join("services/rpxy/rpxy.service"), "[Unit]\n")
-            .expect("write");
+        std::fs::write(dir.path().join("services/rpxy/rpxy.service"), "[Unit]\n").expect("write");
         let found = local_unit_for(dir.path(), "rpxy").expect("found");
         assert!(found.ends_with("services/rpxy/rpxy.service"), "{}", found.display());
     }
@@ -177,5 +171,4 @@ mod tests {
         let err = local_unit_for(dir.path(), "nope").expect_err("should fail");
         assert!(matches!(err, ServiceError::Other(_)), "{err:?}");
     }
-
 }

@@ -7,8 +7,9 @@ use crate::{
     error::ParseError,
     heredoc::HeredocTracker,
     plan::{
-        AssertStep, Assertion, CopyEntry, CopyStep, EnvEntry, ExecutionPlan, LocalStep, ReloadStep,
-        RemoteStep, SecretEntry, Step, Target, WaitStep, is_valid_var_name,
+        AssertStep, Assertion, BackupStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
+        ExecutionPlan, HelperStep, InstallStep, LocalStep, ReloadStep, RemoteStep, SecretEntry,
+        ServiceStep, Step, Target, UnitInventoryStep, WaitStep, Workdir, is_valid_var_name,
     },
     ssh_spec::SshSpec,
 };
@@ -192,6 +193,46 @@ impl State {
             "assert_rendered" => {
                 self.flush();
                 self.add_assert_rendered(payload, line)
+            }
+            "service" => {
+                self.flush();
+                self.add_service(payload, line)
+            }
+            "install" => {
+                self.flush();
+                self.add_install(payload, line)
+            }
+            "backup" => {
+                self.flush();
+                self.add_backup(payload, line)
+            }
+            "credstore" => {
+                self.flush();
+                self.add_credstore(payload, line)
+            }
+            "assert_no_leak" => {
+                self.flush();
+                self.add_assert_no_leak(payload, line)
+            }
+            "assert_digest" => {
+                self.flush();
+                self.add_assert_digest(payload, line)
+            }
+            "assert_credstore" => {
+                self.flush();
+                self.add_assert_credstore(payload, line)
+            }
+            "unit_inventory" => {
+                self.flush();
+                self.add_unit_inventory(payload, line)
+            }
+            "helper" => {
+                self.flush();
+                self.add_helper(payload, line)
+            }
+            "workdir" => {
+                self.flush();
+                self.add_workdir(payload, line)
             }
             "export" => self.declare_export(payload, line),
             "timeout" => {
@@ -542,16 +583,14 @@ impl State {
         // in one transfer: a playbook that ships five templates to the same
         // directory costs one round trip instead of five.
         let mergeable = name.is_none() &&
-            self.plan.steps.last().is_some_and(
-                |step| matches!(step, Step::Copy(existing)
+            self.plan.steps.last().is_some_and(|step| {
+                matches!(step, Step::Copy(existing)
                     if existing.target.text == target
                         && existing.delete == delete
                         && existing.excludes == excludes
-                        && existing.timeout == timeout),
-            );
-        if mergeable
-            && let Some(Step::Copy(existing)) = self.plan.steps.last_mut()
-        {
+                        && existing.timeout == timeout)
+            });
+        if mergeable && let Some(Step::Copy(existing)) = self.plan.steps.last_mut() {
             existing.entries.push(entry);
             return Ok(());
         }
@@ -732,12 +771,7 @@ impl State {
             });
         }
         let target = self.resolve_assert_target(target, "assert", line)?;
-        self.push_assertion(
-            name,
-            target,
-            Assertion::UnitState { unit, state },
-            timeout,
-        );
+        self.push_assertion(name, target, Assertion::UnitState { unit, state }, timeout);
         Ok(())
     }
 
@@ -1073,9 +1107,7 @@ impl State {
             self.plan.steps.last().is_some_and(
                 |step| matches!(step, Step::Assert(existing) if existing.target.text == target),
             );
-        if mergeable
-            && let Some(Step::Assert(existing)) = self.plan.steps.last_mut()
-        {
+        if mergeable && let Some(Step::Assert(existing)) = self.plan.steps.last_mut() {
             existing.checks.push(check);
             return;
         }
@@ -1220,6 +1252,781 @@ impl State {
         }));
         Ok(())
     }
+
+    /// Parse `# @service <unit> @<target> [--enable] [--restart] [--reload]
+    /// [--wait] [--verify] [--force-start] [--timeout SECS]`.
+    ///
+    /// The step owns the whole lifecycle sequence, including the rule that
+    /// the shell spelling got wrong: `--restart` never *starts* a unit that
+    /// was not running. `--force-start` overrides that deliberately.
+    fn add_service(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "service".to_string(),
+                reason: "`@only_if` is not supported on `@service`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let mut timeout = self.pending_timeout.take();
+
+        let (positional, flags) = split_flags(
+            payload,
+            &["--enable", "--restart", "--reload", "--wait", "--verify", "--force-start"],
+            "service",
+            line,
+        )?;
+
+        let mut enable = false;
+        let mut restart = false;
+        let mut reload = false;
+        let mut wait = false;
+        let mut verify = false;
+        let mut force_start = false;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--enable" => enable = true,
+                "--restart" => restart = true,
+                "--reload" => reload = true,
+                "--wait" => wait = true,
+                "--verify" => verify = true,
+                "--force-start" => force_start = true,
+                "--timeout" => {
+                    let secs = flag_value(value, flag, "service", line)?;
+                    timeout = Some(parse_secs(secs, "service", line)?);
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "service".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+
+        if positional.len() != 2 {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "service".to_string(),
+                reason: "expected `<unit> @<target> [--enable] [--restart] [--reload] [--wait] \
+                         [--verify] [--force-start]`"
+                    .to_string(),
+            });
+        }
+        let unit = normalize_unit(&positional[0]);
+        if !is_safe_unit(&unit) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "service".to_string(),
+                reason: format!("unsafe unit name `{unit}`"),
+            });
+        }
+        let target = require_target(&positional[1], "service", line)?;
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Service(ServiceStep {
+            name,
+            target: Target::new(target),
+            unit,
+            enable,
+            restart,
+            reload,
+            wait,
+            verify,
+            force_start,
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @install <src> -> <dst> @<target> [--mode M] [--owner U:G]
+    /// [--dir-mode M]`.
+    ///
+    /// Both paths live **on the target**: the file is shipped by `@copy` and
+    /// then installed in place, atomically.
+    fn add_install(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "install".to_string(),
+                reason: "`@only_if` is not supported on `@install`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (src, rest) = payload.split_once("->").ok_or_else(|| ParseError::InvalidDirective {
+            line,
+            directive: "install".to_string(),
+            reason: "expected `src -> dst @target [--mode M] [--owner U:G]`".to_string(),
+        })?;
+        let src = src.trim();
+        if src.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "install".to_string(),
+                reason: "missing source path".to_string(),
+            });
+        }
+
+        let (positional, flags) = split_flags(rest, &[], "install", line)?;
+        let mut mode = None;
+        let mut owner = None;
+        let mut dir_mode = None;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--mode" => {
+                    let raw = flag_value(value, flag, "install", line)?;
+                    mode = Some(parse_mode(raw, "install", line)?);
+                }
+                "--dir-mode" => {
+                    let raw = flag_value(value, flag, "install", line)?;
+                    dir_mode = Some(parse_mode(raw, "install", line)?);
+                }
+                "--owner" => {
+                    let raw = flag_value(value, flag, "install", line)?;
+                    owner = Some(parse_owner(raw, "install", line)?);
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "install".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+
+        if positional.len() != 2 {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "install".to_string(),
+                reason: "expected `src -> dst @target [--mode M] [--owner U:G] [--dir-mode M]`"
+                    .to_string(),
+            });
+        }
+        let dst = positional[0].trim();
+        if !dst.starts_with('/') {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "install".to_string(),
+                reason: format!("the destination must be absolute (got `{dst}`)"),
+            });
+        }
+        let target = require_target(&positional[1], "install", line)?;
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Install(InstallStep {
+            name,
+            target: Target::new(target),
+            src: src.to_string(),
+            dst: dst.to_string(),
+            mode,
+            owner,
+            dir_mode,
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @backup <path>… @<target> [--keep N] [--seal] [--dir PATH]`.
+    fn add_backup(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "backup".to_string(),
+                reason: "`@only_if` is not supported on `@backup`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, flags) = split_flags(payload, &["--seal"], "backup", line)?;
+        let mut keep = None;
+        let mut seal = false;
+        let mut dir = None;
+        let mut service = None;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--keep" => {
+                    let raw = flag_value(value, flag, "backup", line)?;
+                    let parsed: u32 = raw.parse().map_err(|_| ParseError::InvalidDirective {
+                        line,
+                        directive: "backup".to_string(),
+                        reason: format!("invalid keep count `{raw}`"),
+                    })?;
+                    if parsed == 0 {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "backup".to_string(),
+                            reason: "`--keep` must be greater than zero".to_string(),
+                        });
+                    }
+                    keep = Some(parsed);
+                }
+                "--seal" => seal = true,
+                "--service" => {
+                    let raw = flag_value(value, flag, "backup", line)?;
+                    if !is_safe_unit(raw) {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "backup".to_string(),
+                            reason: format!("unsafe service name `{raw}`"),
+                        });
+                    }
+                    service = Some(raw.to_string());
+                }
+                "--dir" => {
+                    let raw = flag_value(value, flag, "backup", line)?;
+                    dir = Some(raw.to_string());
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "backup".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+
+        if positional.len() < 2 {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "backup".to_string(),
+                reason: "expected `<path>… @<target> [--keep N] [--seal] [--dir PATH]`".to_string(),
+            });
+        }
+        // The target is the last positional argument; everything before it is
+        // a path to snapshot.
+        let target = require_target(&positional[positional.len() - 1], "backup", line)?;
+        let paths: Vec<String> = positional[..positional.len() - 1].to_vec();
+        for path in &paths {
+            if !path.starts_with('/') {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "backup".to_string(),
+                    reason: format!("the path must be absolute (got `{path}`)"),
+                });
+            }
+        }
+        if let Some(dir) = &dir &&
+            !dir.starts_with('/')
+        {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "backup".to_string(),
+                reason: format!("the snapshot directory must be absolute (got `{dir}`)"),
+            });
+        }
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Backup(BackupStep {
+            name,
+            target: Target::new(target),
+            paths,
+            service,
+            keep,
+            seal,
+            dir,
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @credstore <service> @<target> [--require KEY,…]`.
+    fn add_credstore(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "credstore".to_string(),
+                reason: "`@only_if` is not supported on `@credstore`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, flags) = split_flags(payload, &[], "credstore", line)?;
+        let mut require: Vec<String> = Vec::new();
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--require" => {
+                    let raw = flag_value(value, flag, "credstore", line)?;
+                    for key in raw.split(',') {
+                        let key = key.trim();
+                        if key.is_empty() {
+                            continue;
+                        }
+                        if !is_valid_var_name(key) {
+                            return Err(ParseError::InvalidDirective {
+                                line,
+                                directive: "credstore".to_string(),
+                                reason: format!("invalid credential key `{key}`"),
+                            });
+                        }
+                        require.push(key.to_string());
+                    }
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "credstore".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+        if positional.len() != 2 {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "credstore".to_string(),
+                reason: "expected `<service> @<target> [--require KEY,…]`".to_string(),
+            });
+        }
+        let service = positional[0].trim().to_string();
+        if !is_safe_unit(&service) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "credstore".to_string(),
+                reason: format!("unsafe service name `{service}`"),
+            });
+        }
+        let target = require_target(&positional[1], "credstore", line)?;
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Credstore(CredstoreStep {
+            name,
+            target: Target::new(target),
+            service,
+            require,
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @assert_no_leak <unit> [@<target>] [--lines N]`.
+    fn add_assert_no_leak(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_no_leak".to_string(),
+                reason: "`@only_if` is not supported on `@assert_no_leak`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, flags) = split_flags(payload, &[], "assert_no_leak", line)?;
+        let mut lines = None;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--lines" => {
+                    let raw = flag_value(value, flag, "assert_no_leak", line)?;
+                    let parsed: u64 = raw.parse().map_err(|_| ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_no_leak".to_string(),
+                        reason: format!("invalid line count `{raw}`"),
+                    })?;
+                    if parsed == 0 {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_no_leak".to_string(),
+                            reason: "`--lines` must be greater than zero".to_string(),
+                        });
+                    }
+                    lines = Some(parsed);
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_no_leak".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+        if positional.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_no_leak".to_string(),
+                reason: "missing unit name".to_string(),
+            });
+        }
+        let unit = normalize_unit(&positional[0]);
+        if !is_safe_unit(&unit) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_no_leak".to_string(),
+                reason: format!("unsafe unit name `{unit}`"),
+            });
+        }
+        let target = self.resolve_assert_target(
+            positional.get(1).map(|t| t.trim_start_matches('@').trim().to_string()),
+            "assert_no_leak",
+            line,
+        )?;
+        self.push_assertion(name, target, Assertion::NoLeak { unit, lines }, timeout);
+        Ok(())
+    }
+
+    /// Parse `# @assert_digest <path> [@<target>] [--sha256 HEX] [--local PATH]`.
+    fn add_assert_digest(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_digest".to_string(),
+                reason: "`@only_if` is not supported on `@assert_digest`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, flags) = split_flags(payload, &[], "assert_digest", line)?;
+        let mut sha256 = None;
+        let mut local = None;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--sha256" => {
+                    let raw = flag_value(value, flag, "assert_digest", line)?;
+                    let hex = raw.trim().to_ascii_lowercase();
+                    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "assert_digest".to_string(),
+                            reason: format!("`--sha256` wants 64 hex characters (got `{raw}`)"),
+                        });
+                    }
+                    sha256 = Some(hex);
+                }
+                "--local" => {
+                    let raw = flag_value(value, flag, "assert_digest", line)?;
+                    local = Some(raw.to_string());
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_digest".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+        if positional.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_digest".to_string(),
+                reason: "missing path".to_string(),
+            });
+        }
+        let path = positional[0].trim().to_string();
+        if !path.starts_with('/') {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_digest".to_string(),
+                reason: format!("the path must be absolute (got `{path}`)"),
+            });
+        }
+        let target = self.resolve_assert_target(
+            positional.get(1).map(|t| t.trim_start_matches('@').trim().to_string()),
+            "assert_digest",
+            line,
+        )?;
+        self.push_assertion(name, target, Assertion::Digest { path, sha256, local }, timeout);
+        Ok(())
+    }
+
+    /// Parse `# @assert_credstore <service> [@<target>]`.
+    fn add_assert_credstore(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_credstore".to_string(),
+                reason: "`@only_if` is not supported on `@assert_credstore`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, _flags) = split_flags(payload, &[], "assert_credstore", line)?;
+        if positional.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_credstore".to_string(),
+                reason: "missing service name".to_string(),
+            });
+        }
+        let service = positional[0].trim().to_string();
+        if !is_safe_unit(&service) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_credstore".to_string(),
+                reason: format!("unsafe service name `{service}`"),
+            });
+        }
+        let target = self.resolve_assert_target(
+            positional.get(1).map(|t| t.trim_start_matches('@').trim().to_string()),
+            "assert_credstore",
+            line,
+        )?;
+        self.push_assertion(name, target, Assertion::Credstore { service }, timeout);
+        Ok(())
+    }
+
+    /// Parse `# @unit_inventory [@<target>]`.
+    fn add_unit_inventory(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "unit_inventory".to_string(),
+                reason: "`@only_if` is not supported on `@unit_inventory`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, _flags) = split_flags(payload, &[], "unit_inventory", line)?;
+        let target = self.resolve_assert_target(
+            positional.first().map(|t| t.trim_start_matches('@').trim().to_string()),
+            "unit_inventory",
+            line,
+        )?;
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::UnitInventory(UnitInventoryStep {
+            name,
+            target: Target::new(target),
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @helper [@<target>] [--source DIR] [--triple T]
+    /// [--install-path PATH]`.
+    fn add_helper(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        if self.pending_guard.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "helper".to_string(),
+                reason: "`@only_if` is not supported on `@helper`".to_string(),
+            });
+        }
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, flags) = split_flags(payload, &[], "helper", line)?;
+        let mut source = None;
+        let mut triple = None;
+        let mut install_path = "/usr/local/bin/shellflow".to_string();
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--source" => {
+                    let raw = flag_value(value, flag, "helper", line)?;
+                    source = Some(raw.to_string());
+                }
+                "--triple" => {
+                    let raw = flag_value(value, flag, "helper", line)?;
+                    triple = Some(raw.to_string());
+                }
+                "--install-path" => {
+                    let raw = flag_value(value, flag, "helper", line)?;
+                    if !raw.starts_with('/') {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "helper".to_string(),
+                            reason: format!("the install path must be absolute (got `{raw}`)"),
+                        });
+                    }
+                    install_path = raw.to_string();
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "helper".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+        if positional.len() > 1 {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "helper".to_string(),
+                reason: "expected `[@<target>] [--source DIR] [--triple T]`".to_string(),
+            });
+        }
+        let target = self.resolve_assert_target(
+            positional.first().map(|t| t.trim_start_matches('@').trim().to_string()),
+            "helper",
+            line,
+        )?;
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Helper(HelperStep {
+            name,
+            target: Target::new(target),
+            source,
+            triple,
+            install_path,
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @workdir [--prefix NAME]`.
+    ///
+    /// A plan-level directive: it declares the managed temporary directory
+    /// for the whole run, published to the run state as `WORKDIR`.
+    fn add_workdir(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        let (_positional, flags) = split_flags(payload, &[], "workdir", line)?;
+        let mut prefix = "shellflow".to_string();
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--prefix" => {
+                    let raw = flag_value(value, flag, "workdir", line)?;
+                    if raw.is_empty() ||
+                        !raw.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                    {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "workdir".to_string(),
+                            reason: format!("invalid workdir prefix `{raw}`"),
+                        });
+                    }
+                    prefix = raw.to_string();
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "workdir".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+        if self.plan.workdir.is_some() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "workdir".to_string(),
+                reason: "the workdir is already declared".to_string(),
+            });
+        }
+        self.plan.workdir = Some(Workdir { prefix });
+        Ok(())
+    }
+}
+
+/// The positional arguments and the flags of one directive payload.
+type SplitPayload = (Vec<String>, Vec<(String, Option<String>)>);
+
+/// Split a directive payload into positional arguments and flags.
+///
+/// `bools` names the flags that take no value; every other `--flag` takes
+/// the next token as its value. A flag that stands alone at the end of the
+/// payload keeps `None` as its value: only the directive knows which flags
+/// exist, so only it can tell "unknown flag" from "flag without a value".
+///
+/// The positional arguments keep their order, so a directive can read them
+/// positionally (`<unit> @<target>`) or take the last one as the target
+/// (`<path>… @<target>`).
+fn split_flags(
+    payload: &str,
+    bools: &[&str],
+    directive: &str,
+    line: usize,
+) -> Result<SplitPayload, ParseError> {
+    let mut positional: Vec<String> = Vec::new();
+    let mut flags: Vec<(String, Option<String>)> = Vec::new();
+    let mut tokens = payload.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if !token.starts_with("--") {
+            positional.push(token.to_string());
+            continue;
+        }
+        if bools.contains(&token) {
+            flags.push((token.to_string(), None));
+            continue;
+        }
+        // A flag takes the next token as its value; a flag that stands alone
+        // at the end keeps `None`, and only the directive knows whether that
+        // is a typo or a boolean.
+        let value = tokens.next().map(ToOwned::to_owned);
+        flags.push((token.to_string(), value));
+    }
+    let _ = (directive, line);
+    Ok((positional, flags))
+}
+
+/// The value of a flag, or a readable error when the flag stands alone.
+fn flag_value<'a>(
+    value: &'a Option<String>,
+    flag: &str,
+    directive: &str,
+    line: usize,
+) -> Result<&'a str, ParseError> {
+    value.as_deref().ok_or_else(|| ParseError::InvalidDirective {
+        line,
+        directive: directive.to_string(),
+        reason: format!("`{flag}` expects a value"),
+    })
+}
+
+/// The target of a mutating directive: the argument is mandatory, because a
+/// mutation that lands on the wrong host is not recoverable by re-running it.
+fn require_target(raw: &str, directive: &str, line: usize) -> Result<String, ParseError> {
+    let target = raw.trim_start_matches('@').trim();
+    if target.is_empty() {
+        return Err(ParseError::InvalidDirective {
+            line,
+            directive: directive.to_string(),
+            reason: "missing target".to_string(),
+        });
+    }
+    Ok(target.to_string())
+}
+
+/// Parse a seconds value: a positive integer.
+fn parse_secs(raw: &str, directive: &str, line: usize) -> Result<u64, ParseError> {
+    let secs: u64 = raw.parse().map_err(|_| ParseError::InvalidDirective {
+        line,
+        directive: directive.to_string(),
+        reason: format!("invalid seconds `{raw}`"),
+    })?;
+    if secs == 0 {
+        return Err(ParseError::InvalidDirective {
+            line,
+            directive: directive.to_string(),
+            reason: "must be greater than zero".to_string(),
+        });
+    }
+    Ok(secs)
+}
+
+/// Parse an octal file mode (`0644`).
+fn parse_mode(raw: &str, directive: &str, line: usize) -> Result<u32, ParseError> {
+    let trimmed = raw.trim();
+    let digits = trimmed.strip_prefix("0o").unwrap_or(trimmed);
+    if digits.is_empty() || !digits.chars().all(|c| ('0'..='7').contains(&c)) {
+        return Err(ParseError::InvalidDirective {
+            line,
+            directive: directive.to_string(),
+            reason: format!("invalid octal mode `{raw}`"),
+        });
+    }
+    // The digits are octal by construction, so the conversion is total: the
+    // check above is the only place a mode can be rejected.
+    Ok(u32::from_str_radix(digits, 8).unwrap_or_default())
+}
+
+/// Parse an owner (`user`, `user:group`, or `:group`).
+fn parse_owner(raw: &str, directive: &str, line: usize) -> Result<String, ParseError> {
+    let owner = raw.trim();
+    let ok = !owner.is_empty() &&
+        owner.split(':').all(|part| {
+            part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        });
+    if !ok {
+        return Err(ParseError::InvalidDirective {
+            line,
+            directive: directive.to_string(),
+            reason: format!("invalid owner `{raw}` (want `user` or `user:group`)"),
+        });
+    }
+    Ok(owner.to_string())
 }
 
 /// Whether a status pattern is an exact code (`200`) or a class (`2xx`).
@@ -1236,11 +2043,7 @@ fn is_status_pattern(pattern: &str) -> bool {
 /// every time is noise the reader has to skip.
 fn normalize_unit(unit: &str) -> String {
     let unit = unit.trim();
-    if unit.ends_with(".service") {
-        unit.to_string()
-    } else {
-        format!("{unit}.service")
-    }
+    if unit.ends_with(".service") { unit.to_string() } else { format!("{unit}.service") }
 }
 
 /// Whether a unit name is safe to hand to `systemctl`.
@@ -1251,9 +2054,7 @@ fn is_safe_unit(unit: &str) -> bool {
     !unit.is_empty() &&
         !unit.starts_with('.') &&
         !unit.contains("..") &&
-        unit
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        unit.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
 }
 
 /// Strip one layer of surrounding `"` or `'` quotes.
@@ -1359,10 +2160,7 @@ mod tests {
     use super::{directive, parse_script};
     use crate::{
         error::ParseError,
-        plan::{
-            AssertStep, Assertion, CopyStep, EnvEntry, LocalStep, RemoteStep, Step,
-            WaitStep,
-        },
+        plan::{AssertStep, Assertion, CopyStep, EnvEntry, LocalStep, RemoteStep, Step, WaitStep},
     };
 
     fn parse(input: &str) -> Result<crate::plan::ExecutionPlan, String> {
@@ -1401,6 +2199,41 @@ mod tests {
         match step {
             Step::Assert(s) => Ok(s),
             other => Err(format!("expected assert step, got {other:?}")),
+        }
+    }
+
+    fn as_service(step: &Step) -> Result<&crate::plan::ServiceStep, String> {
+        match step {
+            Step::Service(s) => Ok(s),
+            other => Err(format!("expected service step, got {other:?}")),
+        }
+    }
+
+    fn as_install(step: &Step) -> Result<&crate::plan::InstallStep, String> {
+        match step {
+            Step::Install(s) => Ok(s),
+            other => Err(format!("expected install step, got {other:?}")),
+        }
+    }
+
+    fn as_backup(step: &Step) -> Result<&crate::plan::BackupStep, String> {
+        match step {
+            Step::Backup(s) => Ok(s),
+            other => Err(format!("expected backup step, got {other:?}")),
+        }
+    }
+
+    fn as_credstore(step: &Step) -> Result<&crate::plan::CredstoreStep, String> {
+        match step {
+            Step::Credstore(s) => Ok(s),
+            other => Err(format!("expected credstore step, got {other:?}")),
+        }
+    }
+
+    fn as_helper(step: &Step) -> Result<&crate::plan::HelperStep, String> {
+        match step {
+            Step::Helper(s) => Ok(s),
+            other => Err(format!("expected helper step, got {other:?}")),
         }
     }
 
@@ -1528,10 +2361,7 @@ mod tests {
             // A malformed status code.
             "# @server api api\n# @assert_health http://x/ --expect abc @api\n",
         ] {
-            assert!(
-                parse(script).is_err(),
-                "expected an error for:\n{script}"
-            );
+            assert!(parse(script).is_err(), "expected an error for:\n{script}");
         }
     }
 
@@ -2468,5 +3298,429 @@ mod tests {
         input: &str,
     ) -> Result<crate::plan::ExecutionPlan, proptest::prelude::TestCaseError> {
         parse_script(input).map_err(|e| proptest::prelude::TestCaseError::fail(e.to_string()))
+    }
+
+    // === the lifecycle and host-operation primitives ===
+
+    #[test]
+    fn service_parses_unit_target_and_flags() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @service dufs @api --enable --restart --wait --verify\n",
+        )?;
+        let step = as_service(&plan.steps[0])?;
+        assert_eq!(step.unit, "dufs.service");
+        assert_eq!(step.target.text, "api");
+        assert!(step.enable);
+        assert!(step.restart);
+        assert!(step.wait);
+        assert!(step.verify);
+        assert!(!step.reload);
+        assert!(!step.force_start);
+        Ok(())
+    }
+
+    #[test]
+    fn service_accepts_a_bare_unit_name() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @service dufs.service @api\n")?;
+        assert_eq!(as_service(&plan.steps[0])?.unit, "dufs.service");
+        Ok(())
+    }
+
+    #[test]
+    fn service_requires_a_target() {
+        let err = parse("# @server api api\n# @service dufs\n").unwrap_err();
+        assert!(err.contains("expected `<unit> @<target>"), "{err}");
+    }
+
+    #[test]
+    fn service_rejects_an_unknown_flag() {
+        let err = parse("# @server api api\n# @service dufs @api --nope\n").unwrap_err();
+        assert!(err.contains("unknown flag `--nope`"), "{err}");
+    }
+
+    #[test]
+    fn service_rejects_only_if() {
+        let err = parse("# @server api api\n# @only_if true\n# @service dufs @api\n").unwrap_err();
+        assert!(err.contains("`@only_if` is not supported on `@service`"), "{err}");
+    }
+
+    #[test]
+    fn install_parses_paths_and_options() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @install /tmp/x/dufs.service -> /etc/systemd/system/dufs.service @api \
+             --mode 0644 --owner root:root --dir-mode 0755\n",
+        )?;
+        let step = as_install(&plan.steps[0])?;
+        assert_eq!(step.src, "/tmp/x/dufs.service");
+        assert_eq!(step.dst, "/etc/systemd/system/dufs.service");
+        assert_eq!(step.mode, Some(0o644));
+        assert_eq!(step.owner.as_deref(), Some("root:root"));
+        assert_eq!(step.dir_mode, Some(0o755));
+        Ok(())
+    }
+
+    #[test]
+    fn install_requires_an_absolute_destination() {
+        let err = parse("# @server api api\n# @install /a -> b @api\n").unwrap_err();
+        assert!(err.contains("the destination must be absolute"), "{err}");
+    }
+
+    #[test]
+    fn install_requires_the_arrow() {
+        let err = parse("# @server api api\n# @install /a /b @api\n").unwrap_err();
+        assert!(err.contains("expected `src -> dst @target"), "{err}");
+    }
+
+    #[test]
+    fn backup_parses_paths_keep_and_seal() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @backup /etc/systemd/system/dufs.service /opt/dufs/etc/config.toml @api \
+             --keep 5 --seal\n",
+        )?;
+        let step = as_backup(&plan.steps[0])?;
+        assert_eq!(
+            step.paths,
+            vec!["/etc/systemd/system/dufs.service", "/opt/dufs/etc/config.toml"]
+        );
+        assert_eq!(step.target.text, "api");
+        assert_eq!(step.keep, Some(5));
+        assert!(step.seal);
+        Ok(())
+    }
+
+    #[test]
+    fn backup_rejects_a_relative_path() {
+        let err = parse("# @server api api\n# @backup etc/dufs.service @api\n").unwrap_err();
+        assert!(err.contains("the path must be absolute"), "{err}");
+    }
+
+    #[test]
+    fn backup_rejects_a_zero_keep() {
+        let err =
+            parse("# @server api api\n# @backup /etc/dufs.service @api --keep 0\n").unwrap_err();
+        assert!(err.contains("must be greater than zero"), "{err}");
+    }
+
+    #[test]
+    fn credstore_parses_service_and_required_keys() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @credstore dufs @api --require TOKEN,API_KEY\n")?;
+        let step = as_credstore(&plan.steps[0])?;
+        assert_eq!(step.service, "dufs");
+        assert_eq!(step.target.text, "api");
+        assert_eq!(step.require, vec!["TOKEN".to_string(), "API_KEY".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn helper_parses_source_and_triple() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @helper @api --source /src/shellflow --triple x86_64-unknown-linux-musl\n",
+        )?;
+        let step = as_helper(&plan.steps[0])?;
+        assert_eq!(step.target.text, "api");
+        assert_eq!(step.source.as_deref(), Some("/src/shellflow"));
+        assert_eq!(step.triple.as_deref(), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(step.install_path, "/usr/local/bin/shellflow");
+        Ok(())
+    }
+
+    #[test]
+    fn helper_inherits_the_previous_target() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @copy a -> b @api\n# @helper\n")?;
+        assert_eq!(as_helper(&plan.steps[1])?.target.text, "api");
+        Ok(())
+    }
+
+    #[test]
+    fn assert_no_leak_parses_unit_and_lines() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert_no_leak dufs @api --lines 500\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(
+            step.checks,
+            vec![Assertion::NoLeak { unit: "dufs.service".to_string(), lines: Some(500) }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assert_digest_parses_path_and_expected_hash() -> Result<(), String> {
+        let hash = "a".repeat(64);
+        let plan = parse(&format!(
+            "# @server api api\n# @assert_digest /opt/dufs/etc/config.toml @api --sha256 {hash}\n"
+        ))?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(
+            step.checks,
+            vec![Assertion::Digest {
+                path: "/opt/dufs/etc/config.toml".to_string(),
+                sha256: Some(hash),
+                local: None,
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assert_digest_rejects_a_short_hash() {
+        let err = parse("# @server api api\n# @assert_digest /a @api --sha256 abc\n").unwrap_err();
+        assert!(err.contains("64 hex characters"), "{err}");
+    }
+
+    #[test]
+    fn assert_credstore_parses_the_service() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert_credstore dufs @api\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(step.checks, vec![Assertion::Credstore { service: "dufs".to_string() }]);
+        Ok(())
+    }
+
+    #[test]
+    fn new_assertions_merge_into_one_step() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @assert_no_leak dufs @api\n\
+             # @assert_credstore dufs @api\n",
+        )?;
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(as_assert(&plan.steps[0])?.checks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn unit_inventory_inherits_the_target() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @copy a -> b @api\n# @unit_inventory\n")?;
+        match &plan.steps[1] {
+            Step::UnitInventory(s) => assert_eq!(s.target.text, "api"),
+            other => return Err(format!("expected unit_inventory step, got {other:?}")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workdir_declares_the_managed_directory() -> Result<(), String> {
+        let plan = parse("# @workdir --prefix deploy\necho hi\n")?;
+        let workdir = plan.workdir.clone().ok_or("no workdir declared")?;
+        assert_eq!(workdir.prefix, "deploy");
+        Ok(())
+    }
+
+    #[test]
+    fn workdir_cannot_be_declared_twice() {
+        let err = parse("# @workdir\n# @workdir\n").unwrap_err();
+        assert!(err.contains("already declared"), "{err}");
+    }
+
+    #[test]
+    fn workdir_rejects_an_unsafe_prefix() {
+        let err = parse("# @workdir --prefix ../evil\n").unwrap_err();
+        assert!(err.contains("invalid workdir prefix"), "{err}");
+    }
+
+    // === the validation rules of the directives ===
+
+    #[test]
+    fn two_copies_with_different_options_do_not_merge() -> Result<(), String> {
+        // The merge condition is "same target AND same options": a copy
+        // that asked for `--delete` must not be folded into one that did not.
+        let plan = parse(
+            "# @server api api\n\
+             # @copy a -> b @api\n\
+             # @copy c -> d @api --delete\n",
+        )?;
+        let copies: Vec<&CopyStep> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Copy(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies.len(), 2, "{copies:?}");
+        assert!(!copies[0].delete);
+        assert!(copies[1].delete);
+        Ok(())
+    }
+
+    #[test]
+    fn a_state_may_contain_a_dash() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert dufs @api not-running\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(
+            step.checks,
+            vec![Assertion::UnitState {
+                unit: "dufs.service".to_string(),
+                state: "not-running".to_string(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_state_with_an_unsafe_character_is_rejected() {
+        let err = parse("# @server api api\n# @assert dufs @api bad;state\n").unwrap_err();
+        assert!(err.contains("unsafe state"), "{err}");
+    }
+
+    #[test]
+    fn a_health_check_accepts_a_method_and_a_header() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @assert_health http://x/ @api --method POST --header Content-Type:application/json\n",
+        )?;
+        let step = as_assert(&plan.steps[0])?;
+        let Assertion::Health { method, headers, .. } = &step.checks[0] else {
+            return Err("not a health check".to_string());
+        };
+        assert_eq!(method.as_deref(), Some("POST"));
+        assert_eq!(headers, &vec!["Content-Type:application/json".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_health_check_rejects_a_non_alphabetic_method() {
+        let err =
+            parse("# @server api api\n# @assert_health http://x/ @api --method G3T\n").unwrap_err();
+        assert!(err.contains("invalid HTTP method"), "{err}");
+    }
+
+    #[test]
+    fn a_health_check_rejects_a_header_without_a_colon() {
+        let err = parse("# @server api api\n# @assert_health http://x/ @api --header nope\n")
+            .unwrap_err();
+        assert!(err.contains("invalid header"), "{err}");
+    }
+
+    #[test]
+    fn a_health_check_rejects_an_unknown_flag() {
+        let err =
+            parse("# @server api api\n# @assert_health http://x/ @api --bogus\n").unwrap_err();
+        assert!(err.contains("unknown flag `--bogus`"), "{err}");
+    }
+
+    #[test]
+    fn a_health_check_rejects_a_url_with_a_control_character() {
+        // A URL cannot carry a space (the payload is split on whitespace),
+        // but a control character reaches the check and must be rejected.
+        let err = parse("# @server api api\n# @assert_health http://x/a\u{1}b @api\n").unwrap_err();
+        assert!(err.contains("must not contain whitespace"), "{err}");
+    }
+
+    #[test]
+    fn a_reload_accepts_a_wait_flag() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @reload dufs @api --wait\n")?;
+        let Step::Reload(reload) = &plan.steps[0] else {
+            return Err("not a reload step".to_string());
+        };
+        assert!(reload.wait);
+        assert!(reload.signal.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_reload_rejects_a_flag_without_a_value() {
+        let err = parse("# @server api api\n# @reload dufs @api --timeout\n").unwrap_err();
+        assert!(err.contains("`--timeout` expects a value"), "{err}");
+    }
+
+    #[test]
+    fn a_reload_rejects_an_unsafe_signal() {
+        let err = parse("# @server api api\n# @reload dufs @api --signal 'SIG;rm'\n").unwrap_err();
+        assert!(err.contains("invalid signal"), "{err}");
+    }
+
+    #[test]
+    fn a_reload_rejects_a_non_numeric_timeout() {
+        let err = parse("# @server api api\n# @reload dufs @api --timeout soon\n").unwrap_err();
+        assert!(err.contains("invalid seconds"), "{err}");
+    }
+
+    #[test]
+    fn a_reload_rejects_an_unsafe_unit_name() {
+        for unit in ["a..b", ".foo", "..foo", "a;b"] {
+            let err = parse(&format!("# @server api api\n# @reload {unit} @api\n")).unwrap_err();
+            assert!(err.contains("unsafe unit name"), "{unit}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_backup_rejects_an_unsafe_service_name() {
+        let err = parse("# @server api api\n# @backup /etc/x @api --service 'a b'\n").unwrap_err();
+        assert!(err.contains("unsafe service name"), "{err}");
+    }
+
+    #[test]
+    fn a_backup_rejects_a_relative_snapshot_directory() {
+        let err = parse("# @server api api\n# @backup /etc/x @api --dir relative\n").unwrap_err();
+        assert!(err.contains("must be absolute"), "{err}");
+    }
+
+    #[test]
+    fn a_helper_rejects_a_relative_install_path() {
+        let err = parse("# @server api api\n# @helper @api --install-path relative/shellflow\n")
+            .unwrap_err();
+        assert!(err.contains("must be absolute"), "{err}");
+    }
+
+    #[test]
+    fn a_timeout_of_zero_is_rejected() {
+        let err = parse("# @server api api\n# @service dufs @api --timeout 0\n").unwrap_err();
+        assert!(err.contains("greater than zero"), "{err}");
+    }
+
+    #[test]
+    fn a_non_numeric_timeout_is_rejected() {
+        let err = parse("# @server api api\n# @service dufs @api --timeout soon\n").unwrap_err();
+        assert!(err.contains("invalid seconds"), "{err}");
+    }
+
+    #[test]
+    fn a_mode_with_a_non_octal_digit_is_rejected() {
+        let err = parse("# @server api api\n# @install /a -> /b @api --mode 0999\n").unwrap_err();
+        assert!(err.contains("invalid octal mode"), "{err}");
+    }
+
+    #[test]
+    fn a_mode_without_digits_is_rejected() {
+        let err = parse("# @server api api\n# @install /a -> /b @api --mode 0o\n").unwrap_err();
+        assert!(err.contains("invalid octal mode"), "{err}");
+    }
+
+    #[test]
+    fn an_owner_with_an_unsafe_character_is_rejected() {
+        let err =
+            parse("# @server api api\n# @install /a -> /b @api --owner 'bad/owner'\n").unwrap_err();
+        assert!(err.contains("invalid owner"), "{err}");
+    }
+
+    #[test]
+    fn a_status_class_is_accepted_and_a_broken_one_is_not() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert_health http://x/ @api --expect 2xx\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        let Assertion::Health { expect, .. } = &step.checks[0] else {
+            return Err("not a health check".to_string());
+        };
+        assert_eq!(expect, &vec!["2xx".to_string()]);
+        let err = parse("# @server api api\n# @assert_health http://x/ @api --expect 2xxx\n")
+            .unwrap_err();
+        assert!(err.contains("invalid status code"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unsafe_unit_name_is_rejected_everywhere() {
+        for unit in [".foo", "..foo", "a..b", "a..;b", "a;b"] {
+            let err = parse(&format!("# @server api api\n# @assert {unit} @api\n")).unwrap_err();
+            assert!(err.contains("unsafe unit name"), "{unit}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_flag_without_a_value_is_rejected() {
+        let err = parse("# @server api api\n# @install /a -> /b @api --mode\n").unwrap_err();
+        assert!(err.contains("`--mode` expects a value"), "{err}");
     }
 }

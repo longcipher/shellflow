@@ -13,12 +13,10 @@
 //!
 //! Two details make the batch safe to run unattended:
 //!
-//! * Every query reads from `/dev/null`. The script itself arrives on the
-//!   remote's stdin, so a query that read stdin would swallow the rest of
-//!   the script.
-//! * `sudo` runs with `-n`. A sudo that needs a password would otherwise
-//!   read the password prompt from the script's stdin and consume the
-//!   remaining queries.
+//! * Every query reads from `/dev/null`. The script itself arrives on the remote's stdin, so a
+//!   query that read stdin would swallow the rest of the script.
+//! * `sudo` runs with `-n`. A sudo that needs a password would otherwise read the password prompt
+//!   from the script's stdin and consume the remaining queries.
 
 use std::{
     collections::BTreeMap,
@@ -64,13 +62,15 @@ pub(crate) struct Section {
 pub(crate) struct Batch {
     script: String,
     nonce: String,
+    /// How many answers the batch expects.
+    count: usize,
 }
 
 impl Batch {
     /// Start an empty batch.
     #[must_use]
     pub(crate) fn new() -> Self {
-        let mut batch = Self { script: String::new(), nonce: nonce() };
+        let mut batch = Self { script: String::new(), nonce: nonce(), count: 0 };
         batch.script.push_str("set +e\n");
         batch
     }
@@ -86,6 +86,13 @@ impl Batch {
             "out=$({cmd} </dev/null 2>&1); rc=$?; \
              printf '%s %s\\n' '{beg}' \"$rc\"; printf '%s\\n' \"$out\"; printf '%s\\n' '{end}'\n"
         ));
+        self.count += 1;
+    }
+
+    /// How many answers the batch expects.
+    #[must_use]
+    pub(crate) const fn section_count(&self) -> usize {
+        self.count
     }
 
     /// The remote script to send.
@@ -95,29 +102,14 @@ impl Batch {
     }
 
     /// Split a batch's stdout into its framed answers.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn parse(&self, output: &str) -> BTreeMap<String, Section> {
-        let mut sections: BTreeMap<String, Section> = BTreeMap::new();
-        let mut current: Option<(String, i32)> = None;
-        let mut body: Vec<&str> = Vec::new();
+        let mut reader = AnswerReader::new(self);
         for line in output.lines() {
-            if let Some((id, rc)) = self.match_begin(line) {
-                flush(&mut sections, &mut current, &mut body);
-                current = Some((id, rc));
-                continue;
-            }
-            if let Some(id) = self.match_end(line) {
-                if current.as_ref().is_some_and(|(cid, _)| *cid == id) {
-                    flush(&mut sections, &mut current, &mut body);
-                }
-                continue;
-            }
-            if current.is_some() {
-                body.push(line);
-            }
+            reader.push_line(line);
         }
-        flush(&mut sections, &mut current, &mut body);
-        sections
+        reader.finish()
     }
 
     /// Match a begin marker: `__SFW_<nonce>_B_<id> <rc>`.
@@ -167,18 +159,48 @@ impl Batch {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|err| ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}")))?;
+            .map_err(|err| {
+                ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}"))
+            })?;
         if let Some(mut stdin) = child.stdin.take() {
             // A broken pipe here means the connection died; the exit status
             // of `ssh` says so with more precision, so the write error is
             // ignored rather than reported.
             let _ = stdin.write_all(self.script().as_bytes());
         }
-        let output = child
-            .wait_with_output()
+        // The answers are parsed **as they arrive**: the response is never
+        // held twice, and the connection is closed as soon as the last
+        // expected answer is in rather than after a trailing query that may
+        // be slow.
+        let mut reader = AnswerReader::new(self);
+        let mut complete = false;
+        if let Some(stdout) = child.stdout.take() {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                reader.push_line(&line);
+                if reader.is_complete() {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        if complete {
+            // Every answer is in: the connection is not needed any more.
+            let _ = child.kill();
+        }
+        let status = child
+            .wait()
             .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
+        let mut stderr_text = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use std::io::Read as _;
+            let _ = stderr.read_to_string(&mut stderr_text);
+        }
 
-        self.finish(&host, output)
+        Self::finish(&host, status, reader.finish(), stderr_text)
     }
 
     /// Run the batch against one host, asynchronously.
@@ -222,59 +244,127 @@ impl Batch {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|err| ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}")))?;
+            .map_err(|err| {
+                ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}"))
+            })?;
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(self.script().as_bytes()).await;
         }
-        let output = child
-            .wait_with_output()
+        // The answers are parsed **as they arrive** (see the synchronous
+        // path): the response is never held twice, and the connection is
+        // closed as soon as the last expected answer is in.
+        let mut reader = AnswerReader::new(self);
+        let mut complete = false;
+        if let Some(stdout) = child.stdout.take() {
+            use tokio::io::AsyncBufReadExt as _;
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                reader.push_line(&line);
+                if reader.is_complete() {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        if complete {
+            let _ = child.kill().await;
+        }
+        let status = child
+            .wait()
             .await
             .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
+        let mut stderr_text = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use tokio::io::AsyncReadExt as _;
+            let _ = stderr.read_to_string(&mut stderr_text).await;
+        }
 
-        self.finish(&host, output)
+        Self::finish(&host, status, reader.finish(), stderr_text)
     }
 
-    /// Turn the raw output of a batch into its answers.
+    /// Turn the parsed answers of a batch into its result.
     fn finish(
-        &self,
         host: &str,
-        output: std::process::Output,
+        status: std::process::ExitStatus,
+        sections: BTreeMap<String, Section>,
+        stderr: String,
     ) -> Result<BTreeMap<String, Section>, ServiceError> {
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if output.status.code() == Some(255) {
+        if status.code() == Some(255) {
             return Err(ServiceError::Transport(eyre::eyre!(
                 "ssh {host} could not connect: {}",
-                format!("{stdout}{stderr}").trim()
+                stderr.trim()
             )));
         }
-        let sections = self.parse(&stdout);
         if sections.is_empty() {
             return Err(ServiceError::Transport(eyre::eyre!(
                 "ssh {host} returned no data: {}",
-                format!("{stdout}{stderr}").trim()
+                stderr.trim()
             )));
         }
         Ok(sections)
     }
 }
 
-/// Store the answer being collected, if any.
+/// An incremental reader of a batch's framed answers.
 ///
-/// The body is stored **verbatim**: the framing only guarantees that the
-/// answer starts on the line after the begin marker and ends before the end
-/// marker. Trimming it would eat the leading whitespace of a file whose
-/// first line is indented (a YAML document, a shell continuation) and turn
-/// an identical file into a difference.
-fn flush(
-    sections: &mut BTreeMap<String, Section>,
-    current: &mut Option<(String, i32)>,
-    body: &mut Vec<&str>,
-) {
-    if let Some((id, rc)) = current.take() {
-        sections.insert(id, Section { rc, body: body.join("\n") });
+/// The answers arrive over the wire one line at a time. Parsing them as
+/// they come keeps the peak memory at *one* answer plus the answers already
+/// collected, instead of the whole response **and** a copy of it: the
+/// response was read into one buffer and then split into a second set of
+/// strings, so a large journal cost twice its size.
+///
+/// The reader also knows when the batch is **complete**: every expected
+/// answer has arrived. The transport can then stop reading and close the
+/// connection instead of waiting for a trailing query that may be slow.
+struct AnswerReader<'a> {
+    batch: &'a Batch,
+    sections: BTreeMap<String, Section>,
+    current: Option<(String, i32)>,
+    body: Vec<String>,
+}
+
+impl<'a> AnswerReader<'a> {
+    /// A reader for one batch.
+    const fn new(batch: &'a Batch) -> Self {
+        Self { batch, sections: BTreeMap::new(), current: None, body: Vec::new() }
     }
-    body.clear();
+
+    /// Feed one line of the response.
+    fn push_line(&mut self, line: &str) {
+        if let Some((id, rc)) = self.batch.match_begin(line) {
+            self.flush();
+            self.current = Some((id, rc));
+            return;
+        }
+        if let Some(id) = self.batch.match_end(line) {
+            if self.current.as_ref().is_some_and(|(cid, _)| *cid == id) {
+                self.flush();
+            }
+            return;
+        }
+        if self.current.is_some() {
+            self.body.push(line.to_string());
+        }
+    }
+
+    /// Store the answer being collected, if any.
+    fn flush(&mut self) {
+        if let Some((id, rc)) = self.current.take() {
+            self.sections.insert(id, Section { rc, body: self.body.join("\n") });
+        }
+        self.body.clear();
+    }
+
+    /// Whether every expected answer has arrived.
+    fn is_complete(&self) -> bool {
+        self.sections.len() >= self.batch.section_count()
+    }
+
+    /// The answers collected so far.
+    fn finish(mut self) -> BTreeMap<String, Section> {
+        self.flush();
+        self.sections
+    }
 }
 
 /// A human-readable label for a destination (used in error messages).
@@ -287,8 +377,7 @@ fn dest_label(dest: &SshDest) -> String {
 
 /// A per-run token that makes the frame markers unforgeable by content.
 fn nonce() -> String {
-    let nanos =
-        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     format!("{:x}{:x}", std::process::id(), nanos)
 }
 
@@ -300,6 +389,35 @@ mod tests {
         let mut b = Batch::new();
         b.section("unit_state", "systemctl is-active 'foo.service'");
         b
+    }
+
+    #[test]
+    fn the_reader_emits_an_answer_as_it_completes() {
+        // The reader is what makes the transport streaming: an answer is
+        // available as soon as its end marker arrives, and the batch is
+        // complete once every expected answer is in.
+        let b = batch();
+        let nonce = b.nonce.clone();
+        let mut reader = super::AnswerReader::new(&b);
+        assert!(!reader.is_complete());
+        reader.push_line(&format!("__SFW_{nonce}_B_unit_state 0"));
+        reader.push_line("active");
+        assert!(!reader.is_complete());
+        reader.push_line(&format!("__SFW_{nonce}_E_unit_state"));
+        let sections = reader.finish();
+        assert_eq!(sections["unit_state"].rc, 0);
+        assert_eq!(sections["unit_state"].body, "active");
+    }
+
+    #[test]
+    fn the_reader_knows_when_the_batch_is_complete() {
+        let b = batch();
+        let nonce = b.nonce.clone();
+        let mut reader = super::AnswerReader::new(&b);
+        reader.push_line(&format!("__SFW_{nonce}_B_unit_state 0"));
+        reader.push_line("active");
+        reader.push_line(&format!("__SFW_{nonce}_E_unit_state"));
+        assert!(reader.is_complete());
     }
 
     #[test]

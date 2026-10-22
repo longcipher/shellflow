@@ -151,6 +151,16 @@ lines belong to the current block.
 | `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES] [--method M] [--body D] [--header H]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default; `--expect 200,204` or `--expect 2xx,3xx,4xx` to narrow). `--method`/`--body`/`--header` cover endpoints that only answer POST. The probe **waits** (up to the step's timeout) — a service that was just started needs a moment. The target is inherited from the previous step |
 | `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>] [--udp]` | Assert that the ports are listening on the target, waiting up to the step's timeout. Replaces the hand-rolled `for i in $(seq 1 12); do ss … ; sleep 5; done` loops. `--udp` checks the UDP sockets |
 | `@assert_rendered` | `# @assert_rendered <path> [@<target>]` | Assert that the file exists and holds no unexpanded `${…}` placeholder — a rendered config that still carries a placeholder was never rendered |
+| `@assert_no_leak` | `# @assert_no_leak <unit> [@<target>] [--lines N]` | Assert that no credential **value** of the unit's store appears in its journal, its command line, or its environment. Value-based: the target-side helper decrypts the store and compares, so no per-service regular expression is needed and the plaintext never reaches the script or the log |
+| `@assert_digest` | `# @assert_digest <path> [@<target>] [--sha256 HEX] [--local PATH]` | Assert that the file matches a digest or the controller's copy of it — a real drift gate |
+| `@assert_credstore` | `# @assert_credstore <service> [@<target>]` | Assert that the credential store exists, is `0700`/`0600`, and holds exactly the keys the unit declares |
+| `@workdir` | `# @workdir [--prefix NAME]` | Declare the run's remote staging directory (`$WORKDIR`). The controller never creates it, and the target's copy is removed when the run ends |
+| `@helper` | `# @helper [@<target>] [--source DIR] [--triple T] [--install-path PATH]` | Build, cache, ship, and atomically install the target-side helper. The build is cached by source revision and target triple, so the second service reuses the first one's build |
+| `@backup` | `# @backup <path>… @<target> [--keep N] [--seal] [--dir PATH] [--service S]` | Snapshot the paths for rollback, keep the newest `N`, shred the rest. `--seal` encrypts the snapshot with the host key. The "no plaintext left behind" guarantee is structural — the helper checks the files it wrote |
+| `@install` | `# @install <src> -> <dst> @<target> [--mode M] [--owner U:G] [--dir-mode M]` | Install a file on the target **atomically** (write beside the destination, then rename), so a reader never sees a half-written unit file |
+| `@credstore` | `# @credstore <service> @<target> [--require KEY,…]` | Seal the service's credential store and check it against the keys the unit declares |
+| `@service` | `# @service <unit> @<target> [--enable] [--restart] [--reload] [--wait] [--verify] [--force-start]` | Drive the unit's lifecycle. `--restart` restarts a unit that was **running** and leaves a unit that was not running alone (restarting an inactive unit *starts* it) |
+| `@unit_inventory` | `# @unit_inventory [@<target>]` | List the units installed on the target. A report, not a gate |
 
 Consecutive assertions that share a target are **one** step: the whole group
 travels in a single SSH round trip, and the operator sees which condition
@@ -220,6 +230,7 @@ OPTIONS:
       --mask-min-len <N>      Minimum value length to mask for @secrets
       --allow-unfiltered-copy Accept the scp fallback dropping --delete/--exclude
       --local                 Run remote blocks/copies locally (debugging)
+      --no-ssh-reuse          Do not reuse SSH connections within a run
   -h, --help                  Print help
   -V, --version               Print version
 ```
@@ -249,6 +260,21 @@ shellflow cred-env credstore-install <svc> [--store-dir PATH]
                                              per-service credential store
 shellflow secret keys-check [-i PATH] <dir>  all <host>.env.age in <dir> must
                                              share the same key set
+shellflow unit render <svc> <unit> [--repo PATH] [--output PATH] [--check]
+                                          generate the unit's drop-in (the
+                                          credential wiring, the render line,
+                                          the version status line, and the
+                                          shared hardening) from the service
+                                          manifest
+shellflow unit manifest <svc> <unit> [--repo PATH]
+                                          print the service manifest
+shellflow unit verify [--repo PATH]      check the repository: the generated
+                                          drop-ins are up to date, every
+                                          install names a staged file, the
+                                          shared hardening reaches every
+                                          service that takes it, every
+                                          backup runs before the install it
+                                          protects
 shellflow service init <svc> [--host H]…   scaffold services/<svc>/ +
                                              playbooks/deploy-<svc>.sh (flat
                                              layout, shared-helper unit)

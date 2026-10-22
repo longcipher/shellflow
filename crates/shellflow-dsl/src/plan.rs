@@ -217,6 +217,178 @@ pub enum Assertion {
         /// The remote path of the rendered file.
         path: String,
     },
+    /// No credential value may appear in the unit's journal or its argv.
+    ///
+    /// The check is **value based**: the target-side helper decrypts the
+    /// service's own credential store and looks for the real values, so a
+    /// playbook needs no per-service regular expression and the plaintext
+    /// never reaches the script, the command line, or the operator's log.
+    NoLeak {
+        /// The systemd unit whose journal and argv are scanned.
+        unit: String,
+        /// How many journal lines to scan.
+        lines: Option<u64>,
+    },
+    /// The file must exist and match a digest.
+    ///
+    /// This is a real drift gate: the hand-written `md5sum` in a playbook
+    /// printed a digest that nothing compared.
+    Digest {
+        /// The remote path of the file.
+        path: String,
+        /// The expected sha256 hex digest.
+        sha256: Option<String>,
+        /// A controller-side file to compare the remote file against.
+        local: Option<String>,
+    },
+    /// The credential store of a service must exist and agree with the
+    /// credential keys the unit declares.
+    Credstore {
+        /// The service name (the credential-store directory name).
+        service: String,
+    },
+}
+
+/// A systemd unit lifecycle step (`@service`).
+///
+/// The step owns the whole sequence a deploy playbook used to spell out in
+/// shell — verify the unit, reload the manager, enable it, restart it, wait
+/// for it — and it owns the rules that the shell spelling got wrong:
+///
+/// - a unit that was **not active before** is not started by `--restart` (restarting an inactive
+///   unit starts it, which is the opposite of what an operator who keeps a unit stopped intends);
+/// - `--verify` fails closed: an invalid unit aborts the deploy before the manager is reloaded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// systemd unit name (`foo` or `foo.service`).
+    pub unit: String,
+    /// Enable the unit at boot (`systemctl enable`).
+    pub enable: bool,
+    /// Restart the unit — but only if it was active before.
+    pub restart: bool,
+    /// Reload the unit gracefully instead of restarting it.
+    pub reload: bool,
+    /// Wait for the unit to report ready after the action.
+    pub wait: bool,
+    /// Verify the installed unit before touching the manager.
+    pub verify: bool,
+    /// Start the unit even when it was not active before.
+    pub force_start: bool,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
+/// An atomic file install on the target (`@install`).
+///
+/// The install writes to a temporary file **in the destination directory**
+/// and renames it into place, so a reader (systemd, `systemctl cat`, a
+/// concurrent `daemon-reload`) never observes a half-written unit file,
+/// config, or binary — which the `install -m …` spelling did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// The source path **on the target**.
+    pub src: String,
+    /// The destination path **on the target**.
+    pub dst: String,
+    /// The file mode to set (octal, e.g. `0644`).
+    pub mode: Option<u32>,
+    /// The `user:group` to own the file.
+    pub owner: Option<String>,
+    /// The mode of the destination directory, created when missing.
+    pub dir_mode: Option<u32>,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
+/// A backup snapshot step (`@backup`).
+///
+/// The step keeps the rollback copy **and** the retention rule in one place,
+/// and it asserts on the files it wrote itself rather than re-globbing the
+/// snapshot directory through a pipeline that cannot fail.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// The paths to snapshot, all **on the target**.
+    pub paths: Vec<String>,
+    /// The service the snapshot belongs to (the snapshot directory name).
+    pub service: Option<String>,
+    /// How many snapshots to keep.
+    pub keep: Option<u32>,
+    /// Encrypt the snapshot with the host key, so no plaintext lands on disk.
+    pub seal: bool,
+    /// The snapshot directory (default `/root/<service>-backup-<stamp>`).
+    pub dir: Option<String>,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
+/// A credential-store step (`@credstore`).
+///
+/// Seals the service's credential store and checks it against the keys the
+/// unit actually declares, so a mismatch is a deployment-time failure with a
+/// readable message instead of a unit that fails to start with a cryptic
+/// systemd error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredstoreStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// The service name (the credential-store directory name).
+    pub service: String,
+    /// Credential keys that must be present.
+    pub require: Vec<String>,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
+/// A unit inventory report (`@unit_inventory`).
+///
+/// Lists the units installed on the target and compares them with the units
+/// the repository manages. It is a **report**, not a gate: a pre-existing
+/// finding must never block an unrelated deploy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnitInventoryStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
+/// A target-helper build and install step (`@helper`).
+///
+/// The helper is the target-side `shellflow` binary every other primitive
+/// delegates to. Building it on the controller and shipping it is a repeated,
+/// expensive, and easily-mistyped operation; this step does it once, caches
+/// the artifact by source revision and target triple, and installs it
+/// atomically.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HelperStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// The source tree to build (default: `$SHELLFLOW_SRC`).
+    pub source: Option<String>,
+    /// The target triple to build for (default: `x86_64-unknown-linux-musl`).
+    pub triple: Option<String>,
+    /// Where to install the helper on the target.
+    pub install_path: String,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
 }
 
 /// A step that asserts conditions on the target hosts.
@@ -254,6 +426,18 @@ pub enum Step {
     Reload(ReloadStep),
     /// Assert conditions on the target hosts.
     Assert(AssertStep),
+    /// Drive a systemd unit's lifecycle.
+    Service(ServiceStep),
+    /// Install a file on the target atomically.
+    Install(InstallStep),
+    /// Snapshot files on the target for rollback.
+    Backup(BackupStep),
+    /// Seal and verify a service's credential store.
+    Credstore(CredstoreStep),
+    /// Report the units installed on the target.
+    UnitInventory(UnitInventoryStep),
+    /// Build and install the target-side helper.
+    Helper(HelperStep),
 }
 
 impl Step {
@@ -267,6 +451,12 @@ impl Step {
             Self::Wait(s) => s.name.as_deref(),
             Self::Reload(s) => s.name.as_deref(),
             Self::Assert(s) => s.name.as_deref(),
+            Self::Service(s) => s.name.as_deref(),
+            Self::Install(s) => s.name.as_deref(),
+            Self::Backup(s) => s.name.as_deref(),
+            Self::Credstore(s) => s.name.as_deref(),
+            Self::UnitInventory(s) => s.name.as_deref(),
+            Self::Helper(s) => s.name.as_deref(),
         }
     }
 
@@ -281,6 +471,12 @@ impl Step {
             Self::Wait(_) => "wait_active",
             Self::Reload(_) => "reload",
             Self::Assert(_) => "assert",
+            Self::Service(_) => "service",
+            Self::Install(_) => "install",
+            Self::Backup(_) => "backup",
+            Self::Credstore(_) => "credstore",
+            Self::UnitInventory(_) => "unit_inventory",
+            Self::Helper(_) => "helper",
         }
     }
 
@@ -294,6 +490,12 @@ impl Step {
             Self::Wait(s) => Some(&s.target.text),
             Self::Reload(s) => Some(&s.target.text),
             Self::Assert(s) => Some(&s.target.text),
+            Self::Service(s) => Some(&s.target.text),
+            Self::Install(s) => Some(&s.target.text),
+            Self::Backup(s) => Some(&s.target.text),
+            Self::Credstore(s) => Some(&s.target.text),
+            Self::UnitInventory(s) => Some(&s.target.text),
+            Self::Helper(s) => Some(&s.target.text),
         }
     }
 
@@ -304,7 +506,15 @@ impl Step {
             Self::Local(s) => s.guard.as_deref(),
             Self::Remote(s) => s.guard.as_deref(),
             Self::Copy(s) => s.guard.as_deref(),
-            Self::Wait(_) | Self::Reload(_) | Self::Assert(_) => None,
+            Self::Wait(_) |
+            Self::Reload(_) |
+            Self::Assert(_) |
+            Self::Service(_) |
+            Self::Install(_) |
+            Self::Backup(_) |
+            Self::Credstore(_) |
+            Self::UnitInventory(_) |
+            Self::Helper(_) => None,
         }
     }
 
@@ -318,8 +528,27 @@ impl Step {
             Self::Wait(s) => s.timeout,
             Self::Reload(s) => s.timeout,
             Self::Assert(s) => s.timeout,
+            Self::Service(s) => s.timeout,
+            Self::Install(s) => s.timeout,
+            Self::Backup(s) => s.timeout,
+            Self::Credstore(s) => s.timeout,
+            Self::UnitInventory(s) => s.timeout,
+            Self::Helper(s) => s.timeout,
         }
     }
+}
+
+/// A managed temporary directory for one run (`@workdir`).
+///
+/// The playbook's `STAMP="$(date +%s)"; WORKDIR="/tmp/$STAMP"; mkdir -p …`
+/// left a directory behind on every run — including the cross-compiled
+/// helper binary — and nothing ever removed it. A managed workdir is created
+/// once per run, published to the run state as `WORKDIR`, and removed on
+/// every exit path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Workdir {
+    /// The directory name prefix (default `shellflow`).
+    pub prefix: String,
 }
 
 /// Fully parsed deployment plan.
@@ -339,6 +568,8 @@ pub struct ExecutionPlan {
     pub env: Arc<Vec<EnvEntry>>,
     /// All `@secrets` file references in declaration order.
     pub secrets: Vec<SecretEntry>,
+    /// The managed work directory for this run (`@workdir`).
+    pub workdir: Option<Workdir>,
     /// The steps, in declaration order.
     pub steps: Vec<Step>,
 }

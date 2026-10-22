@@ -113,11 +113,22 @@ pub(crate) struct RunFlags {
     #[arg(short = 'i', long, value_name = "PATH")]
     pub identity: Option<PathBuf>,
 
-    /// Reuse SSH connections within a run (`ControlMaster=auto`,
-    /// `ControlPersist=60s`). Faster for many small steps; off by default
-    /// so a stale master socket can never break a deploy silently.
-    #[arg(long)]
+    /// Reuse SSH connections within a run (ControlMaster).
+    ///
+    /// On by default: a playbook is a sequence of steps against the same
+    /// hosts, and every step used to pay a full TCP connect plus key
+    /// exchange. With `ControlMaster=auto` OpenSSH reuses the connection
+    /// when it can and falls back to a fresh one when it cannot — a dead
+    /// control socket is detected and replaced, so it cannot break a deploy.
+    #[arg(long, default_value_t = true)]
     pub ssh_reuse: bool,
+
+    /// Do not reuse SSH connections within a run.
+    ///
+    /// Every step then opens its own connection, which costs a TCP connect
+    /// and a key exchange per step.
+    #[arg(long)]
+    pub no_ssh_reuse: bool,
 
     /// Allow a copy step to fall back to `scp` on a host without `rsync`,
     /// dropping `--delete` and `--exclude`.
@@ -440,6 +451,10 @@ pub(crate) enum SystemdCmd {
     Watch(SystemdWatchArgs),
     /// Run a command as a transient systemd unit.
     Transient(SystemdTransientArgs),
+    /// Run a command under a readiness contract (a `Type=notify` supervisor).
+    Exec(SystemdExecArgs),
+    /// Keep a unit's watchdog alive.
+    Watchdog(SystemdWatchdogArgs),
 }
 
 /// What a wait is waiting for.
@@ -568,6 +583,305 @@ pub(crate) struct SystemdTransientArgs {
     /// Run the command in a scope instead of a service.
     #[arg(long)]
     pub scope: bool,
+}
+
+/// Arguments for `shellflow host` — the target-side host helpers.
+///
+/// These subcommands run **on the target host** (the binary is installed once
+/// per host by a deploy playbook). They own the semantics a playbook used to
+/// spell out in shell, with the guarantees the shell spelling did not have:
+/// atomic installs, structural backup assertions, and a restart that never
+/// starts a unit the operator keeps stopped.
+#[derive(Debug, Args)]
+pub(crate) struct HostArgs {
+    #[command(subcommand)]
+    pub command: HostCmd,
+}
+
+/// The `host` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum HostCmd {
+    /// Drive a systemd unit's lifecycle: verify, enable, restart, wait.
+    Service(HostServiceArgs),
+    /// Install a file on the target atomically.
+    Install(HostInstallArgs),
+    /// Snapshot files on the target for rollback.
+    Backup(HostBackupArgs),
+    /// Seal a service's credential store and check it against the unit.
+    Credstore(HostCredstoreArgs),
+    /// Assert that no credential value appears in the journal or the argv.
+    AssertNoLeak(HostAssertNoLeakArgs),
+    /// Assert that a file matches a digest.
+    AssertDigest(HostAssertDigestArgs),
+    /// Assert that a service's credential store is well formed.
+    AssertCredstore(HostAssertCredstoreArgs),
+    /// List the units installed on the target.
+    Inventory(HostInventoryArgs),
+}
+
+/// Arguments for `host service`.
+#[derive(Debug, Args)]
+pub(crate) struct HostServiceArgs {
+    /// The unit to drive (`foo` or `foo.service`).
+    #[arg(value_name = "UNIT")]
+    pub unit: String,
+
+    /// Enable the unit at boot.
+    #[arg(long)]
+    pub enable: bool,
+
+    /// Restart the unit — but only when it was running.
+    #[arg(long)]
+    pub restart: bool,
+
+    /// Reload the unit through its own `ExecReload=`.
+    #[arg(long)]
+    pub reload: bool,
+
+    /// Wait for the unit to become ready.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Verify the installed unit before reloading the manager.
+    #[arg(long)]
+    pub verify: bool,
+
+    /// Start the unit even when it was not running.
+    #[arg(long)]
+    pub force_start: bool,
+
+    /// How long to wait for readiness, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = 300)]
+    pub timeout: u64,
+}
+
+/// Arguments for `host install`.
+#[derive(Debug, Args)]
+pub(crate) struct HostInstallArgs {
+    /// The source path on the target.
+    #[arg(value_name = "SRC")]
+    pub src: String,
+
+    /// The destination path on the target.
+    #[arg(value_name = "DST")]
+    pub dst: String,
+
+    /// The file mode, in octal (e.g. `0644`).
+    #[arg(long, value_name = "MODE")]
+    pub mode: Option<u32>,
+
+    /// The `user:group` that owns the file.
+    #[arg(long, value_name = "USER[:GROUP]")]
+    pub owner: Option<String>,
+
+    /// The mode of the destination directory, created when missing.
+    #[arg(long, value_name = "MODE")]
+    pub dir_mode: Option<u32>,
+}
+
+/// Arguments for `host backup`.
+#[derive(Debug, Args)]
+pub(crate) struct HostBackupArgs {
+    /// The paths to snapshot on the target.
+    #[arg(value_name = "PATH", required = true)]
+    pub paths: Vec<String>,
+
+    /// The service name the snapshot belongs to.
+    #[arg(long, value_name = "NAME")]
+    pub service: Option<String>,
+
+    /// The snapshot directory (default `/root/<service>-backup-<stamp>`).
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<String>,
+
+    /// How many snapshots to keep.
+    #[arg(long, value_name = "N")]
+    pub keep: Option<u32>,
+
+    /// Encrypt the snapshot with the host key, so no plaintext lands on disk.
+    #[arg(long)]
+    pub seal: bool,
+}
+
+/// Arguments for `host credstore`.
+#[derive(Debug, Args)]
+pub(crate) struct HostCredstoreArgs {
+    /// The service name (the credential-store directory name).
+    #[arg(value_name = "SERVICE")]
+    pub service: String,
+
+    /// Credential keys that must be present (comma-separated).
+    #[arg(long, value_name = "KEY,…")]
+    pub require: Vec<String>,
+}
+
+/// Arguments for `host assert-no-leak`.
+#[derive(Debug, Args)]
+pub(crate) struct HostAssertNoLeakArgs {
+    /// The unit whose journal and argv are scanned.
+    #[arg(value_name = "UNIT")]
+    pub unit: String,
+
+    /// How many journal lines to scan.
+    #[arg(long, value_name = "N", default_value_t = 200)]
+    pub lines: u64,
+}
+
+/// Arguments for `host assert-digest`.
+#[derive(Debug, Args)]
+pub(crate) struct HostAssertDigestArgs {
+    /// The file to check.
+    #[arg(value_name = "PATH")]
+    pub path: String,
+
+    /// The expected sha256 digest.
+    #[arg(long, value_name = "HEX")]
+    pub sha256: Option<String>,
+
+    /// A local file to compare against.
+    #[arg(long, value_name = "PATH")]
+    pub local: Option<String>,
+}
+
+/// Arguments for `host assert-credstore`.
+#[derive(Debug, Args)]
+pub(crate) struct HostAssertCredstoreArgs {
+    /// The service name (the credential-store directory name).
+    #[arg(value_name = "SERVICE")]
+    pub service: String,
+}
+
+/// Arguments for `host inventory`.
+#[derive(Debug, Args)]
+pub(crate) struct HostInventoryArgs {}
+
+/// Arguments for `systemd exec` — the readiness supervisor.
+#[derive(Debug, Args)]
+pub(crate) struct SystemdExecArgs {
+    /// The command to supervise, with its arguments.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        required = true,
+        value_name = "CMD"
+    )]
+    pub command: Vec<String>,
+
+    /// The port that must accept connections before the unit is ready.
+    #[arg(long, value_name = "PORT")]
+    pub ready_port: Option<u16>,
+
+    /// The URL that must answer before the unit is ready.
+    #[arg(long, value_name = "URL")]
+    pub ready_url: Option<String>,
+
+    /// The file that must exist before the unit is ready.
+    #[arg(long, value_name = "PATH")]
+    pub ready_file: Option<String>,
+
+    /// How long to wait for readiness, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = 300)]
+    pub timeout: u64,
+
+    /// Keep the unit's watchdog alive on the child's behalf.
+    #[arg(long)]
+    pub watchdog: bool,
+
+    /// Seconds between watchdog pings.
+    #[arg(long, value_name = "SECS", default_value_t = 10)]
+    pub watchdog_interval: u64,
+
+    /// The status text to publish once the service is ready.
+    #[arg(long, value_name = "TEXT")]
+    pub status: Option<String>,
+}
+
+/// Arguments for `systemd watchdog`.
+#[derive(Debug, Args)]
+pub(crate) struct SystemdWatchdogArgs {
+    /// Seconds between pings.
+    #[arg(long, value_name = "SECS", default_value_t = 10)]
+    pub interval: u64,
+
+    /// How long to keep pinging, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = 3600)]
+    pub timeout: u64,
+}
+
+/// Arguments for `shellflow unit` — the unit generator.
+#[derive(Debug, Args)]
+pub(crate) struct UnitArgs {
+    #[command(subcommand)]
+    pub command: UnitCmd,
+}
+
+/// The `unit` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum UnitCmd {
+    /// Generate a service's drop-in from its manifest.
+    Render(UnitRenderArgs),
+    /// Print a service's manifest.
+    Manifest(UnitManifestArgs),
+    /// Check the repository's consistency: the generated drop-ins, the
+    /// install steps, and the shared hardening.
+    Verify(UnitVerifyArgs),
+}
+
+/// Arguments for `unit render`.
+#[derive(Debug, Args)]
+pub(crate) struct UnitRenderArgs {
+    /// The service to render (`services/<svc>/`).
+    #[arg(value_name = "SERVICE")]
+    pub service: String,
+
+    /// The unit to render (`services/<svc>/<unit>.service.toml`).
+    #[arg(value_name = "UNIT")]
+    pub unit: String,
+
+    /// The repository root (default: the current directory).
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    pub repo: PathBuf,
+
+    /// Where to write the drop-in (default: `services/<svc>/<unit>.service.d/`).
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Print the drop-in instead of writing it.
+    #[arg(long)]
+    pub stdout: bool,
+
+    /// Check that the drop-in on disk is up to date; exit non-zero when it is
+    /// not, without writing anything.
+    #[arg(long)]
+    pub check: bool,
+
+    /// The age identity for reading the credential key set.
+    #[arg(long, value_name = "PATH")]
+    pub identity: Option<PathBuf>,
+}
+
+/// Arguments for `unit verify`.
+#[derive(Debug, Args)]
+pub(crate) struct UnitVerifyArgs {
+    /// The repository root (default: the current directory).
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    pub repo: PathBuf,
+}
+
+/// Arguments for `unit manifest`.
+#[derive(Debug, Args)]
+pub(crate) struct UnitManifestArgs {
+    /// The service to read (`services/<svc>/`).
+    #[arg(value_name = "SERVICE")]
+    pub service: String,
+
+    /// The unit to read (`services/<svc>/<unit>.service.toml`).
+    #[arg(value_name = "UNIT")]
+    pub unit: String,
+
+    /// The repository root (default: the current directory).
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    pub repo: PathBuf,
 }
 
 /// Arguments for `shellflow cred-env` — the target-side credential helpers.
@@ -715,8 +1029,10 @@ pub(crate) struct ServiceInitArgs {
 #[derive(Debug, Args)]
 pub(crate) struct ServiceCheckArgs {
     /// Service name (systemd unit `<svc>.service` on the target).
+    ///
+    /// Omit it with `--all` to audit every service of the host.
     #[arg(value_name = "SVC")]
-    pub service: String,
+    pub service: Option<String>,
 
     /// SSH target (alias, `[user@]host[:port]`, or `~/.ssh/config` entry).
     #[arg(long = "host", value_name = "HOST")]
@@ -725,6 +1041,15 @@ pub(crate) struct ServiceCheckArgs {
     /// Also grep this many journal lines for secret-value shapes (default 50).
     #[arg(long, value_name = "N", default_value_t = 50)]
     pub journal_lines: usize,
+
+    /// Audit every service of the host, in one round trip.
+    #[arg(long)]
+    pub all: bool,
+
+    /// The repository root, for the service manifests (default: the current
+    /// directory).
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    pub repo: PathBuf,
 }
 
 /// Arguments for `service diff`.
@@ -866,8 +1191,12 @@ pub(crate) enum Command {
     CredEnv(CredEnvArgs),
     /// Target-side systemd helpers (run on the target host).
     Systemd(SystemdArgs),
+    /// Target-side host helpers (run on the target host).
+    Host(HostArgs),
     /// Scaffold new services in the flat repository layout.
     Service(ServiceArgs),
+    /// Generate unit drop-ins from the service manifests.
+    Unit(UnitArgs),
     /// Scan a repository for secret-shaped plaintext (pre-commit gate).
     Audit(AuditArgs),
 }
@@ -953,6 +1282,19 @@ mod tests {
         let cli = Cli::parse_from(["shellflow", "--local", "deploy.sh"]);
         assert!(cli.command.is_none());
         assert!(cli.run.flags.local);
+    }
+
+    #[test]
+    fn ssh_reuse_is_on_by_default() {
+        let cli = Cli::parse_from(["shellflow", "deploy.sh"]);
+        assert!(cli.run.flags.ssh_reuse);
+        assert!(!cli.run.flags.no_ssh_reuse);
+    }
+
+    #[test]
+    fn ssh_reuse_can_be_turned_off() {
+        let cli = Cli::parse_from(["shellflow", "--no-ssh-reuse", "deploy.sh"]);
+        assert!(cli.run.flags.no_ssh_reuse);
     }
 
     #[test]
@@ -1108,11 +1450,11 @@ mod tests {
                     assert_eq!(i.service, "myapp");
                     assert_eq!(i.hosts, vec!["api".to_string(), "trade".to_string()]);
                 }
-                super::ServiceCmd::Check(_)
-                | super::ServiceCmd::Diff(_)
-                | super::ServiceCmd::Manifest(_)
-                | super::ServiceCmd::Verify(_)
-                | super::ServiceCmd::Status(_) => {
+                super::ServiceCmd::Check(_) |
+                super::ServiceCmd::Diff(_) |
+                super::ServiceCmd::Manifest(_) |
+                super::ServiceCmd::Verify(_) |
+                super::ServiceCmd::Status(_) => {
                     panic!("expected init subcommand")
                 }
             },
@@ -1126,15 +1468,15 @@ mod tests {
         match cli.command {
             Some(Command::Service(service)) => match service.command {
                 super::ServiceCmd::Check(a) => {
-                    assert_eq!(a.service, "webhook");
+                    assert_eq!(a.service.as_deref(), Some("webhook"));
                     assert_eq!(a.host, "api");
                     assert_eq!(a.journal_lines, 50);
                 }
-                super::ServiceCmd::Init(_)
-                | super::ServiceCmd::Diff(_)
-                | super::ServiceCmd::Manifest(_)
-                | super::ServiceCmd::Verify(_)
-                | super::ServiceCmd::Status(_) => {
+                super::ServiceCmd::Init(_) |
+                super::ServiceCmd::Diff(_) |
+                super::ServiceCmd::Manifest(_) |
+                super::ServiceCmd::Verify(_) |
+                super::ServiceCmd::Status(_) => {
                     panic!("expected check subcommand")
                 }
             },
@@ -1159,11 +1501,11 @@ mod tests {
                 super::ServiceCmd::Init(i) => {
                     assert!(matches!(i.pattern, super::ServicePattern::Container));
                 }
-                super::ServiceCmd::Check(_)
-                | super::ServiceCmd::Diff(_)
-                | super::ServiceCmd::Manifest(_)
-                | super::ServiceCmd::Verify(_)
-                | super::ServiceCmd::Status(_) => {
+                super::ServiceCmd::Check(_) |
+                super::ServiceCmd::Diff(_) |
+                super::ServiceCmd::Manifest(_) |
+                super::ServiceCmd::Verify(_) |
+                super::ServiceCmd::Status(_) => {
                     panic!("expected init subcommand")
                 }
             },

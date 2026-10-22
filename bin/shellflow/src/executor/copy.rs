@@ -151,6 +151,7 @@ pub(crate) async fn run_copy_step(
         let shell_cache = Arc::clone(&args.shell_cache);
         let log_file = args.log_file.clone();
         let cancel = args.cancel.clone();
+        let workdir = args.workdir.clone();
         tasks.spawn(async move {
             // Never run unthrottled when the semaphore is closed.
             let _permit = fanout_slot!(&semaphore, &log_file, host);
@@ -172,6 +173,13 @@ pub(crate) async fn run_copy_step(
                 if !matches!(outcome, HostOutcome::Ok) {
                     return (alias, outcome);
                 }
+            }
+            // A copy into the managed staging directory makes this host
+            // responsible for removing it when the run ends.
+            if let Some(guard) = &workdir &&
+                transfers.iter().any(|transfer| guard.workdir.contains(&transfer.dst))
+            {
+                guard.touch(&host.alias).await;
             }
             (host.alias.clone(), HostOutcome::Ok)
         });
@@ -222,7 +230,7 @@ async fn group_transfers(entries: &[(String, String)]) -> Vec<Transfer> {
             transfers[idx].srcs.push(src.clone());
             transfers[idx].dst = format!("{dir}/");
         } else {
-            by_dir.push((dir.clone(), transfers.len()));
+            by_dir.push((dir, transfers.len()));
             transfers.push(Transfer { srcs: vec![src.clone()], dst: dst.clone() });
         }
     }
@@ -251,7 +259,9 @@ impl Destination {
     fn parse(dst: &str) -> Self {
         if dst.ends_with('/') {
             let trimmed = dst.trim_end_matches('/');
-            return Self::Dir { dir: if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() } };
+            return Self::Dir {
+                dir: if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() },
+            };
         }
         match dst.rsplit_once('/') {
             Some((dir, base)) if !base.is_empty() => {
@@ -679,7 +689,7 @@ async fn run_scp_transfer(
         ));
     }
 
-    let first = srcs.first().map(String::as_str).unwrap_or_default();
+    let first = srcs.first().map_or_default(String::as_str);
     let is_dir_src = tokio::fs::metadata(first).await.is_ok_and(|meta| meta.is_dir());
     // A directory source always lands *in* a directory. A file source may
     // name a file: the destination is then used verbatim, so the artifact
@@ -690,11 +700,8 @@ async fn run_scp_transfer(
     let (dir, dst_is_dir) = scp_remote_dir(dst, is_dir_src);
     // Several sources land in the destination directory; each keeps its own
     // name. A single directory source copies its *contents*.
-    let scp_srcs: Vec<String> = if srcs.len() == 1 && is_dir_src {
-        vec![format!("{first}/.")]
-    } else {
-        srcs.to_vec()
-    };
+    let scp_srcs: Vec<String> =
+        if srcs.len() == 1 && is_dir_src { vec![format!("{first}/.")] } else { srcs.to_vec() };
 
     let quoted_dir = dir.replace('\'', "'\\''");
     let mut mkdir = Command::new("ssh");

@@ -102,7 +102,7 @@ impl RemoteShell {
     }
 
     #[must_use]
-    const fn invoke(self, syntax_only: bool) -> &'static str {
+    pub(super) const fn invoke(self, syntax_only: bool) -> &'static str {
         if syntax_only {
             return "bash -n -s";
         }
@@ -145,6 +145,92 @@ struct RunSetup {
     selected: Vec<(usize, shellflow_core::Step)>,
     total: usize,
     cancel: Cancel,
+    /// The managed work directory, removed when the run ends.
+    ///
+    /// The field exists for its `Drop`: the directory must disappear on
+    /// every exit path — success, failure, and `SIGINT` — and a field's
+    /// lifetime is the only hook that covers all three.
+    workdir: Option<WorkdirGuard>,
+}
+
+/// The managed staging directory of one run.
+///
+/// The directory lives on the **target**: the playbook ships the service
+/// files there and installs them from there. The controller never creates
+/// it, so a run leaves nothing behind on the machine that drives the
+/// deployment — the leak the hand-written `mkdir -p /tmp/<svc>-<epoch>`
+/// caused on every single deploy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Workdir {
+    /// The absolute path on the target.
+    path: String,
+}
+
+impl Workdir {
+    /// Whether a destination path lives inside the staging directory.
+    pub(crate) fn contains(&self, path: &str) -> bool {
+        path == self.path || path.starts_with(&format!("{}/", self.path))
+    }
+}
+
+/// Removes the staging directory from the targets that received a copy.
+#[derive(Clone)]
+pub(crate) struct WorkdirGuard {
+    /// The staging directory.
+    pub(crate) workdir: Workdir,
+    /// The hosts that received a copy into the staging directory.
+    pub(crate) hosts: Arc<Mutex<std::collections::BTreeSet<String>>>,
+}
+
+impl WorkdirGuard {
+    /// Record that a host received a copy into the staging directory.
+    pub(crate) async fn touch(&self, alias: &str) {
+        self.hosts.lock().await.insert(alias.to_string());
+    }
+
+    /// Remove the staging directory from every host that received a copy.
+    ///
+    /// The removal is best effort: a host that is already gone must not
+    /// fail the run that just succeeded.
+    pub(crate) async fn cleanup(&self, plan: &shellflow_core::ExecutionPlan) {
+        let aliases: Vec<String> = self.hosts.lock().await.iter().cloned().collect();
+        for alias in aliases {
+            let Ok(hosts) =
+                shellflow_core::resolve_hosts(plan, &shellflow_core::Target::new(&alias), &[])
+            else {
+                continue;
+            };
+            let Some(host) = hosts.first() else {
+                continue;
+            };
+            let mut cmd = Command::new("ssh");
+            cmd.args(["-o", "BatchMode=yes"]);
+            cmd.args(host.spec.to_ssh_args())
+                .arg("-T")
+                .arg(format!("rm -rf '{}'", self.workdir.path));
+            let _ = cmd.stdin(std::process::Stdio::null()).output().await;
+        }
+    }
+}
+
+/// Create the managed work directory for this run and publish it to the run
+/// state as `WORKDIR`.
+///
+/// The directory is **not** created here: it lives on the target, and the
+/// copy step creates it where the files land. Publishing the path is all
+/// the controller has to do.
+async fn create_workdir(
+    workdir: &shellflow_core::Workdir,
+    run_state: &Arc<Mutex<RunState>>,
+) -> Result<Workdir, String> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = format!("/tmp/{prefix}-{nonce}", prefix = workdir.prefix);
+    // The lock is awaited, never taken blocking: this runs inside the
+    // runtime, and a blocking lock there panics the worker thread.
+    run_state.lock().await.vars.insert("WORKDIR".to_string(), path.clone());
+    Ok(Workdir { path })
 }
 
 /// Build every per-run handle: run state, host selection, secret resolution,
@@ -249,6 +335,22 @@ async fn setup_run(
 
     let total = selected.len();
 
+    // The managed work directory exists before the first step, so every
+    // block and every `@copy` path can name `$WORKDIR`.
+    let workdir = match &plan.workdir {
+        Some(declared) => match create_workdir(declared, &run_state).await {
+            Ok(workdir) => Some(WorkdirGuard {
+                workdir,
+                hosts: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            }),
+            Err(err) => {
+                eprintln!("error: {err}");
+                return None;
+            }
+        },
+        None => None,
+    };
+
     if ui.lock().await.verbosity().info() {
         ui.lock().await.plan_preview(plan, &selected);
     }
@@ -264,6 +366,7 @@ async fn setup_run(
         selected,
         total,
         cancel: cancel.clone(),
+        workdir,
     })
 }
 
@@ -322,6 +425,7 @@ async fn run_single_step(
                         shell_cache: Arc::clone(&setup.shell_cache),
                         log_file: setup.log_file.clone(),
                         cancel: setup.cancel.clone(),
+                        workdir: setup.workdir.clone(),
                     };
                     super::copy::run_copy_step(&copy_args, copy, hosts, config).await
                 }
@@ -366,6 +470,223 @@ async fn run_single_step(
                         cancel: &setup.cancel,
                         run_state: &setup.run_state,
                     })
+                    .await,
+                ),
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
+        shellflow_core::Step::Service(service) => {
+            match shellflow_core::resolve_hosts(plan, &service.target, &setup.restrict) {
+                Ok(hosts) => {
+                    let command = super::host::service_command(
+                        &service.unit,
+                        super::host::ServiceActions {
+                            enable: service.enable,
+                            restart: service.restart,
+                            reload: service.reload,
+                            wait: service.wait,
+                            verify: service.verify,
+                            force_start: service.force_start,
+                        },
+                        service.timeout.unwrap_or(DEFAULT_WAIT_SECS),
+                    );
+                    (
+                        None,
+                        super::host::run_target_command(super::host::TargetCommand {
+                            ui: &setup.ui,
+                            command,
+                            hosts,
+                            config,
+                            semaphore: &setup.semaphore,
+                            log_file: &setup.log_file,
+                            cancel: &setup.cancel,
+                            secrets: &setup.resolved,
+                            shell_cache: &setup.shell_cache,
+                            label: &format!("service {}", service.unit),
+                        })
+                        .await,
+                    )
+                }
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
+        shellflow_core::Step::Install(install) => {
+            match shellflow_core::resolve_hosts(plan, &install.target, &setup.restrict) {
+                Ok(hosts) => {
+                    // The paths may name a captured variable (`$WORKDIR/…`).
+                    // In check mode the local blocks never ran, so the run
+                    // state is empty: the paths are left uninterpolated and
+                    // the step is a no-op, exactly like a copy step.
+                    let (src, dst) = if config.check || config.dry_run {
+                        (install.src.clone(), install.dst.clone())
+                    } else {
+                        let state = setup.run_state.lock().await;
+                        let src = shellflow_core::interpolate(&install.src, &state)
+                            .map_err(eyre::Error::from);
+                        let dst = shellflow_core::interpolate(&install.dst, &state)
+                            .map_err(eyre::Error::from);
+                        match (src, dst) {
+                            (Ok(src), Ok(dst)) => (src, dst),
+                            (Err(err), _) | (_, Err(err)) => {
+                                crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                                return (Some(RunError::Plan), Ok(Vec::new()));
+                            }
+                        }
+                    };
+                    let command = super::host::install_command(
+                        &src,
+                        &dst,
+                        install.mode,
+                        install.owner.as_deref(),
+                        install.dir_mode,
+                    );
+                    (
+                        None,
+                        super::host::run_target_command(super::host::TargetCommand {
+                            ui: &setup.ui,
+                            command,
+                            hosts,
+                            config,
+                            semaphore: &setup.semaphore,
+                            log_file: &setup.log_file,
+                            cancel: &setup.cancel,
+                            secrets: &setup.resolved,
+                            shell_cache: &setup.shell_cache,
+                            label: &format!("install {dst}"),
+                        })
+                        .await,
+                    )
+                }
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
+        shellflow_core::Step::Backup(backup) => {
+            match shellflow_core::resolve_hosts(plan, &backup.target, &setup.restrict) {
+                Ok(hosts) => {
+                    let paths = if config.check || config.dry_run {
+                        backup.paths.clone()
+                    } else {
+                        let state = setup.run_state.lock().await;
+                        let mut resolved = Vec::with_capacity(backup.paths.len());
+                        for path in &backup.paths {
+                            match shellflow_core::interpolate(path, &state) {
+                                Ok(path) => resolved.push(path),
+                                Err(err) => {
+                                    crate::ui::step_failed(
+                                        step_no,
+                                        &err.to_string(),
+                                        &setup.log_file,
+                                    );
+                                    return (Some(RunError::Plan), Ok(Vec::new()));
+                                }
+                            }
+                        }
+                        resolved
+                    };
+                    let command = super::host::backup_command(
+                        &paths,
+                        backup.service.as_deref(),
+                        backup.dir.as_deref(),
+                        backup.keep,
+                        backup.seal,
+                    );
+                    (
+                        None,
+                        super::host::run_target_command(super::host::TargetCommand {
+                            ui: &setup.ui,
+                            command,
+                            hosts,
+                            config,
+                            semaphore: &setup.semaphore,
+                            log_file: &setup.log_file,
+                            cancel: &setup.cancel,
+                            secrets: &setup.resolved,
+                            shell_cache: &setup.shell_cache,
+                            label: "backup",
+                        })
+                        .await,
+                    )
+                }
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
+        shellflow_core::Step::Credstore(credstore) => {
+            match shellflow_core::resolve_hosts(plan, &credstore.target, &setup.restrict) {
+                Ok(hosts) => {
+                    let command =
+                        super::host::credstore_command(&credstore.service, &credstore.require);
+                    (
+                        None,
+                        super::host::run_target_command(super::host::TargetCommand {
+                            ui: &setup.ui,
+                            command,
+                            hosts,
+                            config,
+                            semaphore: &setup.semaphore,
+                            log_file: &setup.log_file,
+                            cancel: &setup.cancel,
+                            secrets: &setup.resolved,
+                            shell_cache: &setup.shell_cache,
+                            label: &format!("credstore {}", credstore.service),
+                        })
+                        .await,
+                    )
+                }
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
+        shellflow_core::Step::UnitInventory(inventory) => {
+            match shellflow_core::resolve_hosts(plan, &inventory.target, &setup.restrict) {
+                Ok(hosts) => (
+                    None,
+                    super::host::run_target_command(super::host::TargetCommand {
+                        ui: &setup.ui,
+                        command: super::host::unit_inventory_command(),
+                        hosts,
+                        config,
+                        semaphore: &setup.semaphore,
+                        log_file: &setup.log_file,
+                        cancel: &setup.cancel,
+                        secrets: &setup.resolved,
+                        shell_cache: &setup.shell_cache,
+                        label: "unit inventory",
+                    })
+                    .await,
+                ),
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
+        shellflow_core::Step::Helper(helper) => {
+            match shellflow_core::resolve_hosts(plan, &helper.target, &setup.restrict) {
+                Ok(hosts) => (
+                    None,
+                    super::host::run_helper_step(
+                        &setup.ui,
+                        helper,
+                        hosts,
+                        config,
+                        &setup.semaphore,
+                        &setup.log_file,
+                        &setup.cancel,
+                    )
                     .await,
                 ),
                 Err(err) => {
@@ -617,7 +938,17 @@ pub(crate) async fn execute_plan(
     }
 
     if cancel.is_cancelled() {
+        // The staging directory is removed even on an interrupt: the run
+        // must not leave its scratch space behind on the target.
+        if let Some(guard) = &setup.workdir {
+            guard.cleanup(&plan).await;
+        }
         return RunOutcome::Interrupted { total, torn_down: true };
+    }
+
+    // The staging directory is removed when the run ends, on every path.
+    if let Some(guard) = &setup.workdir {
+        guard.cleanup(&plan).await;
     }
 
     if flags.continue_on_error || fail_fast_error.is_none() {
@@ -662,6 +993,12 @@ fn target_host_aliases(
             shellflow_core::Step::Wait(wait) => &wait.target,
             shellflow_core::Step::Reload(reload) => &reload.target,
             shellflow_core::Step::Assert(assert) => &assert.target,
+            shellflow_core::Step::Service(service) => &service.target,
+            shellflow_core::Step::Install(install) => &install.target,
+            shellflow_core::Step::Backup(backup) => &backup.target,
+            shellflow_core::Step::Credstore(credstore) => &credstore.target,
+            shellflow_core::Step::UnitInventory(inventory) => &inventory.target,
+            shellflow_core::Step::Helper(helper) => &helper.target,
             shellflow_core::Step::Local(_) => continue,
         };
         match shellflow_core::resolve_hosts(plan, target, restrict) {
@@ -1129,39 +1466,6 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
     let remote_env = resolve_remote_env(host, &shell_cache, &cancel).await;
     let mut payload_env = with_login_path(parts.env.clone(), remote_env.path.as_deref());
     secrets.overlay(&mut payload_env, &host.alias);
-    if let Some(guard) = &parts.guard {
-        match run_remote_guard(RemoteGuardArgs {
-            ui: &ui,
-            host,
-            shell: remote_env.shell,
-            guard,
-            env: &payload_env,
-            timeout: config.timeout,
-            cancel: &cancel,
-            log_file,
-        })
-        .await
-        {
-            GuardResult::Pass => {
-                if config.verbose >= 2 {
-                    // The guard text is user content and can embed a secret.
-                    ui.lock()
-                        .await
-                        .masked_note(&format!("  [{}] guard passed: {guard}", host.alias));
-                }
-            }
-            GuardResult::Fail => {
-                crate::ui::note(&format!("[{}] SKIPPED (guard)", host.alias), log_file);
-                return (host.alias.clone(), HostOutcome::Skipped);
-            }
-            GuardResult::Transport => {
-                return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
-            }
-            GuardResult::Cancelled => {
-                return (host.alias.clone(), HostOutcome::Cancelled);
-            }
-        }
-    }
 
     let env_header = match render_env(&payload_env) {
         Ok(header) => header,
@@ -1170,7 +1474,11 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
             return (host.alias.clone(), HostOutcome::Failed(RunError::Plan));
         }
     };
-    let payload = format!("set -eu\n{}{}{}", env_header, parts.trace_line, parts.script);
+    // The guard is folded into the payload: evaluating it used to cost a
+    // second SSH round trip, so a guarded step paid double for one
+    // precondition.
+    let guard = parts.guard.as_ref().map_or_else(String::new, |guard| folded_guard(guard));
+    let payload = format!("set -eu\n{env_header}{guard}{}{}", parts.trace_line, parts.script);
     let cmd = build_ssh_cmd(host, remote_env.shell, false, config);
     if config.verbose >= 2 {
         ui.lock().await.masked_note(&format!(
@@ -1179,8 +1487,20 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
             super::display_args(&cmd)
         ));
     }
-    match run_ssh_child(ui, host, cmd, &payload, config.timeout, log_file, cancel).await {
-        Ok(()) => (host.alias.clone(), HostOutcome::Ok),
+    match run_ssh_child(ui.clone(), host, cmd, &payload, config.timeout, log_file, cancel).await {
+        Ok(()) => {
+            if let Some(guard) = &parts.guard &&
+                config.verbose >= 2
+            {
+                // The guard text is user content and can embed a secret.
+                ui.lock().await.masked_note(&format!("  [{}] guard passed: {guard}", host.alias));
+            }
+            (host.alias.clone(), HostOutcome::Ok)
+        }
+        Err(SshOutcome::Skipped) => {
+            crate::ui::note(&format!("[{}] SKIPPED (guard)", host.alias), log_file);
+            (host.alias.clone(), HostOutcome::Skipped)
+        }
         Err(outcome) => {
             crate::ui::warn(&format!("[{}] {outcome:?}", host.alias), log_file);
             (host.alias.clone(), classify_ssh(outcome))
@@ -1209,10 +1529,13 @@ fn build_ssh_cmd(
     cmd.args(["-o", "BatchMode=yes"]);
     cmd.args(host.spec.to_ssh_args()).arg("-T");
     if config.ssh_reuse {
-        // Opt-in connection reuse: later steps in the same run share the
-        // first step's authenticated connection instead of re-handshaking.
-        // Off by default so a stale master socket can never break a deploy
-        // silently; rsync/scp copies always go direct.
+        // Connection reuse: later steps in the same run share the first
+        // step's authenticated connection instead of re-handshaking.
+        //
+        // `ControlMaster=auto` is safe by construction: OpenSSH reuses the
+        // master when it is alive and creates a new one when it is not (a
+        // dead control socket is detected and replaced), so a stale socket
+        // cannot break a deploy. rsync/scp copies always go direct.
         cmd.args([
             "-o",
             "ControlMaster=auto",
@@ -1430,6 +1753,8 @@ enum SshOutcome {
     Script,
     TimedOut,
     Cancelled,
+    /// The block's `@only_if` guard said no: the block was skipped.
+    Skipped,
 }
 
 const fn classify_ssh(outcome: SshOutcome) -> HostOutcome {
@@ -1438,79 +1763,31 @@ const fn classify_ssh(outcome: SshOutcome) -> HostOutcome {
         SshOutcome::Script => HostOutcome::Failed(RunError::Script),
         SshOutcome::TimedOut => HostOutcome::TimedOut,
         SshOutcome::Cancelled => HostOutcome::Cancelled,
+        SshOutcome::Skipped => HostOutcome::Skipped,
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GuardResult {
-    Pass,
-    Fail,
-    Transport,
-    Cancelled,
-}
+/// The exit code a folded guard uses to say "skip this block".
+///
+/// The guard runs *inside* the payload, so it cannot report "skip" through a
+/// separate channel; the exit code is the channel. It is deliberately
+/// unusual: `ssh` uses 255 for a transport failure and a shell uses 1..125
+/// for ordinary failures.
+const GUARD_SKIP_EXIT: i32 = 42;
 
-/// The parameters of one host's `@only_if` guard evaluation.
-struct RemoteGuardArgs<'a> {
-    ui: &'a ArcUi,
-    host: &'a ResolvedHost,
-    shell: RemoteShell,
-    guard: &'a str,
-    env: &'a [(String, String)],
-    timeout: Option<u64>,
-    cancel: &'a Cancel,
-    log_file: &'a LogFile,
-}
-
-async fn run_remote_guard(args: RemoteGuardArgs<'_>) -> GuardResult {
-    let RemoteGuardArgs { ui, host, shell, guard, env, timeout, cancel, log_file } = args;
-    let env_header = match render_env(env) {
-        Ok(header) => header,
-        Err(_) => return GuardResult::Transport,
-    };
-    let mut cmd = Command::new("ssh");
-    // Fail closed on an unknown host key or a missing key: never prompt.
-    cmd.args(["-o", "BatchMode=yes"]);
-    cmd.args(host.spec.to_ssh_args()).arg("-T");
-    cmd.arg(shell.invoke(false));
-    cmd.stdin(std::process::Stdio::piped());
-    // Stdout/stderr are set by `run_piped_child` (`quiet` discards the
-    // guard's own output); stdin must already be piped so the payload can
-    // be delivered.
-    cmd.kill_on_drop(true);
-    isolate(&mut cmd);
-    // Fail closed: a guard that could not be delivered must never be reported
-    // as `Pass`. If the write fails, stdin drops, the remote shell reads an
-    // empty script and exits 0 — which would otherwise mark an *unevaluated*
-    // precondition as satisfied and release the block. Routing through the
-    // shared supervisor also bounds the stdin write by the step deadline,
-    // races it against cancellation, and isolates the child in its own
-    // process group.
-    let script = format!("set -e\n{env_header}{guard}\n");
-    let args = stream::PipedArgs {
-        ui,
-        host: &host.alias,
-        payload: Some(&script),
-        timeout,
-        diff_filter: None,
-        log_file,
-        cancel: cancel.clone(),
-        quiet: true,
-        collector: None,
-    };
-    match stream::run_piped_child(args, cmd).await {
-        Ok(stream::PipedRun::Completed(status)) if status.success() => GuardResult::Pass,
-        Ok(stream::PipedRun::Completed(status)) if status.code() == Some(255) => {
-            GuardResult::Transport
-        }
-        Ok(stream::PipedRun::Completed(_)) => GuardResult::Fail,
-        Ok(stream::PipedRun::Cancelled) => GuardResult::Cancelled,
-        // Timed out, broken pipe, or spawn failure: the guard was never
-        // evaluated, so it must not pass. Timeouts surface as transport
-        // here to match the historical classification.
-        Ok(stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken) | Err(_) => {
-            if cancel.is_cancelled() { GuardResult::Cancelled } else { GuardResult::Transport }
-        }
-    }
+/// The guard folded into the payload of a remote block.
+///
+/// The guard used to be a **separate** SSH invocation: one round trip to
+/// evaluate it and another to run the block. Folding it into the payload
+/// halves the round trips of a guarded step, with the same observable
+/// behaviour — a failing guard still skips the block, and the block's own
+/// output is still discarded.
+///
+/// The guard keeps its own relaxed shell options (`set +u`), so a guard that
+/// reads an unset variable behaves as it did before, and its output stays
+/// hidden.
+fn folded_guard(guard: &str) -> String {
+    format!("if ! ( set +u; {guard} ) >/dev/null 2>&1; then exit {GUARD_SKIP_EXIT}; fi\n")
 }
 
 async fn run_ssh_child(
@@ -1538,6 +1815,9 @@ async fn run_ssh_child(
             if !status.success() {
                 if status.code() == Some(255) {
                     return Err(SshOutcome::Transport);
+                }
+                if status.code() == Some(GUARD_SKIP_EXIT) {
+                    return Err(SshOutcome::Skipped);
                 }
                 return Err(SshOutcome::Script);
             }

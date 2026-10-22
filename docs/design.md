@@ -121,6 +121,16 @@ All other lines (including plain comments) belong to the current block.
 | `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES] [--method M] [--body D] [--header H]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default; `--expect` takes exact codes and classes such as `2xx`). `--method`/`--body`/`--header` cover endpoints that only answer POST. The probe waits (up to the step's timeout) on the target, so a service that was just started is not failed for the wrong reason. The target is inherited from the previous step |
 | `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>] [--udp]` | Assert that the ports are listening, waiting up to the step's timeout (in one round trip, not one per poll). `--udp` checks the UDP sockets. The target is inherited from the previous step |
 | `@assert_rendered` | `# @assert_rendered <path> [@<target>]` | Assert that the file exists and holds no unexpanded `${…}` placeholder. The target is inherited from the previous step |
+| `@assert_no_leak` | `# @assert_no_leak <unit> [@<target>] [--lines N]` | Assert that no credential **value** of the unit's store appears in its journal, its command line, or its environment. The check is value-based: the target-side helper decrypts the store and compares, so a playbook needs no per-service regular expression and the plaintext never reaches the script, the command line, or the log |
+| `@assert_digest` | `# @assert_digest <path> [@<target>] [--sha256 HEX] [--local PATH]` | Assert that the file matches a digest (`--sha256`) or the controller's copy of it (`--local`). A real drift gate: the hand-written `md5sum` printed a digest that nothing compared |
+| `@assert_credstore` | `# @assert_credstore <service> [@<target>]` | Assert that the service's credential store exists, is `0700`/`0600`, and holds exactly the keys the unit declares. A key in one and not the other is a unit that fails to start with a cryptic systemd error; this makes it a readable failure |
+| `@workdir` | `# @workdir [--prefix NAME]` | Declare the run's **remote** staging directory, published to the run state as `WORKDIR`. The controller never creates it, so a run leaves nothing behind on the machine that drives the deployment; the target's copy is removed when the run ends |
+| `@helper` | `# @helper [@<target>] [--source DIR] [--triple T] [--install-path PATH]` | Build, cache, ship, and atomically install the target-side helper. The build is the expensive part of a deploy, so the artifact is cached by source revision and target triple: the second service reuses the first one's build |
+| `@backup` | `# @backup <path>… @<target> [--keep N] [--seal] [--dir PATH] [--service S]` | Snapshot the paths for rollback, keep the newest `N`, and shred the rest. `--seal` encrypts the snapshot with the host key, so no plaintext lands on disk. The "no plaintext left behind" guarantee is **structural**: the helper checks the files *it* wrote, not a directory re-globbed through a pipeline that cannot fail |
+| `@install` | `# @install <src> -> <dst> @<target> [--mode M] [--owner U:G] [--dir-mode M]` | Install a file on the target **atomically**: the data is written to a temporary name in the destination directory and renamed into place, so a reader (systemd, `systemctl cat`, a concurrent `daemon-reload`) never observes a half-written unit file, config, or binary |
+| `@credstore` | `# @credstore <service> @<target> [--require KEY,…]` | Seal the service's credential store and check it against the keys the unit declares |
+| `@service` | `# @service <unit> @<target> [--enable] [--restart] [--reload] [--wait] [--verify] [--force-start]` | Drive the unit's lifecycle: verify the installed unit, reload the manager, enable it, restart it, wait for it to be ready. `--restart` restarts a unit that was **running** and leaves a unit that was not running alone — restarting an inactive unit *starts* it, which is the opposite of what an operator who keeps a unit stopped wants. `--force-start` overrides that deliberately |
+| `@unit_inventory` | `# @unit_inventory [@<target>]` | List the units installed on the target. A **report**, not a gate: a pre-existing finding must never block an unrelated deploy |
 
 **Assertion steps.** Consecutive assertions that share a target are merged
 into **one** step: the whole group travels in a single SSH round trip, and the
@@ -262,6 +272,14 @@ pub enum Step {
     Remote(RemoteStep),
     Copy(CopyStep),
     Wait(WaitStep),
+    Reload(ReloadStep),
+    Assert(AssertStep),
+    Service(ServiceStep),
+    Install(InstallStep),
+    Backup(BackupStep),
+    Credstore(CredstoreStep),
+    UnitInventory(UnitInventoryStep),
+    Helper(HelperStep),
 }
 
 /// A wait-for-active step (`@wait_active`).
@@ -547,6 +565,8 @@ OPTIONS:
       --local                 Run remote blocks/copies on the controller
                                (debugging; no network or sudo required)
   -i, --identity <PATH>       age identity for `@secrets` decryption
+      --no-ssh-reuse          Do not reuse SSH connections within a run
+                               (every step opens its own connection)
   -h, --help                  Print help
   -V, --version               Print version
 
@@ -557,6 +577,14 @@ SUBCOMMANDS (the bare positional `shellflow deploy.sh` == `shellflow run`):
   template check <tmpl> <file.env.age>   cross-check ${KEY} against a sealed env
   emit cred-env [-o PATH]                print the bash helper (fallback targets)
   cred-env exec|render|credstore-install target-side helpers (see §S12)
+  host service|install|backup|credstore|assert-no-leak|assert-digest|
+       assert-credstore|inventory         target-side host helpers (§S12.1)
+  unit render <svc> <unit> [--repo PATH]  generate the unit's drop-in from
+       [--output PATH] [--check]          its manifest
+  unit manifest <svc> <unit> [--repo PATH]  print the manifest
+  unit verify [--repo PATH]                check the repository's consistency
+  systemd notify|wait|reload|status|watch|transient|exec|watchdog
+                                      target-side systemd helpers (§S12.1)
   service init <svc> [--host <alias>]    repository scaffolding (see §S12.2)
 
 EXIT CODES:
@@ -590,6 +618,66 @@ shellflow --dry-run --diff deploy.sh     # preview changes, change nothing
 shellflow -t web1 deploy.sh              # deploy one host from group `web`
 shellflow -k deploy.sh                   # syntax-check everything
 ```
+
+### 6.1 The service manifest and the unit generator
+
+A deploy repository repeats the same facts in three places: the systemd unit,
+the playbook, and the operator's memory. The unit declares the credential
+keys, the render template, and the binary; the playbook repeats the service
+name and the host.
+
+The **service manifest** (`services/<svc>/<unit>.service.toml`) states them
+once:
+
+```toml
+host = "api"
+unit = "dufs.service"
+binary = "/opt/dufs/bin/dufs"
+secret_file = "services/dufs/{host}.env.age"
+credentials = ["DUFS_AUTH_PASSWORD"]
+ports = [5000]
+user = "akagi201"
+runtime_dir = "dufs"
+
+[[render]]
+template = "/opt/dufs/etc/config.yaml.tmpl"
+target = "/run/dufs/config.yaml"
+```
+
+`shellflow unit render <svc> <unit>` derives the unit's drop-in from it: the
+`LoadCredentialEncrypted=` wiring, the `ExecStartPre=… cred-env render …`
+line, and the `ExecStartPost=… systemd-notify --status=…` line are identical
+in shape across a repository, so they are **generated** rather than copied —
+and the shared hardening drop-in rides along, which makes the hardening a
+default rather than an opt-in.
+
+The manifest is also the fleet map: `shellflow service status --all` reads the
+host of every service from the manifests instead of parsing playbook text, and
+`service check` uses the same source of truth.
+
+### 6.2 The repository consistency check
+
+A deploy repository has parts that are **generated** (the unit drop-ins) and
+parts that are **written** (the playbooks, the manifests). The generated parts
+drift away from the sources they come from, and the drift is silent.
+
+`shellflow unit verify` answers, statically:
+
+1. **Is every generated drop-in up to date?** The drop-in is re-rendered from
+   the manifest and compared with the file on disk.
+2. **Does every `@install` source exist?** The install steps are read out of
+   the playbook **with the tool's own parser**, so the check sees exactly what
+   a deploy would do, and every source is looked up in the repository.
+3. **Is every generated drop-in installed?** A service whose drop-in is never
+   installed would run with the unit's own (stale) wiring.
+4. **Does the shared hardening reach every service that takes it?** The
+   hardening is a default, not an opt-in; a unit that cannot take it says so
+   in its manifest (`hardening = false`).
+5. **Does every backup run before the install it protects?** The directives
+   execute in source order, so a `# @backup` line that sits below the
+   `# @install` lines snapshots the **new** file: the rollback copy would
+   restore what was just deployed. The check compares the plan's own step
+   order.
 
 ## 7. Execution Engine
 
@@ -1080,6 +1168,47 @@ expression evaluation or a documented latency SLA appears.
   yields a small static binary with no runtime dependencies.
 - `kache` rustc wrapper (already in `.cargo/config.toml`) keeps incremental
   rebuilds fast.
+
+### Round trips
+
+The engine spends SSH round trips, so they are counted explicitly:
+
+| Operation | Round trips |
+|---|---|
+| Remote block | 1 |
+| Remote block with `@only_if` | **1** — the guard is folded into the payload and reports "skip" through a dedicated exit code, instead of costing a second connection |
+| Copy | 1 probe per host per run (cached) + 1 rsync per transfer group |
+| `@assert` group | 1 (one framed batch) |
+| `@service`, `@install`, `@backup`, `@credstore`, `@unit_inventory` | 1 each |
+| `@wait_active` | 1 (the whole poll loop runs on the target) |
+| `service check` | 1 (eight queries batched) |
+| `service status` | 1 per host, **concurrently** |
+
+### Connection reuse
+
+`--ssh-reuse` is **on by default** (`--no-ssh-reuse` turns it off). A
+playbook is a sequence of steps against the same hosts, and every step used
+to pay a full TCP connect plus key exchange. `ControlMaster=auto` is safe by
+construction: OpenSSH reuses the master when it is alive and creates a new
+one when it is not, so a stale control socket is detected and replaced rather
+than breaking a deploy.
+
+### The batch transport
+
+A batch asks many questions in one round trip. Its answers are parsed **as
+they arrive**: the response is never buffered whole and then copied into a
+second set of strings, so the peak memory is one answer plus the answers
+already collected. The transport also knows when the batch is **complete** —
+every expected answer has arrived — and closes the connection then, instead
+of waiting for a trailing query that may be slow.
+
+### The helper build
+
+The target-side helper is built once per **source revision and target
+triple** and cached under `~/.cache/shellflow/`. The build is the single
+most expensive part of a deploy — a cross-compile takes minutes — and the
+cache turns it into a one-off: the second service that needs the helper
+reuses the first one's artifact.
 
 ## 12. Decision Records
 

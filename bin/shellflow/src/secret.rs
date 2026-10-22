@@ -268,6 +268,28 @@ impl Drop for TempPlaintext {
     }
 }
 
+/// The credential keys of a sealed env file.
+///
+/// Only the **key set** is read: the file is decrypted, the keys are
+/// collected, and the values are dropped. The values never reach the caller.
+///
+/// # Errors
+///
+/// Returns when the file cannot be read, the identity is unusable, or the
+/// plaintext is not a valid env file.
+pub(crate) fn credential_key_set(file: &Path, identity: Option<&Path>) -> Result<Vec<String>> {
+    let cipher = read_input(Some(file))?;
+    let identity = load_identity(identity)?;
+    let plain = decrypt_string(&cipher, &identity).map_err(eyre::Report::msg)?;
+    let mut keys: Vec<String> = parse_env_file(&plain)
+        .map_err(eyre::Report::msg)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    keys.sort();
+    Ok(keys)
+}
+
 fn creds(args: &SecretCredsArgs) -> Result<()> {
     let cipher = read_input(Some(&args.file))?;
     let identity = load_identity(args.identity.as_deref())?;

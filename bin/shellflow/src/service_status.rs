@@ -18,13 +18,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use shellflow_core::SshSpec;
+
 use crate::{
     cli::ServiceStatusArgs,
     rbatch::{Batch, SshDest},
-    service::ServiceError,
-    service::ServiceError::Other,
+    service::{ServiceError, ServiceError::Other},
 };
-use shellflow_core::SshSpec;
 
 /// The state of one unit on one host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -53,60 +53,96 @@ pub(crate) fn status(args: &ServiceStatusArgs) -> Result<(), ServiceError> {
              repository declares"
         )));
     }
-    let mut rows: Vec<(String, String, UnitState)> = Vec::new();
+    // The unit list of every host is resolved first: the queries themselves
+    // are network-bound, and they run in parallel so a fleet view costs one
+    // round trip instead of one per host.
+    let mut plans: Vec<(String, SshDest, Vec<String>)> = Vec::new();
     for (alias, dest) in &hosts {
-        let units = units_for_host(args, alias)?;
-        if units.is_empty() {
-            // Nothing to ask about: report that the host answered at all.
-            let mut batch = Batch::new();
-            batch.section("ping", "systemctl --version | head -1");
-            match batch.run_dest(dest) {
-                Ok(sections) => {
-                    let body = sections.get("ping").map_or("", |s| s.body.as_str());
-                    rows.push((
-                        alias.clone(),
-                        String::new(),
-                        UnitState {
-                            unit: "-".to_string(),
-                            active: "reachable".to_string(),
-                            sub: body.to_string(),
-                            load: "-".to_string(),
-                        },
-                    ));
-                }
-                Err(err) => {
-                    println!("[FAIL] {alias}: {err}");
-                }
-            }
-            continue;
-        }
-
-        let mut batch = Batch::new();
-        batch.section(
-            "units",
-            &format!(
-                "systemctl show {} -p Id,ActiveState,SubState,LoadState",
-                units
-                    .iter()
-                    .map(|u| shellflow_core::env::shell_quote_single(u))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
-        );
-        match batch.run_dest(dest) {
-            Ok(sections) => {
-                for state in parse_units(sections.get("units").map_or("", |s| s.body.as_str())) {
-                    rows.push((alias.clone(), state.unit.clone(), state));
-                }
-            }
-            Err(err) => {
-                println!("[FAIL] {alias}: {err}");
-            }
-        }
+        plans.push((alias.clone(), dest.clone(), units_for_host(args, alias)?));
     }
 
+    let mut rows: Vec<(String, String, UnitState)> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (alias, dest, units) in &plans {
+            let alias = alias.clone();
+            let dest = dest.clone();
+            let units = units.clone();
+            handles.push(scope.spawn(move || query_host(&alias, &dest, &units)));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(HostQuery::Rows(states)) => rows.extend(states),
+                Ok(HostQuery::Failed(message)) => failures.push(message),
+                Err(_) => failures.push("the host query panicked".to_string()),
+            }
+        }
+    });
+
+    for failure in &failures {
+        println!("[FAIL] {failure}");
+    }
     print_table(&rows);
     Ok(())
+}
+
+/// What one host's query produced.
+enum HostQuery {
+    /// The unit states the host reported.
+    Rows(Vec<(String, String, UnitState)>),
+    /// The host could not be reached.
+    Failed(String),
+}
+
+/// Query one host for its unit states.
+///
+/// A host with no units to ask about still gets a ping: the operator wants
+/// to know that the host answered at all.
+fn query_host(alias: &str, dest: &SshDest, units: &[String]) -> HostQuery {
+    if units.is_empty() {
+        let mut batch = Batch::new();
+        batch.section("ping", "systemctl --version | head -1");
+        return match batch.run_dest(dest) {
+            Ok(sections) => {
+                let body = sections.get("ping").map_or("", |s| s.body.as_str());
+                HostQuery::Rows(vec![(
+                    alias.to_string(),
+                    String::new(),
+                    UnitState {
+                        unit: "-".to_string(),
+                        active: "reachable".to_string(),
+                        sub: body.to_string(),
+                        load: "-".to_string(),
+                    },
+                )])
+            }
+            Err(err) => HostQuery::Failed(format!("{alias}: {err}")),
+        };
+    }
+
+    let mut batch = Batch::new();
+    batch.section(
+        "units",
+        &format!(
+            "systemctl show {} -p Id,ActiveState,SubState,LoadState",
+            units
+                .iter()
+                .map(|u| shellflow_core::env::shell_quote_single(u))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    );
+    match batch.run_dest(dest) {
+        Ok(sections) => {
+            let states = parse_units(sections.get("units").map_or("", |s| s.body.as_str()))
+                .into_iter()
+                .map(|state| (alias.to_string(), state.unit.clone(), state))
+                .collect();
+            HostQuery::Rows(states)
+        }
+        Err(err) => HostQuery::Failed(format!("{alias}: {err}")),
+    }
 }
 
 /// Print the table of unit states.
@@ -115,7 +151,13 @@ fn print_table(rows: &[(String, String, UnitState)]) {
         println!("(no units to report)");
         return;
     }
-    let header = vec!["HOST".to_string(), "UNIT".to_string(), "ACTIVE".to_string(), "SUB".to_string(), "LOAD".to_string()];
+    let header = vec![
+        "HOST".to_string(),
+        "UNIT".to_string(),
+        "ACTIVE".to_string(),
+        "SUB".to_string(),
+        "LOAD".to_string(),
+    ];
     let mut widths = header.iter().map(|h| h.len()).collect::<Vec<_>>();
     let mut body: Vec<Vec<String>> = Vec::new();
     for (host, _service, state) in rows {
@@ -239,9 +281,18 @@ fn repo_hosts(repo: &Path) -> Result<Vec<(String, String)>, ServiceError> {
 
 /// Which service each host is supposed to run.
 ///
-/// The mapping comes from the playbooks: the service a playbook installs
+/// The mapping comes from the **service manifests** when the repository has
+/// them: a manifest states the host and the service outright, which is
+/// stronger than reading it back out of playbook text. A repository without
+/// manifests falls back to the playbooks: the service a playbook installs
 /// (`SVC=`) and the hosts it targets (`@server`/`@remote`).
 fn repo_fleet(repo: &Path) -> Result<BTreeMap<String, Vec<String>>, ServiceError> {
+    let manifests =
+        crate::manifest::load_all(repo).map_err(|err| ServiceError::Other(eyre::eyre!("{err}")))?;
+    if !manifests.is_empty() {
+        return crate::manifest::service_fleet(&manifests)
+            .map_err(|err| ServiceError::Other(eyre::eyre!("{err}")));
+    }
     let dir = repo.join("playbooks");
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for script in playbook_scripts(&dir)? {
@@ -373,9 +424,7 @@ fn repo_units(repo: &Path) -> Result<Vec<String>, ServiceError> {
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "service"))
-            .filter_map(|path| {
-                path.file_name().and_then(|n| n.to_str()).map(ToString::to_string)
-            })
+            .filter_map(|path| path.file_name().and_then(|n| n.to_str()).map(ToString::to_string))
             .collect();
         candidates.sort();
         if let Some(unit) = candidates.first() {
@@ -392,10 +441,7 @@ mod tests {
     #[test]
     fn a_playbook_names_its_service() {
         assert_eq!(extract_service("# @server api api\nSVC=dufs\n"), Some("dufs".to_string()));
-        assert_eq!(
-            extract_service("SVC=\"${SVC:-dufs}\"\n"),
-            Some("dufs".to_string())
-        );
+        assert_eq!(extract_service("SVC=\"${SVC:-dufs}\"\n"), Some("dufs".to_string()));
         assert_eq!(extract_service("# no service here\n"), None);
     }
 

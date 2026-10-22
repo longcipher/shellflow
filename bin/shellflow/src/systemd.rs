@@ -25,14 +25,15 @@
 
 use std::{
     fmt,
+    io::{Read, Write},
     process::{Command, Stdio},
     thread::sleep,
     time::{Duration, Instant},
 };
 
 use crate::cli::{
-    SystemdCmd, SystemdNotifyArgs, SystemdReloadArgs, SystemdStatusArgs, SystemdTransientArgs,
-    SystemdWaitArgs, SystemdWatchArgs,
+    SystemdCmd, SystemdExecArgs, SystemdNotifyArgs, SystemdReloadArgs, SystemdStatusArgs,
+    SystemdTransientArgs, SystemdWaitArgs, SystemdWatchArgs, SystemdWatchdogArgs,
 };
 
 /// The unit reached the wanted state.
@@ -279,6 +280,8 @@ impl WaitFor {
 pub(crate) async fn run(cmd: &SystemdCmd) -> Result<(), SystemdError> {
     match cmd {
         SystemdCmd::Notify(args) => notify(args),
+        SystemdCmd::Exec(args) => exec(args),
+        SystemdCmd::Watchdog(args) => watchdog(args),
         SystemdCmd::Wait(args) => wait(args),
         SystemdCmd::Reload(args) => reload(args),
         SystemdCmd::Status(args) => status(args),
@@ -353,6 +356,261 @@ fn send_notify(states: &[sd_notify::NotifyState<'_>]) -> Result<(), SystemdError
     }
     sd_notify::notify(states)
         .map_err(|err| SystemdError::internal(format!("cannot send notification: {err}")))
+}
+
+/// `shellflow systemd exec` — run a command under a readiness contract.
+///
+/// A `Type=simple` unit is `active` as soon as the process was forked: it
+/// says nothing about whether the service can serve traffic. That is why a
+/// playbook has to guess — `restart`, `sleep 5`, `is-active` — and why the
+/// guess is sometimes too short and sometimes too long.
+///
+/// This supervisor closes the gap without asking the application to change:
+///
+/// 1. it starts the real binary as a child;
+/// 2. it waits for a declared readiness condition (a port that accepts connections, a URL that
+///    answers, a file that appears);
+/// 3. it sends `READY=1` — so the unit can be `Type=notify` and `active` means *ready*;
+/// 4. it optionally keeps the watchdog alive on the child's behalf;
+/// 5. it forwards `SIGTERM`/`SIGINT` to the child and exits with the child's status, so `systemctl
+///    stop` still works and the unit's `Result=` still describes what actually happened.
+fn exec(args: &SystemdExecArgs) -> Result<(), SystemdError> {
+    if args.command.is_empty() {
+        return Err(SystemdError::usage("no command to run"));
+    }
+    let (program, rest) =
+        args.command.split_first().ok_or_else(|| SystemdError::usage("no command to run"))?;
+
+    let mut child = Command::new(program)
+        .args(rest)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| SystemdError::internal(format!("cannot start `{program}`: {err}")))?;
+    let pid = child.id() as i32;
+    CHILD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+    install_signal_forwarding();
+
+    let readiness = Readiness::from(args);
+    let watchdog = args.watchdog.then(|| Duration::from_secs(args.watchdog_interval.max(1)));
+    let deadline = Instant::now() + Duration::from_secs(args.timeout);
+
+    // The watchdog keeps running while the child does.
+    let watchdog_handle = watchdog.map(|interval| {
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
+            }
+        })
+    });
+
+    // Wait for readiness, but notice the child dying in the meantime: a
+    // process that exits before it is ready must fail the unit, not hang
+    // until the budget expires.
+    let ready = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| SystemdError::internal(format!("cannot wait for the child: {err}")))?
+        {
+            let _ = watchdog_handle.map(|handle| handle.join());
+            return Err(SystemdError {
+                message: format!(
+                    "`{program}` exited with {status} before it became ready",
+                    program = program
+                ),
+                code: EXIT_FAILED,
+            });
+        }
+        if readiness.satisfied() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+
+    if !ready {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        let _ = watchdog_handle.map(|handle| handle.join());
+        return Err(SystemdError {
+            message: format!("`{program}` did not become ready within {}s", args.timeout),
+            code: EXIT_TIMEOUT,
+        });
+    }
+
+    let mut states = vec![sd_notify::NotifyState::Ready];
+    if let Some(status) = &args.status {
+        states.push(sd_notify::NotifyState::Status(status));
+    }
+    // A unit without `NOTIFY_SOCKET` is not managed by systemd; the
+    // supervisor still supervises, it just cannot report.
+    let _ = sd_notify::notify(&states);
+
+    let status = child
+        .wait()
+        .map_err(|err| SystemdError::internal(format!("cannot wait for the child: {err}")))?;
+    let _ = watchdog_handle.map(|handle| handle.join());
+    match status.code() {
+        Some(code) => {
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(SystemdError {
+                    message: format!("`{program}` exited with {code}"),
+                    code: EXIT_FAILED,
+                })
+            }
+        }
+        None => Err(SystemdError {
+            message: format!("`{program}` was killed by a signal"),
+            code: EXIT_FAILED,
+        }),
+    }
+}
+
+/// The child process the signal handler forwards to.
+static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Forward `SIGTERM` and `SIGINT` to the child.
+///
+/// The handler does the minimum an async-signal-safe function may do: read
+/// the pid and send a signal.
+fn install_signal_forwarding() {
+    extern "C" fn forward(raw: i32) {
+        let Ok(signal) = nix::sys::signal::Signal::try_from(raw) else {
+            return;
+        };
+        let pid = CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
+        if pid > 0 {
+            // `kill` is async-signal-safe, and the handler does nothing else.
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal);
+        }
+    }
+    // SAFETY: the handler is async-signal-safe (it reads an atomic and
+    // sends a signal) and stays installed for the life of the process.
+    unsafe {
+        let _ = nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGTERM,
+            nix::sys::signal::SigHandler::Handler(forward),
+        );
+        let _ = nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGINT,
+            nix::sys::signal::SigHandler::Handler(forward),
+        );
+    }
+}
+
+/// The readiness condition a supervised service must satisfy.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Readiness {
+    port: Option<u16>,
+    url: Option<String>,
+    file: Option<String>,
+}
+
+impl Readiness {
+    /// The readiness condition declared on the command line.
+    fn from(args: &SystemdExecArgs) -> Self {
+        Self { port: args.ready_port, url: args.ready_url.clone(), file: args.ready_file.clone() }
+    }
+
+    /// Whether the condition holds.
+    fn satisfied(&self) -> bool {
+        if let Some(port) = self.port &&
+            !port_open(port)
+        {
+            return false;
+        }
+        if let Some(url) = &self.url &&
+            !url_answers(url)
+        {
+            return false;
+        }
+        if let Some(file) = &self.file &&
+            !std::path::Path::new(file).exists()
+        {
+            return false;
+        }
+        // No condition at all means "ready as soon as the process runs".
+        self.port.is_some() || self.url.is_some() || self.file.is_some()
+    }
+}
+
+/// Whether a TCP port accepts a connection on the loopback interface.
+fn port_open(port: u16) -> bool {
+    let Ok(addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// Whether a URL answers with a 2xx or 3xx status.
+///
+/// The probe is deliberately minimal: a plain HTTP/1.0 `GET` over TCP, so the
+/// helper needs no HTTP client and works on a host that has neither `curl`
+/// nor `wget`.
+fn url_answers(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        // An https URL needs a TLS client; the supervisor does not bring one.
+        return false;
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, path),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => (host, port),
+            Err(_) => (authority, 80),
+        },
+        None => (authority, 80),
+    };
+    let Ok(addr) = format!("{host}:{port}").parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let request = format!("GET /{path} HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    let Some(status) = text.split_whitespace().nth(1) else {
+        return false;
+    };
+    status.starts_with('2') || status.starts_with('3')
+}
+
+/// `shellflow systemd watchdog` — keep a unit's watchdog alive.
+///
+/// The helper is meant to run **inside** the unit (as the unit's own
+/// process, or as a sidecar in its cgroup): systemd only accepts a watchdog
+/// ping from a process it attributes to the unit.
+fn watchdog(args: &SystemdWatchdogArgs) -> Result<(), SystemdError> {
+    let interval = Duration::from_secs(args.interval.max(1));
+    let deadline = Instant::now() + Duration::from_secs(args.timeout);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(SystemdError {
+                message: format!("the watchdog keepalive ran for {}s and stopped", args.timeout),
+                code: EXIT_TIMEOUT,
+            });
+        }
+        sd_notify::notify(&[sd_notify::NotifyState::Watchdog])
+            .map_err(|err| SystemdError::internal(format!("cannot send notification: {err}")))?;
+        std::thread::sleep(interval);
+    }
 }
 
 /// `shellflow systemd wait` — wait for a unit to reach a state.

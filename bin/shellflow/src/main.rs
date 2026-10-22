@@ -21,8 +21,10 @@ mod diffutil;
 mod emit;
 mod executor;
 mod fsx;
+mod host;
 mod keys;
 mod lint;
+mod manifest;
 mod preflight;
 mod rbatch;
 mod secret;
@@ -37,6 +39,9 @@ mod systemd;
 mod systemd_dbus;
 mod template;
 mod ui;
+mod unit;
+mod unit_cmd;
+mod unit_verify;
 
 use std::{sync::Arc, time::Duration};
 
@@ -119,6 +124,20 @@ async fn main() -> Result<()> {
             Err(err) => {
                 eprintln!("error: {err:#}");
                 err.exit_code()
+            }
+        },
+        Some(Command::Host(cmd)) => match host::run(&cmd.command) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("error: {err}");
+                err.exit_code()
+            }
+        },
+        Some(Command::Unit(cmd)) => match unit_cmd::run(&cmd.command) {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                1
             }
         },
         Some(Command::Service(cmd)) => match service::run(&cmd.command) {

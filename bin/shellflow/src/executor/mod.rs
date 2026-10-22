@@ -13,6 +13,7 @@
 mod assert_step;
 mod cancel;
 mod copy;
+mod host;
 mod local;
 mod process;
 mod remote;
@@ -59,6 +60,8 @@ pub(crate) struct CopyStepArgs {
     pub log_file: LogFile,
     /// The cooperative cancellation signal.
     pub cancel: Cancel,
+    /// The managed staging directory, when the run declares one.
+    pub workdir: Option<remote::WorkdirGuard>,
 }
 
 /// Arguments for [`run_local_block`] — groups the parameters that would
@@ -110,7 +113,7 @@ impl StepConfig {
             verbose: run.flags.verbose,
             timeout,
             local: run.flags.local,
-            ssh_reuse: run.flags.ssh_reuse,
+            ssh_reuse: run.flags.ssh_reuse && !run.flags.no_ssh_reuse,
             allow_unfiltered_copy: run.flags.allow_unfiltered_copy,
         }
     }

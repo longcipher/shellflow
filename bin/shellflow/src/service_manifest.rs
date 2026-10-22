@@ -4,12 +4,10 @@
 //! A manifest is the sha256 of every file under a deployed tree, sorted by
 //! path. It answers two questions that a deploy otherwise leaves open:
 //!
-//! * *Is what runs the thing the repository describes?* — `verify` recomputes
-//!   the manifest on the host and compares it with a saved one; a changed,
-//!   missing or extra file is drift.
-//! * *Did the transfer land intact?* — the manifest is computed from the
-//!   files on the host, so it is a statement about the host, not about the
-//!   controller's copy.
+//! * *Is what runs the thing the repository describes?* — `verify` recomputes the manifest on the
+//!   host and compares it with a saved one; a changed, missing or extra file is drift.
+//! * *Did the transfer land intact?* — the manifest is computed from the files on the host, so it
+//!   is a statement about the host, not about the controller's copy.
 //!
 //! The manifest is plain text (`<sha256>  <path>` per line, with a header
 //! naming the roots), so it diffs, greps and version-controls like any
@@ -17,13 +15,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use shellflow_core::env::shell_quote_single;
+
 use crate::{
     cli::{ServiceManifestArgs, ServiceVerifyArgs},
     rbatch::Batch,
-    service::ServiceError,
-    service::ServiceError::Other,
+    service::{ServiceError, ServiceError::Other},
 };
-use shellflow_core::env::shell_quote_single;
 
 /// The manifest format marker.
 const MANIFEST_VERSION: &str = "# shellflow-manifest v1";
@@ -112,8 +110,9 @@ pub(crate) fn manifest(args: &ServiceManifestArgs) -> Result<(), ServiceError> {
 
     match &args.output {
         Some(path) => {
-            crate::fsx::write_public_file(path, text.as_bytes())
-                .map_err(|err| Other(eyre::eyre!("service manifest: cannot write {}: {err}", path.display())))?;
+            crate::fsx::write_public_file(path, text.as_bytes()).map_err(|err| {
+                Other(eyre::eyre!("service manifest: cannot write {}: {err}", path.display()))
+            })?;
             println!("service manifest: {count} file(s) written to {}", path.display());
         }
         None => print!("{text}"),
@@ -130,10 +129,7 @@ pub(crate) fn manifest(args: &ServiceManifestArgs) -> Result<(), ServiceError> {
 /// drifted away from it.
 pub(crate) fn verify(args: &ServiceVerifyArgs) -> Result<(), ServiceError> {
     let text = std::fs::read_to_string(&args.manifest).map_err(|err| {
-        Other(eyre::eyre!(
-            "service verify: cannot read {}: {err}",
-            args.manifest.display()
-        ))
+        Other(eyre::eyre!("service verify: cannot read {}: {err}", args.manifest.display()))
     })?;
     let expected = Manifest::from_text(&text)?;
 
@@ -144,9 +140,7 @@ pub(crate) fn verify(args: &ServiceVerifyArgs) -> Result<(), ServiceError> {
         }
     }
     if roots.is_empty() {
-        return Err(Other(eyre::eyre!(
-            "service verify: the manifest names no root; pass --path"
-        )));
+        return Err(Other(eyre::eyre!("service verify: the manifest names no root; pass --path")));
     }
     let current = compute(&args.host, &roots)?;
 
@@ -163,8 +157,8 @@ pub(crate) fn verify(args: &ServiceVerifyArgs) -> Result<(), ServiceError> {
         drift += 1;
     }
     for (path, hash) in &current {
-        if let Some(want) = expected.entries.get(path)
-            && want != hash
+        if let Some(want) = expected.entries.get(path) &&
+            want != hash
         {
             println!("[FAIL] changed: {path}");
             drift += 1;
@@ -172,9 +166,7 @@ pub(crate) fn verify(args: &ServiceVerifyArgs) -> Result<(), ServiceError> {
     }
 
     if drift > 0 {
-        return Err(Other(eyre::eyre!(
-            "service verify: {drift} file(s) drifted from the manifest"
-        )));
+        return Err(Other(eyre::eyre!("service verify: {drift} file(s) drifted from the manifest")));
     }
     println!("service verify: {} file(s) match the manifest", current.len());
     Ok(())
