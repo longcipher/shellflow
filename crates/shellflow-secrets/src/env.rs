@@ -13,10 +13,14 @@ fn strip_quotes(value: &str) -> String {
 
 /// Parse an env file into ordered `(key, value)` pairs.
 ///
-/// Blank lines and `#` comments are ignored. An optional `export ` prefix per
-/// line is tolerated (both `source`-able and `EnvironmentFile=`-style files
-/// are accepted). The first `=` splits the key from the value; a surrounding
-/// pair of matching quotes is stripped from the value.
+/// Blank lines and full-line `#` comments are ignored (inline `#` stays part
+/// of the value). An optional single-space `export ` prefix per line is
+/// tolerated; other whitespace forms (`export\tA=1`) are rejected as
+/// malformed so a tab is never silently folded into a key. The first `=`
+/// splits the key from the value; a surrounding pair of matching quotes is
+/// stripped once from the value. Unquoted surrounding whitespace is trimmed
+/// (quote to preserve it); no backslash escapes are processed, unlike bash
+/// double quotes.
 ///
 /// A repeated key keeps the **last** value and appears once, in the position
 /// of its first occurrence — matching bash `source` semantics and keeping the

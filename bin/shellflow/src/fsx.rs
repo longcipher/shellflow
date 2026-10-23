@@ -55,3 +55,13 @@ pub(crate) fn write_executable_file(path: &Path, bytes: &[u8]) -> Result<()> {
 fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     shellflow_secrets::fsx::write_atomic(path, bytes, mode).map_err(|err| eyre::eyre!("{err}"))
 }
+
+/// Write scaffold text (no secret), creating parent directories.
+pub(crate) fn write_text_file(path: &Path, content: &str) -> Result<()> {
+    use eyre::WrapErr as _;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("failed to create `{}`", parent.display()))?;
+    }
+    write_public_file(path, content.as_bytes())
+}

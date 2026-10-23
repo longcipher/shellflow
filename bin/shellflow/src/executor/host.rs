@@ -409,7 +409,7 @@ pub(crate) fn cache_dir() -> PathBuf {
 ///
 /// A git checkout is keyed by its HEAD; anything else by the modification
 /// time of its manifest, which changes whenever the sources change.
-pub(crate) fn source_revision(source: &Path) -> Result<String, String> {
+pub(crate) fn source_revision(source: &Path) -> eyre::Result<String> {
     let git = source.join(".git");
     if git.exists() {
         let out = std::process::Command::new("git")
@@ -418,7 +418,7 @@ pub(crate) fn source_revision(source: &Path) -> Result<String, String> {
             .args(["rev-parse", "HEAD"])
             .stdin(Stdio::null())
             .output()
-            .map_err(|err| format!("cannot run `git`: {err}"))?;
+            .map_err(|err| eyre::eyre!("cannot run `git`: {err}"))?;
         if out.status.success() {
             let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !head.is_empty() {
@@ -428,17 +428,17 @@ pub(crate) fn source_revision(source: &Path) -> Result<String, String> {
     }
     let manifest = source.join("Cargo.toml");
     let meta = std::fs::metadata(&manifest)
-        .map_err(|err| format!("cannot stat `{}`: {err}", manifest.display()))?;
+        .map_err(|err| eyre::eyre!("cannot stat `{}`: {err}", manifest.display()))?;
     let modified = meta
         .modified()
-        .map_err(|err| format!("cannot read the modification time: {err}"))?
+        .map_err(|err| eyre::eyre!("cannot read the modification time: {err}"))?
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     Ok(format!("m{modified}"))
 }
 
 /// The cached helper for a source revision and target triple.
-pub(crate) fn cached_helper(source: &Path, triple: &str) -> Result<PathBuf, String> {
+pub(crate) fn cached_helper(source: &Path, triple: &str) -> eyre::Result<PathBuf> {
     let revision = source_revision(source)?;
     let dir = cache_dir().join(format!("helper-{revision}-{triple}"));
     let binary = dir.join("shellflow");
@@ -446,7 +446,7 @@ pub(crate) fn cached_helper(source: &Path, triple: &str) -> Result<PathBuf, Stri
         return Ok(binary);
     }
     std::fs::create_dir_all(&dir)
-        .map_err(|err| format!("cannot create `{}`: {err}", dir.display()))?;
+        .map_err(|err| eyre::eyre!("cannot create `{}`: {err}", dir.display()))?;
     build_helper(source, triple, &binary)?;
     Ok(binary)
 }
@@ -455,7 +455,7 @@ pub(crate) fn cached_helper(source: &Path, triple: &str) -> Result<PathBuf, Stri
 ///
 /// The build is the expensive part of a deploy, so it happens once per source
 /// revision and target triple and is then reused by every playbook.
-fn build_helper(source: &Path, triple: &str, out: &Path) -> Result<(), String> {
+fn build_helper(source: &Path, triple: &str, out: &Path) -> eyre::Result<()> {
     // `cargo zigbuild --version` is not a thing: cargo-zigbuild has no
     // `--version` option and exits 2 on it. `--help` is the probe that
     // actually answers "is cargo-zigbuild installed?".
@@ -477,13 +477,13 @@ fn build_helper(source: &Path, triple: &str, out: &Path) -> Result<(), String> {
     cmd.arg("--release").arg("-p").arg("shellflow").arg("--target").arg(triple);
     cmd.current_dir(source);
     cmd.stdin(Stdio::null());
-    let status = cmd.status().map_err(|err| format!("cannot run `cargo`: {err}"))?;
+    let status = cmd.status().map_err(|err| eyre::eyre!("cannot run `cargo`: {err}"))?;
     if !status.success() {
-        return Err(format!("building the helper for {triple} failed"));
+        return Err(eyre::eyre!("building the helper for {triple} failed"));
     }
     let built = source.join("target").join(triple).join("release").join("shellflow");
     std::fs::copy(&built, out).map_err(|err| {
-        format!("cannot copy `{}` to `{}`: {err}", built.display(), out.display())
+        eyre::eyre!("cannot copy `{}` to `{}`: {err}", built.display(), out.display())
     })?;
     Ok(())
 }
@@ -526,7 +526,7 @@ pub(super) async fn run_helper_step(
         return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
     }
 
-    let source = resolve_helper_source(step).map_err(|err| eyre::eyre!("{err}"))?;
+    let source = resolve_helper_source(step)?;
     let triple = step.triple.clone().unwrap_or_else(|| "x86_64-unknown-linux-musl".to_string());
 
     // The build blocks; keep it off the async runtime's worker threads.
@@ -539,8 +539,8 @@ pub(super) async fn run_helper_step(
     {
         Ok(Ok(path)) => path,
         Ok(Err(err)) => {
-            crate::ui::step_failed(0, &err, log_file);
-            return Err(eyre::eyre!("{err}"));
+            crate::ui::step_failed(0, &err.to_string(), log_file);
+            return Err(err);
         }
         Err(err) => {
             crate::ui::step_failed(0, &format!("the helper build panicked: {err}"), log_file);
@@ -574,7 +574,17 @@ pub(super) async fn run_helper_step(
             if cancel.is_cancelled() {
                 return (host.alias.clone(), HostOutcome::Cancelled);
             }
-            match ship_helper(&host, &built, &staged, &install_path, &ui, &log_file).await {
+            let request = HelperShip {
+                host: &host,
+                built: &built,
+                staged: &staged,
+                install_path: &install_path,
+                ui: &ui,
+                log_file: &log_file,
+                config,
+                cancel: &cancel,
+            };
+            match ship_helper(request).await {
                 Ok(()) => {
                     ui.lock().await.masked_note(&format!("[{}] helper installed", host.alias));
                     (host.alias.clone(), HostOutcome::Ok)
@@ -602,19 +612,20 @@ pub(super) async fn run_helper_step(
 }
 
 /// The source tree to build the helper from.
-fn resolve_helper_source(step: &shellflow_core::HelperStep) -> Result<PathBuf, String> {
+fn resolve_helper_source(step: &shellflow_core::HelperStep) -> eyre::Result<PathBuf> {
     let candidate =
         step.source.clone().or_else(|| std::env::var("SHELLFLOW_SRC").ok()).ok_or_else(|| {
-            "the helper source is unknown: pass `--source <dir>` to `@helper`, or export \
-             SHELLFLOW_SRC"
-                .to_string()
+            eyre::eyre!(
+                "the helper source is unknown: pass `--source <dir>` to `@helper`, or export \
+                 SHELLFLOW_SRC"
+            )
         })?;
     let path = PathBuf::from(candidate);
     if !path.is_dir() {
-        return Err(format!("the helper source `{}` is not a directory", path.display()));
+        return Err(eyre::eyre!("the helper source `{}` is not a directory", path.display()));
     }
     if !path.join("Cargo.toml").exists() {
-        return Err(format!(
+        return Err(eyre::eyre!(
             "the helper source `{}` has no Cargo.toml: it is not the shellflow workspace",
             path.display()
         ));
@@ -623,14 +634,66 @@ fn resolve_helper_source(step: &shellflow_core::HelperStep) -> Result<PathBuf, S
 }
 
 /// Copy the helper to the target and install it atomically.
-async fn ship_helper(
-    host: &ResolvedHost,
-    built: &Path,
-    staged: &str,
-    install_path: &str,
-    ui: &ArcUi,
-    log_file: &LogFile,
-) -> Result<(), String> {
+///
+/// Both children run under the step supervisor: process-group isolated, bound
+/// by the step timeout, and observing cooperative cancellation, so a hung
+/// transfer cannot hang the step and `Ctrl-C` leaves no orphan.
+struct HelperShip<'a> {
+    host: &'a ResolvedHost,
+    built: &'a Path,
+    staged: &'a str,
+    install_path: &'a str,
+    ui: &'a ArcUi,
+    log_file: &'a LogFile,
+    config: StepConfig,
+    cancel: &'a Cancel,
+}
+
+/// Copy the helper to the target and install it atomically.
+async fn ship_helper(request: HelperShip<'_>) -> eyre::Result<()> {
+    let HelperShip { host, built, staged, install_path, ui, log_file, config, cancel } = request;
+    use crate::executor::process::{GroupGuard, isolate};
+    async fn supervised_output(
+        mut cmd: Command,
+        timeout: Option<u64>,
+        cancel: &Cancel,
+    ) -> eyre::Result<std::process::Output> {
+        isolate(&mut cmd);
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().map_err(|err| eyre::eyre!("spawn failed: {err}"))?;
+        let mut guard = GroupGuard::new(&child);
+        let mut cancel_clone = cancel.clone();
+        let timeout_dur = timeout.map(Duration::from_secs);
+        let output_fut = child.wait_with_output();
+        tokio::pin!(output_fut);
+        // The guard owns the group kill: on timeout/cancel the future (and
+        // its child) is dropped, then the guard SIGKILLs the whole group.
+        // `kill_on_drop` alone would reap only the direct child.
+        let output = tokio::select! {
+            result = &mut output_fut => result.map_err(|err| eyre::eyre!("wait failed: {err}"))?,
+            () = async {
+                if let Some(dur) = timeout_dur {
+                    tokio::time::sleep(dur).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                drop(guard);
+                // Reap the group kill promptly.
+                return Err(eyre::eyre!("timed out — killed"));
+            }
+            () = cancel_clone.cancelled() => {
+                drop(guard);
+                return Err(eyre::eyre!("cancelled"));
+            }
+        };
+        guard.disarm();
+        Ok(output)
+    }
+    let timeout = config.timeout;
+    if cancel.is_cancelled() {
+        return Err(eyre::eyre!("cancelled"));
+    }
     let mut rsync = Command::new("rsync");
     rsync.args(["-a", "-z"]);
     let remote_shell = host.spec.rsync_remote_shell();
@@ -639,22 +702,31 @@ async fn ship_helper(
     }
     rsync.arg(built).arg(format!("{}:{staged}", host.spec.dest()));
     rsync.stdout(Stdio::piped()).stderr(Stdio::piped());
-    rsync.kill_on_drop(true);
-    let output = rsync.output().await.map_err(|err| format!("rsync failed: {err}"))?;
+    rsync.stdin(Stdio::null());
+    let output = supervised_output(rsync, timeout, cancel)
+        .await
+        .map_err(|err| eyre::eyre!("rsync failed: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("rsync exited with {}: {}", output.status, stderr.trim()));
+        return Err(eyre::eyre!("rsync exited with {}: {}", output.status, stderr.trim()));
     }
     let _ = ui;
     let _ = log_file;
 
+    if cancel.is_cancelled() {
+        return Err(eyre::eyre!("cancelled"));
+    }
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes"]);
     cmd.args(host.spec.to_ssh_args()).arg("-T").arg(helper_install_command(staged, install_path));
-    let output = cmd.output().await.map_err(|err| format!("ssh failed: {err}"))?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
+    let output = supervised_output(cmd, timeout, cancel)
+        .await
+        .map_err(|err| eyre::eyre!("ssh failed: {err}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("the install failed: {}", stderr.trim()));
+        return Err(eyre::eyre!("the install failed: {}", stderr.trim()));
     }
     Ok(())
 }

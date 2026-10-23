@@ -1,7 +1,7 @@
 //! Local step execution: `bash -c` with `set -eu` semantics, guard evaluation,
 //! and `@export` capture.
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, process::Stdio, sync::Arc};
 
 use eyre::{Context as _, Result};
 use shellflow_core::{EnvEntry, LocalStep, RunState};
@@ -15,13 +15,15 @@ use super::{
 /// Why a local block did not complete successfully.
 ///
 /// The distinction matters: a timeout is a `TIMEOUT` status, a broken payload
-/// pipe is a transport failure (exit 3), and anything else is a script
-/// failure (exit 4).
+/// pipe is a transport failure (exit 3), cancellation is a `CANCELLED` status,
+/// and anything else is a script failure (exit 4).
 pub(crate) enum LocalFailure {
     /// The block exceeded its timeout.
     Timeout,
     /// The block's script could not be delivered to the shell.
     PipeBroken,
+    /// The run was interrupted.
+    Cancelled,
     /// The block failed for any other reason.
     Failed(eyre::Report),
 }
@@ -38,6 +40,10 @@ pub(crate) enum GuardOutcome {
     Pass,
     /// The guard failed: skip the block.
     Fail,
+    /// The guard timed out.
+    TimedOut,
+    /// The guard was interrupted.
+    Cancelled,
     /// The guard could not be evaluated.
     Failed(RunError),
 }
@@ -109,7 +115,7 @@ pub(crate) async fn capture_exports(
     let content = fs::read(capture.path())
         .await
         .wrap_err_with(|| format!("failed to read capture file {}", capture.path().display()))?;
-    let table = shellflow_core::parse_capture_records(&content)
+    let table = shellflow_core::parse_capture_records_checked(&content, Some(vars))
         .wrap_err("failed to parse `@export` capture records")?;
 
     let mut state = run_state.lock().await;
@@ -236,6 +242,12 @@ pub(crate) async fn run_local_step(
                     crate::ui::note("  local guard failed — skipping block", &log_file);
                     return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
                 }
+                GuardOutcome::TimedOut => {
+                    return Ok(vec![("localhost".to_string(), HostOutcome::TimedOut)]);
+                }
+                GuardOutcome::Cancelled => {
+                    return Ok(vec![("localhost".to_string(), HostOutcome::Cancelled)]);
+                }
                 GuardOutcome::Failed(err) => {
                     crate::ui::warn(&format!("local guard failed: {err}"), &log_file);
                     return Ok(vec![("localhost".to_string(), HostOutcome::Failed(err))]);
@@ -265,6 +277,7 @@ pub(crate) async fn run_local_step(
         Ok(()) => HostOutcome::Ok,
         Err(LocalFailure::Timeout) => HostOutcome::TimedOut,
         Err(LocalFailure::PipeBroken) => HostOutcome::Failed(RunError::Transport),
+        Err(LocalFailure::Cancelled) => HostOutcome::Cancelled,
         Err(LocalFailure::Failed(err)) => {
             crate::ui::warn(&format!("local step failed: {err:#}"), &log_file);
             HostOutcome::Failed(RunError::Script)
@@ -314,9 +327,8 @@ pub(crate) async fn evaluate_guard(
                 GuardOutcome::Fail
             }
         }
-        Ok(super::stream::PipedRun::TimedOut | super::stream::PipedRun::Cancelled) => {
-            GuardOutcome::Failed(RunError::Script)
-        }
+        Ok(super::stream::PipedRun::TimedOut) => GuardOutcome::TimedOut,
+        Ok(super::stream::PipedRun::Cancelled) => GuardOutcome::Cancelled,
         Ok(super::stream::PipedRun::PipeBroken) | Err(_) => {
             GuardOutcome::Failed(RunError::Transport)
         }
@@ -348,20 +360,40 @@ async fn run_bash_streamed(
         // The local child died before reading its script: a spawn-level or
         // script-delivery failure, not a timeout.
         super::stream::PipedRun::PipeBroken => Err(LocalFailure::PipeBroken),
-        super::stream::PipedRun::Cancelled => {
-            Err(LocalFailure::Failed(eyre::eyre!("local step cancelled")))
-        }
+        super::stream::PipedRun::Cancelled => Err(LocalFailure::Cancelled),
     }
 }
 
 async fn run_bash_n(script: &str, log_file: &LogFile) -> Result<(), LocalFailure> {
-    let output = Command::new("bash")
-        .arg("-n")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .await
+    use super::process::{GroupGuard, isolate};
+    let mut cmd = Command::new("bash");
+    cmd.arg("-n").arg("-c").arg(script);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    isolate(&mut cmd);
+    let child = cmd
+        .spawn()
         .map_err(|err| LocalFailure::Failed(eyre::eyre!("failed to run bash -n: {err}")))?;
+    let mut guard = GroupGuard::new(&child);
+    // `bash -n` is short-lived, but a `PATH`-shadowed `bash` shim could hang:
+    // bound it like every other child so check/dry-run cannot hang.
+    let output =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+            .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                guard.disarm();
+                return Err(LocalFailure::Failed(eyre::eyre!("failed to run bash -n: {err}")));
+            }
+            Err(_) => {
+                drop(guard);
+                return Err(LocalFailure::Failed(eyre::eyre!("bash -n timed out — killed")));
+            }
+        };
+    // Guard disarmed: the child was reaped normally.
+    guard.disarm();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // `bash -n` echoes the offending source line, which can contain a

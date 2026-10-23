@@ -255,6 +255,9 @@ fn verify_unit_file(unit: &str, path: &str) -> Result<(), HostError> {
 fn is_a_missing_file(line: &str) -> bool {
     line.contains("is not executable") ||
         line.contains("No such file or directory") ||
+        line.contains("not found") ||
+        line.contains("Cannot find") ||
+        line.contains("Failed to resolve") ||
         line.trim().is_empty()
 }
 
@@ -543,21 +546,55 @@ fn prune_snapshots(dir: &str, service: &str, keep: u32) -> Result<(), HostError>
 }
 
 /// Overwrite a file with random data, then remove it.
+///
+/// The unelevated path never hands a path to a shell: removal runs as
+/// `sudo rm -rf -- <path>` / `sudo find <path> ... -exec shred` with the path
+/// as argv, so a directory named `'; rm -rf /'` cannot inject commands.
 fn shred_and_remove(path: &Path) -> Result<(), HostError> {
     if !nix::unistd::Uid::effective().is_root() {
         // The snapshot belongs to root: shredding it in place needs root.
         // An unelevated pass would fail to write the file and would leave
         // the old credential copies on disk -- the opposite of the point.
-        let quoted = path.to_str().unwrap_or_default();
+        if let Some(parent) = path.parent() {
+            validate_absolute_path(parent)?;
+        }
+        validate_absolute_path(path)?;
         let out = Command::new("sudo")
             .arg("-n")
-            .arg("sh")
-            .arg("-c")
-            .arg(format!(
-                "find {quoted} -type f -exec shred -u {{}} + 2>/dev/null; rm -rf {quoted}"
-            ))
+            .arg("find")
+            .arg("--")
+            .arg(path)
+            .arg("-type")
+            .arg("f")
+            .arg("-exec")
+            .arg("shred")
+            .arg("-u")
+            .arg("--")
+            .arg("{}")
+            .arg("+")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|err| {
+                HostError::internal(format!("cannot remove `{}`: {err}", path.display()))
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(HostError::failed(format!(
+                "cannot remove `{}`: {}",
+                path.display(),
+                stderr.trim()
+            )));
+        }
+        let out = Command::new("sudo")
+            .arg("-n")
+            .arg("rm")
+            .arg("-rf")
+            .arg("--")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
             .map_err(|err| {
@@ -951,6 +988,24 @@ fn inventory(_args: &HostInventoryArgs) -> Result<(), HostError> {
 }
 
 // === shared helpers ===
+
+/// Validate an absolute path that is handed to a privileged command as argv.
+///
+/// The path is never passed through a shell, but it is still validated so a
+/// programming error (empty path, relative path, NUL byte) fails closed
+/// instead of deleting the wrong tree.
+fn validate_absolute_path(path: &Path) -> Result<(), HostError> {
+    let Some(text) = path.to_str() else {
+        return Err(HostError::usage("path is not valid UTF-8"));
+    };
+    if !path.is_absolute() {
+        return Err(HostError::usage(format!("the path must be absolute (got `{text}`)")));
+    }
+    if text.contains('\0') {
+        return Err(HostError::usage("path must not contain NUL"));
+    }
+    Ok(())
+}
 
 /// Whether a file name is a systemd unit file.
 fn is_unit_file(name: &str) -> bool {

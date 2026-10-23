@@ -6,7 +6,7 @@ use crate::error::ParseError;
 ///
 /// The destination is rendered back into `ssh`/`rsync` argv fragments by
 /// [`to_ssh_args`](Self::to_ssh_args) and
-/// [`to_rsync_args`](Self::to_rsync_args).
+/// [`dest`](Self::dest) / [`rsync_remote_shell`](Self::rsync_remote_shell).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SshSpec {
     /// Optional login user (as in `deploy@host`).
@@ -59,6 +59,13 @@ impl SshSpec {
                     spec: spec.to_string(),
                     reason: format!("invalid port `{port}`"),
                 })?;
+                if port == 0 {
+                    return Err(ParseError::InvalidSshSpec {
+                        line: 0,
+                        spec: spec.to_string(),
+                        reason: "invalid port `0` (must be 1-65535)".to_string(),
+                    });
+                }
                 (host.to_string(), Some(port))
             }
             None => (rest.to_string(), None),
@@ -120,8 +127,13 @@ impl SshSpec {
 /// accepting it produces an opaque `ssh` failure instead of a parse-time
 /// diagnostic.
 fn is_valid_spec_component(component: &str) -> bool {
-    !component.is_empty() &&
-        component.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    if component.is_empty() || component == "-" || component == "." || component == ".." {
+        return false;
+    }
+    if component.starts_with('.') || component.starts_with('-') {
+        return false;
+    }
+    component.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 #[cfg(test)]
@@ -238,7 +250,7 @@ mod tests {
         fn ssh_argv_shape_is_fixed(
             spec in prop_oneof![
                 "[a-z0-9]([a-z0-9.-]{0,28}[a-z0-9])?".prop_map(|host| host.to_owned()),
-                ("[a-z0-9.-]{1,20}", 1_u16..65535)
+                ("[a-z][a-z0-9.-]{0,19}", 1_u16..65535)
                     .prop_map(|(host, port)| format!("{host}:{port}")),
             ],
         ) {

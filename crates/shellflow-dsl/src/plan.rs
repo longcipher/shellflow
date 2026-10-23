@@ -23,9 +23,14 @@ pub struct Target {
 
 impl Target {
     /// Create a target from raw script text.
+    ///
+    /// A leading `@` is stripped so hand-built targets (`Target::new("@web")`)
+    /// resolve the same way as parsed ones.
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        let raw: String = text.into();
+        let stripped = raw.trim_start_matches('@').trim().to_string();
+        Self { text: stripped }
     }
 }
 
@@ -605,8 +610,12 @@ pub fn resolve_hosts(
     target: &Target,
     restrict: &[String],
 ) -> Result<Vec<ResolvedHost>, ParseError> {
+    let normalized = target.text.trim_start_matches('@').trim().to_string();
+    if normalized.is_empty() {
+        return Err(ParseError::EmptyTarget { target: target.text.clone() });
+    }
     let mut hosts: Vec<ResolvedHost> = Vec::new();
-    if let Some(members) = plan.groups.get(&target.text) {
+    if let Some(members) = plan.groups.get(&normalized) {
         for member in members {
             // A member with no `@server` is a plan error, not a host to skip
             // silently: `parse_script` validates this today, but
@@ -614,16 +623,16 @@ pub fn resolve_hosts(
             // when handed a hand-built plan.
             let spec = plan.servers.get(member).ok_or_else(|| ParseError::UnknownGroupMember {
                 line: 0,
-                group: target.text.clone(),
+                group: normalized.clone(),
                 server: member.clone(),
             })?;
             hosts.push(ResolvedHost { alias: member.clone(), spec: spec.clone() });
         }
-    } else if let Some(spec) = plan.servers.get(&target.text) {
-        hosts.push(ResolvedHost { alias: target.text.clone(), spec: spec.clone() });
+    } else if let Some(spec) = plan.servers.get(&normalized) {
+        hosts.push(ResolvedHost { alias: normalized, spec: spec.clone() });
     } else {
-        let spec = SshSpec::parse(&target.text)?;
-        hosts.push(ResolvedHost { alias: target.text.clone(), spec });
+        let spec = SshSpec::parse(&normalized)?;
+        hosts.push(ResolvedHost { alias: normalized, spec });
     }
 
     if restrict.is_empty() {
@@ -643,10 +652,11 @@ pub fn resolve_hosts(
 fn allowed_aliases(plan: &ExecutionPlan, restrict: &[String]) -> HashSet<String> {
     let mut allowed = HashSet::new();
     for item in restrict {
-        if let Some(members) = plan.groups.get(item) {
+        let normalized = item.trim_start_matches('@').trim();
+        if let Some(members) = plan.groups.get(normalized) {
             allowed.extend(members.iter().cloned());
         } else {
-            allowed.insert(item.clone());
+            allowed.insert(normalized.to_string());
         }
     }
     allowed

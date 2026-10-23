@@ -15,7 +15,7 @@ mod cancel;
 mod copy;
 mod host;
 mod local;
-mod process;
+pub(crate) mod process;
 mod remote;
 mod stream;
 

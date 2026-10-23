@@ -237,11 +237,13 @@ fn decrypt_file(
         // the masker also sorts longest-first to avoid prefix leakage.
         if value.len() >= mask_min_len && !masks.contains(&value) {
             masks.push(value.clone());
-        } else if !value.is_empty() && !shorts.iter().any(|(k, _)| k == &key) {
+        } else if !value.is_empty() {
             // A value below the threshold is still a secret: a global
             // substring replace would shred unrelated output, so it is
             // registered for token/key-anchored redaction instead of being
-            // silently exempted.
+            // silently exempted. Last-wins, like the env map: a repeated
+            // short key must redact the live value, not a stale one.
+            shorts.retain(|(k, _)| k != &key);
             shorts.push((key.clone(), value.clone()));
         }
         out.retain(|(existing, _)| existing != &key);

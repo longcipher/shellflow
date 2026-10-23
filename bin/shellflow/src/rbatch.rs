@@ -235,8 +235,8 @@ impl Batch {
         use tokio::io::AsyncWriteExt as _;
 
         let host = dest_label(dest);
-        let mut child = tokio::process::Command::new("ssh")
-            .arg("-o")
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
             .arg("ConnectTimeout=15")
@@ -246,11 +246,12 @@ impl Batch {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|err| {
-                ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}"))
-            })?;
+            .kill_on_drop(true);
+        crate::executor::process::isolate(&mut cmd);
+        let mut child = cmd.spawn().map_err(|err| {
+            ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}"))
+        })?;
+        let mut guard = crate::executor::process::GroupGuard::new(&child);
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(self.script().as_bytes()).await;
         }
@@ -277,6 +278,7 @@ impl Batch {
             .wait()
             .await
             .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
+        guard.disarm();
         let mut stderr_text = String::new();
         if let Some(mut stderr) = child.stderr.take() {
             use tokio::io::AsyncReadExt as _;

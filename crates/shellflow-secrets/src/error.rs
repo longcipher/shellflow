@@ -30,6 +30,15 @@ pub enum SecretsError {
         reason: String,
     },
 
+    /// A file could not be written atomically (identity, ciphertext, env).
+    #[error("failed to write file {path}: {source}")]
+    WriteFile {
+        /// The file path that was written.
+        path: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
     /// The identity file could not be written.
     #[error("failed to write identity file {path}: {source}")]
     WriteIdentity {

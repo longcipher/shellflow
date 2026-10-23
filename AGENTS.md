@@ -57,7 +57,7 @@ just mutation
 ## Code conventions
 
 - A deploy script must stay 100% valid Bash: `bash deploy.sh` has to run it unchanged. Never emit syntax that only the shellflow parser accepts.
-- Directives are `# @server`, `# @group`, `# @local`, `# @remote`, `# @copy`, `# @export`, `# @env`, `# @only_if`, `# @timeout` and `# @name`; add new ones to `shellflow-dsl` with a parse test, never ad hoc in the executors.
+- Directives are defined in `docs/design.md` section 4.1 (`shellflow-dsl` owns the scanner); add new ones to `shellflow-dsl` with a parse test, never ad hoc in the executors.
 - Multi-host fan-out goes through `JoinSet` plus a semaphore; never spawn one task per host without the bound.
 - The `dbus` feature (systemd unit state over D-Bus) is off by default so the standard build stays a single static binary; the CLI polls instead. Keep D-Bus code behind the feature.
 - `unsafe` appears only in `shellflow-secrets` test helpers that call `std::env::set_var`/`remove_var`; they hold `ENV_LOCK` and carry a `// SAFETY:` comment. Keep that pattern.

@@ -64,15 +64,24 @@ pub(crate) struct Finding {
     pub(crate) message: String,
 }
 
-/// Collect scannable files: skip `.git/`, `target/`, encrypted blobs, and
-/// lockfiles full of hashes.
+/// Collect scannable files: skip VCS/build/dependency dirs, encrypted blobs,
+/// and lockfiles full of hashes. Binary files are skipped by the caller via
+/// `read_to_string` failure and documented as such.
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let entries = fs::read_dir(root).wrap_err_with(|| format!("cannot read {}", root.display()))?;
     for entry in entries {
         let entry = entry.wrap_err("cannot read directory entry")?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == ".git" || name == "target" || name == "node_modules" || name == ".codebuddy" {
+        if name == ".git" ||
+            name == "target" ||
+            name == "node_modules" ||
+            name == ".codebuddy" ||
+            name == ".venv" ||
+            name == "dist" ||
+            name == ".cache" ||
+            name == "vendor"
+        {
             continue;
         }
         let file_type = entry.file_type().wrap_err("cannot stat directory entry")?;

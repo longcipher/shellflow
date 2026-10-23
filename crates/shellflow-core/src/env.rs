@@ -35,9 +35,24 @@ pub const CAPTURE_SEPARATOR: u8 = 0;
 ///
 /// # Errors
 ///
-/// Returns [`CaptureError::MissingSeparator`] for a record without `=`, and
-/// [`CaptureError::NotUtf8`] when a name or value is not valid UTF-8.
+/// Returns [`CaptureError::MissingSeparator`] for a record without `=`,
+/// [`CaptureError::NotUtf8`] when a name or value is not valid UTF-8, and
+/// [`CaptureError::UnexpectedVar`] when `allowed` is given and a record names
+/// a variable outside it, or when a name is not a valid shell identifier.
 pub fn parse_capture_records(bytes: &[u8]) -> Result<BTreeMap<String, String>, CaptureError> {
+    parse_capture_records_checked(bytes, None)
+}
+
+/// Parse capture records, optionally rejecting names outside `allowed`.
+///
+/// When `allowed` is `Some`, every record name must be a member of it;
+/// otherwise [`CaptureError::UnexpectedVar`] is returned. This is the
+/// allow-list check the executor needs: the shell block can write arbitrary
+/// `NAME=VALUE\0` lines, and only names the playbook exported may be trusted.
+pub fn parse_capture_records_checked(
+    bytes: &[u8],
+    allowed: Option<&[String]>,
+) -> Result<BTreeMap<String, String>, CaptureError> {
     let mut out = BTreeMap::new();
     for record in bytes.split(|&b| b == CAPTURE_SEPARATOR) {
         if record.is_empty() {
@@ -49,6 +64,14 @@ pub fn parse_capture_records(bytes: &[u8]) -> Result<BTreeMap<String, String>, C
         let (name, value) = record.split_at(eq);
         let name = std::str::from_utf8(name).map_err(|_| CaptureError::NotUtf8)?;
         let value = std::str::from_utf8(&value[1..]).map_err(|_| CaptureError::NotUtf8)?;
+        if name.is_empty() || !is_valid_var_name(name) {
+            return Err(CaptureError::UnexpectedVar { name: name.to_string() });
+        }
+        if let Some(allowed) = allowed &&
+            !allowed.iter().any(|item| item == name)
+        {
+            return Err(CaptureError::UnexpectedVar { name: name.to_string() });
+        }
         out.insert(name.to_string(), value.to_string());
     }
     Ok(out)
@@ -127,9 +150,10 @@ pub fn mask_line<S: AsRef<str>>(line: &str, masks: &[S]) -> String {
 
 /// Whether `c` is part of a shell-style identifier.
 ///
-/// Used to decide whether a secret occurrence stands alone as a token.
-fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+/// Shell identifiers are ASCII (`[A-Za-z0-9_]`), so a non-ASCII letter is a
+/// delimiter: the token next to it stands alone to a shell.
+const fn is_word(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 /// Redact a below-threshold secret that appears as a standalone token.
@@ -323,6 +347,20 @@ impl SecretMasker {
 
         // 1. A value whose prefix ended on an earlier line continues here.
         let mut kept: Vec<(String, usize)> = Vec::new();
+        if line.is_empty() {
+            // An empty line carries no bytes, so it cannot continue or break
+            // a value: keep every pending prefix for the next non-empty line.
+            kept = std::mem::take(&mut self.pending);
+            self.pending = kept;
+            // Still run the narrow rules so `KEY=` on an empty line stays
+            // consistent (a no-op today, but explicit).
+            let mut out = line.to_string();
+            for (key, value) in self.shorts.iter() {
+                out = mask_token(&out, value);
+                out = mask_keyed(&out, key, value);
+            }
+            return out;
+        }
         for (secret, consumed) in std::mem::take(&mut self.pending) {
             let Some(rest) = secret.get(consumed..) else {
                 continue;

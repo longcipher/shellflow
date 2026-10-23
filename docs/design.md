@@ -130,6 +130,7 @@ All other lines (including plain comments) belong to the current block.
 | `@install` | `# @install <src> -> <dst> @<target> [--mode M] [--owner U:G] [--dir-mode M]` | Install a file on the target **atomically**: the data is written to a temporary name in the destination directory and renamed into place, so a reader (systemd, `systemctl cat`, a concurrent `daemon-reload`) never observes a half-written unit file, config, or binary |
 | `@credstore` | `# @credstore <service> @<target> [--require KEY,…]` | Seal the service's credential store and check it against the keys the unit declares |
 | `@service` | `# @service <unit> @<target> [--enable] [--restart] [--reload] [--wait] [--verify] [--force-start]` | Drive the unit's lifecycle: verify the installed unit, reload the manager, enable it, restart it, wait for it to be ready. `--restart` restarts a unit that was **running** and leaves a unit that was not running alone — restarting an inactive unit *starts* it, which is the opposite of what an operator who keeps a unit stopped wants. `--force-start` overrides that deliberately |
+| `@reload` | `# @reload <unit> @<target> [--signal SIG] [--wait] [--timeout SECS]` | Reload a unit through its own `ExecReload=` (or an explicit `--signal`); `--wait` waits for readiness. A reload that cannot be performed fails instead of degrading into a restart |
 | `@unit_inventory` | `# @unit_inventory [@<target>]` | List the units installed on the target. A **report**, not a gate: a pre-existing finding must never block an unrelated deploy |
 
 **Assertion steps.** Consecutive assertions that share a target are merged
@@ -152,15 +153,20 @@ to end with, and that every playbook spelled differently.
 3. Blocks default to `local` until an explicit `@remote`/`@copy`/`@local`.
    `@copy` is a self-contained step that carries its own target, and it returns
    the block mode to `local` — the lines that follow are not streamed to the
-   copy's remote target.
+   copy's remote target. Other self-contained steps (`@wait_active`,
+   `@reload`, `@assert*`, `@service`, `@install`, `@backup`, `@credstore`,
+   `@helper`, `@workdir`, `@unit_inventory`) leave the ambient mode unchanged:
+   lines after `# @service …` still run where the previous `@remote`/`@local`
+   put them.
 4. `@env`, `@only_if`, `@timeout`, and `@name` apply to the *next* block that
    contains statements. `@export` applies to the *preceding* local block and is
    an error after a remote block (remote variables cannot be captured). Because
    every directive flushes the pending block, the preceding local block may
    already have been emitted when `@export` is read; `@export` therefore binds
    to the last emitted local step, not only to the pending one.
-5. The shebang `#!/usr/bin/env shellflow` is ignored, as is any line before the
-   first directive that only contains comments/blank lines.
+5. The shebang `#!/usr/bin/env shellflow` is a comment like any other: a
+   comment-only block is dropped, but a block that also holds code keeps its
+   lines verbatim (harmless under `bash`, which treats it as a comment).
 6. CRLF line endings are tolerated (`\r` stripped).
 7. Lines are included verbatim in the payload, preserving fidelity.
 8. A here-document body is opaque: `<<TAG` / `<<-TAG` openers are tracked
@@ -250,8 +256,8 @@ pub struct RemoteStep {
 #[derive(Clone, Debug)]
 pub struct CopyStep {
     pub name: Option<String>,
-    pub src: String,
-    pub dst: String,
+    /// Consecutive copies to the same target travel in one transfer.
+    pub entries: Vec<CopyEntry>,
     pub target: Target,
     pub delete: bool,
     /// `--exclude <glob>` patterns (repeatable); honored by the rsync path,
@@ -263,7 +269,7 @@ pub struct CopyStep {
     /// Per-step timeout in seconds (`@timeout`); bounds the rsync/scp transfer.
     pub timeout: Option<u64>,
     /// `@env` snapshot in effect when the copy was declared.
-    pub env: Vec<EnvEntry>,
+    pub env: std::sync::Arc<Vec<EnvEntry>>,
 }
 
 #[derive(Clone, Debug)]
@@ -310,6 +316,8 @@ pub struct ExecutionPlan {
     pub env: Arc<Vec<EnvEntry>>,
     /// All `@secrets` file references, in declaration order.
     pub secrets: Vec<SecretEntry>,
+    /// The run's remote staging directory (`@workdir`), if declared.
+    pub workdir: Option<Workdir>,
     pub steps: Vec<Step>,
 }
 
@@ -326,7 +334,7 @@ pub fn resolve_hosts(
     plan: &ExecutionPlan,
     target: &Target,
     restrict: &[String],
-) -> Vec<ResolvedHost>;
+) -> Result<Vec<ResolvedHost>, ParseError>;
 ```
 
 `ResolvedHost { alias: String, spec: SshSpec }` carries the display alias
@@ -345,7 +353,7 @@ pub fn resolve_hosts(
   `` <<`gen_tag` ``) cannot be tracked statically, so its body keeps the
   untracked behavior. Quoted (`<<'TAG'`, `<<"TAG"`) and backslash-escaped
   (`<<\TAG`) delimiters are literal and are tracked exactly. See
-  `crates/shellflow-core/src/heredoc.rs`.
+  `crates/shellflow-dsl/src/heredoc.rs`.
 - No conditional/loop constructs in the DSL itself. Script authors use plain
   Bash (`if`, `for`, `command -v`, `[ -f ] || …`) for control flow, and
   `@only_if` for host-level preconditions.
@@ -353,10 +361,13 @@ pub fn resolve_hosts(
   strings extracted from the comment, so a bare `$VERSION` there is *not*
   expanded by Bash and would silently reach `rsync` verbatim. Use `@export` to
   capture values and let shellflow interpolate `$VAR`/`${VAR}` from run state.
-  An unresolved variable is an error at plan-build time, never a silent no-op.
+  An unresolved variable is an error at execution time, never a silent no-op.
+  `@env KEY= value` keeps the space, like a shell assignment with a quoted
+  value would need quoting to preserve.
 - `@copy` delimiters are fixed: `src`/`dst` must not contain the literal `->`,
   the target is the final whitespace-separated token (an `@` prefix is
-  recommended), and paths containing spaces or a leading `@` are unsupported.
+  optional and stripped). A `dst` with spaces is joined from the middle tokens;
+  a leading `@` in a path is ambiguous with the target marker and unsupported.
 
 ## 5. Architecture
 
@@ -443,12 +454,11 @@ shellflow/
 
 **`shellflow-core`** — pure, synchronous, dependency-light.
 
-- Parses scripts into `ExecutionPlan`.
-- Resolves targets to host lists (`resolve_hosts`).
-- Builds `ssh`/`rsync` argv strings from `SshSpec` (including `-p` for ports and
-  `-e 'ssh -p N'` for rsync).
+- Re-exports the DSL plan model (`ExecutionPlan`, `Target`, `resolve_hosts`,
+  `SshSpec`, `interpolate`); the grammar itself lives in `shellflow-dsl`.
 - Renders the payload env header (escaping + `set -x` ordering), parses the
-  NUL-delimited `@export` capture records, and masks known secret values — all
+  NUL-delimited `@export` capture records (with an allow-list-checked variant
+  for the executor), and masks known secret values — all
   pure string logic, unit- and proptest-able.
 - Owns the workspace-wide definitions that more than one crate needs: the
   shell-identifier check (`is_valid_var_name`) and the quote-stripping rule
@@ -470,14 +480,16 @@ shellflow/
   rather than as the current directory: the default location is then
   undefined, and resolving it to a *relative* path would adopt a planted
   `./.config/age/keys.txt` as the operator's identity. The resolver fails
-  closed with a clear message instead.
-- Parses `KEY=VALUE` env files (blank lines and `#` comments ignored; first
-  `=` splits the key; a repeated key keeps its last value and appears once,
-  matching `source` semantics).
+  closed with a clear message instead. A whitespace-only
+  `$SHELLFLOW_AGE_IDENTITY` is treated as unset.
+- Parses `KEY=VALUE` env files (blank lines and full-line `#` comments ignored;
+  first `=` splits the key; a repeated key keeps its last value and appears once,
+  matching `source` semantics; single-space `export` prefix tolerated).
 - Library-only: no `tokio`, no `std::process`. It does perform its own file
   I/O (identity load, env-file read), which is exactly its stated job (§S7);
   it has no network or subprocess surface. `fsx` owns the atomic-write
-  primitive (staged temp file + rename) that every secret-bearing file uses.
+  primitives (staged temp file + rename for `write_atomic`, hard-link for
+  `write_new_file`) that every secret-bearing file uses.
 - `shellflow-core` stays free of async, I/O, and crypto.
 
 **`bin/shellflow`** — the I/O boundary.
@@ -573,12 +585,18 @@ OPTIONS:
 SUBCOMMANDS (the bare positional `shellflow deploy.sh` == `shellflow run`):
   run [SCRIPT] [flags]                   run a deploy script (the default)
   keys generate | public                 manage age identities
-  secret encrypt|decrypt|edit|creds|keys-check
+  secret encrypt|decrypt|edit|creds|keys-check|find-duplicates
   template check <tmpl> <file.env.age>   cross-check ${KEY} against a sealed env
-  emit cred-env [-o PATH]                print the bash helper (fallback targets)
+  template render <tmpl> <file.env.age> [--format toml|json|none]
+  emit cred-env [-o PATH]                print the bash helper (fallback targets;
+                                         covers exec/render only)
   cred-env exec|render|credstore-install target-side helpers (see §S12)
   host service|install|backup|credstore|assert-no-leak|assert-digest|
        assert-credstore|inventory         target-side host helpers (§S12.1)
+  systemd notify|wait|reload|status|watch|transient|exec|watchdog
+  unit render|manifest|verify             service manifest and drop-in gates
+  service init|check|diff|manifest|status repository scaffolding and fleet gates
+  audit [PATH]                           scan the repo for secret-shaped plaintext
   unit render <svc> <unit> [--repo PATH]  generate the unit's drop-in from
        [--output PATH] [--check]          its manifest
   unit manifest <svc> <unit> [--repo PATH]  print the manifest
