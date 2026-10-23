@@ -84,6 +84,9 @@ pub(crate) fn status(args: &ServiceStatusArgs) -> Result<(), ServiceError> {
         println!("[FAIL] {failure}");
     }
     print_table(&rows);
+    if !failures.is_empty() {
+        return Err(Other(eyre::eyre!("service status: {} host(s) unreachable", failures.len())));
+    }
     Ok(())
 }
 

@@ -22,7 +22,7 @@ pub mod template;
 
 pub use env::{
     CAPTURE_SEPARATOR, MASK, SecretMasker, mask_keyed, mask_line, mask_token,
-    parse_capture_records, prepare_masks, render_env,
+    parse_capture_records, parse_capture_records_checked, prepare_masks, render_env,
 };
 pub use error::{CaptureError, RenderEnvError};
 // The deploy-script grammar and the plan model live in `shellflow-dsl`.

@@ -148,6 +148,7 @@ pub(super) async fn run_assert_step(
             }
             Err(err) => {
                 crate::ui::warn(&format!("assert task failed: {err}"), log_file);
+                out.push(("unknown".to_string(), HostOutcome::Failed(RunError::Transport)));
             }
         }
     }

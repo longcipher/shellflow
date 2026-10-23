@@ -120,7 +120,23 @@ fn check_dropin(repo: &Path, m: &ServiceManifest, report: &mut Report) {
         });
         return;
     }
-    let rendered = unit::render(m, &m.credentials);
+    // The key set: an explicit `credentials` list wins; otherwise the sealed
+    // file defines it. `unit render` decrypts the sealed file for this, but
+    // `unit verify` runs offline without an identity, so a sealed-defined set
+    // cannot be checked here without one — skipping avoids a false
+    // out-of-date report.
+    let keys: Vec<String> = if !m.credentials.is_empty() {
+        m.credentials.clone()
+    } else if let Some(secret) = m.secret_file.clone() {
+        let file = repo.join(secret.replace("{host}", &m.host));
+        match crate::secret::credential_key_set(&file, None) {
+            Ok(keys) => keys,
+            Err(_) => return,
+        }
+    } else {
+        Vec::new()
+    };
+    let rendered = unit::render(m, &keys);
     let Ok(current) = std::fs::read_to_string(&path) else {
         return;
     };

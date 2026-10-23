@@ -413,13 +413,13 @@ fn validate_schedule(schedule: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write a file, creating parent directories.
+/// Write a scaffold file, creating parent directories.
 fn write_file(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .wrap_err_with(|| format!("failed to create `{}`", parent.display()))?;
     }
-    fs::write(path, content).wrap_err_with(|| format!("failed to write `{}`", path.display()))
+    crate::fsx::write_text_file(path, content)
 }
 
 /// Write a file with mode 0755 (playbooks are executed directly).

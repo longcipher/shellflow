@@ -202,7 +202,7 @@ OPTIONS:
   -t, --target <TARGET>       Restrict to these servers/groups (comma-separated)
   -o, --only <STEP>           Run only matching blocks (by name or 1-based index)
   -s, --skip <STEP>           Skip matching blocks (repeatable)
-  -p, --parallel <N>          Max concurrent hosts per step [default: all]
+  -p, --parallel <N>          Max concurrent hosts per step [default: 16; 0 = all]
   -c, --continue-on-error     Continue after a failed host/step; print summary
   -k, --check                 Syntax-check only: local bash -n, remote bash -n -s
       --timeout <SECS>        Per-step timeout for all steps
@@ -503,8 +503,10 @@ ExecStart=/usr/local/bin/shellflow cred-env exec /usr/local/bin/<svc> -c /run/<s
   (URL-embedded creds, live assignments, token shapes, PEM blocks).
 
 `shellflow emit cred-env` still prints a pure-bash equivalent of `exec`/`render`
-for targets that cannot host the binary — a documented fallback with the same
-semantics (verified by shared integration fixtures).
+for targets that cannot host the binary — a documented fallback for those two
+verbs only (`credstore-install` needs the binary). The fallback fails closed
+like the Rust helper on missing keys and non-UTF8 values; error texts differ,
+so do not grep for them.
 
 Self-built apps can skip `cred-env` entirely: read
 `$CREDENTIALS_DIRECTORY/<KEY>` early in the process (about 10 lines) and point

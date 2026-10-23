@@ -6,8 +6,6 @@
 //! Targets never need this crate or any crypto tooling: decryption happens on
 //! the controller only.
 
-//! controller only.
-
 // See `shellflow-core`: the workspace denies `panic`/`unwrap`/`expect` in
 // production code; test modules need them and opt out explicitly. `pedantic`
 // is scoped the same way — style guidance has no value in a test fixture.

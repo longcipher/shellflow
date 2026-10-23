@@ -7,11 +7,15 @@
 //!
 //! 1. **0600 by default.** `std::fs::write` creates `0666 & ~umask`, so a `secret decrypt -o env`
 //!    would leave secrets group/world readable.
-//! 2. **Atomic.** Content is staged in a same-directory temp file and renamed into place, so a
-//!    failure never truncates the previous contents and a reader never observes a partial write.
+//! 2. **Atomic.** Content is staged in a same-directory temp file and renamed into place
+//!    (`write_atomic`), or hard-linked into place when refusing to overwrite (`write_new_file`), so
+//!    a failure never truncates the previous contents and a reader never observes a partial write.
 //! 3. **Mode enforced on every write, not just on create.** `OpenOptions::mode` only applies when
 //!    the file is created; re-writing an existing 0644 file would otherwise silently keep the old
 //!    mode.
+//!
+//! Unix only: the staging primitive sets POSIX modes. This matches the
+//! supported targets (Bash + OpenSSH hosts) and is documented intentionally.
 
 use std::{
     fs,
@@ -34,14 +38,14 @@ const NAME_ATTEMPTS: u32 = 10;
 ///
 /// # Errors
 ///
-/// Returns [`SecretsError::WriteIdentity`] on I/O failures.
+/// Returns [`SecretsError::WriteFile`] on I/O failures.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), SecretsError> {
     let temp = stage(path, bytes, mode)?;
     match fs::rename(&temp, path) {
         Ok(()) => Ok(()),
         Err(source) => {
             let _ = fs::remove_file(&temp);
-            Err(SecretsError::WriteIdentity { path: path.display().to_string(), source })
+            Err(SecretsError::WriteFile { path: path.display().to_string(), source })
         }
     }
 }
@@ -56,7 +60,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), SecretsE
 ///
 /// # Errors
 ///
-/// Returns [`SecretsError::WriteIdentity`] on I/O failures, including when
+/// Returns [`SecretsError::WriteFile`] on I/O failures, including when
 /// `path` already exists.
 pub fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), SecretsError> {
     let temp = stage(path, bytes, mode)?;
@@ -67,7 +71,7 @@ pub fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Secret
         }
         Err(source) => {
             let _ = fs::remove_file(&temp);
-            Err(SecretsError::WriteIdentity { path: path.display().to_string(), source })
+            Err(SecretsError::WriteFile { path: path.display().to_string(), source })
         }
     }
 }
@@ -128,7 +132,7 @@ fn stage_with(path: &Path, bytes: &[u8], mode: u32, seed: u128) -> Result<PathBu
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| SecretsError::WriteIdentity {
+    Err(last_err.unwrap_or_else(|| SecretsError::WriteFile {
         path: path.display().to_string(),
         source: std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -140,7 +144,7 @@ fn stage_with(path: &Path, bytes: &[u8], mode: u32, seed: u128) -> Result<PathBu
 /// Create the staging file with `mode`, write `bytes` into it, and flush it
 /// to disk.
 fn stage_file(temp: &Path, bytes: &[u8], mode: u32) -> Result<(), SecretsError> {
-    let err = |source: std::io::Error| SecretsError::WriteIdentity {
+    let err = |source: std::io::Error| SecretsError::WriteFile {
         path: temp.display().to_string(),
         source,
     };
@@ -163,7 +167,7 @@ fn stage_file(temp: &Path, bytes: &[u8], mode: u32) -> Result<(), SecretsError> 
 
 /// Whether the failure only warrants trying another temp name.
 fn is_name_collision(err: &SecretsError) -> bool {
-    matches!(err, SecretsError::WriteIdentity { source, .. }
+    matches!(err, SecretsError::WriteFile { source, .. }
         if source.kind() == std::io::ErrorKind::AlreadyExists)
 }
 
@@ -258,7 +262,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("missing").join("secret.txt");
         let err = stage_with(&path, b"payload", 0o600, 1).expect_err("staging must fail");
-        let crate::error::SecretsError::WriteIdentity { path: reported, .. } = &err else {
+        let crate::error::SecretsError::WriteFile { path: reported, .. } = &err else {
             panic!("unexpected error: {err}");
         };
         assert_eq!(

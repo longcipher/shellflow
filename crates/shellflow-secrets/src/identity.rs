@@ -47,7 +47,10 @@ fn allow_unsafe_identity() -> bool {
 /// `$HOME` is unset or empty. Leaving the path unchanged would make it
 /// *relative*, and a relative path is resolved against the current working
 /// directory — so a planted `./…` file could be adopted as the operator's
-/// identity.
+/// identity. A bare `~` or `~user/...` is not expanded and is rejected as
+/// [`SecretsError::InvalidIdentity`]-class usage by the caller validating the
+/// path; here it is passed through unchanged so the filesystem error names the
+/// literal path.
 pub fn expand_home(path: &Path) -> Result<PathBuf, SecretsError> {
     let s = path.to_string_lossy();
     // An empty `$HOME` is treated as absent: `PathBuf::from("")` would make a
@@ -60,6 +63,10 @@ pub fn expand_home(path: &Path) -> Result<PathBuf, SecretsError> {
     }
     if s.starts_with("~/") {
         return Err(SecretsError::NoHome);
+    }
+    if s == "~" || s.starts_with('~') {
+        // `~` alone and `~user/...` are not expanded by this helper by design;
+        // passing them through keeps the error tied to the literal path.
     }
     Ok(path.to_path_buf())
 }
@@ -74,9 +81,13 @@ pub fn expand_home(path: &Path) -> Result<PathBuf, SecretsError> {
 /// nor a usable `$HOME` is available. Without a usable `$HOME` there is no
 /// honest default: a *relative* path would silently adopt whatever identity
 /// happens to sit in the current directory, so the path is reported as
-/// undefined instead.
+/// undefined instead. A whitespace-only `$SHELLFLOW_AGE_IDENTITY` is treated
+/// as unset.
 pub fn default_identity_path() -> Result<PathBuf, SecretsError> {
-    if let Some(env) = std::env::var_os(IDENTITY_ENV).filter(|v| !v.is_empty()) {
+    if let Some(env) = std::env::var_os(IDENTITY_ENV)
+        .map(|v| v.to_string_lossy().trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
         return expand_home(&PathBuf::from(env));
     }
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).ok_or(SecretsError::NoHome)?;
@@ -120,10 +131,7 @@ pub fn load_x25519_identity(path: &Path) -> Result<age::x25519::Identity, Secret
     // that is actually read.
     let mut file = fs::File::open(path).map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => SecretsError::MissingIdentity(path.display().to_string()),
-        _ => SecretsError::ReadIdentity {
-            path: path.display().to_string(),
-            source: std::io::Error::from(err.kind()),
-        },
+        _ => SecretsError::ReadIdentity { path: path.display().to_string(), source: err },
     })?;
     let metadata = file.metadata().map_err(|source| SecretsError::ReadIdentity {
         path: path.display().to_string(),
@@ -169,13 +177,13 @@ pub fn load_x25519_identity(path: &Path) -> Result<age::x25519::Identity, Secret
 ///
 /// # Errors
 ///
-/// Returns [`SecretsError::WriteIdentity`] on I/O failures or when the file
+/// Returns [`SecretsError::WriteFile`] on I/O failures or when the file
 /// already exists.
 pub fn generate_identity(path: &Path) -> Result<age::x25519::Identity, SecretsError> {
     let identity = age::x25519::Identity::generate();
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| SecretsError::WriteIdentity {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|source| SecretsError::WriteFile {
             path: parent.display().to_string(),
             source,
         })?;
@@ -274,7 +282,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("keys.txt");
         generate_identity(&path).expect("first write");
-        assert!(matches!(generate_identity(&path), Err(SecretsError::WriteIdentity { .. })));
+        assert!(matches!(generate_identity(&path), Err(SecretsError::WriteFile { .. })));
     }
 
     #[test]

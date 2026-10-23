@@ -112,7 +112,10 @@ fn render(args: &TemplateRenderArgs, ui: &Ui) -> Result<()> {
         }
         RenderFormat::Json => {
             serde_json::from_str::<serde_json::Value>(&rendered).map_err(|err| {
-                eyre!("rendered output is not valid JSON: {err} (unit would fail to parse it)")
+                // `serde_json` errors can echo the offending input, which may
+                // contain a substituted secret — report location only.
+                let first = err.to_string().lines().next().unwrap_or("parse error").to_string();
+                eyre!("rendered output is not valid JSON: {first} (unit would fail to parse it)")
             })?;
         }
         RenderFormat::None => {}

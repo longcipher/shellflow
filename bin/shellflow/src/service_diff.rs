@@ -60,8 +60,8 @@ pub(crate) fn diff(args: &ServiceDiffArgs) -> Result<(), ServiceError> {
         }
         // The remote answer arrives without its trailing newline (the
         // remote's command substitution strips it), so the two sides are
-        // compared without their trailing newlines. A difference in the
-        // last blank line is not a drift worth failing a deploy over.
+        // compared without their trailing newlines. A missing final newline
+        // is not drift; use `--check` on the unit for byte-exact gating.
         let local_body = local_text.trim_end_matches(['\n', '\r']);
         let remote_body = remote_body.trim_end_matches(['\n', '\r']);
         if local_body == remote_body {

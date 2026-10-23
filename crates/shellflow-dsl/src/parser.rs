@@ -290,6 +290,15 @@ impl State {
             directive: "server".to_string(),
             reason: "missing name".to_string(),
         })?;
+        if !is_valid_alias_name(name) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "server".to_string(),
+                reason: format!(
+                    "invalid server name `{name}` (allowed: letters, digits, `_`, `-`, `.`)"
+                ),
+            });
+        }
         let spec = parts.next().ok_or_else(|| ParseError::InvalidDirective {
             line,
             directive: "server".to_string(),
@@ -323,6 +332,15 @@ impl State {
             directive: "group".to_string(),
             reason: "missing name".to_string(),
         })?;
+        if !is_valid_alias_name(name) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "group".to_string(),
+                reason: format!(
+                    "invalid group name `{name}` (allowed: letters, digits, `_`, `-`, `.`)"
+                ),
+            });
+        }
         let members = parts.next().ok_or_else(|| ParseError::InvalidDirective {
             line,
             directive: "group".to_string(),
@@ -349,18 +367,39 @@ impl State {
                 reason: format!("group `{name}` is already defined"),
             });
         }
-        let members: Vec<String> = members
+        let raw_members: Vec<String> = members
             .split(',')
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(ToOwned::to_owned)
             .collect();
-        if members.is_empty() {
+        if raw_members.is_empty() {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "group".to_string(),
                 reason: format!("no members for `{name}`"),
             });
+        }
+        if raw_members.iter().any(|m| m == name) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "group".to_string(),
+                reason: format!("group `{name}` cannot contain itself"),
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut members: Vec<String> = Vec::with_capacity(raw_members.len());
+        for member in raw_members {
+            if !is_valid_alias_name(&member) {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "group".to_string(),
+                    reason: format!("invalid member `{member}` in group `{name}`"),
+                });
+            }
+            if seen.insert(member.clone()) {
+                members.push(member);
+            }
         }
         self.group_lines.insert(name.to_string(), line);
         self.plan.groups.insert(name.to_string(), members);
@@ -385,6 +424,8 @@ impl State {
                     reason: format!("invalid variable name `{key}`"),
                 });
             }
+            // A value of `KEY= value` keeps the space: shell assignment would
+            // too. Documented in `docs/design.md` §4.4.
             EnvEntry::Literal { key: key.to_string(), value: value.to_string() }
         } else {
             if !is_valid_var_name(payload) {
@@ -489,13 +530,7 @@ impl State {
         // not a script, so a guard has no well-defined evaluation context.
         // Rejecting at parse time prevents a silently-ignored guard (which
         // would copy even where the precondition fails).
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "copy".to_string(),
-                reason: "`@only_if` is not supported on `@copy`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "copy", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
         let env = Arc::clone(&self.plan.env);
@@ -581,14 +616,17 @@ impl State {
         let entry = CopyEntry { src: src.to_string(), dst };
         // Consecutive copies that share a target *and* their options travel
         // in one transfer: a playbook that ships five templates to the same
-        // directory costs one round trip instead of five.
+        // directory costs one round trip instead of five. The env snapshot is
+        // part of the merge key: an intervening `@env` changes the transfer
+        // environment, so it must start a new step.
         let mergeable = name.is_none() &&
             self.plan.steps.last().is_some_and(|step| {
                 matches!(step, Step::Copy(existing)
                     if existing.target.text == target
                         && existing.delete == delete
                         && existing.excludes == excludes
-                        && existing.timeout == timeout)
+                        && existing.timeout == timeout
+                        && *existing.env == *env)
             });
         if mergeable && let Some(Step::Copy(existing)) = self.plan.steps.last_mut() {
             existing.entries.push(entry);
@@ -613,13 +651,7 @@ impl State {
     /// rejected (a wait has no script context to evaluate a guard in) while
     /// `@name` and `@timeout` apply.
     fn add_wait(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "wait_active".to_string(),
-                reason: "`@only_if` is not supported on `@wait_active`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "wait_active", line)?;
         let name = self.pending_name.take();
         let pending_timeout = self.pending_timeout.take();
         let mut tokens: Vec<&str> = payload.split_whitespace().collect();
@@ -704,13 +736,7 @@ impl State {
     /// script context to evaluate a guard in) while `@name` and `@timeout`
     /// apply.
     fn add_assert(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "assert".to_string(),
-                reason: "`@only_if` is not supported on `@assert`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "assert", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -780,13 +806,7 @@ impl State {
     /// The URL must be an `http`/`https` address. The accepted status codes
     /// default to any 2xx or 3xx; `--expect 200,204` narrows them.
     fn add_assert_health(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "assert_health".to_string(),
-                reason: "`@only_if` is not supported on `@assert_health`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "assert_health", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -939,13 +959,7 @@ impl State {
     /// `for i in $(seq 1 12); do ss … ; sleep 5; done` loop did — in one
     /// round trip instead of one per poll.
     fn add_assert_port(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "assert_port".to_string(),
-                reason: "`@only_if` is not supported on `@assert_port`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "assert_port", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1015,13 +1029,7 @@ impl State {
     /// rendered config that still carries a placeholder is a config that
     /// was never rendered.
     fn add_assert_rendered(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "assert_rendered".to_string(),
-                reason: "`@only_if` is not supported on `@assert_rendered`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "assert_rendered", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1083,7 +1091,15 @@ impl State {
         line: usize,
     ) -> Result<String, ParseError> {
         if let Some(target) = explicit {
-            return Ok(target);
+            let trimmed = target.trim_start_matches('@').trim();
+            if trimmed.is_empty() {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: directive.to_string(),
+                    reason: "missing target".to_string(),
+                });
+            }
+            return Ok(trimmed.to_string());
         }
         self.last_target.clone().ok_or_else(|| ParseError::InvalidDirective {
             line,
@@ -1104,9 +1120,10 @@ impl State {
         timeout: Option<u64>,
     ) {
         let mergeable = name.is_none() &&
-            self.plan.steps.last().is_some_and(
-                |step| matches!(step, Step::Assert(existing) if existing.target.text == target),
-            );
+            self.plan.steps.last().is_some_and(|step| {
+                matches!(step, Step::Assert(existing)
+                    if existing.target.text == target && existing.timeout == timeout)
+            });
         if mergeable && let Some(Step::Assert(existing)) = self.plan.steps.last_mut() {
             existing.checks.push(check);
             return;
@@ -1131,13 +1148,7 @@ impl State {
     /// is rejected (a reload has no script context), and `@name`/`@timeout`
     /// apply.
     fn add_reload(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "reload".to_string(),
-                reason: "`@only_if` is not supported on `@reload`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "reload", line)?;
         let name = self.pending_name.take();
         let pending_timeout = self.pending_timeout.take();
         let mut tokens: Vec<&str> = payload.split_whitespace().collect();
@@ -1260,13 +1271,7 @@ impl State {
     /// the shell spelling got wrong: `--restart` never *starts* a unit that
     /// was not running. `--force-start` overrides that deliberately.
     fn add_service(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "service".to_string(),
-                reason: "`@only_if` is not supported on `@service`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "service", line)?;
         let name = self.pending_name.take();
         let mut timeout = self.pending_timeout.take();
 
@@ -1345,13 +1350,7 @@ impl State {
     /// Both paths live **on the target**: the file is shipped by `@copy` and
     /// then installed in place, atomically.
     fn add_install(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "install".to_string(),
-                reason: "`@only_if` is not supported on `@install`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "install", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1430,13 +1429,7 @@ impl State {
 
     /// Parse `# @backup <path>… @<target> [--keep N] [--seal] [--dir PATH]`.
     fn add_backup(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "backup".to_string(),
-                reason: "`@only_if` is not supported on `@backup`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "backup", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1534,13 +1527,7 @@ impl State {
 
     /// Parse `# @credstore <service> @<target> [--require KEY,…]`.
     fn add_credstore(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "credstore".to_string(),
-                reason: "`@only_if` is not supported on `@credstore`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "credstore", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1603,13 +1590,7 @@ impl State {
 
     /// Parse `# @assert_no_leak <unit> [@<target>] [--lines N]`.
     fn add_assert_no_leak(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "assert_no_leak".to_string(),
-                reason: "`@only_if` is not supported on `@assert_no_leak`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "assert_no_leak", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1668,13 +1649,7 @@ impl State {
 
     /// Parse `# @assert_digest <path> [@<target>] [--sha256 HEX] [--local PATH]`.
     fn add_assert_digest(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "assert_digest".to_string(),
-                reason: "`@only_if` is not supported on `@assert_digest`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "assert_digest", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1734,13 +1709,7 @@ impl State {
 
     /// Parse `# @assert_credstore <service> [@<target>]`.
     fn add_assert_credstore(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "assert_credstore".to_string(),
-                reason: "`@only_if` is not supported on `@assert_credstore`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "assert_credstore", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1771,13 +1740,7 @@ impl State {
 
     /// Parse `# @unit_inventory [@<target>]`.
     fn add_unit_inventory(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "unit_inventory".to_string(),
-                reason: "`@only_if` is not supported on `@unit_inventory`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "unit_inventory", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1799,13 +1762,7 @@ impl State {
     /// Parse `# @helper [@<target>] [--source DIR] [--triple T]
     /// [--install-path PATH]`.
     fn add_helper(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        if self.pending_guard.is_some() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "helper".to_string(),
-                reason: "`@only_if` is not supported on `@helper`".to_string(),
-            });
-        }
+        reject_guard(self.pending_guard.is_some(), "helper", line)?;
         let name = self.pending_name.take();
         let timeout = self.pending_timeout.take();
 
@@ -1931,7 +1888,7 @@ fn split_flags(
 ) -> Result<SplitPayload, ParseError> {
     let mut positional: Vec<String> = Vec::new();
     let mut flags: Vec<(String, Option<String>)> = Vec::new();
-    let mut tokens = payload.split_whitespace();
+    let mut tokens = payload.split_whitespace().peekable();
     while let Some(token) = tokens.next() {
         if !token.starts_with("--") {
             positional.push(token.to_string());
@@ -1941,13 +1898,18 @@ fn split_flags(
             flags.push((token.to_string(), None));
             continue;
         }
-        // A flag takes the next token as its value; a flag that stands alone
-        // at the end keeps `None`, and only the directive knows whether that
-        // is a typo or a boolean.
-        let value = tokens.next().map(ToOwned::to_owned);
+        // A flag takes the next token as its value. A value that looks like a
+        // flag is not consumed: `# @backup /p @t --dir --seal` means a missing
+        // `--dir` value, not a directory named `--seal`. The missing value is
+        // kept as `None` so the directive can report `unknown flag` for
+        // unknown flags and `expects a value` for known ones.
+        let value = match tokens.peek() {
+            Some(next) if !next.starts_with("--") => tokens.next().map(ToOwned::to_owned),
+            _ => None,
+        };
+        let _ = (directive, line);
         flags.push((token.to_string(), value));
     }
-    let _ = (directive, line);
     Ok((positional, flags))
 }
 
@@ -2007,18 +1969,33 @@ fn parse_mode(raw: &str, directive: &str, line: usize) -> Result<u32, ParseError
             reason: format!("invalid octal mode `{raw}`"),
         });
     }
-    // The digits are octal by construction, so the conversion is total: the
-    // check above is the only place a mode can be rejected.
-    Ok(u32::from_str_radix(digits, 8).unwrap_or_default())
+    u32::from_str_radix(digits, 8).map_err(|_| ParseError::InvalidDirective {
+        line,
+        directive: directive.to_string(),
+        reason: format!("invalid octal mode `{raw}` (out of range for u32)"),
+    })
 }
 
 /// Parse an owner (`user`, `user:group`, or `:group`).
 fn parse_owner(raw: &str, directive: &str, line: usize) -> Result<String, ParseError> {
     let owner = raw.trim();
-    let ok = !owner.is_empty() &&
-        owner.split(':').all(|part| {
+    let parts: Vec<&str> = owner.split(':').collect();
+    let valid_part = |part: &str| {
+        !part.is_empty() &&
             part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        });
+    };
+    let ok = match parts.as_slice() {
+        [user] => valid_part(user),
+        [user, group] => {
+            // `user:group` requires a user; `:group` requires a group.
+            (!user.is_empty() || !group.is_empty()) &&
+                (user.is_empty() || valid_part(user)) &&
+                (group.is_empty() || valid_part(group)) &&
+                !(user.is_empty() && group.is_empty())
+        }
+        _ => false,
+    } && !owner.is_empty() &&
+        parts.len() <= 2;
     if !ok {
         return Err(ParseError::InvalidDirective {
             line,
@@ -2044,6 +2021,24 @@ fn is_status_pattern(pattern: &str) -> bool {
 fn normalize_unit(unit: &str) -> String {
     let unit = unit.trim();
     if unit.ends_with(".service") { unit.to_string() } else { format!("{unit}.service") }
+}
+
+/// Whether a server/group alias is syntactically valid.
+fn is_valid_alias_name(name: &str) -> bool {
+    !name.is_empty() &&
+        name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Reject `@only_if` on steps that carry no script context.
+fn reject_guard(has_guard: bool, directive: &str, line: usize) -> Result<(), ParseError> {
+    if has_guard {
+        return Err(ParseError::InvalidDirective {
+            line,
+            directive: directive.to_string(),
+            reason: format!("`@only_if` is not supported on `@{directive}`"),
+        });
+    }
+    Ok(())
 }
 
 /// Whether a unit name is safe to hand to `systemctl`.
@@ -3282,7 +3277,7 @@ mod tests {
         #[test]
         fn server_spec_round_trips(
             name in "[a-z][a-z0-9]{0,12}",
-            host in "[a-z0-9.\\-]{1,40}",
+            host in "[a-z][a-z0-9.-]{0,39}",
             port in 1_u16..65535,
         ) {
             let script = format!("# @server {name} deploy@{host}:{port}\n");

@@ -20,6 +20,23 @@ pub(super) struct CopyOpts<'a> {
     pub(super) excludes: &'a [String],
 }
 
+/// Split a step timeout across the two sequential scp phases (mkdir + scp).
+///
+/// Each phase runs sequentially, so giving each the full budget doubles the
+/// effective step timeout. The budget is split: mkdir gets half (at least 1s
+/// when a timeout is set), scp gets the remainder, so the sum never exceeds
+/// the step budget.
+fn split_timeout(timeout: Option<u64>) -> (Option<u64>, Option<u64>) {
+    match timeout {
+        None => (None, None),
+        Some(secs) => {
+            let first = (secs / 2).max(1).min(secs);
+            let second = secs.saturating_sub(first).max(1);
+            (Some(first), Some(second))
+        }
+    }
+}
+
 /// How a copy failed, kept separate from the message so nothing has to
 /// string-match to pick the exit code (design §6 classifies 3 vs 4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -714,10 +731,13 @@ async fn run_scp_transfer(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     mkdir.kill_on_drop(true);
+    // The step budget covers both phases: mkdir gets half, scp gets the rest.
+    // Running each with the full timeout doubled the effective budget.
+    let (mkdir_timeout, scp_timeout) = split_timeout(config.timeout);
     // Routed through `run_command_status` so the mkdir honours the per-step
     // timeout and owns a `GroupGuard`: an unbounded `ssh` here used to hang a
     // `--timeout`-bounded copy step forever.
-    let status = run_command_status(mkdir, config.timeout, "remote mkdir", &cancel)
+    let status = run_command_status(mkdir, mkdir_timeout, "remote mkdir", &cancel)
         .await
         .map_err(|err| CopyFailure::transport(format!("failed to create remote dir: {err:#}")))?;
     if !status.success() {
@@ -757,7 +777,7 @@ async fn run_scp_transfer(
         ui: &ui,
         host: &host.alias,
         payload: None,
-        timeout: config.timeout,
+        timeout: scp_timeout,
         diff_filter: None,
         log_file,
         cancel: cancel.clone(),

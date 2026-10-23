@@ -191,7 +191,8 @@ impl WorkdirGuard {
     /// Remove the staging directory from every host that received a copy.
     ///
     /// The removal is best effort: a host that is already gone must not
-    /// fail the run that just succeeded.
+    /// fail the run that just succeeded. Each removal is bounded (10s) and
+    /// never blocks shutdown past the interrupt grace period.
     pub(crate) async fn cleanup(&self, plan: &shellflow_core::ExecutionPlan) {
         let aliases: Vec<String> = self.hosts.lock().await.iter().cloned().collect();
         for alias in aliases {
@@ -204,11 +205,20 @@ impl WorkdirGuard {
                 continue;
             };
             let mut cmd = Command::new("ssh");
-            cmd.args(["-o", "BatchMode=yes"]);
+            cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
             cmd.args(host.spec.to_ssh_args())
                 .arg("-T")
                 .arg(format!("rm -rf '{}'", self.workdir.path));
-            let _ = cmd.stdin(std::process::Stdio::null()).output().await;
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            cmd.kill_on_drop(true);
+            crate::executor::process::isolate(&mut cmd);
+            let Ok(mut child) = cmd.spawn() else {
+                continue;
+            };
+            let _guard = crate::executor::process::GroupGuard::new(&child);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
         }
     }
 }
@@ -1371,6 +1381,12 @@ async fn run_remote_step_local(args: RemoteLocalArgs<'_>) -> Result<Vec<(String,
                     crate::ui::note("  local guard failed — skipping block", log_file);
                     return Ok(vec![("localhost".to_string(), HostOutcome::Skipped)]);
                 }
+                GuardOutcome::TimedOut => {
+                    return Ok(vec![("localhost".to_string(), HostOutcome::TimedOut)]);
+                }
+                GuardOutcome::Cancelled => {
+                    return Ok(vec![("localhost".to_string(), HostOutcome::Cancelled)]);
+                }
                 GuardOutcome::Failed(err) => {
                     crate::ui::warn(&format!("local guard failed: {err}"), log_file);
                     return Ok(vec![("localhost".to_string(), HostOutcome::Failed(err))]);
@@ -1396,6 +1412,9 @@ async fn run_remote_step_local(args: RemoteLocalArgs<'_>) -> Result<Vec<(String,
         }
         Err(super::local::LocalFailure::PipeBroken) => {
             Ok(vec![("localhost".to_string(), HostOutcome::Failed(RunError::Transport))])
+        }
+        Err(super::local::LocalFailure::Cancelled) => {
+            Ok(vec![("localhost".to_string(), HostOutcome::Cancelled)])
         }
         Err(super::local::LocalFailure::Failed(err)) => {
             crate::ui::warn(&format!("local step failed: {err:#}"), log_file);
@@ -1604,8 +1623,10 @@ const PROBE_END_MARKER: &str = "SHELLFLOW_PROBE_END";
 ///
 /// The probe sets this explicitly instead of inheriting the operator's
 /// `~/.ssh/config`: a probe is a *cheap* question, and a dropped SYN on a
-/// long-haul link must not stall the whole run.
-const PROBE_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// long-haul link must not stall the whole run. Kept well below the interrupt
+/// grace period (main `INTERRUPT_GRACE`) so `Ctrl-C` during a probe still
+/// tears down promptly.
+const PROBE_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 /// The wall-clock budget of one probe attempt.
 ///
@@ -1613,7 +1634,8 @@ const PROBE_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// equal, a slow TCP connect has `ssh` give up at the same moment the probe
 /// does, and the probe is cut off mid-flight — the host looks like it has no
 /// rsync, and a perfectly good deploy fails with a misleading message.
-const PROBE_ATTEMPT_BUDGET_SECS: u64 = 15;
+/// Kept small so two attempts plus backoff stay within the interrupt grace.
+const PROBE_ATTEMPT_BUDGET_SECS: u64 = 6;
 
 /// How many times a failed probe is retried.
 ///
