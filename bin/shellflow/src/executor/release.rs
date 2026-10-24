@@ -53,7 +53,9 @@ pub(super) fn release_command(
          LATEST=$(sfw_latest_tag || true); \
          echo \"installed=${{INSTALLED:-unknown}} latest=${{LATEST:-unknown}}\"; \
          if [ -z \"$LATEST\" ]; then echo 'could not resolve the latest release; skipping'; exit 0; fi; \
-         if [ -n \"$INSTALLED\" ] && [ \"$INSTALLED\" = \"$LATEST\" ]; then \
+         IV=$(printf '%s' \"$INSTALLED\" | sed 's/^v//'); \
+         LV=$(printf '%s' \"$LATEST\" | sed 's/^v//'); \
+         if [ -n \"$INSTALLED\" ] && [ \"$IV\" = \"$LV\" ]; then \
            echo 'already up to date'; exit 0; \
          fi; \
          TAG=\"$LATEST\"; VER=$(printf '%s' \"$LATEST\" | sed 's/^v//'); \
@@ -70,8 +72,8 @@ pub(super) fn release_command(
          for f in \"$TMP\"/*; do \
            [ -f \"$f\" ] && [ -x \"$f\" ] || continue; \
            b=$(basename \"$f\"); \
-           sudo cp -f \"$f\" \"{dir}/.$b.new\" && sudo mv -f \"{dir}/.$b.new\" \"{dir}/$b\" \
-             && sudo chmod +x \"{dir}/$b\" && n=$((n + 1)) && echo \"installed $b\"; \
+           sudo cp -f \"$f\" \"$SF_DIR/.$b.new\" && sudo mv -f \"$SF_DIR/.$b.new\" \"$SF_DIR/$b\" \
+             && sudo chmod +x \"$SF_DIR/$b\" && n=$((n + 1)) && echo \"installed $b\"; \
          done; \
          rm -rf \"$TMP\"; \
          if [ \"$n\" = 0 ]; then echo 'no executable found in the asset' >&2; exit 1; fi",
@@ -119,6 +121,25 @@ mod tests {
         );
         assert!(cmd.contains("downloads.openobserve.ai/releases/openobserve"), "{cmd}");
         assert!(!cmd.contains("github.com/openobserve/openobserve/releases/download"), "{cmd}");
+    }
+
+    #[test]
+    fn release_compares_versions_without_the_v_prefix() {
+        // `dufs --version` prints `0.47.0` while the tag is `v0.47.0`: the
+        // comparison strips the prefix on both sides, or every run would
+        // re-download the installed version.
+        let cmd = release_command("o/r", "x", "a-{tag}.tar.gz", "/tmp", None);
+        assert!(cmd.contains("sed 's/^v//'"), "{cmd}");
+        assert!(cmd.contains("[ \"$IV\" = \"$LV\" ]"), "{cmd}");
+    }
+
+    #[test]
+    fn release_installs_through_the_staging_dir_variable() {
+        // The install loop must use `$SF_DIR`, not the quoted literal: a
+        // literal `'...'` in the path makes every copy fail.
+        let cmd = release_command("o/r", "x", "a-{tag}.tar.gz", "/opt/x/bin", None);
+        assert!(cmd.contains("$SF_DIR/.$b.new"), "{cmd}");
+        assert!(!cmd.contains("'/opt/x/bin'/."), "{cmd}");
     }
 
     #[test]

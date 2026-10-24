@@ -151,34 +151,33 @@ fn for_unquoted_expansion(code: &str) -> Option<String> {
 /// Reads (`$status`, `${status}`) are fine and never match: only the
 /// assignment aborts the block under `zsh`.
 fn is_status_assignment(code: &str) -> bool {
-    let bytes = code.as_bytes();
-    let mut i = 0;
-    while i + 6 < bytes.len() {
-        if code[i..].starts_with("status") {
-            let before = if i == 0 { ' ' } else { bytes[i - 1] as char };
-            let before_ok = before == ' ' ||
-                before == '\t' ||
-                before == ';' ||
-                before == '&' ||
-                before == '|' ||
-                before == '(';
-            let after = bytes.get(i + 6).copied().unwrap_or(b' ') as char;
-            // `status=…` assigns; `for status in …` assigns via the loop.
-            if before_ok && (after == '=' || after == ' ' || after == '\t') {
-                let rest = &code[i + 6..];
-                if after == '=' {
+    // `match_indices` yields byte offsets at char boundaries, so multibyte
+    // lines (CJK comments are common in playbooks) can never panic this
+    // scan the way a manual byte-index walk would.
+    for (i, _) in code.match_indices("status") {
+        let before_ok = if i == 0 {
+            true
+        } else {
+            matches!(code[..i].chars().next_back(), Some(' ' | '\t' | ';' | '&' | '|' | '('))
+        };
+        if !before_ok {
+            continue;
+        }
+        let after = &code[i + "status".len()..];
+        // `status=...` assigns; `for status in ...` assigns via the loop.
+        if after.starts_with('=') {
+            return true;
+        }
+        if after.starts_with(' ') || after.starts_with('\t') {
+            let rest = after.trim_start();
+            if rest.starts_with("in ") || rest.starts_with("in\t") {
+                // Confirm the `for` keyword precedes it on this line.
+                let head = code[..i].trim_end();
+                if head == "for" || head.ends_with("; for") || head.ends_with("&& for") {
                     return true;
-                }
-                if rest.trim_start().starts_with("in ") || rest.trim_start().starts_with("in\t") {
-                    // Confirm the `for` keyword precedes it on this line.
-                    let head = code[..i].trim_end();
-                    if head == "for" || head.ends_with("; for") || head.ends_with("&& for") {
-                        return true;
-                    }
                 }
             }
         }
-        i += 1;
     }
     false
 }
@@ -308,6 +307,19 @@ mod tests {
     fn default_expansion_is_clean() {
         let findings = lint_block("SVC=\"${SVC:-sws}\"");
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn multibyte_lines_never_panic_the_scan() {
+        // CJK comments are common in playbooks; a byte-index walk would
+        // panic on a split char boundary (`start byte index … is not a char
+        // boundary`). The scan must stay silent on all of these.
+        let findings = lint_block(
+            "# 需要重启: 内核已更新\nstatus=0 # 状态\nfor x in a b; do echo \u{4e2d}文; done\n",
+        );
+        assert!(findings.iter().any(|f| f.message.contains("read-only")));
+        let clean = lint_block("# 纯中文注释行\necho ok\n");
+        assert!(clean.is_empty());
     }
 
     #[test]
