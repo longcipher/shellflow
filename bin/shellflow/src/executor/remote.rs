@@ -726,6 +726,120 @@ async fn run_single_step(
                 }
             }
         }
+        shellflow_core::Step::Release(release) => {
+            match shellflow_core::resolve_hosts(plan, &release.target, &setup.restrict) {
+                Ok(hosts) => {
+                    let command = super::release::release_command(
+                        &release.repo,
+                        &release.installed_cmd,
+                        &release.asset,
+                        &release.to_dir,
+                        release.base_url.as_deref(),
+                    );
+                    (
+                        None,
+                        super::host::run_target_command(super::host::TargetCommand {
+                            ui: &setup.ui,
+                            command,
+                            hosts,
+                            config,
+                            semaphore: &setup.semaphore,
+                            log_file: &setup.log_file,
+                            cancel: &setup.cancel,
+                            secrets: &setup.resolved,
+                            shell_cache: &setup.shell_cache,
+                            label: &format!("release {}", release.repo),
+                        })
+                        .await,
+                    )
+                }
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
+        shellflow_core::Step::Build(build) => {
+            match shellflow_core::resolve_hosts(plan, &build.target, &setup.restrict) {
+                Ok(hosts) => {
+                    let command = super::build::build_command(build);
+                    (
+                        None,
+                        super::host::run_target_command(super::host::TargetCommand {
+                            ui: &setup.ui,
+                            command,
+                            hosts,
+                            config,
+                            semaphore: &setup.semaphore,
+                            log_file: &setup.log_file,
+                            cancel: &setup.cancel,
+                            secrets: &setup.resolved,
+                            shell_cache: &setup.shell_cache,
+                            label: &format!("build {}", build.repo),
+                        })
+                        .await,
+                    )
+                }
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
+        shellflow_core::Step::Toolchain(toolchain) => {
+            match shellflow_core::resolve_hosts(plan, &toolchain.target, &setup.restrict) {
+                Ok(hosts) => {
+                    let command = super::toolchain::toolchain_command(&toolchain.tools);
+                    (
+                        None,
+                        super::host::run_target_command(super::host::TargetCommand {
+                            ui: &setup.ui,
+                            command,
+                            hosts,
+                            config,
+                            semaphore: &setup.semaphore,
+                            log_file: &setup.log_file,
+                            cancel: &setup.cancel,
+                            secrets: &setup.resolved,
+                            shell_cache: &setup.shell_cache,
+                            label: "toolchain update",
+                        })
+                        .await,
+                    )
+                }
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
+        shellflow_core::Step::Image(image) => {
+            match shellflow_core::resolve_hosts(plan, &image.target, &setup.restrict) {
+                Ok(hosts) => {
+                    let command = super::image::image_command(&image.images, image.prune);
+                    (
+                        None,
+                        super::host::run_target_command(super::host::TargetCommand {
+                            ui: &setup.ui,
+                            command,
+                            hosts,
+                            config,
+                            semaphore: &setup.semaphore,
+                            log_file: &setup.log_file,
+                            cancel: &setup.cancel,
+                            secrets: &setup.resolved,
+                            shell_cache: &setup.shell_cache,
+                            label: "image update",
+                        })
+                        .await,
+                    )
+                }
+                Err(err) => {
+                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                    (Some(RunError::Plan), Ok(Vec::new()))
+                }
+            }
+        }
     }
 }
 
@@ -1009,6 +1123,10 @@ fn target_host_aliases(
             shellflow_core::Step::Credstore(credstore) => &credstore.target,
             shellflow_core::Step::UnitInventory(inventory) => &inventory.target,
             shellflow_core::Step::Helper(helper) => &helper.target,
+            shellflow_core::Step::Release(release) => &release.target,
+            shellflow_core::Step::Build(build) => &build.target,
+            shellflow_core::Step::Toolchain(toolchain) => &toolchain.target,
+            shellflow_core::Step::Image(image) => &image.target,
             shellflow_core::Step::Local(_) => continue,
         };
         match shellflow_core::resolve_hosts(plan, target, restrict) {

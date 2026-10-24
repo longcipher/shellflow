@@ -196,6 +196,18 @@ pub enum Assertion {
         /// The expected `ActiveState` (`active`).
         state: String,
     },
+    /// The systemd unit's enablement must equal the expected state.
+    ///
+    /// Replaces the hand-written `systemctl is-enabled` audit loops that
+    /// every fleet ends up with: the expected boot state is declared next
+    /// to the unit, and drift (a stopped service re-enabled, an enabled
+    /// service that should stay dormant) is a deployment-time failure.
+    Enabled {
+        /// The systemd unit name (`foo.service`).
+        unit: String,
+        /// The expected `is-enabled` output (`enabled`).
+        state: String,
+    },
     /// The URL must answer with an accepted HTTP status.
     Health {
         /// The URL to probe.
@@ -216,6 +228,16 @@ pub enum Assertion {
         ports: Vec<u16>,
         /// Whether the ports are UDP rather than TCP.
         udp: bool,
+    },
+    /// The ports must be free on the target.
+    ///
+    /// The failure message attributes the occupant (the listening process,
+    /// a `nft`/`iptables` DNAT rule, or a container publish mapping) so the
+    /// operator does not need the manual `ss`/`nft`/`podman` archaeology
+    /// that a bind conflict otherwise requires.
+    PortFree {
+        /// The ports that must have no listener.
+        ports: Vec<u16>,
     },
     /// The file must exist and hold no unexpanded `${…}` placeholder.
     Rendered {
@@ -396,6 +418,115 @@ pub struct HelperStep {
     pub timeout: Option<u64>,
 }
 
+/// A GitHub-release tracking step (`@release`).
+///
+/// Replaces the hand-written version-compare blocks (`--version` output vs
+/// the `releases/latest` redirect) that every binary-from-release service
+/// repeats: the step resolves the newest release tag, compares it against
+/// the installed binary, and downloads the matching asset only when they
+/// differ. No download means no restart downstream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// The `owner/repo` whose releases are tracked.
+    pub repo: String,
+    /// Command that prints the installed version
+    /// (e.g. `/opt/dufs/bin/dufs --version`).
+    pub installed_cmd: String,
+    /// Asset name template for the release download. Supports `{tag}`
+    /// (the `v`-prefixed tag) and `{version}` (the tag without `v`).
+    pub asset: String,
+    /// Directory the asset is downloaded and extracted into.
+    pub to_dir: String,
+    /// Download base URL (default `https://github.com/<repo>/releases/download`).
+    /// A vendor CDN (e.g. `https://downloads.openobserve.ai/releases/openobserve`)
+    /// goes here; `{tag}`/`{version}` are **not** expanded in it.
+    pub base_url: Option<String>,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
+/// A source-build step (`@build`).
+///
+/// The native-build half of the binary catalog: check out the pinned ref,
+/// build on the target (native glibc, no cross), probe the fresh binary,
+/// back up the running one, and install atomically. The manifest fields are
+/// data — the chain (fetch → build → probe → backup → install → verify)
+/// is owned by the runner, so a new service adds one declarative block
+/// instead of a new build script.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// The git repository to build from.
+    pub repo: String,
+    /// The pinned ref: tag, branch, or commit sha.
+    pub git_ref: String,
+    /// The build command, run at the repository root
+    /// (e.g. `cargo build --release -p myapp`).
+    pub build_cmd: String,
+    /// A preparation command, run at the repository root after checkout and
+    /// before the build (e.g. `git submodule update --init --recursive`).
+    pub prep_cmd: Option<String>,
+    /// Build artifacts, relative to the cargo target directory,
+    /// each optionally renamed with `path=name`.
+    pub artifacts: Vec<String>,
+    /// Directories the artifacts are installed into.
+    pub install_dirs: Vec<String>,
+    /// Units restarted after the install (only when previously active).
+    pub units: Vec<String>,
+    /// Flag that prints the binary's version for the preflight probe
+    /// (`--version`); empty skips the probe.
+    pub version_flag: String,
+    /// Minimum free disk (GB) required before building.
+    pub min_free_gb: u64,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
+/// A language-toolchain update step (`@toolchain`).
+///
+/// The dozen `command -v X || skip; update X` wrappers in every fleet-wide
+/// update playbook, as data: each named tool updates through its own
+/// manager, and the per-tool quirks (the ones operators keep
+/// re-discovering) are owned by the runner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolchainStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// Tool names to update (`rustup`, `cargo`, `go`, `npm`, `pipx`,
+    /// `uv`, `foundry`, `proto`, `gh`).
+    pub tools: Vec<String>,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
+/// A container-image update step (`@image`).
+///
+/// Pulls each image, compares the digest before and after, and reports
+/// which images actually moved — the pull/compare/prune loop every
+/// container fleet hand-writes, owned by the runner instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageStep {
+    /// Optional label from `@name`.
+    pub name: Option<String>,
+    /// Target server/group/spec.
+    pub target: Target,
+    /// Images to pull (`name:tag`).
+    pub images: Vec<String>,
+    /// Prune dangling images after the pull.
+    pub prune: bool,
+    /// Optional per-step timeout in seconds from `@timeout`.
+    pub timeout: Option<u64>,
+}
+
 /// A step that asserts conditions on the target hosts.
 ///
 /// Assertions replace the hand-written `systemctl is-active && curl -f`
@@ -443,6 +574,14 @@ pub enum Step {
     UnitInventory(UnitInventoryStep),
     /// Build and install the target-side helper.
     Helper(HelperStep),
+    /// Track a GitHub release and download the asset on drift.
+    Release(ReleaseStep),
+    /// Build a pinned ref from source on the target.
+    Build(BuildStep),
+    /// Update language toolchains on the target.
+    Toolchain(ToolchainStep),
+    /// Pull container images and report digest drift.
+    Image(ImageStep),
 }
 
 impl Step {
@@ -462,6 +601,10 @@ impl Step {
             Self::Credstore(s) => s.name.as_deref(),
             Self::UnitInventory(s) => s.name.as_deref(),
             Self::Helper(s) => s.name.as_deref(),
+            Self::Release(s) => s.name.as_deref(),
+            Self::Build(s) => s.name.as_deref(),
+            Self::Toolchain(s) => s.name.as_deref(),
+            Self::Image(s) => s.name.as_deref(),
         }
     }
 
@@ -482,6 +625,10 @@ impl Step {
             Self::Credstore(_) => "credstore",
             Self::UnitInventory(_) => "unit_inventory",
             Self::Helper(_) => "helper",
+            Self::Release(_) => "release",
+            Self::Build(_) => "build",
+            Self::Toolchain(_) => "toolchain",
+            Self::Image(_) => "image",
         }
     }
 
@@ -501,6 +648,10 @@ impl Step {
             Self::Credstore(s) => Some(&s.target.text),
             Self::UnitInventory(s) => Some(&s.target.text),
             Self::Helper(s) => Some(&s.target.text),
+            Self::Release(s) => Some(&s.target.text),
+            Self::Build(s) => Some(&s.target.text),
+            Self::Toolchain(s) => Some(&s.target.text),
+            Self::Image(s) => Some(&s.target.text),
         }
     }
 
@@ -519,7 +670,11 @@ impl Step {
             Self::Backup(_) |
             Self::Credstore(_) |
             Self::UnitInventory(_) |
-            Self::Helper(_) => None,
+            Self::Helper(_) |
+            Self::Release(_) |
+            Self::Build(_) |
+            Self::Toolchain(_) |
+            Self::Image(_) => None,
         }
     }
 
@@ -539,6 +694,10 @@ impl Step {
             Self::Credstore(s) => s.timeout,
             Self::UnitInventory(s) => s.timeout,
             Self::Helper(s) => s.timeout,
+            Self::Release(s) => s.timeout,
+            Self::Build(s) => s.timeout,
+            Self::Toolchain(s) => s.timeout,
+            Self::Image(s) => s.timeout,
         }
     }
 }

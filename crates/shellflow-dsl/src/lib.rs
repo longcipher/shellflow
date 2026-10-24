@@ -42,10 +42,10 @@ pub use error::{InterpolateError, ParseError};
 pub use heredoc::{Heredoc, HeredocTracker};
 pub use parser::parse_script;
 pub use plan::{
-    AssertStep, Assertion, BackupStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry, ExecutionPlan,
-    HelperStep, InstallStep, LocalStep, ReloadStep, RemoteStep, ResolvedHost, RunState,
-    SecretEntry, ServiceStep, Step, Target, UnitInventoryStep, WaitStep, Workdir, interpolate,
-    is_valid_var_name, resolve_hosts,
+    AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
+    ExecutionPlan, HelperStep, ImageStep, InstallStep, LocalStep, ReleaseStep, ReloadStep,
+    RemoteStep, ResolvedHost, RunState, SecretEntry, ServiceStep, Step, Target, ToolchainStep,
+    UnitInventoryStep, WaitStep, Workdir, interpolate, is_valid_var_name, resolve_hosts,
 };
 pub use ssh_spec::SshSpec;
 pub use text::{shell_quote_single, strip_surrounding_quotes};

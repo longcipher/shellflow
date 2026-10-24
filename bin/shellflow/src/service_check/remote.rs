@@ -128,6 +128,15 @@ fn add_unit_sections(batch: &mut Batch, service: &str, unit: &str, journal_lines
          }}; sfw_paths"
     );
     batch.section(&section_id(unit, "paths"), &paths_cmd);
+    batch.section(
+        "ports",
+        "ss -ltnp 2>/dev/null | awk 'NR>1 {{print}}'; \
+         echo '--- nft ---'; \
+         (sudo -n nft list ruleset 2>/dev/null || nft list ruleset 2>/dev/null) \
+           | grep -E 'dport [0-9]+' | head -20; \
+         echo '--- podman ---'; \
+         (podman ps --format '{{{{.Names}}}} {{{{.Ports}}}}' 2>/dev/null || true) | head -20",
+    );
 }
 
 #[cfg(test)]
@@ -151,7 +160,8 @@ mod tests {
             assert!(script.contains(&format!("_B_foo.service_{id}")), "missing query {id}");
         }
         assert!(script.contains("_B_fleet_dirs"), "missing the fleet query");
-        assert_eq!(script.matches("out=$(").count(), 9);
+        assert!(script.contains("_B_ports"), "missing the ports query");
+        assert_eq!(script.matches("out=$(").count(), 10);
     }
 
     #[test]
@@ -204,6 +214,14 @@ mod tests {
         ] {
             assert!(script.contains(prop), "missing path property {prop}");
         }
+    }
+
+    #[test]
+    fn the_ports_query_names_occupants() {
+        let script = Probe::new("foo.service", "foo", 50).batch.script().to_string();
+        assert!(script.contains("ss -ltnp"), "{script}");
+        assert!(script.contains("nft list ruleset"), "{script}");
+        assert!(script.contains("podman ps"), "{script}");
     }
 
     #[test]

@@ -472,7 +472,8 @@ mod tests {
 
     use super::{
         CAPTURE_SEPARATOR, MASK, SecretMasker, mask_keyed, mask_line, mask_token,
-        parse_capture_records, prepare_masks, render_env, shell_quote_single,
+        parse_capture_records, parse_capture_records_checked, prepare_masks, render_env,
+        shell_quote_single,
     };
 
     #[test]
@@ -520,6 +521,40 @@ mod tests {
         assert!(matches!(
             parse_capture_records(b"A=v\0NOSEP\0"),
             Err(crate::error::CaptureError::MissingSeparator)
+        ));
+    }
+
+    #[test]
+    fn checked_records_reject_a_leading_digit_name() {
+        // `1BAD` is non-empty but not a valid variable name: the name check
+        // is a disjunction, so either side alone must reject it.
+        assert!(matches!(
+            parse_capture_records_checked(b"1BAD=x\0", None),
+            Err(crate::error::CaptureError::UnexpectedVar { .. })
+        ));
+    }
+
+    #[test]
+    fn checked_records_reject_an_empty_name() {
+        assert!(matches!(
+            parse_capture_records_checked(b"=x\0", None),
+            Err(crate::error::CaptureError::UnexpectedVar { .. })
+        ));
+    }
+
+    #[test]
+    fn checked_records_accept_a_listed_name() {
+        let allowed = ["A".to_string()];
+        let parsed = parse_capture_records_checked(b"A=1\0", Some(&allowed)).expect("listed name");
+        assert_eq!(parsed.get("A").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn checked_records_reject_an_unlisted_name() {
+        let allowed = ["A".to_string()];
+        assert!(matches!(
+            parse_capture_records_checked(b"B=1\0", Some(&allowed)),
+            Err(crate::error::CaptureError::UnexpectedVar { .. })
         ));
     }
 

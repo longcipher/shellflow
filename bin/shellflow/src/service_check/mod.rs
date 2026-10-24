@@ -217,8 +217,10 @@ fn check_unit(
     }
 
     // The unit-level invariants: the mistakes that cost an outage and that
-    // nothing else reports.
-    let fleet = body("fleet_dirs");
+    // nothing else reports. The fleet answer is host-wide (one section for
+    // the whole batch), so it is read by its raw id, not by the
+    // per-unit `{unit}_{kind}` id the `body` helper builds.
+    let fleet = sections.get("fleet_dirs").map_or_else(String::new, |s| s.body.clone());
     let invariants = unit_invariant_findings(&show, &fleet);
     if invariants.is_empty() {
         report("unit invariants hold", Check::Ok, failures);
@@ -226,6 +228,62 @@ fn check_unit(
     for (message, status) in invariants {
         report(&message, status, failures);
     }
+
+    // The host's listening sockets with their occupants: the answer to
+    // "what is on this port" without the manual `ss`/`nft`/`podman`
+    // archaeology. Informational only — `@assert_port` / `@assert_port_free`
+    // are the gates.
+    for message in
+        listening_ports(&sections.get("ports").map_or_else(String::new, |s| s.body.clone()))
+    {
+        report(&message, Check::Ok, failures);
+    }
+}
+
+/// One line per listening TCP socket, with its occupant.
+///
+/// The remote half prints the `ss -ltnp` table, then the `nft` DNAT rules
+/// and the container publish mappings under `--- nft ---` / `--- podman ---`
+/// markers. Only the socket table becomes per-port lines; the NAT and
+/// container blocks are occupant context the operator reads when a port is
+/// unexpectedly taken.
+fn listening_ports(ports: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in ports.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("---") || trimmed.starts_with("State") {
+            continue;
+        }
+        // The NAT / container blocks follow the markers: they are context,
+        // not sockets, so they never become lines of their own.
+        if trimmed.starts_with("ip ") ||
+            trimmed.starts_with("tcp ") ||
+            trimmed.starts_with("udp ") ||
+            trimmed.starts_with("meta ")
+        {
+            continue;
+        }
+        let mut fields = trimmed.split_whitespace();
+        let state = fields.next().unwrap_or_default();
+        if state != "LISTEN" {
+            continue;
+        }
+        let addr = fields.nth(2).unwrap_or_default();
+        let port = addr.rsplit(':').next().unwrap_or_default();
+        if port.is_empty() || port == "*" {
+            continue;
+        }
+        // The next field is the peer (always `0.0.0.0:*` for a listener);
+        // everything after it names the occupant.
+        let rest: Vec<&str> = fields.collect();
+        let occupant = rest.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+        if occupant.is_empty() {
+            out.push(format!("listening {addr} (no owning process visible)"));
+        } else {
+            out.push(format!("listening {addr} {occupant}"));
+        }
+    }
+    out
 }
 
 /// The paths the unit references that do not exist on the target.
@@ -572,8 +630,8 @@ fn validate_service_name(service: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Check, has_argv_secret, journal_contains, looks_like_leak, missing_paths, notify_findings,
-        parse_show_props, timeout_start_is_short, unit_invariant_findings,
+        Check, has_argv_secret, journal_contains, listening_ports, looks_like_leak, missing_paths,
+        notify_findings, parse_show_props, timeout_start_is_short, unit_invariant_findings,
     };
 
     #[test]
@@ -679,6 +737,29 @@ mod tests {
         assert_eq!(missing.len(), 2);
         assert!(missing.iter().any(|m| m == "ReadWritePaths=/var/lib/app"));
         assert!(missing.iter().any(|m| m == "EnvironmentFile=/etc/app/secrets.env"));
+    }
+
+    #[test]
+    fn listening_sockets_report_their_occupants() {
+        let out = "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n\
+                   LISTEN 0 128 0.0.0.0:3000 0.0.0.0:* users:((\"951\",pid=1,fd=9))\n\
+                   LISTEN 0 128 [::]:8080 [::]:* users:((\"nginx\",pid=2,fd=3))\n\
+                   --- nft ---\n\
+                   ip daddr 127.0.0.1 tcp dport 3000 jump foo\n";
+        let lines = listening_ports(out);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("0.0.0.0:3000"), "{lines:?}");
+        assert!(lines[0].contains("pid=1"), "{lines:?}");
+        assert!(lines[1].contains("[::]:8080"), "{lines:?}");
+    }
+
+    #[test]
+    fn nat_and_container_blocks_never_become_socket_lines() {
+        let out = "--- nft ---\n\
+                   ip daddr 127.0.0.1 tcp dport 3000 jump foo\n\
+                   --- podman ---\n\
+                   browserless 127.0.0.1:3000->3000/tcp\n";
+        assert!(listening_ports(out).is_empty());
     }
 
     #[test]

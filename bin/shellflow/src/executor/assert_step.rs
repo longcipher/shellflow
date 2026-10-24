@@ -41,8 +41,11 @@ fn check_budget(check: &Assertion, step_timeout: Option<u64>) -> u64 {
     match check {
         Assertion::Port { .. } => step_timeout.unwrap_or(DEFAULT_PORT_TIMEOUT_SECS),
         Assertion::Health { .. } => step_timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS),
-        // The unit-state and the rendered checks answer at once.
+        // The unit-state, enablement, port-free, and rendered checks answer
+        // at once.
         Assertion::UnitState { .. } |
+        Assertion::Enabled { .. } |
+        Assertion::PortFree { .. } |
         Assertion::Rendered { .. } |
         Assertion::NoLeak { .. } |
         Assertion::Digest { .. } |
@@ -218,6 +221,10 @@ fn interpolate_check(
         Assertion::Rendered { path } => Assertion::Rendered {
             path: shellflow_core::interpolate(path, state).map_err(eyre::Error::from)?,
         },
+        Assertion::Enabled { unit, state: expected } => Assertion::Enabled {
+            unit: shellflow_core::interpolate(unit, state).map_err(eyre::Error::from)?,
+            state: expected.clone(),
+        },
         Assertion::NoLeak { unit, lines } => Assertion::NoLeak {
             unit: shellflow_core::interpolate(unit, state).map_err(eyre::Error::from)?,
             lines: *lines,
@@ -252,6 +259,42 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
             unit = quote(unit),
             state = quote(state),
         ),
+        Assertion::Enabled { unit, state } => format!(
+            "s=$(systemctl is-enabled {unit} 2>/dev/null); \
+             if [ \"$s\" = {state} ]; then echo \"{unit} is-enabled $s\"; \
+             else echo \"{unit} is-enabled $s (want {state})\"; false; fi",
+            unit = quote(unit),
+            state = quote(state),
+        ),
+        Assertion::PortFree { ports } => {
+            // A bind conflict is diagnosed where it happens: the check names
+            // the occupant (the listening process, a NAT redirect, or a
+            // container publish mapping) instead of just "address in use".
+            // Only listening sockets count: TIME-WAIT connections after a
+            // stop are not occupants.
+            let list: Vec<String> = ports.iter().map(u16::to_string).collect();
+            let checks: Vec<String> = list
+                .iter()
+                .map(|port| {
+                    format!(
+                        "if ss -ltn 2>/dev/null | grep -qE \":${{p}}[[:space:]]\"; then \
+                         echo 'port {port} is occupied:'; \
+                         sfw_occupant {port}; false; \
+                         else echo 'port {port} is free'; fi"
+                    )
+                })
+                .collect();
+            format!(
+                "sfw_occupant() {{ p=\"$1\"; \
+                 ss -ltnp 2>/dev/null | grep -E \":${{p}}[[:space:]]\" | head -2; \
+                 (sudo -n nft list ruleset 2>/dev/null || nft list ruleset 2>/dev/null) \
+                   | grep -E \"dport ${{p}}[^0-9]\" | head -3; \
+                 (podman ps --format '{{{{.Names}}}} {{{{.Ports}}}}' 2>/dev/null || true) \
+                   | grep -E \"(^|[\\s:])${{p}}->\" | head -3; \
+                 return 0; }}; {checks}",
+                checks = checks.join("; "),
+            )
+        }
         Assertion::Port { ports, udp } => {
             // The wait happens on the target: one round trip covers the
             // whole budget, not one round trip per poll.
@@ -552,5 +595,36 @@ mod tests {
     #[test]
     fn a_value_with_a_quote_is_escaped() {
         assert_eq!(quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn an_enabled_check_asks_systemd_for_the_boot_state() {
+        let cmd = command_for(
+            &Assertion::Enabled { unit: "smg.service".to_string(), state: "disabled".to_string() },
+            Some(10),
+        );
+        assert!(cmd.contains("systemctl is-enabled 'smg.service'"), "{cmd}");
+        assert!(cmd.contains("'disabled'"), "{cmd}");
+        assert!(cmd.contains("false;"), "{cmd}");
+    }
+
+    #[test]
+    fn a_port_free_check_names_the_occupant() {
+        let cmd = command_for(&Assertion::PortFree { ports: vec![3000] }, Some(10));
+        assert!(cmd.contains("ss -ltn"), "{cmd}");
+        assert!(cmd.contains("sfw_occupant 3000"), "{cmd}");
+        // The occupant attribution covers the three sources operators
+        // otherwise check by hand: the listening process, NAT rules, and
+        // container publish mappings. TIME-WAIT sockets must not count.
+        assert!(cmd.contains("ss -ltnp"), "{cmd}");
+        assert!(cmd.contains("nft list ruleset"), "{cmd}");
+        assert!(cmd.contains("podman ps"), "{cmd}");
+        assert!(cmd.contains("false;"), "{cmd}");
+    }
+
+    #[test]
+    fn port_free_checks_only_match_listening_sockets() {
+        let cmd = command_for(&Assertion::PortFree { ports: vec![8080] }, Some(10));
+        assert!(!cmd.contains("-tan"), "{cmd}");
     }
 }

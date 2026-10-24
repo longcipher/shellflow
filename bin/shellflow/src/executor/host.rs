@@ -28,7 +28,7 @@ const EXIT_TIMEOUT: i32 = 4;
 pub(crate) const HELPER_PATH: &str = "/usr/local/bin/shellflow";
 
 /// Quote a value for the remote shell.
-fn quote(value: &str) -> String {
+pub(super) fn quote(value: &str) -> String {
     shellflow_core::env::shell_quote_single(value)
 }
 
