@@ -49,7 +49,7 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
     };
     format!(
         "SF_REPO={repo} SF_REF={git_ref} SF_BUILD={build} SF_PREP={prep} \
-         SF_VFLAG={vflag} SF_MINGB={min_gb}; \
+         SF_VFLAG={vflag} SF_MINGB={min_gb} SF_WORKDIR={workdir}; \
          sfw_probe() {{ b=\"$1\"; f=\"$2\"; \
            if [ -n \"$f\" ]; then out=$(\"$b\" \"$f\" 2>&1); verrc=$?; \
            else out=$(for sfw_f in --version -V -v -version version; do \
@@ -58,7 +58,8 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
            printf '%s' \"$out\" | head -1; }}; \
          WORK=${{SF_WORK:-$HOME/src/shellflow-builds}}; \
          NAME=$(basename \"$SF_REPO\" .git); \
-         DEST=\"$WORK/$NAME\"; \
+         if [ -n \"$SF_WORKDIR\" ]; then DEST=\"$SF_WORKDIR\"; SF_FORCE=\"\"; \
+         else DEST=\"$WORK/$NAME\"; SF_FORCE=\"--force\"; fi; \
          sfw_fetch() {{ \
            n=0; \
            while [ \"$n\" -lt 3 ]; do \
@@ -69,18 +70,15 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
            done; \
            return 1; \
          }}; \
-         if [ -d \"$DEST/.git\" ]; then \
-           if ! (cd \"$DEST\" && sfw_fetch 2>/dev/null \
-             && (git checkout --detach --force \"origin/$SF_REF\" 2>/dev/null \
-               || git checkout --detach --force \"$SF_REF\" 2>/dev/null)); then \
-             echo \"fetch/checkout $SF_REF failed\" >&2; exit 1; fi; \
-         else \
+         if [ ! -d \"$DEST/.git\" ]; then \
+           if [ -n \"$SF_WORKDIR\" ]; then echo \"workdir $DEST is not a git checkout\" >&2; exit 1; fi; \
            mkdir -p \"$WORK\" || exit 1; \
            if ! git clone \"$SF_REPO\" \"$DEST\" 2>/dev/null; then echo 'clone failed' >&2; exit 1; fi; \
-           if ! (cd \"$DEST\" && (git checkout --detach --force \"origin/$SF_REF\" 2>/dev/null \
-             || git checkout --detach --force \"$SF_REF\" 2>/dev/null)); then \
-             echo \"checkout $SF_REF failed\" >&2; exit 1; fi; \
          fi; \
+         if ! (cd \"$DEST\" && sfw_fetch 2>/dev/null \
+           && (git checkout --detach $SF_FORCE \"origin/$SF_REF\" 2>/dev/null \
+             || git checkout --detach $SF_FORCE \"$SF_REF\" 2>/dev/null)); then \
+           echo \"fetch/checkout $SF_REF failed\" >&2; exit 1; fi; \
          if [ -n \"$SF_PREP\" ]; then \
            echo 'running prep'; \
            if ! (cd \"$DEST\" && sh -c \"$SF_PREP\"); then echo 'prep failed' >&2; exit 1; fi; \
@@ -141,6 +139,7 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
         units_loop = units_loop,
         vflag = quote(&build.version_flag),
         min_gb = build.min_free_gb,
+        workdir = quote(build.workdir.as_deref().unwrap_or("")),
     )
 }
 
@@ -156,6 +155,7 @@ mod tests {
             git_ref: "abc123".to_string(),
             build_cmd: "cargo build --release -p app".to_string(),
             prep_cmd: None,
+            workdir: None,
             artifacts: vec!["target/release/app".to_string()],
             install_dirs: vec!["/opt/app/bin".to_string()],
             units: vec!["app.service".to_string()],
@@ -199,6 +199,7 @@ mod tests {
             git_ref: "r".to_string(),
             build_cmd: "make".to_string(),
             prep_cmd: None,
+            workdir: None,
             artifacts: vec!["app".to_string()],
             install_dirs: vec!["/opt/a".to_string()],
             units: vec![],
@@ -218,6 +219,7 @@ mod tests {
             git_ref: "r; evil".to_string(),
             build_cmd: "make".to_string(),
             prep_cmd: None,
+            workdir: None,
             artifacts: vec!["a".to_string()],
             install_dirs: vec!["/opt/a".to_string()],
             units: vec![],
@@ -243,6 +245,7 @@ mod tests {
             git_ref: "5710c1f".to_string(),
             build_cmd: "cargo build --release -p reth".to_string(),
             prep_cmd: None,
+            workdir: None,
             artifacts: vec!["target/release/reth=reth-bsc".to_string()],
             install_dirs: vec!["/usr/local/bin".to_string()],
             units: vec!["bsc-reth-testnet.service".to_string()],
@@ -300,6 +303,36 @@ mod tests {
     }
 
     #[test]
+    fn build_in_an_existing_checkout_skips_clone_and_force() {
+        let mut step = shellflow_core::BuildStep {
+            name: None,
+            target: shellflow_core::Target::new("api"),
+            repo: "https://github.com/x/y.git".to_string(),
+            workdir: Some("/home/u/src/x".to_string()),
+            git_ref: "abc123".to_string(),
+            build_cmd: "make".to_string(),
+            prep_cmd: None,
+            artifacts: vec!["a".to_string()],
+            install_dirs: vec!["/opt/a".to_string()],
+            units: vec![],
+            version_flag: String::new(),
+            min_free_gb: 8,
+            timeout: None,
+        };
+        let cmd = build_command(&step);
+        // Operator trees are never reset: checkouts there run without
+        // --force, so a dirty tree fails loudly instead of being reset
+        // from under its owner. (fetch --force is fine: it never touches
+        // the working tree.)
+        assert!(cmd.contains("is not a git checkout"), "{cmd}");
+        assert!(cmd.contains("SF_FORCE=\"\""), "{cmd}");
+        step.workdir = None;
+        let managed = build_command(&step);
+        assert!(managed.contains("git clone"), "{managed}");
+        assert!(managed.contains("SF_FORCE=\"--force\""), "{managed}");
+    }
+
+    #[test]
     fn build_without_units_emits_no_loop() {
         let mut step = shellflow_core::BuildStep {
             name: None,
@@ -308,6 +341,7 @@ mod tests {
             git_ref: "r".to_string(),
             build_cmd: "make".to_string(),
             prep_cmd: None,
+            workdir: None,
             artifacts: vec!["a".to_string()],
             install_dirs: vec!["/opt/a".to_string()],
             units: vec![],
@@ -359,6 +393,7 @@ mod tests {
             git_ref: "r".to_string(),
             build_cmd: "make".to_string(),
             prep_cmd: Some("git submodule update --init --recursive".to_string()),
+            workdir: None,
             artifacts: vec!["a".to_string()],
             install_dirs: vec!["/opt/a".to_string()],
             units: vec![],

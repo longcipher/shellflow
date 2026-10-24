@@ -1974,7 +1974,7 @@ impl State {
 
     /// Parse `# @build <repo-url> @<target> --ref REF --build CMD
     /// --artifacts A… --install-dirs D… [--prep CMD] [--units U…] [--version-flag F]
-    /// [--min-free-gb N]`.
+    /// [--min-free-gb N] [--workdir DIR]`.
     ///
     /// Builds the pinned ref from source on the target: fetch, build
     /// natively, probe the fresh binary, back up the running one, install
@@ -1993,6 +1993,7 @@ impl State {
         let mut git_ref: Option<String> = None;
         let mut build_cmd: Option<String> = None;
         let mut prep_cmd: Option<String> = None;
+        let mut workdir: Option<String> = None;
         let mut artifacts: Vec<String> = Vec::new();
         let mut install_dirs: Vec<String> = Vec::new();
         let mut units: Vec<String> = Vec::new();
@@ -2008,6 +2009,9 @@ impl State {
                 }
                 "--prep" => {
                     prep_cmd = Some(flag_value(value, flag, "build", line)?.to_string());
+                }
+                "--workdir" => {
+                    workdir = Some(flag_value(value, flag, "build", line)?.to_string());
                 }
                 "--artifacts" => {
                     let raw = flag_value(value, flag, "build", line)?;
@@ -2048,7 +2052,7 @@ impl State {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "build".to_string(),
-                reason: "expected `<repo-url> @<target> --ref REF --build CMD --artifacts A… --install-dirs D… [--prep CMD]`"
+                reason: "expected `<repo-url> @<target> --ref REF --build CMD --artifacts A… --install-dirs D… [--prep CMD] [--workdir DIR]`"
                     .to_string(),
             });
         }
@@ -2096,6 +2100,15 @@ impl State {
                 reason: "missing `--install-dirs`".to_string(),
             });
         }
+        if let Some(workdir) = &workdir &&
+            !workdir.starts_with('/')
+        {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "build".to_string(),
+                reason: format!("the workdir must be absolute (got `{workdir}`)"),
+            });
+        }
         for dir in &install_dirs {
             if !dir.starts_with('/') {
                 return Err(ParseError::InvalidDirective {
@@ -2120,6 +2133,7 @@ impl State {
             name,
             target: Target::new(target),
             repo,
+            workdir,
             git_ref,
             build_cmd,
             prep_cmd,
@@ -4600,6 +4614,26 @@ mod tests {
         assert_eq!(step.min_free_gb, 20);
         assert_eq!(step.prep_cmd, None);
         Ok(())
+    }
+
+    #[test]
+    fn build_accepts_an_absolute_workdir() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @build https://github.com/x/y.git @api --ref r --build b --artifacts a --install-dirs /opt/a --workdir /home/u/src/x\n",
+        )?;
+        let step = as_build(&plan.steps[0])?;
+        assert_eq!(step.workdir.as_deref(), Some("/home/u/src/x"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_rejects_a_relative_workdir() {
+        let err = parse(
+            "# @server api api\n# @build https://github.com/x/y.git @api --ref r --build b --artifacts a --install-dirs /opt/a --workdir rel/path\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
     }
 
     #[test]

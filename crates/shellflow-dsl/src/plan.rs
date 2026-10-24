@@ -465,6 +465,13 @@ pub struct BuildStep {
     pub target: Target,
     /// The git repository to build from.
     pub repo: String,
+    /// An existing checkout to build in, instead of the managed
+    /// `~/src/shellflow-builds/<name>` directory. Required when the build
+    /// needs sibling checkouts (cross-repo `path = "../..."` dependencies).
+    /// Must already be a git checkout; the runner fetches and detaches the
+    /// ref there but never touches uncommitted files (a dirty tree fails
+    /// the checkout instead of being reset).
+    pub workdir: Option<String>,
     /// The pinned ref: tag, branch, or commit sha.
     pub git_ref: String,
     /// The build command, run at the repository root
