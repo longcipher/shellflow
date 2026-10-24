@@ -25,7 +25,7 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
         "echo 'no units to restart';".to_string()
     } else {
         format!(
-            "for u in {} do \
+            "for u in {} ; do \
              was=$(systemctl is-active \"$u\" 2>/dev/null || true); \
              if [ \"$was\" = active ]; then \
                if ! sudo systemctl restart \"$u\"; then \
@@ -56,8 +56,18 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
          WORK=${{SF_WORK:-$HOME/src/shellflow-builds}}; \
          NAME=$(basename \"$SF_REPO\" .git); \
          DEST=\"$WORK/$NAME\"; \
+         sfw_fetch() {{ \
+           n=0; \
+           while [ \"$n\" -lt 3 ]; do \
+             if git -C \"$DEST\" fetch origin --tags --force 2>/dev/null; then return 0; fi; \
+             n=$((n + 1)); \
+             echo \"fetch failed ($n/3), backing off\" >&2; \
+             sleep $((n * 20)); \
+           done; \
+           return 1; \
+         }}; \
          if [ -d \"$DEST/.git\" ]; then \
-           if ! (cd \"$DEST\" && git fetch origin --tags 2>/dev/null \
+           if ! (cd \"$DEST\" && sfw_fetch 2>/dev/null \
              && (git checkout --detach --force \"origin/$SF_REF\" 2>/dev/null \
                || git checkout --detach --force \"$SF_REF\" 2>/dev/null)); then \
              echo \"fetch/checkout $SF_REF failed\" >&2; exit 1; fi; \
@@ -79,7 +89,8 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
          case \"$AVAIL\" in ''|*[!0-9]*) AVAIL=0;; esac; \
          if [ \"$((AVAIL / 1024 / 1024))\" -lt \"$SF_MINGB\" ]; then \
            echo \"disk free below ${{SF_MINGB}}G, refusing to build\" >&2; exit 1; fi; \
-         if ! (cd \"$DEST\" && CARGO_BUILD_JOBS=\"${{CARGO_BUILD_JOBS:-4}}\" sh -c \"$SF_BUILD\"); then \
+         if ! (cd \"$DEST\" && CARGO_BUILD_JOBS=\"${{CARGO_BUILD_JOBS:-4}}\" \
+           nice -n \"${{BUILD_NICE:-10}}\" sh -c \"$SF_BUILD\"); then \
            echo 'build failed' >&2; exit 1; fi; \
          for a in {artifacts}; do \
            case \"$a\" in *=*) src=\"${{a%%=*}}\"; nm=\"${{a#*=}}\";; *) src=\"$a\"; nm=$(basename \"$a\");; esac; \
@@ -154,7 +165,8 @@ mod tests {
     #[test]
     fn build_checks_out_builds_probes_and_installs() {
         let cmd = sample();
-        assert!(cmd.contains("git fetch"), "{cmd}");
+        assert!(cmd.contains("sfw_fetch"), "{cmd}");
+        assert!(cmd.contains("fetch origin --tags"), "{cmd}");
         assert!(cmd.contains("checkout --detach"), "{cmd}");
         // Branch REFs resolve via the freshly fetched origin/* first: a
         // detached checkout of the local branch name alone could sit on a
@@ -220,6 +232,45 @@ mod tests {
     }
 
     #[test]
+    fn build_retries_fetch_with_backoff() {
+        let cmd = sample();
+        assert!(cmd.contains("backing off"), "{cmd}");
+        assert!(cmd.contains("sleep $((n * 20))"), "{cmd}");
+    }
+
+    #[test]
+    fn build_runs_quietly_beside_online_services() {
+        // Production builds must not starve online services: the build runs
+        // nicened with capped cargo parallelism (both overridable from the
+        // environment, matching the old playbook's BUILD_NICE/BUILD_JOBS).
+        let cmd = sample();
+        assert!(cmd.contains("nice -n"), "{cmd}");
+        assert!(cmd.contains("CARGO_BUILD_JOBS"), "{cmd}");
+    }
+
+    #[test]
+    fn every_for_loop_opens_with_do() {
+        // The generated script is one long `;`-separated line: a `for`
+        // without a following `do` is a zsh parse error (`for u in X do`).
+        // Split on `;` and require every `for` segment's successor to open
+        // the loop body.
+        let cmd = sample();
+        let segs: Vec<&str> = cmd.split(';').collect();
+        let mut fors = 0;
+        for (i, seg) in segs.iter().enumerate() {
+            if seg.trim_start().starts_with("for ") {
+                fors += 1;
+                let next = segs.get(i + 1).map(|s| s.trim_start()).unwrap_or("");
+                assert!(
+                    next.starts_with("do ") || next.starts_with("do\t") || next == "do",
+                    "for without do: {seg} || {next}"
+                );
+            }
+        }
+        assert!(fors >= 3, "expected several for loops, got {fors}");
+    }
+
+    #[test]
     fn build_without_units_emits_no_loop() {
         let mut step = shellflow_core::BuildStep {
             name: None,
@@ -251,7 +302,8 @@ mod tests {
         let cmd = sample();
         assert!(cmd.contains("for a in 'target/release/app'"), "{cmd}");
         assert!(cmd.contains("for d in '/opt/app/bin'"), "{cmd}");
-        assert!(cmd.contains("for u in 'app.service'"), "{cmd}");
+        assert!(cmd.contains("for u in 'app.service' ; do"), "{cmd}");
+        assert!(!cmd.contains("for u in ; do"), "{cmd}");
         assert!(!cmd.contains("for a in $"), "{cmd}");
         assert!(!cmd.contains("for d in $"), "{cmd}");
         assert!(!cmd.contains("for u in $"), "{cmd}");
