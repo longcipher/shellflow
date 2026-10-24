@@ -19,9 +19,34 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
     let arts: Vec<String> = build.artifacts.iter().map(|a| quote(a)).collect();
     let dirs: Vec<String> = build.install_dirs.iter().map(|d| quote(d)).collect();
     let units_args: Vec<String> = build.units.iter().map(|u| quote(u)).collect();
+    // An empty unit list must not render as `for u in ; do` (a syntax
+    // error): with no units there is nothing to restart.
+    let units_loop = if units_args.is_empty() {
+        "echo 'no units to restart';".to_string()
+    } else {
+        format!(
+            "for u in {} do \
+             was=$(systemctl is-active \"$u\" 2>/dev/null || true); \
+             if [ \"$was\" = active ]; then \
+               if ! sudo systemctl restart \"$u\"; then \
+                 echo \"restart $u failed\" >&2; sfw_rollback; exit 1; fi; \
+               sleep 2; \
+               now=$(systemctl is-active \"$u\" 2>/dev/null || true); \
+               if [ \"$now\" != active ]; then \
+                 echo \"$u did not come back\" >&2; sfw_rollback; \
+                 sudo systemctl restart \"$u\" >/dev/null 2>&1 || true; \
+                 exit 1; fi; \
+               echo \"$u restarted ($now)\"; \
+             else \
+               echo \"$u was not running, left stopped\"; \
+             fi; \
+           done;",
+            units_args.join(" ")
+        )
+    };
     format!(
-        "SF_REPO={repo} SF_REF={git_ref} SF_BUILD={build} SF_PREP={prep} SF_ARTS={arts} \
-         SF_DIRS={dirs} SF_UNITS={units} SF_VFLAG={vflag} SF_MINGB={min_gb}; \
+        "SF_REPO={repo} SF_REF={git_ref} SF_BUILD={build} SF_PREP={prep} \
+         SF_VFLAG={vflag} SF_MINGB={min_gb}; \
          sfw_probe() {{ b=\"$1\"; f=\"$2\"; \
            if [ -n \"$f\" ]; then out=$(\"$b\" \"$f\" 2>&1); verrc=$?; \
            else out=$(for sfw_f in --version -V -v -version version; do \
@@ -33,12 +58,14 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
          DEST=\"$WORK/$NAME\"; \
          if [ -d \"$DEST/.git\" ]; then \
            if ! (cd \"$DEST\" && git fetch origin --tags 2>/dev/null \
-             && git checkout --detach \"$SF_REF\" 2>/dev/null); then \
+             && (git checkout --detach --force \"origin/$SF_REF\" 2>/dev/null \
+               || git checkout --detach --force \"$SF_REF\" 2>/dev/null)); then \
              echo \"fetch/checkout $SF_REF failed\" >&2; exit 1; fi; \
          else \
            mkdir -p \"$WORK\" || exit 1; \
            if ! git clone \"$SF_REPO\" \"$DEST\" 2>/dev/null; then echo 'clone failed' >&2; exit 1; fi; \
-           if ! (cd \"$DEST\" && git checkout --detach \"$SF_REF\" 2>/dev/null); then \
+           if ! (cd \"$DEST\" && (git checkout --detach --force \"origin/$SF_REF\" 2>/dev/null \
+             || git checkout --detach --force \"$SF_REF\" 2>/dev/null)); then \
              echo \"checkout $SF_REF failed\" >&2; exit 1; fi; \
          fi; \
          if [ -n \"$SF_PREP\" ]; then \
@@ -54,16 +81,20 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
            echo \"disk free below ${{SF_MINGB}}G, refusing to build\" >&2; exit 1; fi; \
          if ! (cd \"$DEST\" && CARGO_BUILD_JOBS=\"${{CARGO_BUILD_JOBS:-4}}\" sh -c \"$SF_BUILD\"); then \
            echo 'build failed' >&2; exit 1; fi; \
-         for a in $SF_ARTS; do \
+         for a in {artifacts}; do \
            case \"$a\" in *=*) src=\"${{a%%=*}}\"; nm=\"${{a#*=}}\";; *) src=\"$a\"; nm=$(basename \"$a\");; esac; \
            case \"$src\" in target/*) full=\"$TDIR/${{src#target/}}\";; *) full=\"$DEST/$src\";; esac; \
            [ -f \"$full\" ] || {{ echo \"artifact missing: $src\" >&2; exit 1; }}; \
            if ! sfw_probe \"$full\" \"$SF_VFLAG\" >/dev/null; then \
              echo \"preflight failed: $src runs nothing usable\" >&2; exit 1; fi; \
            echo \"preflight: $(sfw_probe \"$full\" \"$SF_VFLAG\")\"; \
-           STAMP=$(date +%Y%m%d-%H%M%S); \
-           for d in $SF_DIRS; do \
-             BK=\"/root/$nm-bin-backup-$STAMP\"; \
+         done; \
+         SF_STAMP=$(date +%Y%m%d-%H%M%S); \
+         for a in {artifacts}; do \
+           case \"$a\" in *=*) src=\"${{a%%=*}}\"; nm=\"${{a#*=}}\";; *) src=\"$a\"; nm=$(basename \"$a\");; esac; \
+           case \"$src\" in target/*) full=\"$TDIR/${{src#target/}}\";; *) full=\"$DEST/$src\";; esac; \
+           for d in {dirs}; do \
+             BK=\"/root/$nm-bin-backup-$SF_STAMP\"; \
              [ -f \"$d/$nm\" ] && {{ sudo install -d -m 0700 \"$BK\" 2>/dev/null || install -d -m 0700 \"$BK\"; \
                sudo cp -f \"$d/$nm\" \"$BK/$nm\" 2>/dev/null || cp -f \"$d/$nm\" \"$BK/$nm\" || exit 1; }}; \
              sudo cp -f \"$full\" \"$d/.$nm.new\" 2>/dev/null || cp -f \"$full\" \"$d/.$nm.new\" || exit 1; \
@@ -72,26 +103,28 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
              echo \"installed $d/$nm\"; \
            done; \
          done; \
-         for u in $SF_UNITS; do \
-           was=$(systemctl is-active \"$u\" 2>/dev/null || true); \
-           if [ \"$was\" = active ]; then \
-             sudo systemctl restart \"$u\" || {{ echo \"restart $u failed\" >&2; exit 1; }}; \
-             sleep 2; \
-             now=$(systemctl is-active \"$u\" 2>/dev/null || true); \
-             if [ \"$now\" != active ]; then echo \"$u did not come back\" >&2; exit 1; fi; \
-             echo \"$u restarted ($now)\"; \
-           else \
-             echo \"$u was not running, left stopped\"; \
-           fi; \
-         done; \
+         sfw_rollback() {{ \
+           echo 'rolling back'; \
+           for a in {artifacts}; do \
+             case \"$a\" in *=*) nm=\"${{a#*=}}\";; *) nm=$(basename \"$a\");; esac; \
+             for d in {dirs}; do \
+               BK=\"/root/$nm-bin-backup-$SF_STAMP\"; \
+               if [ -f \"$BK/$nm\" ]; then \
+                 sudo cp -f \"$BK/$nm\" \"$d/.$nm.rollback\" 2>/dev/null || cp -f \"$BK/$nm\" \"$d/.$nm.rollback\" || continue; \
+                 sudo mv -f \"$d/.$nm.rollback\" \"$d/$nm\" 2>/dev/null || mv -f \"$d/.$nm.rollback\" \"$d/$nm\" || continue; \
+                 echo \"restored $d/$nm\"; \
+               fi; \
+             done; \
+           done; }}; \
+         {units_loop} \
          echo 'build step complete'",
         repo = quote(&build.repo),
         git_ref = quote(&build.git_ref),
         build = quote(&build.build_cmd),
         prep = quote(build.prep_cmd.as_deref().unwrap_or("")),
-        arts = quote(&arts.join(" ")),
-        dirs = quote(&dirs.join(" ")),
-        units = quote(&units_args.join(" ")),
+        artifacts = arts.join(" "),
+        dirs = dirs.join(" "),
+        units_loop = units_loop,
         vflag = quote(&build.version_flag),
         min_gb = build.min_free_gb,
     )
@@ -123,6 +156,10 @@ mod tests {
         let cmd = sample();
         assert!(cmd.contains("git fetch"), "{cmd}");
         assert!(cmd.contains("checkout --detach"), "{cmd}");
+        // Branch REFs resolve via the freshly fetched origin/* first: a
+        // detached checkout of the local branch name alone could sit on a
+        // stale tip while origin moved on.
+        assert!(cmd.contains("origin/$SF_REF"), "{cmd}");
         assert!(cmd.contains("cargo build --release"), "{cmd}");
         assert!(cmd.contains("disk free below"), "{cmd}");
         assert!(cmd.contains("preflight"), "{cmd}");
@@ -180,6 +217,54 @@ mod tests {
     fn build_supports_renamed_artifacts() {
         let cmd = sample();
         assert!(cmd.contains("%%=*"), "{cmd}");
+    }
+
+    #[test]
+    fn build_without_units_emits_no_loop() {
+        let mut step = shellflow_core::BuildStep {
+            name: None,
+            target: shellflow_core::Target::new("api"),
+            repo: "https://github.com/x/y.git".to_string(),
+            git_ref: "r".to_string(),
+            build_cmd: "make".to_string(),
+            prep_cmd: None,
+            artifacts: vec!["a".to_string()],
+            install_dirs: vec!["/opt/a".to_string()],
+            units: vec![],
+            version_flag: String::new(),
+            min_free_gb: 8,
+            timeout: None,
+        };
+        let cmd = build_command(&step);
+        assert!(cmd.contains("no units to restart"), "{cmd}");
+        assert!(!cmd.contains("for u in"), "{cmd}");
+        step.units = vec!["a.service".to_string()];
+        let with_units = build_command(&step);
+        assert!(with_units.contains("for u in 'a.service'"), "{with_units}");
+    }
+
+    #[test]
+    fn build_lists_are_literal_words_safe_under_zsh() {
+        // `for x in $VAR` does not word-split under zsh, so the artifact,
+        // directory, and unit lists are baked in as literal words. A runtime
+        // variable expansion here would run the whole loop once at best.
+        let cmd = sample();
+        assert!(cmd.contains("for a in 'target/release/app'"), "{cmd}");
+        assert!(cmd.contains("for d in '/opt/app/bin'"), "{cmd}");
+        assert!(cmd.contains("for u in 'app.service'"), "{cmd}");
+        assert!(!cmd.contains("for a in $"), "{cmd}");
+        assert!(!cmd.contains("for d in $"), "{cmd}");
+        assert!(!cmd.contains("for u in $"), "{cmd}");
+    }
+
+    #[test]
+    fn build_rolls_back_and_restarts_on_failure() {
+        let cmd = sample();
+        assert!(cmd.contains("sfw_rollback"), "{cmd}");
+        assert!(cmd.contains("restored $d/$nm"), "{cmd}");
+        // A unit that does not come back gets its old binary restored and
+        // one more start attempt before the step fails.
+        assert!(cmd.contains("did not come back"), "{cmd}");
     }
 
     #[test]
