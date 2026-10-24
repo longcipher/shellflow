@@ -235,6 +235,32 @@ mod tests {
     }
 
     #[test]
+    fn build_installs_renamed_artifacts_under_the_new_name() {
+        let mut step = shellflow_core::BuildStep {
+            name: None,
+            target: shellflow_core::Target::new("ai"),
+            repo: "https://github.com/bnb-chain/reth.git".to_string(),
+            git_ref: "5710c1f".to_string(),
+            build_cmd: "cargo build --release -p reth".to_string(),
+            prep_cmd: None,
+            artifacts: vec!["target/release/reth=reth-bsc".to_string()],
+            install_dirs: vec!["/usr/local/bin".to_string()],
+            units: vec!["bsc-reth-testnet.service".to_string()],
+            version_flag: "--version".to_string(),
+            min_free_gb: 20,
+            timeout: None,
+        };
+        let cmd = build_command(&step);
+        // The installed file and its backup carry the *new* name; the
+        // built file keeps the workspace name.
+        assert!(cmd.contains("$d/.$nm.new"), "{cmd}");
+        assert!(cmd.contains("/root/$nm-bin-backup-$SF_STAMP"), "{cmd}");
+        step.artifacts = vec!["target/release/reth".to_string()];
+        let plain = build_command(&step);
+        assert!(plain.contains("nm=$(basename \"$a\")"), "{plain}");
+    }
+
+    #[test]
     fn build_retries_fetch_with_backoff() {
         let cmd = sample();
         assert!(cmd.contains("backing off"), "{cmd}");
