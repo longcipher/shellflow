@@ -64,10 +64,9 @@ pub fn expand_home(path: &Path) -> Result<PathBuf, SecretsError> {
     if s.starts_with("~/") {
         return Err(SecretsError::NoHome);
     }
-    if s == "~" || s.starts_with('~') {
-        // `~` alone and `~user/...` are not expanded by this helper by design;
-        // passing them through keeps the error tied to the literal path.
-    }
+    // `~` alone and `~user/...` are not expanded by this helper by design;
+    // they pass through unchanged so the filesystem error names the literal
+    // path.
     Ok(path.to_path_buf())
 }
 

@@ -11,13 +11,17 @@
 //! last-resort net for paths that drop a child without awaiting `terminate`.
 
 mod assert_step;
+mod build;
 mod cancel;
 mod copy;
 mod host;
+mod image;
 mod local;
 pub(crate) mod process;
+mod release;
 mod remote;
 mod stream;
+mod toolchain;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 

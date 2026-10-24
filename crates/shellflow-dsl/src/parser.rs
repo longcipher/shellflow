@@ -7,9 +7,10 @@ use crate::{
     error::ParseError,
     heredoc::HeredocTracker,
     plan::{
-        AssertStep, Assertion, BackupStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
-        ExecutionPlan, HelperStep, InstallStep, LocalStep, ReloadStep, RemoteStep, SecretEntry,
-        ServiceStep, Step, Target, UnitInventoryStep, WaitStep, Workdir, is_valid_var_name,
+        AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
+        ExecutionPlan, HelperStep, ImageStep, InstallStep, LocalStep, ReleaseStep, ReloadStep,
+        RemoteStep, SecretEntry, ServiceStep, Step, Target, ToolchainStep, UnitInventoryStep,
+        WaitStep, Workdir, is_valid_var_name,
     },
     ssh_spec::SshSpec,
 };
@@ -190,6 +191,14 @@ impl State {
                 self.flush();
                 self.add_assert_port(payload, line)
             }
+            "assert_port_free" => {
+                self.flush();
+                self.add_assert_port_free(payload, line)
+            }
+            "assert_enabled" => {
+                self.flush();
+                self.add_assert_enabled(payload, line)
+            }
             "assert_rendered" => {
                 self.flush();
                 self.add_assert_rendered(payload, line)
@@ -229,6 +238,22 @@ impl State {
             "helper" => {
                 self.flush();
                 self.add_helper(payload, line)
+            }
+            "release" => {
+                self.flush();
+                self.add_release(payload, line)
+            }
+            "build" => {
+                self.flush();
+                self.add_build(payload, line)
+            }
+            "toolchain" => {
+                self.flush();
+                self.add_toolchain(payload, line)
+            }
+            "image" => {
+                self.flush();
+                self.add_image(payload, line)
             }
             "workdir" => {
                 self.flush();
@@ -1824,6 +1849,571 @@ impl State {
         Ok(())
     }
 
+    /// Parse `# @release <owner/repo> @<target> --installed-cmd CMD
+    /// --asset PATTERN --to DIR`.
+    ///
+    /// Tracks a GitHub repository's releases: the runner resolves the newest
+    /// tag, compares it against the installed binary, and downloads the
+    /// matching asset only on drift. `{tag}` in the asset pattern expands
+    /// to the `v`-prefixed tag, `{version}` to the tag without `v`.
+    /// `--installed-cmd` is either a bare binary path (the runner tries the
+    /// version-flag chain) or a full command, run as-is.
+    fn add_release(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        reject_guard(self.pending_guard.is_some(), "release", line)?;
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, flags) = split_flags(payload, &[], "release", line)?;
+        let mut installed_cmd: Option<String> = None;
+        let mut asset: Option<String> = None;
+        let mut to_dir: Option<String> = None;
+        let mut base_url: Option<String> = None;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--installed-cmd" => {
+                    installed_cmd = Some(flag_value(value, flag, "release", line)?.to_string());
+                }
+                "--asset" => {
+                    asset = Some(flag_value(value, flag, "release", line)?.to_string());
+                }
+                "--to" => {
+                    to_dir = Some(flag_value(value, flag, "release", line)?.to_string());
+                }
+                "--base-url" => {
+                    base_url = Some(flag_value(value, flag, "release", line)?.to_string());
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "release".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+        if positional.len() != 2 {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "release".to_string(),
+                reason:
+                    "expected `<owner/repo> @<target> --installed-cmd CMD --asset PATTERN --to DIR [--base-url URL]`"
+                        .to_string(),
+            });
+        }
+        let repo = positional[0].clone();
+        if !repo.contains('/') ||
+            repo.starts_with('/') ||
+            repo.contains(' ') ||
+            repo.split('/').count() != 2
+        {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "release".to_string(),
+                reason: format!("the repo must look like `owner/name` (got `{repo}`)"),
+            });
+        }
+        let target = positional[1].trim_start_matches('@').trim().to_string();
+        if target.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "release".to_string(),
+                reason: "missing target".to_string(),
+            });
+        }
+        let Some(installed_cmd) = installed_cmd else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "release".to_string(),
+                reason: "missing `--installed-cmd`".to_string(),
+            });
+        };
+        let Some(asset) = asset else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "release".to_string(),
+                reason: "missing `--asset`".to_string(),
+            });
+        };
+        let Some(to_dir) = to_dir else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "release".to_string(),
+                reason: "missing `--to`".to_string(),
+            });
+        };
+        if !to_dir.starts_with('/') {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "release".to_string(),
+                reason: format!("the destination must be absolute (got `{to_dir}`)"),
+            });
+        }
+        if let Some(base) = &base_url &&
+            !base.starts_with("https://") &&
+            !base.starts_with("http://")
+        {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "release".to_string(),
+                reason: format!("the base URL must be http(s) (got `{base}`)"),
+            });
+        }
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Release(ReleaseStep {
+            name,
+            target: Target::new(target),
+            repo,
+            installed_cmd,
+            asset,
+            to_dir,
+            base_url,
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @build <repo-url> @<target> --ref REF --build CMD
+    /// --artifacts A… --install-dirs D… [--prep CMD] [--units U…] [--version-flag F]
+    /// [--min-free-gb N]`.
+    ///
+    /// Builds the pinned ref from source on the target: fetch, build
+    /// natively, probe the fresh binary, back up the running one, install
+    /// atomically. One declarative block replaces the per-service build
+    /// script.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flag per manifest field; splitting would scatter the grammar"
+    )]
+    fn add_build(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        reject_guard(self.pending_guard.is_some(), "build", line)?;
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, flags) = split_flags(payload, &[], "build", line)?;
+        let mut git_ref: Option<String> = None;
+        let mut build_cmd: Option<String> = None;
+        let mut prep_cmd: Option<String> = None;
+        let mut artifacts: Vec<String> = Vec::new();
+        let mut install_dirs: Vec<String> = Vec::new();
+        let mut units: Vec<String> = Vec::new();
+        let mut version_flag = String::new();
+        let mut min_free_gb: u64 = 8;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--ref" => {
+                    git_ref = Some(flag_value(value, flag, "build", line)?.to_string());
+                }
+                "--build" => {
+                    build_cmd = Some(flag_value(value, flag, "build", line)?.to_string());
+                }
+                "--prep" => {
+                    prep_cmd = Some(flag_value(value, flag, "build", line)?.to_string());
+                }
+                "--artifacts" => {
+                    let raw = flag_value(value, flag, "build", line)?;
+                    artifacts.extend(raw.split(',').map(|s| s.trim().to_string()));
+                    artifacts.retain(|s| !s.is_empty());
+                }
+                "--install-dirs" => {
+                    let raw = flag_value(value, flag, "build", line)?;
+                    install_dirs.extend(raw.split(',').map(|s| s.trim().to_string()));
+                    install_dirs.retain(|s| !s.is_empty());
+                }
+                "--units" => {
+                    let raw = flag_value(value, flag, "build", line)?;
+                    units.extend(raw.split(',').map(|s| s.trim().to_string()));
+                    units.retain(|s| !s.is_empty());
+                }
+                "--version-flag" => {
+                    version_flag = flag_value(value, flag, "build", line)?.to_string();
+                }
+                "--min-free-gb" => {
+                    let raw = flag_value(value, flag, "build", line)?;
+                    min_free_gb = raw.parse::<u64>().map_err(|_| ParseError::InvalidDirective {
+                        line,
+                        directive: "build".to_string(),
+                        reason: format!("invalid `--min-free-gb` `{raw}`"),
+                    })?;
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "build".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+        if positional.len() != 2 {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "build".to_string(),
+                reason: "expected `<repo-url> @<target> --ref REF --build CMD --artifacts A… --install-dirs D… [--prep CMD]`"
+                    .to_string(),
+            });
+        }
+        let repo = positional[0].clone();
+        if repo.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "build".to_string(),
+                reason: "missing repo url".to_string(),
+            });
+        }
+        let target = positional[1].trim_start_matches('@').trim().to_string();
+        if target.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "build".to_string(),
+                reason: "missing target".to_string(),
+            });
+        }
+        let Some(git_ref) = git_ref else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "build".to_string(),
+                reason: "missing `--ref`".to_string(),
+            });
+        };
+        let Some(build_cmd) = build_cmd else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "build".to_string(),
+                reason: "missing `--build`".to_string(),
+            });
+        };
+        if artifacts.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "build".to_string(),
+                reason: "missing `--artifacts`".to_string(),
+            });
+        }
+        if install_dirs.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "build".to_string(),
+                reason: "missing `--install-dirs`".to_string(),
+            });
+        }
+        for dir in &install_dirs {
+            if !dir.starts_with('/') {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "build".to_string(),
+                    reason: format!("install dirs must be absolute (got `{dir}`)"),
+                });
+            }
+        }
+        for unit in &units {
+            let normalized = normalize_unit(unit);
+            if !is_safe_unit(&normalized) {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "build".to_string(),
+                    reason: format!("unsafe unit name `{unit}`"),
+                });
+            }
+        }
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Build(BuildStep {
+            name,
+            target: Target::new(target),
+            repo,
+            git_ref,
+            build_cmd,
+            prep_cmd,
+            artifacts,
+            install_dirs,
+            units: units.iter().map(|u| normalize_unit(u)).collect(),
+            version_flag,
+            min_free_gb,
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @toolchain <tool,…> @<target>`.
+    ///
+    /// The dozen `command -v X || skip; update X` wrappers in every fleet-wide
+    /// update playbook, as data: the runner owns the per-tool quirks, so a
+    /// new fleet member adds one tool name instead of a new wrapper.
+    ///
+    /// The known tool names are `os` (the system package manager), `aur`
+    /// (paru/yay, never under sudo), `rustup`, `cargo` (reported, never
+    /// reinstalled), `go`, `npm`, `pipx`, `uv`, `foundry` (skipped while
+    /// `anvil` runs), `proto`, and `gh`. Unknown names are rejected so a
+    /// typo never silently skips an update.
+    fn add_toolchain(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        reject_guard(self.pending_guard.is_some(), "toolchain", line)?;
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let mut tools: Vec<String> = Vec::new();
+        let mut target: Option<String> = None;
+        for token in payload.split_whitespace() {
+            if let Some(alias) = token.strip_prefix('@') {
+                if alias.is_empty() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "toolchain".to_string(),
+                        reason: "missing target".to_string(),
+                    });
+                }
+                if target.is_some() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "toolchain".to_string(),
+                        reason: "more than one target".to_string(),
+                    });
+                }
+                target = Some(alias.to_string());
+                continue;
+            }
+            for part in token.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if !is_known_tool(part) {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "toolchain".to_string(),
+                        reason: format!(
+                            "unknown tool `{part}` (expected os, aur, rustup, cargo, go, npm, pipx, uv, foundry, proto, gh)"
+                        ),
+                    });
+                }
+                if !tools.contains(&part.to_string()) {
+                    tools.push(part.to_string());
+                }
+            }
+        }
+        if tools.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "toolchain".to_string(),
+                reason: "missing tool list".to_string(),
+            });
+        }
+        let target = self.resolve_assert_target(target, "toolchain", line)?;
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Toolchain(ToolchainStep {
+            name,
+            target: Target::new(target),
+            tools,
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @image <image…> @<target> [--prune]`.
+    fn add_image(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        reject_guard(self.pending_guard.is_some(), "image", line)?;
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let (positional, flags) = split_flags(payload, &["--prune"], "image", line)?;
+        let mut prune = false;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--prune" => {
+                    if value.is_some() {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "image".to_string(),
+                            reason: "`--prune` takes no value".to_string(),
+                        });
+                    }
+                    prune = true;
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "image".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
+            }
+        }
+        let mut images: Vec<String> = Vec::new();
+        let mut target: Option<String> = None;
+        for token in positional {
+            if let Some(alias) = token.strip_prefix('@') {
+                if alias.is_empty() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "image".to_string(),
+                        reason: "missing target".to_string(),
+                    });
+                }
+                if target.is_some() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "image".to_string(),
+                        reason: "more than one target".to_string(),
+                    });
+                }
+                target = Some(alias.to_string());
+                continue;
+            }
+            images.push(token);
+        }
+        if images.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "image".to_string(),
+                reason: "missing image".to_string(),
+            });
+        }
+        let target = self.resolve_assert_target(target, "image", line)?;
+        self.last_target = Some(target.clone());
+        self.plan.steps.push(Step::Image(ImageStep {
+            name,
+            target: Target::new(target),
+            images,
+            prune,
+            timeout,
+        }));
+        Ok(())
+    }
+
+    /// Parse `# @assert_enabled <unit> <enabled|disabled|static|masked> [@<target>]`.
+    fn add_assert_enabled(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        reject_guard(self.pending_guard.is_some(), "assert_enabled", line)?;
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let mut unit: Option<String> = None;
+        let mut state: Option<String> = None;
+        let mut target: Option<String> = None;
+        for token in payload.split_whitespace() {
+            if let Some(alias) = token.strip_prefix('@') {
+                if alias.is_empty() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_enabled".to_string(),
+                        reason: "missing target".to_string(),
+                    });
+                }
+                if target.is_some() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_enabled".to_string(),
+                        reason: "more than one target".to_string(),
+                    });
+                }
+                target = Some(alias.to_string());
+                continue;
+            }
+            if unit.is_none() {
+                unit = Some(normalize_unit(token));
+            } else if state.is_none() {
+                state = Some(token.to_string());
+            } else {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "assert_enabled".to_string(),
+                    reason: "expected `<unit> <state> [@<target>]`".to_string(),
+                });
+            }
+        }
+        let Some(unit) = unit else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_enabled".to_string(),
+                reason: "missing unit".to_string(),
+            });
+        };
+        let Some(state) = state else {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_enabled".to_string(),
+                reason: "missing state (expected enabled, disabled, static, or masked)".to_string(),
+            });
+        };
+        if !matches!(state.as_str(), "enabled" | "disabled" | "static" | "masked") {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_enabled".to_string(),
+                reason: format!(
+                    "invalid state `{state}` (expected enabled, disabled, static, or masked)"
+                ),
+            });
+        }
+        if !is_safe_unit(&unit) {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_enabled".to_string(),
+                reason: format!("unsafe unit name `{unit}`"),
+            });
+        }
+        let target = self.resolve_assert_target(target, "assert_enabled", line)?;
+        self.push_assertion(name, target, Assertion::Enabled { unit, state }, timeout);
+        Ok(())
+    }
+
+    /// Parse `# @assert_port_free <port>,… [@<target>]`.
+    fn add_assert_port_free(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
+        reject_guard(self.pending_guard.is_some(), "assert_port_free", line)?;
+        let name = self.pending_name.take();
+        let timeout = self.pending_timeout.take();
+
+        let mut ports: Vec<u16> = Vec::new();
+        let mut target: Option<String> = None;
+        for token in payload.split_whitespace() {
+            if let Some(alias) = token.strip_prefix('@') {
+                if alias.is_empty() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_port_free".to_string(),
+                        reason: "missing target".to_string(),
+                    });
+                }
+                if target.is_some() {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_port_free".to_string(),
+                        reason: "more than one target".to_string(),
+                    });
+                }
+                target = Some(alias.to_string());
+                continue;
+            }
+            for part in token.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let Ok(port) = part.parse::<u16>() else {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_port_free".to_string(),
+                        reason: format!("invalid port `{part}`"),
+                    });
+                };
+                if port == 0 {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "assert_port_free".to_string(),
+                        reason: "port 0 is not a listening port".to_string(),
+                    });
+                }
+                ports.push(port);
+            }
+        }
+        if ports.is_empty() {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "assert_port_free".to_string(),
+                reason: "missing port".to_string(),
+            });
+        }
+        let target = self.resolve_assert_target(target, "assert_port_free", line)?;
+        self.push_assertion(name, target, Assertion::PortFree { ports }, timeout);
+        Ok(())
+    }
+
     /// Parse `# @workdir [--prefix NAME]`.
     ///
     /// A plan-level directive: it declares the managed temporary directory
@@ -1888,14 +2478,27 @@ fn split_flags(
 ) -> Result<SplitPayload, ParseError> {
     let mut positional: Vec<String> = Vec::new();
     let mut flags: Vec<(String, Option<String>)> = Vec::new();
-    let mut tokens = payload.split_whitespace().peekable();
+    let mut tokens = split_words(payload).into_iter().peekable();
     while let Some(token) = tokens.next() {
         if !token.starts_with("--") {
-            positional.push(token.to_string());
+            positional.push(token);
             continue;
         }
-        if bools.contains(&token) {
-            flags.push((token.to_string(), None));
+        // `--flag=value` carries its value inline, so a value that itself
+        // looks like a flag (`--version-flag=--version`) still parses.
+        if let Some((flag, inline)) = token.split_once('=') {
+            if bools.contains(&flag) {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: directive.to_string(),
+                    reason: format!("`{flag}` takes no value"),
+                });
+            }
+            flags.push((flag.to_string(), Some(inline.to_string())));
+            continue;
+        }
+        if bools.contains(&token.as_str()) {
+            flags.push((token, None));
             continue;
         }
         // A flag takes the next token as its value. A value that looks like a
@@ -1904,13 +2507,66 @@ fn split_flags(
         // kept as `None` so the directive can report `unknown flag` for
         // unknown flags and `expects a value` for known ones.
         let value = match tokens.peek() {
-            Some(next) if !next.starts_with("--") => tokens.next().map(ToOwned::to_owned),
+            Some(next) if !next.starts_with("--") => tokens.next(),
             _ => None,
         };
         let _ = (directive, line);
-        flags.push((token.to_string(), value));
+        flags.push((token, value));
     }
     Ok((positional, flags))
+}
+
+/// Split a directive payload into whitespace-separated words, honouring
+/// single and double quotes (a quoted region never splits, and the quotes
+/// themselves are removed). A backslash escapes the next character. An
+/// unterminated quote runs to the end of the payload.
+///
+/// Multi-word flag values (`--build 'cargo build --release'`) depend on
+/// this: without quote awareness the value would be truncated to its first
+/// word and the rest misread as positionals.
+fn split_words(payload: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = payload.chars();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if c == '\\' && q == '"' {
+                // Inside double quotes a backslash escapes the next char.
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            } else {
+                cur.push(c);
+            }
+            in_word = true;
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+            in_word = true;
+        } else if c.is_whitespace() {
+            if in_word {
+                words.push(std::mem::take(&mut cur));
+                in_word = false;
+            }
+        } else if c == '\\' {
+            // Outside quotes a backslash escapes the next char, so
+            // `a\ b` stays one word.
+            if let Some(n) = chars.next() {
+                cur.push(n);
+                in_word = true;
+            }
+        } else {
+            cur.push(c);
+            in_word = true;
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    words
 }
 
 /// The value of a flag, or a readable error when the flag stands alone.
@@ -1984,18 +2640,20 @@ fn parse_owner(raw: &str, directive: &str, line: usize) -> Result<String, ParseE
         !part.is_empty() &&
             part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
+    // `(!u.e || !g.e)` and `!(u.e && g.e)` are the same clause by De Morgan,
+    // so it appears once. `parts.len() <= 2` and the non-empty owner need no
+    // conjunct either: the `_` arm already rejects any other arity, and a
+    // matching arm always names a non-empty part.
     let ok = match parts.as_slice() {
         [user] => valid_part(user),
         [user, group] => {
             // `user:group` requires a user; `:group` requires a group.
-            (!user.is_empty() || !group.is_empty()) &&
-                (user.is_empty() || valid_part(user)) &&
+            (user.is_empty() || valid_part(user)) &&
                 (group.is_empty() || valid_part(group)) &&
                 !(user.is_empty() && group.is_empty())
         }
         _ => false,
-    } && !owner.is_empty() &&
-        parts.len() <= 2;
+    };
     if !ok {
         return Err(ParseError::InvalidDirective {
             line,
@@ -2027,6 +2685,23 @@ fn normalize_unit(unit: &str) -> String {
 fn is_valid_alias_name(name: &str) -> bool {
     !name.is_empty() &&
         name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Whether a toolchain name is known to the `@toolchain` step.
+fn is_known_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "os" | "aur" |
+            "rustup" |
+            "cargo" |
+            "go" |
+            "npm" |
+            "pipx" |
+            "uv" |
+            "foundry" |
+            "proto" |
+            "gh"
+    )
 }
 
 /// Reject `@only_if` on steps that carry no script context.
@@ -2152,7 +2827,7 @@ pub fn parse_script(input: &str) -> Result<ExecutionPlan, ParseError> {
 mod tests {
     use proptest::sample::select;
 
-    use super::{directive, parse_script};
+    use super::{directive, is_valid_alias_name, parse_script, split_words};
     use crate::{
         error::ParseError,
         plan::{AssertStep, Assertion, CopyStep, EnvEntry, LocalStep, RemoteStep, Step, WaitStep},
@@ -2229,6 +2904,34 @@ mod tests {
         match step {
             Step::Helper(s) => Ok(s),
             other => Err(format!("expected helper step, got {other:?}")),
+        }
+    }
+
+    fn as_release(step: &Step) -> Result<&crate::plan::ReleaseStep, String> {
+        match step {
+            Step::Release(s) => Ok(s),
+            other => Err(format!("expected release step, got {other:?}")),
+        }
+    }
+
+    fn as_build(step: &Step) -> Result<&crate::plan::BuildStep, String> {
+        match step {
+            Step::Build(s) => Ok(s),
+            other => Err(format!("expected build step, got {other:?}")),
+        }
+    }
+
+    fn as_toolchain(step: &Step) -> Result<&crate::plan::ToolchainStep, String> {
+        match step {
+            Step::Toolchain(s) => Ok(s),
+            other => Err(format!("expected toolchain step, got {other:?}")),
+        }
+    }
+
+    fn as_image(step: &Step) -> Result<&crate::plan::ImageStep, String> {
+        match step {
+            Step::Image(s) => Ok(s),
+            other => Err(format!("expected image step, got {other:?}")),
         }
     }
 
@@ -3676,6 +4379,9 @@ mod tests {
     fn a_mode_with_a_non_octal_digit_is_rejected() {
         let err = parse("# @server api api\n# @install /a -> /b @api --mode 0999\n").unwrap_err();
         assert!(err.contains("invalid octal mode"), "{err}");
+        // The digit check fires first: an out-of-range radix error would mean
+        // the octal validation was skipped.
+        assert!(!err.contains("out of range"), "{err}");
     }
 
     #[test]
@@ -3689,6 +4395,50 @@ mod tests {
         let err =
             parse("# @server api api\n# @install /a -> /b @api --owner 'bad/owner'\n").unwrap_err();
         assert!(err.contains("invalid owner"), "{err}");
+    }
+
+    #[test]
+    fn an_alias_with_a_blank_or_a_slash_is_invalid() {
+        assert!(is_valid_alias_name("api"));
+        assert!(is_valid_alias_name("a-b_c.d9"));
+        assert!(!is_valid_alias_name(""));
+        assert!(!is_valid_alias_name("a b"));
+        assert!(!is_valid_alias_name("a/b"));
+    }
+
+    #[test]
+    fn an_owner_accepts_user_group_and_either_side_empty() -> Result<(), String> {
+        for owner in ["u", "u:g", "u:", ":g", "a-b_c.d"] {
+            let plan =
+                parse(&format!("# @server api api\n# @install /a -> /b @api --owner {owner}\n"))
+                    .map_err(|e| format!("{owner}: {e}"))?;
+            let step = as_install(&plan.steps[0])?;
+            assert_eq!(step.owner.as_deref(), Some(owner));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_owner_rejects_empty_and_extra_parts() {
+        // Empty and multi-part owners never reach a valid user:group shape.
+        // `--owner ''` keeps its quotes in the raw value, which is itself
+        // not a valid owner character.
+        for flag in ["--owner ''", "--owner :", "--owner u:g:x", "--owner 'u g'"] {
+            let err = parse(&format!("# @server api api\n# @install /a -> /b @api {flag}\n"))
+                .unwrap_err();
+            assert!(err.contains("invalid owner"), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_owner_rejects_either_side_invalid() {
+        // Each `&&` in the pair clause is load-bearing: an invalid user fails
+        // even with a valid group, and vice versa.
+        for flag in ["--owner u!:g", "--owner u:g!"] {
+            let err = parse(&format!("# @server api api\n# @install /a -> /b @api {flag}\n"))
+                .unwrap_err();
+            assert!(err.contains("invalid owner"), "{flag}: {err}");
+        }
     }
 
     #[test]
@@ -3714,8 +4464,251 @@ mod tests {
     }
 
     #[test]
+    fn quoted_flag_values_survive_as_one_word() {
+        // `split_words` is what lets `--build 'cargo build --release'`
+        // arrive intact; without quote awareness the value would truncate
+        // to `cargo` and the rest would become bogus positionals.
+        assert_eq!(split_words("a 'b c' d"), vec!["a", "b c", "d"]);
+        assert_eq!(
+            split_words("--build 'cargo build --release'"),
+            vec!["--build", "cargo build --release"]
+        );
+    }
+
+    #[test]
+    fn split_words_handles_quotes_backslashes_and_edges() {
+        // Double quotes process backslash escapes; single quotes do not.
+        assert_eq!(split_words("\"a\\\"b\""), vec!["a\"b"]);
+        assert_eq!(split_words("'a\\b'"), vec!["a\\b"]);
+        // Outside quotes a backslash escapes the next char, keeping `a b` whole.
+        assert_eq!(split_words("a\\ b c"), vec!["a b", "c"]);
+        // An unterminated quote runs to the end; empty quotes are one empty word.
+        assert_eq!(split_words("'abc"), vec!["abc"]);
+        assert_eq!(split_words("''"), vec![""]);
+        // Plain splitting is unchanged (multiple spaces, tabs).
+        assert_eq!(split_words("  a\tb  "), vec!["a", "b"]);
+        assert!(split_words("   ").is_empty());
+    }
+
+    #[test]
+    fn inline_flag_values_support_dashed_values() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @service app @api --enable --timeout=60\n")?;
+        match &plan.steps[0] {
+            Step::Service(s) => assert_eq!(s.timeout, Some(60)),
+            other => return Err(format!("expected service step, got {other:?}")),
+        }
+        let err = parse("# @server api api\n# @service app @api --enable=x\n").unwrap_err();
+        assert!(err.contains("takes no value"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_value_flag_never_swallows_the_next_flag() {
+        // `split_flags` must not consume a following `--flag` as the value:
+        // `# @backup /p @t --dir --seal` is a missing `--dir` value, not a
+        // directory named `--seal`.
+        let err = parse("# @server api api\n# @backup /p @t --dir --seal\n").unwrap_err();
+        assert!(err.contains("`--dir` expects a value"), "{err}");
+    }
+
+    #[test]
     fn a_flag_without_a_value_is_rejected() {
         let err = parse("# @server api api\n# @install /a -> /b @api --mode\n").unwrap_err();
         assert!(err.contains("`--mode` expects a value"), "{err}");
+    }
+
+    #[test]
+    fn release_parses_repo_target_and_options() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @release sigoden/dufs @api --installed-cmd /opt/dufs/bin/dufs --asset dufs-{tag}-x86_64-unknown-linux-musl.tar.gz --to /opt/dufs/bin\n",
+        )?;
+        let step = as_release(&plan.steps[0])?;
+        assert_eq!(step.repo, "sigoden/dufs");
+        assert_eq!(step.target.text, "api");
+        assert_eq!(step.installed_cmd, "/opt/dufs/bin/dufs");
+        assert_eq!(step.asset, "dufs-{tag}-x86_64-unknown-linux-musl.tar.gz");
+        assert_eq!(step.to_dir, "/opt/dufs/bin");
+        assert_eq!(step.base_url, None);
+        Ok(())
+    }
+
+    #[test]
+    fn release_parses_a_vendor_download_host() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @release o/r @api --installed-cmd x --asset y --to /tmp --base-url https://cdn.example.com/rel\n",
+        )?;
+        let step = as_release(&plan.steps[0])?;
+        assert_eq!(step.base_url.as_deref(), Some("https://cdn.example.com/rel"));
+        Ok(())
+    }
+
+    #[test]
+    fn release_rejects_a_non_http_base_url() {
+        let err = parse(
+            "# @server api api\n# @release o/r @api --installed-cmd x --asset y --to /tmp --base-url ftp://x\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("http"), "{err}");
+    }
+
+    #[test]
+    fn release_rejects_a_non_repo_first_arg() {
+        let err = parse(
+            "# @server api api\n# @release not-a-repo @api --installed-cmd x --asset y --to /tmp\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("owner/name"), "{err}");
+    }
+
+    #[test]
+    fn release_rejects_absolute_and_spaced_repos() {
+        // `/or` (one slash) kills the leading-`||` mutants; `/o/r` and
+        // `o/r/extra` kill the arity clause. A spaced repo never reaches the
+        // check — whitespace splits it into extra positionals.
+        for repo in ["/or", "/o/r", "o/r/extra"] {
+            let err = parse(&format!(
+                "# @server api api\n# @release {repo} @api --installed-cmd x --asset y --to /tmp\n"
+            ))
+            .unwrap_err();
+            assert!(err.contains("owner/name") || err.contains("expected"), "{repo}: {err}");
+        }
+    }
+
+    #[test]
+    fn release_requires_all_options() {
+        let err =
+            parse("# @server api api\n# @release o/r @api --asset y --to /tmp\n").unwrap_err();
+        assert!(err.contains("--installed-cmd"), "{err}");
+    }
+
+    #[test]
+    fn build_parses_manifest_fields() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @build https://github.com/x/y.git @api --ref abc123 --build cargo --artifacts target/release/app --install-dirs /opt/app/bin --units app.service --version-flag=--version --min-free-gb 20\n",
+        )?;
+        let step = as_build(&plan.steps[0])?;
+        assert_eq!(step.repo, "https://github.com/x/y.git");
+        assert_eq!(step.git_ref, "abc123");
+        assert_eq!(step.build_cmd, "cargo");
+        assert_eq!(step.artifacts, vec!["target/release/app".to_string()]);
+        assert_eq!(step.install_dirs, vec!["/opt/app/bin".to_string()]);
+        assert_eq!(step.units, vec!["app.service".to_string()]);
+        assert_eq!(step.version_flag, "--version");
+        assert_eq!(step.min_free_gb, 20);
+        assert_eq!(step.prep_cmd, None);
+        Ok(())
+    }
+
+    #[test]
+    fn build_rejects_a_relative_install_dir() {
+        let err = parse(
+            "# @server api api\n\
+             # @build https://github.com/x/y.git @api --ref r --build b --artifacts a --install-dirs rel/path\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn build_parses_an_optional_prep_command() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @build https://github.com/x/y.git @api --ref r --build b --artifacts a --install-dirs /opt/a --prep 'git submodule update --init'\n",
+        )?;
+        let step = as_build(&plan.steps[0])?;
+        assert_eq!(step.prep_cmd.as_deref(), Some("git submodule update --init"));
+        Ok(())
+    }
+
+    #[test]
+    fn toolchain_parses_tool_list_and_target() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @toolchain rustup,cargo,uv @api\n")?;
+        let step = as_toolchain(&plan.steps[0])?;
+        assert_eq!(step.tools, vec!["rustup", "cargo", "uv"]);
+        assert_eq!(step.target.text, "api");
+        Ok(())
+    }
+
+    #[test]
+    fn toolchain_rejects_unknown_tools() {
+        let err = parse("# @server api api\n# @toolchain rustup,brew @api\n").unwrap_err();
+        assert!(err.contains("unknown tool `brew`"), "{err}");
+    }
+
+    #[test]
+    fn toolchain_deduplicates_tools() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @toolchain uv,uv @api\n")?;
+        let step = as_toolchain(&plan.steps[0])?;
+        assert_eq!(step.tools, vec!["uv".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn image_parses_images_and_prune() -> Result<(), String> {
+        let plan =
+            parse("# @server api api\n# @image searxng:latest rsshub:latest @api --prune\n")?;
+        let step = as_image(&plan.steps[0])?;
+        assert_eq!(step.images, vec!["searxng:latest", "rsshub:latest"]);
+        assert!(step.prune);
+        Ok(())
+    }
+
+    #[test]
+    fn image_requires_an_image() {
+        let err = parse("# @server api api\n# @image @api\n").unwrap_err();
+        assert!(err.contains("missing image"), "{err}");
+    }
+
+    #[test]
+    fn assert_enabled_parses_unit_state_and_target() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert_enabled smg disabled @api\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(
+            step.checks,
+            vec![Assertion::Enabled {
+                unit: "smg.service".to_string(),
+                state: "disabled".to_string(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn assert_enabled_rejects_unknown_states() {
+        let err = parse("# @server api api\n# @assert_enabled smg off @api\n").unwrap_err();
+        assert!(err.contains("invalid state"), "{err}");
+    }
+
+    #[test]
+    fn assert_port_free_parses_ports_and_target() -> Result<(), String> {
+        let plan = parse("# @server api api\n# @assert_port_free 3000,3001 @api\n")?;
+        let step = as_assert(&plan.steps[0])?;
+        assert_eq!(step.checks, vec![Assertion::PortFree { ports: vec![3000, 3001] }]);
+        Ok(())
+    }
+
+    #[test]
+    fn assert_port_free_rejects_port_zero() {
+        let err = parse("# @server api api\n# @assert_port_free 0 @api\n").unwrap_err();
+        assert!(err.contains("port 0"), "{err}");
+    }
+
+    #[test]
+    fn new_steps_expose_names_kinds_and_targets() -> Result<(), String> {
+        let plan = parse(
+            "# @server api api\n\
+             # @name rel\n\
+             # @release o/r @api --installed-cmd x --asset y --to /tmp\n\
+             # @name b\n\
+             # @build https://github.com/x/y.git @api --ref r --build b --artifacts a --install-dirs /opt/a\n",
+        )?;
+        assert_eq!(plan.steps[0].name(), Some("rel"));
+        assert_eq!(plan.steps[0].kind(), "release");
+        assert_eq!(plan.steps[0].target_text(), Some("api"));
+        assert_eq!(plan.steps[1].kind(), "build");
+        Ok(())
     }
 }

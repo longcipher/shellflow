@@ -126,8 +126,12 @@ impl SshSpec {
 /// host containing whitespace or a quote cannot be a real destination, and
 /// accepting it produces an opaque `ssh` failure instead of a parse-time
 /// diagnostic.
+///
+/// The rejected single- and double-dot names (`-`, `.`, `..`) need no
+/// special case: a leading dot or dash is rejected outright, which subsumes
+/// them.
 fn is_valid_spec_component(component: &str) -> bool {
-    if component.is_empty() || component == "-" || component == "." || component == ".." {
+    if component.is_empty() {
         return false;
     }
     if component.starts_with('.') || component.starts_with('-') {
@@ -138,7 +142,7 @@ fn is_valid_spec_component(component: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::SshSpec;
+    use super::{SshSpec, is_valid_spec_component};
 
     fn parse(spec: &str) -> Result<SshSpec, String> {
         SshSpec::parse(spec).map_err(|e| e.to_string())
@@ -196,6 +200,15 @@ mod tests {
         for spec in ["web1 web2", "deploy user@host", "host;id", "host'", "ho st"] {
             assert!(SshSpec::parse(spec).is_err(), "`{spec}` must be rejected");
         }
+    }
+
+    #[test]
+    fn rejects_empty_dotted_and_dashed_components() {
+        for component in ["", "-", ".", "..", ".foo", "-foo"] {
+            assert!(!is_valid_spec_component(component), "`{component}` must be rejected");
+        }
+        assert!(is_valid_spec_component("web1"));
+        assert!(is_valid_spec_component("a-b_c.d9"));
     }
 
     #[test]

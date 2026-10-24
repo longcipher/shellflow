@@ -78,6 +78,8 @@ lines belong to the current block.
 | `@assert` | `# @assert <unit> [@<target>] [<state>]` | Assert the unit's `ActiveState` (default `active`); the target is inherited from the previous step |
 | `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES] [--method M] [--body D] [--header H]` | Assert the URL answers with an accepted status (any 2xx/3xx by default). The probe **waits** (up to the step's timeout) |
 | `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>] [--udp]` | Assert the ports are listening, waiting up to the step's timeout |
+| `@assert_port_free` | `# @assert_port_free <port>[,<port>…] [@<target>]` | Assert the ports have no listener. A conflict names the occupant: the listening process, `nft` DNAT rules, and container publish mappings |
+| `@assert_enabled` | `# @assert_enabled <unit> <enabled\|disabled\|static\|masked> [@<target>]` | Assert the unit's boot state (`systemctl is-enabled`). Declares the expected state next to the unit so enablement drift fails the deploy |
 | `@assert_rendered` | `# @assert_rendered <path> [@<target>]` | Assert the file exists and holds no unexpanded `${…}` placeholder |
 | `@assert_no_leak` | `# @assert_no_leak <unit> [@<target>] [--lines N]` | Assert no credential **value** of the unit's store appears in its journal, command line, or environment. Value-based: the helper decrypts the store and compares |
 | `@assert_digest` | `# @assert_digest <path> [@<target>] [--sha256 HEX] [--local PATH]` | Assert the file matches a digest or the controller's copy — a real drift gate |
@@ -89,6 +91,10 @@ lines belong to the current block.
 | `@credstore` | `# @credstore <service> @<target> [--require KEY,…]` | Seal the credential store and check it against the unit's declared keys |
 | `@service` | `# @service <unit> @<target> [--enable] [--restart] [--reload] [--wait] [--verify] [--force-start]` | Drive the unit's lifecycle. `--restart` restarts a unit that was **running** and leaves a stopped unit alone |
 | `@unit_inventory` | `# @unit_inventory [@<target>]` | List the units installed on the target. A report, not a gate |
+| `@release` | `# @release <owner/repo> @<target> --installed-cmd CMD --asset PATTERN --to DIR [--base-url URL]` | Track a GitHub release: resolve the newest tag, download the matching asset only on drift, install atomically. `{tag}` = `v`-prefixed tag, `{version}` = tag without `v`. A bare-binary `CMD` is probed with the version-flag chain. `--base-url` overrides the download host for vendor CDNs |
+| `@build` | `# @build <repo-url> @<target> --ref REF --build CMD --artifacts A… --install-dirs D… [--prep CMD] [--units U…] [--version-flag F] [--min-free-gb N]` | Build a pinned ref from source on the target: fetch, build natively, probe the fresh binary, back up, install atomically, restart only running units. Artifacts support `path=name` renames |
+| `@toolchain` | `# @toolchain <tool,…> @<target>` | Update language toolchains (`os`, `aur`, `rustup`, `cargo`, `go`, `npm`, `pipx`, `uv`, `foundry`, `proto`, `gh`). Per-tool quirks (no-sudo AUR, `uv --all`, anvil-aware foundry) are owned by the runner |
+| `@image` | `# @image <image…> @<target> [--prune]` | Pull container images, compare digests, report MOVED/SAME/FAIL. Runtime auto-detected (podman, then docker) |
 
 Behavioral rules to remember:
 
@@ -98,9 +104,11 @@ Behavioral rules to remember:
   a failing command stops the block.
 - Remote blocks run under the target's login shell, which may be `zsh`.
   `-k` / `--dry-run` lint every block for zsh-unsafe constructs (`for x in
-  $VAR` without word splitting, `${!name}`, `${}` literals) and print
-  `zsh-risk` warnings next to the `bash -n` result. `bash -n` alone cannot
-  catch these — treat warnings as errors before deploying to zsh hosts.
+  $VAR` without word splitting, `${!name}`, `${}` literals, assigning to the
+  read-only `status`, `local` outside any function, `read` without `-r`) and
+  print `zsh-risk`/`shell-risk` warnings next to the `bash -n` result. `bash
+  -n` alone cannot catch these — treat warnings as errors before deploying
+  to zsh hosts.
 - `@copy` paths are parsed by shellflow, not Bash. Capture values with
   `@export` and reference them as `$VAR` / `${VAR}`. Unresolved variables are
   a hard error in a real run, and a warning + skip in `--dry-run`/`--check`.

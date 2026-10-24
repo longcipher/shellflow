@@ -120,6 +120,8 @@ All other lines (including plain comments) belong to the current block.
 | `@assert` | `# @assert <unit> [@<target>] [<state>]` | Assert the unit's `ActiveState` on the target (default `active`). The target is inherited from the previous step when it is not given. A failed assertion fails the step (script class) |
 | `@assert_health` | `# @assert_health <url> [@<target>] [--expect CODES] [--method M] [--body D] [--header H]` | Assert that the URL answers with an accepted HTTP status (any 2xx/3xx by default; `--expect` takes exact codes and classes such as `2xx`). `--method`/`--body`/`--header` cover endpoints that only answer POST. The probe waits (up to the step's timeout) on the target, so a service that was just started is not failed for the wrong reason. The target is inherited from the previous step |
 | `@assert_port` | `# @assert_port <port>[,<port>…] [@<target>] [--udp]` | Assert that the ports are listening, waiting up to the step's timeout (in one round trip, not one per poll). `--udp` checks the UDP sockets. The target is inherited from the previous step |
+| `@assert_port_free` | `# @assert_port_free <port>[,<port>…] [@<target>]` | Assert that the ports have no listener. A conflict names the occupant (the listening process, `nft` DNAT rules, container publish mappings) instead of just "address in use" |
+| `@assert_enabled` | `# @assert_enabled <unit> <enabled\|disabled\|static\|masked> [@<target>]` | Assert the unit's boot state. The expected state is declared next to the unit, so enablement drift fails the deploy instead of waiting for a reboot surprise |
 | `@assert_rendered` | `# @assert_rendered <path> [@<target>]` | Assert that the file exists and holds no unexpanded `${…}` placeholder. The target is inherited from the previous step |
 | `@assert_no_leak` | `# @assert_no_leak <unit> [@<target>] [--lines N]` | Assert that no credential **value** of the unit's store appears in its journal, its command line, or its environment. The check is value-based: the target-side helper decrypts the store and compares, so a playbook needs no per-service regular expression and the plaintext never reaches the script, the command line, or the log |
 | `@assert_digest` | `# @assert_digest <path> [@<target>] [--sha256 HEX] [--local PATH]` | Assert that the file matches a digest (`--sha256`) or the controller's copy of it (`--local`). A real drift gate: the hand-written `md5sum` printed a digest that nothing compared |
@@ -132,6 +134,10 @@ All other lines (including plain comments) belong to the current block.
 | `@service` | `# @service <unit> @<target> [--enable] [--restart] [--reload] [--wait] [--verify] [--force-start]` | Drive the unit's lifecycle: verify the installed unit, reload the manager, enable it, restart it, wait for it to be ready. `--restart` restarts a unit that was **running** and leaves a unit that was not running alone — restarting an inactive unit *starts* it, which is the opposite of what an operator who keeps a unit stopped wants. `--force-start` overrides that deliberately |
 | `@reload` | `# @reload <unit> @<target> [--signal SIG] [--wait] [--timeout SECS]` | Reload a unit through its own `ExecReload=` (or an explicit `--signal`); `--wait` waits for readiness. A reload that cannot be performed fails instead of degrading into a restart |
 | `@unit_inventory` | `# @unit_inventory [@<target>]` | List the units installed on the target. A **report**, not a gate: a pre-existing finding must never block an unrelated deploy |
+| `@release` | `# @release <owner/repo> @<target> --installed-cmd CMD --asset PATTERN --to DIR [--base-url URL]` | Track a GitHub release: resolve the newest tag (via the `releases/latest` redirect, falling back to the API), compare against the installed binary, and download the matching asset only on drift. `{tag}`/`{version}` expand to the `v`-prefixed/bare tag; the install is atomic; an unresolvable release skips instead of failing. `--base-url` overrides the download host for vendor CDNs |
+| `@build` | `# @build <repo-url> @<target> --ref REF --build CMD --artifacts A… --install-dirs D… [--prep CMD] [--units U…] [--version-flag F] [--min-free-gb N]` | Build a pinned ref from source on the target: fetch and detached-checkout, native build, disk guard, fresh-binary preflight (declared flag first, then the flag chain), backup, atomic install, restart-only-running units. Artifacts support `path=name` renames. `--prep` runs at the repo root after checkout (e.g. submodule init) |
+| `@toolchain` | `# @toolchain <tool,…> @<target>` | Update language toolchains (`os`, `aur`, `rustup`, `cargo`, `go`, `npm`, `pipx`, `uv`, `foundry`, `proto`, `gh`). Each missing tool reports SKIP; any failed update fails the step. The per-tool quirks (AUR never under sudo, `uv tool upgrade --all`, foundry skipped while `anvil` runs) are owned by the runner |
+| `@image` | `# @image <image…> @<target> [--prune]` | Pull container images (podman, then docker), compare digests before/after, report MOVED/SAME/FAIL per image |
 
 **Assertion steps.** Consecutive assertions that share a target are merged
 into **one** step: the whole group travels in a single SSH round trip, and the
@@ -155,7 +161,8 @@ to end with, and that every playbook spelled differently.
    the block mode to `local` — the lines that follow are not streamed to the
    copy's remote target. Other self-contained steps (`@wait_active`,
    `@reload`, `@assert*`, `@service`, `@install`, `@backup`, `@credstore`,
-   `@helper`, `@workdir`, `@unit_inventory`) leave the ambient mode unchanged:
+   `@helper`, `@workdir`, `@unit_inventory`, `@release`, `@build`,
+   `@toolchain`, `@image`) leave the ambient mode unchanged:
    lines after `# @service …` still run where the previous `@remote`/`@local`
    put them.
 4. `@env`, `@only_if`, `@timeout`, and `@name` apply to the *next* block that

@@ -29,11 +29,11 @@ pub use error::{CaptureError, RenderEnvError};
 // They are re-exported here so that a consumer of the runtime helpers does
 // not have to know which of the two crates owns which half of the language.
 pub use shellflow_dsl::{
-    AssertStep, Assertion, BackupStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry, ExecutionPlan,
-    HelperStep, InstallStep, InterpolateError, LocalStep, ParseError, ReloadStep, RemoteStep,
-    ResolvedHost, RunState, SecretEntry, ServiceStep, SshSpec, Step, Target, UnitInventoryStep,
-    WaitStep, Workdir, interpolate, is_valid_var_name, parse_script, shell_quote_single,
-    strip_surrounding_quotes,
+    AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
+    ExecutionPlan, HelperStep, ImageStep, InstallStep, InterpolateError, LocalStep, ParseError,
+    ReleaseStep, ReloadStep, RemoteStep, ResolvedHost, RunState, SecretEntry, ServiceStep, SshSpec,
+    Step, Target, ToolchainStep, UnitInventoryStep, WaitStep, Workdir, interpolate,
+    is_valid_var_name, parse_script, shell_quote_single, strip_surrounding_quotes,
 };
 pub use shellflow_dsl::{Heredoc, HeredocTracker, resolve_hosts};
 pub use template::{render_template, template_keys};
