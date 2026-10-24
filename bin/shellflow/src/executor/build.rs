@@ -30,13 +30,16 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
              if [ \"$was\" = active ]; then \
                if ! sudo systemctl restart \"$u\"; then \
                  echo \"restart $u failed\" >&2; sfw_rollback; exit 1; fi; \
-               sleep 2; \
-               now=$(systemctl is-active \"$u\" 2>/dev/null || true); \
-               if [ \"$now\" != active ]; then \
+               ok=0; i=0; \
+               while [ \"$i\" -lt 30 ]; do \
+                 if sudo systemctl is-active --quiet \"$u\" 2>/dev/null; then ok=1; break; fi; \
+                 i=$((i + 1)); sleep 2; \
+               done; \
+               if [ \"$ok\" != 1 ]; then \
                  echo \"$u did not come back\" >&2; sfw_rollback; \
                  sudo systemctl restart \"$u\" >/dev/null 2>&1 || true; \
                  exit 1; fi; \
-               echo \"$u restarted ($now)\"; \
+               echo \"$u restarted (active)\"; \
              else \
                echo \"$u was not running, left stopped\"; \
              fi; \
@@ -315,8 +318,10 @@ mod tests {
         assert!(cmd.contains("sfw_rollback"), "{cmd}");
         assert!(cmd.contains("restored $d/$nm"), "{cmd}");
         // A unit that does not come back gets its old binary restored and
-        // one more start attempt before the step fails.
+        // one more start attempt before the step fails. Slow starters get a
+        // bounded poll, not a single shot.
         assert!(cmd.contains("did not come back"), "{cmd}");
+        assert!(cmd.contains("while [ \"$i\" -lt 30 ]"), "{cmd}");
     }
 
     #[test]
