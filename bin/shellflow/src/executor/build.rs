@@ -107,6 +107,7 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
            case \"$src\" in target/*) full=\"$TDIR/${{src#target/}}\";; *) full=\"$DEST/$src\";; esac; \
            for d in {dirs}; do \
              BK=\"/root/$nm-bin-backup-$SF_STAMP\"; \
+             sudo install -d -m 0755 \"$d\" 2>/dev/null || install -d -m 0755 \"$d\" || exit 1; \
              [ -f \"$d/$nm\" ] && {{ sudo install -d -m 0700 \"$BK\" 2>/dev/null || install -d -m 0700 \"$BK\"; \
                sudo cp -f \"$d/$nm\" \"$BK/$nm\" 2>/dev/null || cp -f \"$d/$nm\" \"$BK/$nm\" || exit 1; }}; \
              sudo cp -f \"$full\" \"$d/.$nm.new\" 2>/dev/null || cp -f \"$full\" \"$d/.$nm.new\" || exit 1; \
