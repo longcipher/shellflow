@@ -63,7 +63,7 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
          sfw_fetch() {{ \
            n=0; \
            while [ \"$n\" -lt 3 ]; do \
-             if git -C \"$DEST\" fetch origin --tags --force 2>/dev/null; then return 0; fi; \
+             if timeout 300 git -C \"$DEST\" fetch origin --tags --force 2>/dev/null; then return 0; fi; \
              n=$((n + 1)); \
              echo \"fetch failed ($n/3), backing off\" >&2; \
              sleep $((n * 20)); \
@@ -74,7 +74,7 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
            if [ -n \"$SF_WORKDIR\" ]; then echo \"workdir $DEST is not a git checkout\" >&2; exit 1; fi; \
            mkdir -p \"$WORK\" || exit 1; \
            n=0; while [ \"$n\" -lt 3 ]; do \
-              if git clone \"$SF_REPO\" \"$DEST\" 2>/dev/null; then break; fi; \
+              if timeout 600 git clone \"$SF_REPO\" \"$DEST\" 2>/dev/null; then break; fi; \
               n=$((n + 1)); \
               echo \"clone failed ($n/3), backing off\" >&2; \
                 rm -rf \"$DEST\"; \
@@ -82,10 +82,15 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
             done; \
             [ -d \"$DEST/.git\" ] || {{ echo 'clone failed' >&2; exit 1; }}; \
          fi; \
-         if ! (cd \"$DEST\" && sfw_fetch 2>/dev/null \
-           && (git checkout --detach $SF_FORCE \"origin/$SF_REF\" 2>/dev/null \
-             || git checkout --detach $SF_FORCE \"$SF_REF\" 2>/dev/null)); then \
-           echo \"fetch/checkout $SF_REF failed\" >&2; exit 1; fi; \
+         cur=$(git -C \"$DEST\" rev-parse HEAD 2>/dev/null || true); \
+          want=\"\"; \
+          case \"$SF_REF\" in ''|*[!0-9a-fA-F]*) : ;; *) want=$(git -C \"$DEST\" rev-parse \"$SF_REF^{{commit}}\" 2>/dev/null || true);; esac; \
+          if [ -n \"$want\" ] && [ \"$want\" = \"$cur\" ]; then \
+            echo \"already at $SF_REF, skipping fetch\"; \
+          elif ! (cd \"$DEST\" && sfw_fetch 2>/dev/null \
+            && (git checkout --detach $SF_FORCE \"origin/$SF_REF\" 2>/dev/null \
+              || git checkout --detach $SF_FORCE \"$SF_REF\" 2>/dev/null)); then \
+            echo \"fetch/checkout $SF_REF failed\" >&2; exit 1; fi; \
          if [ -n \"$SF_PREP\" ]; then \
            echo 'running prep'; \
            if ! (cd \"$DEST\" && sh -c \"$SF_PREP\"); then echo 'prep failed' >&2; exit 1; fi; \
@@ -279,6 +284,18 @@ mod tests {
         // Clones move an order of magnitude more data than fetches and hit
         // the same rate limits: they retry instead of failing outright.
         assert!(cmd.contains("git clone \"$SF_REPO\" \"$DEST\""), "{cmd}");
+        // Network operations are bounded: a stalled transfer fails the step
+        // instead of hanging it until the step timeout.
+        assert!(cmd.contains("timeout 300 git -C"), "{cmd}");
+        assert!(cmd.contains("timeout 600 git clone"), "{cmd}");
+    }
+
+    #[test]
+    fn build_skips_fetch_when_already_at_ref() {
+        // Re-runs pinning an exact sha must not pay for a network round trip
+        // at all: if HEAD already equals the ref, there is nothing to fetch.
+        let cmd = sample();
+        assert!(cmd.contains("already at $SF_REF, skipping fetch"), "{cmd}");
     }
 
     #[test]
