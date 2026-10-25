@@ -73,7 +73,13 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
          if [ ! -d \"$DEST/.git\" ]; then \
            if [ -n \"$SF_WORKDIR\" ]; then echo \"workdir $DEST is not a git checkout\" >&2; exit 1; fi; \
            mkdir -p \"$WORK\" || exit 1; \
-           if ! git clone \"$SF_REPO\" \"$DEST\" 2>/dev/null; then echo 'clone failed' >&2; exit 1; fi; \
+           n=0; while [ \"$n\" -lt 3 ]; do \
+              if git clone \"$SF_REPO\" \"$DEST\" 2>/dev/null; then break; fi; \
+              n=$((n + 1)); \
+              echo \"clone failed ($n/3), backing off\" >&2; \
+              sleep $((n * 20)); \
+            done; \
+            [ -d \"$DEST/.git\" ] || {{ echo 'clone failed' >&2; exit 1; }}; \
          fi; \
          if ! (cd \"$DEST\" && sfw_fetch 2>/dev/null \
            && (git checkout --detach $SF_FORCE \"origin/$SF_REF\" 2>/dev/null \
@@ -269,6 +275,9 @@ mod tests {
         let cmd = sample();
         assert!(cmd.contains("backing off"), "{cmd}");
         assert!(cmd.contains("sleep $((n * 20))"), "{cmd}");
+        // Clones move an order of magnitude more data than fetches and hit
+        // the same rate limits: they retry instead of failing outright.
+        assert!(cmd.contains("git clone \"$SF_REPO\" \"$DEST\""), "{cmd}");
     }
 
     #[test]
