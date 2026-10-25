@@ -98,6 +98,7 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
          TDIR=$(cd \"$DEST\" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
            | tr ',' '\\n' | grep -m1 '\"target_directory\"' | cut -d'\"' -f4); \
          [ -n \"$TDIR\" ] || TDIR=\"$DEST/target\"; \
+          mkdir -p \"$TDIR\" || {{ echo \"cannot create $TDIR\" >&2; exit 1; }}; \
          AVAIL=$(df -Pk \"$TDIR\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          case \"$AVAIL\" in ''|*[!0-9]*) AVAIL=0;; esac; \
          if [ \"$((AVAIL / 1024 / 1024))\" -lt \"$SF_MINGB\" ]; then \
@@ -192,6 +193,9 @@ mod tests {
         assert!(cmd.contains("disk free below"), "{cmd}");
         assert!(cmd.contains("preflight"), "{cmd}");
         assert!(cmd.contains("mv -f"), "{cmd}");
+        // The install dir is created first: probing an absent path
+        // with df falsely reports it as full.
+        assert!(cmd.contains("mkdir -p \"$TDIR\""), "{cmd}");
     }
 
     #[test]
