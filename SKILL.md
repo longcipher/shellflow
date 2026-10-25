@@ -213,9 +213,9 @@ OPTIONS:
   -p, --parallel <N>          Max concurrent hosts per step [default: 16; 0 = all]
   -c, --continue-on-error     Continue after a failed host/step; print summary
   -k, --check                 Syntax-check only: local bash -n, remote bash -n -s
-      --timeout <SECS>        Per-step timeout for all steps
+      --timeout <SECS>        Default per-step timeout; @timeout overrides it
       --output <MODE>         stream (default) | grouped
-  -l, --log-file <PATH>       Append streamed lines (tagged host+stream)
+  -l, --log-file <PATH>       Append streamed lines (run path only)
       --no-color              Disable ANSI colors
   -i, --identity <PATH>       Age identity for @secrets decryption
       --mask-min-len <N>      Minimum value length to mask for @secrets

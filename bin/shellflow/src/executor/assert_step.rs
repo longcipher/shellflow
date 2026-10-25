@@ -23,7 +23,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
     executor::{ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel},
-    rbatch::Batch,
+    rbatch::{Batch, SshDest},
 };
 
 /// The default budget for one health probe, in seconds.
@@ -172,7 +172,12 @@ async fn run_on_host(
         batch.section(&format!("c{idx}"), &command_for(check, step_timeout));
     }
 
-    let run = batch.run_async(&host.alias);
+    // Assertions must reach the host the playbook declared, not an alias
+    // that `~/.ssh/config` may resolve differently (or not at all). Every
+    // other target-side step uses the resolved spec; this one used to be the
+    // exception.
+    let dest = SshDest::Spec(host.spec.clone());
+    let run = batch.run_async_dest(&dest, Duration::from_secs(wait_budget));
     let sections = match tokio::time::timeout(Duration::from_secs(wait_budget), run).await {
         Ok(Ok(sections)) => sections,
         Ok(Err(err)) => {
@@ -333,12 +338,11 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
             // the same rights the service reads it with.
             format!(
                 "if sudo test -f {quoted} && ! sudo grep -qE '{pattern}' {quoted} 2>/dev/null; then \
-                 echo '{path} is fully rendered'; \
-                 else echo '{path} is missing or still carries unexpanded placeholders'; \
+                 echo {quoted}' is fully rendered'; \
+                 else echo {quoted}' is missing or still carries unexpanded placeholders'; \
                  false; fi",
                 quoted = quoted,
                 pattern = pattern,
-                path = path,
             )
         }
         Assertion::Health { url, expect, method, body, headers } => {
@@ -356,19 +360,19 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
             // the wrong reason. The wait happens on the target, so the
             // whole budget costs one round trip.
             format!(
-                "sfw_http() {{ d=$(( $(date +%s) + $1 )); \
+                r#"sfw_http() {{ d=$(( $(date +%s) + $1 )); \
                  while :; do \
                  c=$( {probe} ); \
                  case \"$c\" in {accepted}) echo \"$c\"; return 0 ;; esac; \
                  if [ \"$(date +%s)\" -ge \"$d\" ]; then echo \"$c\"; return 1; fi; \
                  sleep 2; \
                  done; }}; \
-                 if c=$(sfw_http {timeout_secs}); then echo \"{url} answered $c\"; \
-                 else echo \"{url} answered $c (want {want})\"; false; fi",
+                 if c=$(sfw_http {timeout_secs}); then echo {quoted_url}" answered $c"; \
+                 else echo {quoted_url}" answered $c (want {want})"; false; fi"#,
                 probe = http_probe(url, timeout_secs, method.as_deref(), body.as_deref(), headers),
                 accepted = accepted,
                 timeout_secs = timeout_secs,
-                url = url,
+                quoted_url = quote(url),
                 want = if expect.is_empty() { "2xx/3xx".to_string() } else { expect.join("|") },
             )
         }
@@ -472,6 +476,31 @@ mod tests {
     use shellflow_core::Assertion;
 
     use super::{command_for, http_probe, quote};
+
+    #[test]
+    fn a_rendered_path_with_a_quote_stays_one_shell_word() {
+        let cmd =
+            command_for(&Assertion::Rendered { path: "/tmp/it's/config.toml".to_string() }, None);
+        assert!(cmd.contains("'/tmp/it'\\''s/config.toml'"), "{cmd}");
+        let status =
+            std::process::Command::new("bash").args(["-n", "-c", &cmd]).status().expect("bash -n");
+        assert!(status.success(), "generated shell is invalid: {cmd}");
+    }
+
+    #[test]
+    fn a_health_url_with_a_quote_stays_one_shell_word() {
+        let cmd = command_for(
+            &Assertion::Health {
+                url: "http://x/it's".to_string(),
+                expect: Vec::new(),
+                method: None,
+                body: None,
+                headers: Vec::new(),
+            },
+            None,
+        );
+        assert!(cmd.contains("'http://x/it'\\''s'"), "{cmd}");
+    }
 
     #[test]
     fn a_unit_check_asks_systemd_for_the_state() {

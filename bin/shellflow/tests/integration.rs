@@ -296,6 +296,10 @@ fn dry_run_rsync_itemizes() -> TestResult<()> {
     assert!(log.contains("--dry-run"), "dry-run missing: {log}");
     assert!(log.contains("--delete"), "delete missing: {log}");
     assert!(log.contains("-i"), "itemize missing: {log}");
+    assert!(
+        log.contains("BatchMode=yes"),
+        "rsync's own ssh must not prompt for a password or host key: {log}"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(">f++++++++"), "itemize output missing: {stdout}");
     Ok(())
@@ -1360,8 +1364,8 @@ fn step_without_hosts_renders_an_em_dash() -> TestResult<()> {
 
 #[test]
 fn step_numbers_agree_between_header_and_summary() -> TestResult<()> {
-    // With `--only`, the header counts the selected steps; the summary must
-    // use the same numbering or the two disagree.
+    // With `--only`, the header keeps the step's plan index — the number the
+    // selector itself uses — and the summary must use the same number.
     let sb = Sandbox::new("stepnum")?;
     let script = sb.script(
         "# @name build\n# @local\necho AAA\n\
@@ -1371,8 +1375,8 @@ fn step_numbers_agree_between_header_and_summary() -> TestResult<()> {
     let out = sb.run(&script, &["--only", "deploy"])?;
     assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[STEP 1/1] deploy"), "unexpected header: {stdout}");
-    assert!(stdout.contains("step  1  "), "summary must number the selected step 1: {stdout}");
+    assert!(stdout.contains("[STEP 2/3] deploy"), "unexpected header: {stdout}");
+    assert!(stdout.contains("step  2  "), "summary must use the plan index: {stdout}");
     Ok(())
 }
 
@@ -2083,9 +2087,9 @@ fn a_dry_run_never_writes_through_the_scp_fallback() -> TestResult<()> {
 #[test]
 fn the_plan_preview_and_the_step_headers_share_one_numbering() -> TestResult<()> {
     // `-v` prints the plan preview; the step headers carry their own number.
-    // When `--skip` filters the plan, both must count the *selected* steps —
-    // otherwise the same run shows two different numbering spaces and the
-    // operator cannot tell which header belongs to which preview entry.
+    // When `--skip` filters the plan, both keep the step's plan index — the
+    // number `--only`/`--skip` themselves accept — so a header can be traced
+    // back to the preview entry it belongs to.
     let sb = Sandbox::new("plan-numbering")?;
     let script = sb.script(
         "# @local\n\
@@ -2106,12 +2110,12 @@ fn the_plan_preview_and_the_step_headers_share_one_numbering() -> TestResult<()>
         .collect();
     assert_eq!(preview.len(), 2, "the preview must list the selected steps: {stdout}");
     assert!(preview[0].contains(" 1: local"), "preview numbering: {stdout}");
-    assert!(preview[1].contains(" 2: local"), "preview numbering: {stdout}");
+    assert!(preview[1].contains(" 3: local"), "preview numbering: {stdout}");
 
-    // The headers number the same two steps out of two.
-    assert!(stdout.contains("[STEP 1/2]"), "step header numbering missing: {stdout}");
-    assert!(stdout.contains("[STEP 2/2]"), "step header numbering missing: {stdout}");
-    assert!(!stdout.contains("[STEP 3/"), "the skipped step must not get a header: {stdout}");
+    // The headers carry the same plan indices, out of the unsplit plan.
+    assert!(stdout.contains("[STEP 1/3]"), "step header numbering missing: {stdout}");
+    assert!(stdout.contains("[STEP 3/3]"), "step header numbering missing: {stdout}");
+    assert!(!stdout.contains("[STEP 2/"), "the skipped step must not get a header: {stdout}");
     Ok(())
 }
 
@@ -2351,5 +2355,217 @@ fn wait_active_fails_when_the_unit_stays_inactive() -> TestResult<()> {
     )?;
     let out = sb.run(&script, &[])?;
     assert_eq!(status_code(&out), 4, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Regression guards for the review findings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_block_that_exits_42_without_a_guard_is_a_failure() -> TestResult<()> {
+    // 42 is the folded-guard skip channel. It must only be interpreted as a
+    // skip when a guard was actually folded into the payload.
+    let sb = Sandbox::new("plain-42")?;
+    let script = sb.script(
+        "# @server plain1 plain42@h1\n\
+         # @remote plain1\n\
+         echo hi\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_ne!(status_code(&out), 0, "exit 42 must not be reported as success");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("SKIPPED"), "42 was misread as a guard skip: {stdout}");
+    assert_eq!(status_code(&out), 4, "a remote script failure is a script error");
+    Ok(())
+}
+
+#[test]
+fn a_guarded_block_still_skips_with_the_reserved_exit_code() -> TestResult<()> {
+    let sb = Sandbox::new("guard-skip")?;
+    let script = sb.script(
+        "# @server run1 runpayload@h1\n\
+         # @remote run1\n\
+         # @only_if false\n\
+         echo SHOULD_NOT_RUN\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("SKIPPED (guard)"), "guard skip missing: {stdout}");
+    assert!(!stdout.contains("SHOULD_NOT_RUN"), "guarded block ran: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn assert_uses_the_declared_ssh_spec_not_the_alias() -> TestResult<()> {
+    // `@server web deploy@10.0.0.9:2222` must be asserted on that exact
+    // destination. `ssh web` can resolve to a different machine in
+    // ~/.ssh/config, or fail when no alias exists.
+    let sb = Sandbox::new("assert-spec")?;
+    let script = sb.script(
+        "# @server web deploy@10.0.0.9:2222\n\
+         # @assert dufs.service active @web\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = sb.ssh_log();
+    assert!(
+        log.contains("-p 2222 deploy@10.0.0.9 sh -s"),
+        "assert ignored the declared spec: {log}"
+    );
+    assert!(!log.contains("ARGS: -o BatchMode=yes -o ConnectTimeout=15 web sh -s"), "{log}");
+    Ok(())
+}
+
+#[test]
+fn step_timeout_overrides_the_cli_timeout() -> TestResult<()> {
+    // The CLI documents `--timeout` as a default that `@timeout` overrides.
+    // The reverse precedence silently cut long build/health steps at 1s.
+    let sb = Sandbox::new("timeout-precedence")?;
+    let script = sb.script(
+        "# @timeout 5\n\
+         # @local\n\
+         sleep 2\n\
+         echo SURVIVED\n",
+    )?;
+    let out = sb.run(&script, &["--timeout", "1"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("SURVIVED"), "the step was cut short: {stdout}");
+    Ok(())
+}
+
+#[test]
+fn check_mode_does_not_require_secrets() -> TestResult<()> {
+    // `--check` is the keyless syntax gate: no identity, no {host} file.
+    let sb = Sandbox::new("check-secrets")?;
+    let script = sb.script(
+        "# @server ok1 ok@h1\n\
+         # @secrets /nonexistent/shellflow-{host}.env.age\n\
+         # @remote ok1\n\
+         echo hi\n",
+    )?;
+    let out = sb.run(&script, &["--check"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let log = sb.ssh_log();
+    assert!(log.contains("bash -n -s"), "the syntax check did not run: {log}");
+    Ok(())
+}
+
+#[test]
+fn per_host_secrets_fail_closed_on_a_raw_spec() -> TestResult<()> {
+    // A raw `user@host` target has no alias to substitute for {host}; it
+    // used to expand over zero hosts and deploy without credentials.
+    let sb = Sandbox::new("secrets-raw")?;
+    let script = sb.script(
+        "# @secrets /nonexistent/shellflow-{host}.env.age\n\
+         # @remote deploy@10.0.0.9\n\
+         echo hi\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_ne!(status_code(&out), 0, "a raw target silently skipped its secrets");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("raw SSH specs"), "unexpected error: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn step_numbers_match_the_only_and_skip_selectors() -> TestResult<()> {
+    // The preview/header number is the plan index, the same number the
+    // selectors use. `--skip 1` must leave `[STEP 2/3] b`, and `--only 1`
+    // must select `a`.
+    let sb = Sandbox::new("numbering")?;
+    let script = sb.script(
+        "# @name a\n\
+         # @local\n\
+         echo A\n\
+         # @name b\n\
+         # @local\n\
+         echo B\n\
+         # @name c\n\
+         # @local\n\
+         echo C\n",
+    )?;
+    let out = sb.run(&script, &["--skip", "1", "-v"])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(" 2: local (b)"), "preview numbering: {stdout}");
+    assert!(stdout.contains(" 3: local (c)"), "preview numbering: {stdout}");
+    assert!(stdout.contains("[STEP 2/3]"), "header numbering: {stdout}");
+
+    let only = sb.run(&script, &["--only", "1", "-v"])?;
+    assert_eq!(status_code(&only), 0);
+    let only_out = String::from_utf8_lossy(&only.stdout);
+    assert!(only_out.contains("A"), "selector 1 did not select step 1: {only_out}");
+    assert!(!only_out.contains("B"), "selector 1 selected another step: {only_out}");
+    Ok(())
+}
+
+#[test]
+fn log_file_is_run_only() -> TestResult<()> {
+    // A global flag was accepted by maintenance subcommands and silently
+    // ignored. It is now rejected instead of pretending to write an audit.
+    let out = Command::new(env!("CARGO_BIN_EXE_shellflow"))
+        .args(["service", "check", "--host", "h", "--log-file", "/tmp/x"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    assert!(!out.status.success(), "the ignored flag was accepted");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unexpected argument"), "unexpected error: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn target_side_directives_execute_end_to_end() -> TestResult<()> {
+    // These directives used to be covered only by `contains()` unit tests on
+    // their command builders: a typo in the dispatch (or in the payload) was
+    // invisible. Each case runs the real binary against the mock transport
+    // and asserts what reached the target.
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "service",
+            "# @server ok1 ok@h1\n# @service dufs.service @ok1 --enable --restart --wait --verify\n",
+            "/usr/local/bin/shellflow host service",
+        ),
+        (
+            "install",
+            "# @server ok1 ok@h1\n# @install /tmp/a -> /etc/b @ok1 --mode 0644 --owner root:root\n",
+            "host install",
+        ),
+        ("backup", "# @server ok1 ok@h1\n# @backup /etc/a @ok1 --keep 5\n", "host backup"),
+        (
+            "credstore",
+            "# @server ok1 ok@h1\n# @credstore dufs @ok1 --require TOKEN\n",
+            "host credstore",
+        ),
+        ("unit_inventory", "# @server ok1 ok@h1\n# @unit_inventory @ok1\n", "host inventory"),
+        ("reload", "# @server ok1 ok@h1\n# @reload dufs @ok1 --wait\n", "systemctl"),
+        (
+            "release",
+            "# @server ok1 ok@h1\n\
+             # @release owner/repo @ok1 --installed-cmd /usr/bin/x --asset 'x-{version}' --to /tmp\n",
+            "SF_REPO='owner/repo'",
+        ),
+        (
+            "build",
+            "# @server ok1 ok@h1\n\
+             # @build https://example.com/x.git @ok1 --ref main --build 'make' --artifacts x --install-dirs /usr/local/bin\n",
+            "SF_REF='main'",
+        ),
+        ("toolchain", "# @server ok1 ok@h1\n# @toolchain rustup,cargo @ok1\n", "step_rustup"),
+        ("image", "# @server ok1 ok@h1\n# @image searxng:latest @ok1 --prune\n", "podman"),
+    ];
+    for (name, script, needle) in cases {
+        let sb = Sandbox::new(&format!("directive-{name}"))?;
+        let path = sb.script(script)?;
+        let out = sb.run(&path, &[])?;
+        assert_eq!(status_code(&out), 0, "{name} failed: {}", String::from_utf8_lossy(&out.stderr));
+        // Most directives run through the batch payload; `@reload` runs
+        // through its own `systemctl` batch. Check both transports.
+        let payload = sb.read("ssh-stdin-ok@h1.txt");
+        let seen = format!("{payload}\n{}", sb.ssh_log());
+        assert!(seen.contains(needle), "{name}: target saw {seen:?}");
+    }
     Ok(())
 }

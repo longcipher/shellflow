@@ -50,7 +50,7 @@ just mutation
 - The DSL is Bash, not a parser library: `shellflow-dsl` scans `# @` directives itself. Do not introduce a YAML/TOML script format.
 - Remote execution shells out to the system `ssh`/`rsync`/`scp` through `tokio::process::Command`; never add an SSH client crate.
 - Secrets use `age` for encryption and `zeroize` for in-memory wiping. Secret values are masked in every preview, including local blocks.
-- `nix` covers process/signal/user/fs handling, `sd-notify` the systemd readiness protocol, `zbus` the optional D-Bus path, `tokio` (`full`) the async runtime, `clap` (derive) the CLI, `colored` and `tracing-subscriber` (env-filter) the output.
+- `nix` covers process/signal/user/fs handling, `sd-notify` the systemd readiness protocol, `zbus` the optional D-Bus path, `tokio` (`full`) the async runtime, `clap` (derive) the CLI, `colored` the output. There is no logging framework: `ui` is the one output path (streaming, masking, audit log).
 - Errors: `thiserror` in the library crates, `eyre` in `bin/shellflow`. Concrete error types through `?`; never string errors.
 - Forbidden here: `anyhow`, `log`, `reqwest`, `dashmap`.
 

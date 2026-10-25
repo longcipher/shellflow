@@ -316,14 +316,10 @@ impl Ui {
 
     /// Print the plan preview shown at `-v` and above.
     ///
-    /// The step numbering follows the *selected* steps, so the preview and
-    /// the step headers agree — including when `--only`/`--skip` filtered
-    /// the plan.
-    ///
-    /// `selected` pairs each step with its index in the *unfiltered* plan;
-    /// the number shown here is the step's position in the selected list, not
-    /// that plan index. Numbering by the plan index would give the preview
-    /// and the step headers two different numbering spaces in the same run.
+    /// The step numbering follows the *unfiltered* plan index, the same
+    /// number `--only`/`--skip` select by. The preview and the step headers
+    /// therefore agree, and a number copied from the preview selects the step
+    /// it names even when `--skip` removed earlier steps.
     pub(crate) fn plan_preview(&self, plan: &ExecutionPlan, selected: &[(usize, Step)]) {
         if !self.verbose.info() {
             return;
@@ -343,11 +339,11 @@ impl Ui {
                     .to_string(),
             );
         }
-        for (pos, (_plan_index, step)) in selected.iter().enumerate() {
+        for (plan_index, step) in selected {
             let target = step.target_text().map_or_default(|t| format!(" -> {t}"));
             let name = step.name().map_or_default(|n| format!(" ({n})"));
             self.log_line(
-                format!("  step    {:>2}: {}{}{}", pos + 1, step.kind(), name, target)
+                format!("  step    {:>2}: {}{}{}", plan_index + 1, step.kind(), name, target)
                     .dimmed()
                     .to_string(),
             );

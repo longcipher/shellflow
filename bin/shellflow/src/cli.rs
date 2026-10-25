@@ -145,6 +145,14 @@ pub(crate) struct RunFlags {
     /// unparsable.
     #[arg(long, value_name = "N")]
     pub mask_min_len: Option<usize>,
+
+    /// Append every streamed run line (tagged [host] + stream) to this file.
+    ///
+    /// Only the `run` path produces those lines, so the flag lives here and
+    /// not on the global set: the other subcommands used to accept it and
+    /// silently ignore it.
+    #[arg(short = 'l', long, value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
 }
 
 /// Arguments for the `run` subcommand (also the default).
@@ -1151,23 +1159,16 @@ pub(crate) struct ServiceVerifyArgs {
     pub paths: Vec<String>,
 }
 
-/// Flags that apply to every subcommand.
+/// Flags shared by every subcommand.
 ///
-/// They are declared once, at the top level, and marked `global`: clap
-/// propagates them to every subcommand, so they can be given before *or*
-/// after the subcommand name. That is what makes
-/// `shellflow --no-color template check …` work — the alternative (a flag
-/// per subcommand) drifts, and the alternative (a flag that conflicts with
-/// subcommands) makes the flag unusable at all.
+/// `--no-color` is declared once, at the top level, and marked `global`: clap
+/// propagates it to every subcommand, so it can be given before *or* after
+/// the subcommand name.
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct GlobalFlags {
     /// Disable ANSI colors.
     #[arg(long, global = true)]
     pub no_color: bool,
-
-    /// Append every streamed line (tagged [host] + stream) to this file.
-    #[arg(short = 'l', long, value_name = "PATH", global = true)]
-    pub log_file: Option<PathBuf>,
 }
 
 /// The top-level CLI: a `run` subcommand (also the default via the bare

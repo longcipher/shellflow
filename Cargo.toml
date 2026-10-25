@@ -37,8 +37,7 @@ tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = "1.54.0"
 toml_edit = "0.25.17"
-tracing-subscriber = "0.3.23"
-zbus = { version = "6.0.0", default-features = false, features = ["tokio", "proxy"] }
+zbus = { version = "6.1.0", default-features = false, features = ["tokio", "proxy"] }
 zeroize = "1.9.1"
 
 [workspace.lints.clippy]
@@ -112,8 +111,8 @@ dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 
-# Use tracing instead of println/eprintln in library code
-# CLI crates override this via #![allow(...)] in lib.rs/main.rs
+# Library code never prints; CLI crates override this via
+# #![allow(...)] in main.rs for user-facing streaming output.
 print_stdout = "deny"
 print_stderr = "deny"
 

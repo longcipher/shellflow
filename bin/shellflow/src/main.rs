@@ -69,7 +69,6 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
 
     let code = match &cli.command {
@@ -90,15 +89,16 @@ async fn main() -> Result<()> {
             }
         },
         Some(Command::Template(cmd)) => {
-            let ui = match ui::Ui::new(0, cli.globals.no_color, cli::OutputMode::Stream, None) {
-                Ok(ui) => ui,
-                Err(err) => {
-                    eprintln!("error: {err:#}");
-                    return Ok(());
-                }
-            };
-            match template::run(&cmd.command, &ui) {
-                Ok(()) => 0,
+            match ui::Ui::new(0, cli.globals.no_color, cli::OutputMode::Stream, None) {
+                Ok(ui) => match template::run(&cmd.command, &ui) {
+                    Ok(()) => 0,
+                    Err(err) => {
+                        eprintln!("error: {err:#}");
+                        1
+                    }
+                },
+                // An unwritable audit target or a broken terminal must fail
+                // the command; returning `Ok(())` here used to exit 0.
                 Err(err) => {
                     eprintln!("error: {err:#}");
                     1
@@ -230,7 +230,7 @@ async fn run_plan(
         run.flags.verbose,
         globals.no_color,
         run.flags.output,
-        globals.log_file.clone(),
+        run.flags.log_file.clone(),
     ) {
         Ok(ui) => Arc::new(Mutex::new(ui)),
         Err(err) => {
@@ -326,14 +326,6 @@ async fn run_plan(
             EXIT_INTERRUPTED
         }
     }
-}
-
-/// Initialize `tracing_subscriber` with an env-filter defaulting to `info`.
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ =
-        tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
 }
 
 /// Resolve when SIGINT or SIGTERM is received.

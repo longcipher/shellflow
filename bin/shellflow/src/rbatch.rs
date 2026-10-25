@@ -22,12 +22,23 @@ use std::{
     collections::BTreeMap,
     io::Write,
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use shellflow_core::SshSpec;
 
 use crate::service::ServiceError;
+
+/// The transport budget of one batch.
+///
+/// `ConnectTimeout` only covers the handshake; a host that accepts the
+/// connection and then stops writing would otherwise block the command (and,
+/// on the synchronous path, a runtime worker) forever.
+const BATCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Where a batch is sent.
 #[derive(Clone, Debug)]
@@ -130,6 +141,9 @@ impl Batch {
 
     /// Run the batch against one host and return its framed answers.
     ///
+    /// Used by the synchronous maintenance subcommands; the executor's
+    /// assertion path uses [`run_async_dest`](Self::run_async_dest).
+    ///
     /// # Errors
     ///
     /// Returns [`ServiceError::Transport`] when the SSH transport is
@@ -151,8 +165,8 @@ impl Batch {
         dest: &SshDest,
     ) -> Result<BTreeMap<String, Section>, ServiceError> {
         let host = dest_label(dest);
-        let mut child = Command::new("ssh")
-            .arg("-o")
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
             .arg("ConnectTimeout=15")
@@ -161,23 +175,62 @@ impl Batch {
             .arg("-s")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}"))
-            })?;
+            .stderr(Stdio::piped());
+        // Own the process group so a timeout can kill ssh and everything it
+        // spawned, and so a stray child cannot outlive the command.
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+        let mut child = cmd.spawn().map_err(|err| {
+            ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}"))
+        })?;
         if let Some(mut stdin) = child.stdin.take() {
             // A broken pipe here means the connection died; the exit status
             // of `ssh` says so with more precision, so the write error is
             // ignored rather than reported.
             let _ = stdin.write_all(self.script().as_bytes());
         }
+
+        // stderr is drained **concurrently** with stdout. Reading it after
+        // `wait()` deadlocks as soon as ssh writes more than a pipe buffer:
+        // ssh blocks on stderr, never closes stdout, and `wait()` never
+        // returns.
+        let stderr_handle = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut text = String::new();
+                let _ = stderr.read_to_string(&mut text);
+                text
+            })
+        });
+
+        // The watchdog kills the group when the host stops making progress.
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        {
+            let pid = child.id();
+            let timed_out = Arc::clone(&timed_out);
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + BATCH_TIMEOUT;
+                while !finished.load(Ordering::Relaxed) {
+                    if Instant::now() >= deadline {
+                        timed_out.store(true, Ordering::Relaxed);
+                        crate::executor::process::signal_group(
+                            pid,
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
+
         // The answers are parsed **as they arrive**: the response is never
         // held twice, and the connection is closed as soon as the last
         // expected answer is in rather than after a trailing query that may
         // be slow.
         let mut reader = AnswerReader::new(self);
-        let mut complete = false;
         if let Some(stdout) = child.stdout.take() {
             use std::io::BufRead as _;
             for line in std::io::BufReader::new(stdout).lines() {
@@ -186,39 +239,31 @@ impl Batch {
                 };
                 reader.push_line(&line);
                 if reader.is_complete() {
-                    complete = true;
+                    // Every answer is in: kill the whole group, not only ssh.
+                    // A ProxyCommand (or another local descendant) inherits
+                    // the group and could otherwise hold the stderr pipe open
+                    // after ssh is gone, blocking the drain below.
+                    crate::executor::process::signal_group(
+                        child.id(),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
                     break;
                 }
             }
         }
-        if complete {
-            // Every answer is in: the connection is not needed any more.
-            let _ = child.kill();
-        }
         let status = child
             .wait()
             .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
-        let mut stderr_text = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            use std::io::Read as _;
-            let _ = stderr.read_to_string(&mut stderr_text);
+        finished.store(true, Ordering::Relaxed);
+        let stderr_text = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+        if timed_out.load(Ordering::Relaxed) {
+            return Err(ServiceError::Transport(eyre::eyre!(
+                "ssh {host} timed out after {}s",
+                BATCH_TIMEOUT.as_secs()
+            )));
         }
 
         Self::finish(&host, status, reader.finish(), stderr_text)
-    }
-
-    /// Run the batch against one host, asynchronously.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServiceError::Transport`] when the SSH transport is
-    /// unavailable or when the host answered with nothing that looks like a
-    /// batch.
-    pub(crate) async fn run_async(
-        &self,
-        host: &str,
-    ) -> Result<BTreeMap<String, Section>, ServiceError> {
-        self.run_async_dest(&SshDest::Host(host.to_string())).await
     }
 
     /// Run the batch against one destination, asynchronously.
@@ -231,6 +276,7 @@ impl Batch {
     pub(crate) async fn run_async_dest(
         &self,
         dest: &SshDest,
+        timeout: Duration,
     ) -> Result<BTreeMap<String, Section>, ServiceError> {
         use tokio::io::AsyncWriteExt as _;
 
@@ -255,35 +301,69 @@ impl Batch {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(self.script().as_bytes()).await;
         }
-        // The answers are parsed **as they arrive** (see the synchronous
-        // path): the response is never held twice, and the connection is
-        // closed as soon as the last expected answer is in.
+        // stderr is drained concurrently (see the synchronous path): reading
+        // it only after `wait()` deadlocks once ssh fills the stderr pipe.
+        let stderr_task = child.stderr.take().map(|mut stderr| {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt as _;
+                let mut text = String::new();
+                let _ = stderr.read_to_string(&mut text).await;
+                text
+            })
+        });
+
+        // The answers are parsed **as they arrive**: the response is never
+        // held twice, and the connection is closed as soon as the last
+        // expected answer is in.
         let mut reader = AnswerReader::new(self);
-        let mut complete = false;
-        if let Some(stdout) = child.stdout.take() {
-            use tokio::io::AsyncBufReadExt as _;
-            let mut lines = tokio::io::BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                reader.push_line(&line);
-                if reader.is_complete() {
-                    complete = true;
-                    break;
+        let read = async {
+            if let Some(stdout) = child.stdout.take() {
+                use tokio::io::AsyncBufReadExt as _;
+                let mut lines = tokio::io::BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    reader.push_line(&line);
+                    if reader.is_complete() {
+                        // See the synchronous path: the group goes, so a
+                        // ProxyCommand cannot outlive the answer.
+                        if let Some(pid) = child.id() {
+                            crate::executor::process::signal_group(
+                                pid,
+                                nix::sys::signal::Signal::SIGKILL,
+                            );
+                        }
+                        break;
+                    }
                 }
             }
-        }
-        if complete {
-            let _ = child.kill().await;
-        }
-        let status = child
-            .wait()
-            .await
-            .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
+            child.wait().await
+        };
+        let status = match tokio::time::timeout(timeout, read).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(err)) => {
+                crate::executor::process::terminate(&mut child).await;
+                guard.disarm();
+                if let Some(task) = stderr_task {
+                    task.abort();
+                }
+                return Err(ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")));
+            }
+            Err(_) => {
+                crate::executor::process::terminate(&mut child).await;
+                guard.disarm();
+                if let Some(task) = stderr_task {
+                    task.abort();
+                }
+                return Err(ServiceError::Transport(eyre::eyre!(
+                    "ssh {host} timed out after {}s",
+                    timeout.as_secs()
+                )));
+            }
+        };
         guard.disarm();
-        let mut stderr_text = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            use tokio::io::AsyncReadExt as _;
-            let _ = stderr.read_to_string(&mut stderr_text).await;
-        }
+        let stderr_text = match stderr_task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => String::new(),
+        };
 
         Self::finish(&host, status, reader.finish(), stderr_text)
     }
@@ -362,6 +442,9 @@ impl<'a> AnswerReader<'a> {
     }
 
     /// Whether every expected answer has arrived.
+    // `BTreeMap::len` is not a const fn on stable, so clippy's suggestion
+    // does not compile; the method is still the clearest form.
+    #[expect(clippy::missing_const_for_fn, reason = "BTreeMap::len is not const on stable")]
     fn is_complete(&self) -> bool {
         self.sections.len() >= self.batch.section_count()
     }

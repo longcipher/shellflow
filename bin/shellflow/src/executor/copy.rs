@@ -475,7 +475,9 @@ struct RsyncHostArgs<'a> {
 
 async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
     let RsyncHostArgs { ui, host, srcs, dst, opts, config, has_rsync, log_file, cancel } = args;
-    let remote_shell = host.spec.rsync_remote_shell().unwrap_or_else(|| "ssh".to_string());
+    // Never a bare `ssh`: a transport without BatchMode can stop at a
+    // password or host-key prompt in the middle of an unattended deploy.
+    let remote_shell = host.spec.rsync_transport();
 
     if config.verbose >= 2 {
         crate::ui::note(
@@ -620,7 +622,9 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<
         cmd.arg(src);
     }
     cmd.arg(&dest);
-    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
     cmd.kill_on_drop(true);
 
     if args.config.verbose >= 2 {
@@ -750,7 +754,7 @@ async fn run_scp_transfer(
         format!("{}:{dst}", host.spec.dest())
     };
     let mut scp = Command::new("scp");
-    scp.args(["-q", "-o", "BatchMode=yes"]);
+    scp.args(["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]);
     if let Some(port) = host.spec.port {
         scp.args(["-P", &port.to_string()]);
     }
@@ -761,7 +765,9 @@ async fn run_scp_transfer(
         scp.arg(src);
     }
     scp.arg(&dest);
-    scp.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    scp.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
     scp.kill_on_drop(true);
     isolate(&mut scp);
 

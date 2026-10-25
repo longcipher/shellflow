@@ -32,16 +32,30 @@ fn verify(args: &crate::cli::UnitVerifyArgs) -> Result<i32> {
     for problem in &report.problems {
         eprintln!("error: {problem}");
     }
+    for skipped in &report.skipped {
+        eprintln!("skip: {skipped}");
+    }
     if report.problems.is_empty() {
-        println!(
-            "unit verify: {} unit(s) and {} playbook(s) are consistent",
-            report.units, report.playbooks
-        );
+        if report.skipped.is_empty() {
+            println!(
+                "unit verify: {} unit(s) and {} playbook(s) are consistent",
+                report.units, report.playbooks
+            );
+        } else {
+            println!(
+                "unit verify: {} unit(s) and {} playbook(s) are consistent, {} check(s) \
+                 skipped (not verified)",
+                report.units,
+                report.playbooks,
+                report.skipped.len()
+            );
+        }
         return Ok(0);
     }
     eprintln!(
-        "unit verify: {} problem(s) in {} unit(s) and {} playbook(s)",
+        "unit verify: {} problem(s), {} skipped, in {} unit(s) and {} playbook(s)",
         report.problems.len(),
+        report.skipped.len(),
         report.units,
         report.playbooks
     );

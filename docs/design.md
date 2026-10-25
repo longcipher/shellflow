@@ -393,7 +393,7 @@ shellflow/
 │   └── shellflow/             # CLI + execution engine (I/O boundary)
 │       ├── Cargo.toml
 │       ├── src/
-│       │   ├── main.rs        # clap entry, tracing init, orchestration
+│       │   ├── main.rs        # clap entry, orchestration
 │       │   ├── cli.rs         # Args (clap derive), all subcommands
 │       │   ├── ui.rs          # colored streaming output, plan summary, masking
 │       │   ├── fsx.rs         # atomic 0600/0755 writes (secret + helper assets)
@@ -501,13 +501,14 @@ shellflow/
 
 **`bin/shellflow`** — the I/O boundary.
 
-- clap parsing, `tracing_subscriber` init, script loading.
+- clap parsing and script loading.
 - The execution engine: spawns `bash`, `ssh`, `rsync` via
   `tokio::process::Command`; fans out to hosts with `tokio::task::JoinSet`;
   streams prefixed output.
-- `eyre` for application errors; `tracing` for logs; `println!`/`eprintln!`
-  only for user-facing streaming UI (with `#![allow(clippy::print_stdout)]`,
-  as permitted for CLI crates in the workspace lint config).
+- `eyre` for application errors. There is no logging framework: the CLI owns
+  one output path (`ui`), which streams user-facing lines, applies masking,
+  and writes the audit log (`#![allow(clippy::print_stdout)]`, as permitted
+  for CLI crates in the workspace lint config).
 
 ### 5.3 Dependencies
 
@@ -515,12 +516,12 @@ Added via `cargo add` only (never hand-edited into `Cargo.toml`):
 
 ```bash
 # workspace level
-cargo add eyre tokio tracing-subscriber --workspace   # already present
+cargo add eyre tokio --workspace                       # already present
 cargo add colored --workspace                          # ANSI UI in bin
 cargo add age tempfile --workspace                     # secrets crate
 
 # bin/shellflow
-cargo add clap tokio eyre colored tracing-subscriber -p shellflow --workspace
+cargo add clap tokio eyre colored -p shellflow --workspace
 cargo add shellflow-core shellflow-secrets -p shellflow --path crates/...
 
 # crates/shellflow-core
@@ -540,7 +541,6 @@ cargo add tempfile -p shellflow-secrets --workspace --dev
 | `tokio` | bin | async process supervision, `JoinSet` |
 | `eyre` | bin | application error handling (per AGENTS.md) |
 | `thiserror` | core/secrets | library error types (per AGENTS.md) |
-| `tracing-subscriber` | bin | env-filtered logging init |
 | `colored` | bin | host-prefix and step-header ANSI styling |
 | `age` | secrets | embedded X25519 encryption (no `rage` binary) |
 | `shellflow-dsl` | bin | local path dependency (the grammar + the plan model) |
@@ -573,13 +573,14 @@ OPTIONS:
   -c, --continue-on-error     Continue after a failed host/step; print summary
   -k, --check                 Syntax-check only: local `bash -n`, remote
                               `ssh host bash -n -s`; no execution
-      --timeout <SECS>        Per-step timeout for all steps [default: none]
+      --timeout <SECS>        Per-step timeout for all steps [default: none;
+                              @timeout overrides it per step]
       --output <MODE>         stream (default) | grouped — print each host's
                               logs as one block when that host finishes
       --mask-min-len <N>      Minimum @secrets value length that is masked;
                               defaults to $SHELLFLOW_MASK_MIN_LEN, else 6
   -l, --log-file <PATH>       Append every streamed line (tagged host+stream)
-                              to a file for audit
+                              to a file for audit (run path only)
       --no-color              Disable ANSI colors
       --local                 Run remote blocks/copies on the controller
                                (debugging; no network or sudo required)
@@ -621,6 +622,16 @@ EXIT CODES:
       payload pipe, rsync I/O error)
   4   script execution failure (a local/remote step exited non-zero)
   130 interrupted by SIGINT/SIGTERM (see §7.5)
+
+42 is reserved inside a guarded remote payload as the guard's "skip"
+channel; it never becomes the process exit code. The payload installs an
+`EXIT` trap that remaps a block's own `exit 42` to 1, and the guard disables
+the trap before it exits 42. A block without a guard is never interpreted as
+a skip.
+
+`--log-file` belongs to `run`, not to the global option set: the maintenance
+subcommands produce no streamed lines and now reject the flag instead of
+accepting it and silently writing nothing.
 
 The distinction between 1 and 4 is deliberate: 1 means "the playbook is
 wrong" (nothing was attempted), 4 means "the deployment failed". A CI gate
@@ -704,6 +715,12 @@ drift away from the sources they come from, and the drift is silent.
    restore what was just deployed. The check compares the plan's own step
    order.
 
+The check is deliberately offline. When it cannot read a sealed credential
+file (no identity is available), the affected drop-in is reported as
+**skipped** in both the per-check output and the summary, and the summary
+never calls the repository consistent without naming the skipped count. A
+skipped check is not a pass.
+
 ## 7. Execution Engine
 
 ### 7.1 Step lifecycle
@@ -711,7 +728,10 @@ drift away from the sources they come from, and the drift is silent.
 ```text
 for each step (sequentially):
     resolve hosts (respecting --target restriction)
-    print step header  [STEP n/m] <name> <kind> -> <target>
+    print header  [STEP n/m] <name> <kind> -> <target>
+        # n is the step's 1-based index in the unfiltered plan (the number
+        # --only/--skip accept); m is that plan's step count, even when a
+        # filter runs only some of them
     if payload display requested (-vv, dry-run, diff): print script preview
     match step:
         Local  -> run_local(step)
@@ -1006,7 +1026,11 @@ Three cooperating layers, deliberately *not* a state engine:
    step is a no-op when content matches.
 2. **Guard idempotency** — `@only_if` blocks are skipped where the precondition
    already holds; skipped blocks print `SKIPPED (guard)` and count as success,
-   so repeated runs converge.
+   so repeated runs converge. The skip travels through exit code 42, which is
+   reserved *inside a guarded payload only*: the guard clears the payload's
+   `EXIT` trap before using it, and the trap remaps a block's own `exit 42`
+   to 1. A remote block without a guard therefore cannot be mistaken for a
+   skip.
 3. **Author idempotency** — plain Bash (`[ -f ] ||`, `command -v`,
    `systemctl is-active`) for everything the tool can't infer. `set -eu` and
    pre-run `bash -n` make partial failures from typos impossible.
@@ -1016,10 +1040,13 @@ Three cooperating layers, deliberately *not* a state engine:
 - **Inherit the user's SSH trust**: keys, `~/.ssh/config`, `ssh-agent`, jump
   hosts, YubiKey — all handled by the system `ssh`. We never touch credentials.
 - **No interactive prompts**: we use `ssh -T` (no TTY) **and**
-  `-o BatchMode=yes` on every ssh invocation the tool makes. The secrets
-  payload travels over that channel, so an unknown host key or a missing key
-  must fail closed rather than raise a prompt an operator may approve for a
-  rogue key. Host-key *policy* stays with the user's `~/.ssh/config` — the
+  `-o BatchMode=yes` on every ssh invocation the tool makes. A transfer tool
+  that starts its own ssh is given the same options (rsync through `-e`, scp
+  directly), so a copy cannot stop at a password or host-key prompt in the
+  middle of a run. The secrets payload travels over that channel, so an
+  unknown host key or a missing key must fail closed rather than raise a
+  prompt an operator may approve for a rogue key. Host-key *policy* stays
+  with the user's `~/.ssh/config` — the
   tool does not add `accept-new` or `no`, which would auto-trust an unseen
   key. Provision a first connection explicitly:
   `ssh-keyscan <host> >> ~/.ssh/known_hosts`. `sudo` in scripts
@@ -1139,8 +1166,9 @@ End-to-end tests with **mock `ssh`/`rsync` shims** placed earlier on `PATH`
 - SIGINT: an in-flight mock `ssh` is killed and shellflow exits 130, and the
   interrupt summary is recorded in the `--log-file` audit trail;
 - `--output grouped` emits per-host blocks; `--log-file` contains tagged lines;
-- the plan preview and the step headers share one numbering space, also when
-  `--only`/`--skip` filtered the plan;
+- the plan preview and the step headers share one numbering space (the
+  unfiltered plan index, which is also what `--only`/`--skip` accept), also
+  when a filter runs only some of the plan;
 - preflight: PATH without `ssh` fails fast with exit 3 and a friendly message;
   the `service check` subcommand reports the same failure class the same way;
 - `-vvv` with an `@env` secret: the mock's echoed payload shows the value
@@ -1298,7 +1326,7 @@ secret in `ssh`'s argv, visible to `ps` and to `-vv` argv printing).
 | `bin/` CLI + `crates/` libs | `bin/shellflow` + `crates/shellflow-core` + `crates/shellflow-secrets` |
 | `cargo add` only; `workspace = true` | §5.3 |
 | `eyre` app / `thiserror` lib | §5.2, D-6 |
-| `tracing` for logs | bin initializes `tracing_subscriber`; `println!` reserved for streaming UI with the documented `#![allow(clippy::print_stdout)]` |
+| One output path | no logging framework; `ui` streams user-facing lines, masks secrets, and writes the audit log (`#![allow(clippy::print_stdout)]`) |
 | No `anyhow`/`log`/`reqwest`/`dashmap` | none used |
 | No `unsafe`, no `unwrap`/`expect`/`panic` | workspace lints deny; code uses `?` + `eyre` context |
 | Pedantic/nursery clippy, `missing_docs` | all public items documented |

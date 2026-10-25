@@ -14,8 +14,9 @@
 //! description to use.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use shellflow_core::SshSpec;
@@ -25,6 +26,14 @@ use crate::{
     rbatch::{Batch, SshDest},
     service::{ServiceError, ServiceError::Other},
 };
+
+/// The number of hosts `service status` queries at once.
+///
+/// The fan-out is intentionally bounded: one thread and one SSH connection
+/// per host exhausts the server's `MaxStartups` and the operator's file
+/// descriptors on a large fleet. The bound matches the default of `--parallel`
+/// for `run` so both commands present the same load.
+const STATUS_PARALLEL: usize = crate::cli::DEFAULT_PARALLEL;
 
 /// The state of one unit on one host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,24 +70,41 @@ pub(crate) fn status(args: &ServiceStatusArgs) -> Result<(), ServiceError> {
         plans.push((alias.clone(), dest.clone(), units_for_host(args, alias)?));
     }
 
-    let mut rows: Vec<(String, String, UnitState)> = Vec::new();
-    let mut failures: Vec<String> = Vec::new();
+    // A fixed pool of workers drains the host queue: N hosts no longer mean
+    // N threads and N simultaneous SSH sessions.
+    let queue = Mutex::new(plans.into_iter().collect::<VecDeque<_>>());
+    let results = Mutex::new(Vec::with_capacity(queue.lock().map_or(0, |q| q.len())));
+    let workers = STATUS_PARALLEL.min(queue.lock().map_or(0, |q| q.len())).max(1);
     std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (alias, dest, units) in &plans {
-            let alias = alias.clone();
-            let dest = dest.clone();
-            let units = units.clone();
-            handles.push(scope.spawn(move || query_host(&alias, &dest, &units)));
-        }
-        for handle in handles {
-            match handle.join() {
-                Ok(HostQuery::Rows(states)) => rows.extend(states),
-                Ok(HostQuery::Failed(message)) => failures.push(message),
-                Err(_) => failures.push("the host query panicked".to_string()),
-            }
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let job = {
+                        let mut queue = queue.lock().unwrap_or_else(|p| p.into_inner());
+                        queue.pop_front()
+                    };
+                    let Some((alias, dest, units)) = job else {
+                        break;
+                    };
+                    let result = query_host(&alias, &dest, &units);
+                    results.lock().unwrap_or_else(|p| p.into_inner()).push(result);
+                }
+            });
         }
     });
+    let results = results.into_inner().unwrap_or_else(|p| p.into_inner());
+    let mut rows: Vec<(String, String, UnitState)> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for result in results {
+        match result {
+            HostQuery::Rows(states) => rows.extend(states),
+            HostQuery::Failed(message) => failures.push(message),
+        }
+    }
+    // The workers finish out of order; the table is sorted so two runs over
+    // the same fleet produce the same output.
+    rows.sort_by(|a, b| (&a.0, &a.2.unit).cmp(&(&b.0, &b.2.unit)));
+    failures.sort();
 
     for failure in &failures {
         println!("[FAIL] {failure}");
