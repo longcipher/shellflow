@@ -77,6 +77,7 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
               if git clone \"$SF_REPO\" \"$DEST\" 2>/dev/null; then break; fi; \
               n=$((n + 1)); \
               echo \"clone failed ($n/3), backing off\" >&2; \
+                rm -rf \"$DEST\"; \
               sleep $((n * 20)); \
             done; \
             [ -d \"$DEST/.git\" ] || {{ echo 'clone failed' >&2; exit 1; }}; \
