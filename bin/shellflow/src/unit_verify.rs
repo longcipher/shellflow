@@ -50,6 +50,10 @@ impl fmt::Display for Problem {
 pub(crate) struct Report {
     /// The problems found.
     pub problems: Vec<Problem>,
+    /// The checks that could not run (for example a sealed credential file
+    /// without an identity), reported so "pass" is never confused with "not
+    /// checked".
+    pub skipped: Vec<Problem>,
     /// How many units were checked.
     pub units: usize,
     /// How many playbooks were checked.
@@ -131,13 +135,27 @@ fn check_dropin(repo: &Path, m: &ServiceManifest, report: &mut Report) {
         let file = repo.join(secret.replace("{host}", &m.host));
         match crate::secret::credential_key_set(&file, None) {
             Ok(keys) => keys,
-            Err(_) => return,
+            Err(err) => {
+                report.skipped.push(Problem {
+                    location: path.display().to_string(),
+                    message: format!(
+                        "the drop-in was not verified: the credential keys of `{}` cannot be \
+                         read offline ({err})",
+                        file.display()
+                    ),
+                });
+                return;
+            }
         }
     } else {
         Vec::new()
     };
     let rendered = unit::render(m, &keys);
     let Ok(current) = std::fs::read_to_string(&path) else {
+        report.problems.push(Problem {
+            location: path.display().to_string(),
+            message: "the generated drop-in cannot be read".to_string(),
+        });
         return;
     };
     if current != rendered.text {
@@ -617,6 +635,24 @@ mod tests {
             report.problems.iter().any(|p| p.message.contains("drop-in is missing")),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn a_dropin_that_cannot_be_verified_is_reported_as_skipped() {
+        // `unit verify` runs offline. Without an identity the sealed file's
+        // key set is unknown; the check must say so instead of returning as
+        // if the drop-in had matched.
+        let dir = repo_with_service();
+        fs::write(
+            dir.path().join("services/dufs/dufs.service.toml"),
+            "host = \"api\"\nunit = \"dufs.service\"\nsecret_file = \"dufs-{host}.env.age\"\n",
+        )
+        .expect("write");
+        let dropin = dir.path().join("services/dufs/dufs.service.d/20-shellflow.conf");
+        fs::create_dir_all(dropin.parent().expect("parent")).expect("mkdir");
+        fs::write(&dropin, "[Service]\n").expect("write");
+        let report = verify(dir.path()).expect("verify");
+        assert!(report.skipped.iter().any(|p| p.message.contains("not verified")), "{report:?}");
     }
 
     #[test]

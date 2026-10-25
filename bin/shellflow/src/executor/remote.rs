@@ -283,9 +283,22 @@ async fn setup_run(
         .map(|(idx, step)| (idx, step.clone()))
         .collect();
 
-    let host_aliases = target_host_aliases(plan, &restrict, &selected, &log_file);
+    let host_targets = target_host_aliases(plan, &restrict, &selected, &log_file);
+    let host_aliases = host_targets.aliases;
+    let uses_per_host = plan.secrets.iter().any(|entry| entry.file.contains("{host}"));
+    if !flags.check && uses_per_host && !host_targets.raw.is_empty() {
+        eprintln!(
+            "error: per-host `@secrets` ({{host}}) need a named `@server` alias; these targets \
+             are raw SSH specs and cannot key a secret file: {}",
+            host_targets.raw.join(", ")
+        );
+        return None;
+    }
 
-    let resolved = if plan.secrets.is_empty() {
+    // `--check` is the syntax gate: it does not execute anything, so it must
+    // not need an identity or a `{host}` file. Resolving secrets here made a
+    // keyless CI runner unable to run the cheapest, safest check.
+    let resolved = if flags.check || plan.secrets.is_empty() {
         ResolvedSecrets::empty()
     } else {
         match crate::secrets::resolve_secrets(
@@ -343,7 +356,11 @@ async fn setup_run(
     let semaphore: Option<Arc<Semaphore>> =
         (flags.parallel != 0).then(|| Arc::new(Semaphore::new(flags.parallel)));
 
-    let total = selected.len();
+    // Numbering is by the step's position in the unfiltered plan, the same
+    // index `--only`/`--skip` use. Numbering by the filtered position made
+    // `--skip 1 --only 1` select a step the preview had numbered
+    // differently.
+    let total = plan.steps.len();
 
     // The managed work directory exists before the first step, so every
     // block and every `@copy` path can name `$WORKDIR`.
@@ -392,7 +409,9 @@ async fn run_single_step(
     step_no: usize,
     step: &shellflow_core::Step,
 ) -> (Option<RunError>, eyre::Result<Vec<(String, HostOutcome)>>) {
-    let config = StepConfig::new(run, run.flags.timeout.or_else(|| step.timeout()));
+    // `@timeout` overrides the run-wide default: a long build or health
+    // check must be able to widen the budget the CLI set for ordinary steps.
+    let config = StepConfig::new(run, step.timeout().or(run.flags.timeout));
     match step {
         shellflow_core::Step::Local(local) => {
             let outcome = super::local::run_local_step(
@@ -1014,7 +1033,7 @@ pub(crate) async fn execute_plan(
     let mut fail_fast_error: Option<RunError> = None;
     let mut first_error: Option<RunError> = None;
 
-    for (pos, (_idx, step)) in setup.selected.iter().enumerate() {
+    for (idx, step) in &setup.selected {
         if fail_fast_error.is_some() {
             break;
         }
@@ -1023,7 +1042,7 @@ pub(crate) async fn execute_plan(
         if cancel.is_cancelled() {
             break;
         }
-        let step_no = pos + 1;
+        let step_no = idx + 1;
         crate::ui::step_header(step_no, total, step, &log_file);
 
         let started = std::time::Instant::now();
@@ -1103,13 +1122,21 @@ fn is_selected(run: &crate::cli::RunArgs, idx: usize, step: &shellflow_core::Ste
     true
 }
 
+/// The named hosts a run targets, plus the raw SSH specs that cannot key a
+/// per-host secret file.
+struct HostTargets {
+    aliases: Vec<String>,
+    raw: Vec<String>,
+}
+
 fn target_host_aliases(
     plan: &shellflow_core::ExecutionPlan,
     restrict: &[String],
     selected: &[(usize, shellflow_core::Step)],
     log_file: &LogFile,
-) -> Vec<String> {
+) -> HostTargets {
     let mut aliases = std::collections::BTreeSet::new();
+    let mut raw = std::collections::BTreeSet::new();
     for (_, step) in selected {
         let target = match step {
             shellflow_core::Step::Remote(remote) => &remote.target,
@@ -1131,12 +1158,13 @@ fn target_host_aliases(
         };
         match shellflow_core::resolve_hosts(plan, target, restrict) {
             Ok(hosts) => {
-                aliases.extend(
-                    hosts
-                        .into_iter()
-                        .map(|host| host.alias)
-                        .filter(|alias| plan.servers.contains_key(alias)),
-                );
+                for host in hosts {
+                    if plan.servers.contains_key(&host.alias) {
+                        aliases.insert(host.alias);
+                    } else {
+                        raw.insert(host.alias);
+                    }
+                }
             }
             Err(err) => {
                 crate::ui::warn(
@@ -1146,7 +1174,7 @@ fn target_host_aliases(
             }
         }
     }
-    aliases.into_iter().collect()
+    HostTargets { aliases: aliases.into_iter().collect(), raw: raw.into_iter().collect() }
 }
 
 #[derive(Clone)]
@@ -1572,15 +1600,18 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
                 super::display_args(&cmd)
             ));
         }
-        return match run_ssh_child(
+        return match run_ssh_child(SshChildArgs {
             ui,
             host,
-            build_ssh_cmd(host, RemoteShell::Bash, true, config),
-            &payload,
-            config.timeout,
+            cmd: build_ssh_cmd(host, RemoteShell::Bash, true, config),
+            payload: &payload,
+            timeout: config.timeout,
+            // A syntax check has no guard: exit 42 in user code is an
+            // ordinary failure, never a skip.
+            has_guard: false,
             log_file,
             cancel,
-        )
+        })
         .await
         {
             Ok(()) => {
@@ -1614,6 +1645,7 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
     // The guard is folded into the payload: evaluating it used to cost a
     // second SSH round trip, so a guarded step paid double for one
     // precondition.
+    let has_guard = parts.guard.is_some();
     let guard = parts.guard.as_ref().map_or_else(String::new, |guard| folded_guard(guard));
     let payload = format!("set -eu\n{env_header}{guard}{}{}", parts.trace_line, parts.script);
     let cmd = build_ssh_cmd(host, remote_env.shell, false, config);
@@ -1624,7 +1656,18 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
             super::display_args(&cmd)
         ));
     }
-    match run_ssh_child(ui.clone(), host, cmd, &payload, config.timeout, log_file, cancel).await {
+    match run_ssh_child(SshChildArgs {
+        ui: ui.clone(),
+        host,
+        cmd,
+        payload: &payload,
+        timeout: config.timeout,
+        has_guard,
+        log_file,
+        cancel,
+    })
+    .await
+    {
         Ok(()) => {
             if let Some(guard) = &parts.guard &&
                 config.verbose >= 2
@@ -1923,22 +1966,38 @@ const GUARD_SKIP_EXIT: i32 = 42;
 /// behaviour — a failing guard still skips the block, and the block's own
 /// output is still discarded.
 ///
+/// The `EXIT` trap remaps the *block's* exit code 42 to 1: 42 is the skip
+/// channel, and a script that exits 42 for its own reason must not be
+/// reported as a skipped block. The guard's own `exit 42` disables the trap
+/// first, so only the guard can use the channel.
+///
 /// The guard keeps its own relaxed shell options (`set +u`), so a guard that
 /// reads an unset variable behaves as it did before, and its output stays
 /// hidden.
 fn folded_guard(guard: &str) -> String {
-    format!("if ! ( set +u; {guard} ) >/dev/null 2>&1; then exit {GUARD_SKIP_EXIT}; fi\n")
+    format!(
+        "trap 'rc=$?; if [ \"$rc\" = {GUARD_SKIP_EXIT} ]; then exit 1; fi' EXIT\n\
+         if ! ( set +u; {guard} ) >/dev/null 2>&1; then trap - EXIT; exit {GUARD_SKIP_EXIT}; fi\n"
+    )
 }
 
-async fn run_ssh_child(
+/// One SSH child invocation.
+struct SshChildArgs<'a> {
     ui: ArcUi,
-    host: &ResolvedHost,
+    host: &'a ResolvedHost,
     cmd: Command,
-    payload: &str,
+    payload: &'a str,
     timeout: Option<u64>,
-    log_file: &LogFile,
+    /// Only a payload that folded a guard may use the skip exit code. Without
+    /// this flag, any block that exits 42 would be classified as SKIPPED and
+    /// the step would count as a success.
+    has_guard: bool,
+    log_file: &'a LogFile,
     cancel: Cancel,
-) -> Result<(), SshOutcome> {
+}
+
+async fn run_ssh_child(args: SshChildArgs<'_>) -> Result<(), SshOutcome> {
+    let SshChildArgs { ui, host, cmd, payload, timeout, has_guard, log_file, cancel } = args;
     let args = stream::PipedArgs {
         ui: &ui,
         host: &host.alias,
@@ -1956,7 +2015,7 @@ async fn run_ssh_child(
                 if status.code() == Some(255) {
                     return Err(SshOutcome::Transport);
                 }
-                if status.code() == Some(GUARD_SKIP_EXIT) {
+                if has_guard && status.code() == Some(GUARD_SKIP_EXIT) {
                     return Err(SshOutcome::Skipped);
                 }
                 return Err(SshOutcome::Script);
@@ -1973,7 +2032,38 @@ async fn run_ssh_child(
 
 #[cfg(test)]
 mod tests {
-    use super::{wait_collector, wait_command};
+    use super::{GUARD_SKIP_EXIT, folded_guard, wait_collector, wait_command};
+
+    /// Run a folded guard plus a body exactly as the remote payload does.
+    fn run_payload(guard: &str, body: &str) -> i32 {
+        let script = format!("set -eu\n{}{body}", folded_guard(guard));
+        let status =
+            std::process::Command::new("bash").args(["-c", &script]).status().expect("bash");
+        status.code().expect("the child was not signalled")
+    }
+
+    #[test]
+    fn a_failed_guard_uses_the_reserved_skip_exit() {
+        assert_eq!(run_payload("false", "echo ran"), GUARD_SKIP_EXIT);
+    }
+
+    #[test]
+    fn a_block_exiting_42_is_not_mistaken_for_a_skip() {
+        // 42 is the skip channel; a block that exits 42 for its own reason is
+        // an ordinary failure, so the trap must remap it.
+        assert_eq!(run_payload("true", "exit 42"), 1);
+    }
+
+    #[test]
+    fn a_guarded_block_keeps_its_own_failure_code() {
+        assert_eq!(run_payload("true", "exit 7"), 7);
+        assert_eq!(run_payload("true", "false"), 1);
+    }
+
+    #[test]
+    fn a_passing_guard_runs_the_block() {
+        assert_eq!(run_payload("true", "exit 0"), 0);
+    }
 
     #[test]
     fn the_wait_command_prefers_the_target_side_helper() {

@@ -158,6 +158,17 @@ case "$host" in
     echo "mock: intentional failure" >&2
     exit 7
     ;;
+  *plain42*)
+    # A block that exits 42 for its own reason. Without a folded guard this
+    # must be an ordinary failure, never a skip.
+    exit 42
+    ;;
+  *runpayload*)
+    # Execute the recorded payload, so guard semantics (including the skip
+    # exit code) run for real.
+    bash "$MOCK_DIR/ssh-stdin-$host.txt"
+    exit $?
+    ;;
   *hang*)
     # Record this process's pid so a test can assert that an interrupt left
     # no orphaned process group behind.

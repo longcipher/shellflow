@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use sha2::{Digest, Sha256};
 use shellflow_core::ResolvedHost;
 use tokio::{process::Command, sync::Semaphore};
 
@@ -274,7 +275,14 @@ pub(super) fn service_command(unit: &str, actions: ServiceActions, timeout: u64)
 
     // The fallback reproduces the same rules: the unit is restarted only when
     // it was running, so a unit the operator keeps stopped stays stopped.
-    let fallback = service_fallback(unit, actions.enable, actions.reload, actions.force_start);
+    let fallback = service_fallback(
+        unit,
+        actions.enable,
+        actions.reload,
+        actions.wait,
+        actions.force_start,
+        timeout,
+    );
     helper_command("service", &args, &fallback)
 }
 
@@ -283,24 +291,50 @@ pub(super) fn service_command(unit: &str, actions: ServiceActions, timeout: u64)
 ///
 /// The rules are the ones the helper implements: the unit is verified before
 /// the manager is reloaded, and it is restarted only when it was running.
-fn service_fallback(unit: &str, enable: bool, reload: bool, force_start: bool) -> String {
-    let enable = if enable { "systemctl enable \"$u\"; " } else { "" };
-    let reload = if reload { "systemctl reload \"$u\"; " } else { "" };
+fn service_fallback(
+    unit: &str,
+    enable: bool,
+    reload: bool,
+    wait: bool,
+    force_start: bool,
+    timeout: u64,
+) -> String {
+    let enable = if enable { "$SC enable \"$u\"; " } else { "" };
+    let reload = if reload { "$SC reload \"$u\"; " } else { "" };
     let force = if force_start { "1" } else { "0" };
+    let wait = if wait {
+        format!(
+            "if [ \"$was\" = 1 ] || [ \"{force}\" = 1 ]; then \
+               d=$(( $(date +%s) + {timeout} )); \
+               while :; do \
+                 if $SC is-active --quiet \"$u\"; then echo \"$u is active\"; break; fi; \
+                 if $SC is-failed --quiet \"$u\"; then echo \"$u failed\" >&2; exit 1; fi; \
+                 if [ \"$(date +%s)\" -ge \"$d\" ]; then \
+                   echo \"timed out waiting for $u\" >&2; exit 3; \
+                 fi; \
+                 sleep 2; \
+               done; \
+             else echo \"$u was left stopped: not waiting for readiness\"; fi; "
+        )
+    } else {
+        String::new()
+    };
     format!(
         "u={u}; \
-         was=$(systemctl is-active \"$u\" 2>/dev/null || true); \
-         [ \"$was\" = active ] && was=1 || was=0; \
+         if [ \"$(id -u)\" = 0 ]; then SC=systemctl; else SC='sudo -n systemctl'; fi; \
+         was=$($SC is-active \"$u\" 2>/dev/null || true); \
+         case \"$was\" in \"\"|inactive|unknown) was=0 ;; *) was=1 ;; esac; \
          if command -v systemd-analyze >/dev/null 2>&1; then \
            systemd-analyze verify \"$u\" >/dev/null 2>&1 \
              || {{ echo \"unit $u failed verification\" >&2; exit 1; }}; \
          fi; \
-         systemctl daemon-reload; \
+         $SC daemon-reload; \
          {enable}\
          {reload}\
-         if [ \"$was\" = 1 ]; then systemctl restart \"$u\"; \
-         elif [ \"{force}\" = 1 ]; then systemctl start \"$u\"; \
-         else echo \"$u was not running: left it stopped\"; fi",
+         if [ \"$was\" = 1 ]; then $SC restart \"$u\"; \
+         elif [ \"{force}\" = 1 ]; then $SC start \"$u\"; \
+         else echo \"$u was not running: left it stopped\"; fi; \
+         {wait}",
         u = quote(unit),
     )
 }
@@ -337,7 +371,7 @@ pub(super) fn install_command(
 /// shellflow.
 fn install_fallback(src: &str, dst: &str, mode: Option<u32>, owner: Option<&str>) -> String {
     let mode = format!("{:o}", mode.unwrap_or(0o644));
-    let chown = owner.map_or_else(String::new, |o| format!("chown {o} \"$t\" && "));
+    let chown = owner.map_or_else(String::new, |o| format!("chown {} \"$t\" && ", quote(o)));
     format!(
         "d={dst}; s={src}; \
          dir=$(dirname \"$d\"); \
@@ -407,48 +441,147 @@ pub(crate) fn cache_dir() -> PathBuf {
 
 /// The revision of a source tree, used as the cache key.
 ///
-/// A git checkout is keyed by its HEAD; anything else by the modification
-/// time of its manifest, which changes whenever the sources change.
+/// The key is a hash of the build **inputs**, not of a VCS pointer or one
+/// manifest's mtime: a modified `.rs` file, a changed `Cargo.lock`, and a
+/// dirty checkout all produce a new key. The old scheme reused a stale helper
+/// after any edit that did not touch `Cargo.toml`.
+///
+/// In a git checkout the input set is the one git reports (tracked files plus
+/// unignored new ones), so generated trees (`target/`, fuzz corpora,
+/// `mutants.out/`) are excluded by the same rules that keep them out of a
+/// commit. A plain directory is walked instead, skipping VCS metadata,
+/// hidden directories and `target`/`mutants.out` by name.
 pub(crate) fn source_revision(source: &Path) -> eyre::Result<String> {
-    let git = source.join(".git");
-    if git.exists() {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(source)
-            .args(["rev-parse", "HEAD"])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|err| eyre::eyre!("cannot run `git`: {err}"))?;
-        if out.status.success() {
-            let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !head.is_empty() {
-                return Ok(head.chars().take(12).collect());
-            }
-        }
+    let mut hasher = Sha256::new();
+    match git_inputs(source) {
+        Some(files) => hash_files(source, &files, &mut hasher)?,
+        None => hash_tree(source, source, &mut hasher)?,
     }
-    let manifest = source.join("Cargo.toml");
-    let meta = std::fs::metadata(&manifest)
-        .map_err(|err| eyre::eyre!("cannot stat `{}`: {err}", manifest.display()))?;
-    let modified = meta
-        .modified()
-        .map_err(|err| eyre::eyre!("cannot read the modification time: {err}"))?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    Ok(format!("m{modified}"))
+    // `Cargo.lock` is ignored by this repository's `.gitignore`, so git does
+    // not report it even though the helper's dependency set — and therefore
+    // the binary — changes with it.
+    let lock = source.join("Cargo.lock");
+    if lock.is_file() {
+        hash_file(Path::new("Cargo.lock"), &lock, &mut hasher)?;
+    }
+    let digest = hasher.finalize();
+    let mut revision = String::with_capacity(12);
+    for byte in digest.iter().take(6) {
+        use std::fmt::Write as _;
+        // Writing to a `String` cannot fail.
+        let _ = write!(revision, "{byte:02x}");
+    }
+    Ok(revision)
+}
+
+/// The files git considers part of the worktree: tracked files plus untracked
+/// ones that are not ignored.
+///
+/// Returns `None` when git is unavailable or `source` is not a checkout, so
+/// the caller falls back to walking the tree.
+fn git_inputs(source: &Path) -> Option<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut files: Vec<PathBuf> = out
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    files.sort();
+    Some(files)
+}
+
+/// Hash `files`, whose paths are relative to `root`.
+fn hash_files(root: &Path, files: &[PathBuf], hasher: &mut Sha256) -> eyre::Result<()> {
+    for rel in files {
+        hash_file(rel, &root.join(rel), hasher)?;
+    }
+    Ok(())
+}
+
+/// Hash one file's relative name, length and contents.
+///
+/// A tracked file can be absent from the worktree (a sparse or partial
+/// checkout); the absence is part of the key instead of an error.
+fn hash_file(rel: &Path, path: &Path, hasher: &mut Sha256) -> eyre::Result<()> {
+    hasher.update(rel.as_os_str().as_encoded_bytes());
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(eyre::eyre!("cannot read `{}`: {err}", path.display())),
+    };
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    Ok(())
+}
+
+/// Hash a tree that git cannot describe, skipping what is not a build input.
+///
+/// Symlinks are never followed: a link that points back into the tree would
+/// recurse forever, so its target is hashed instead. Hidden directories,
+/// `target/` and `mutants.out/` are generated state, not sources.
+fn hash_tree(root: &Path, dir: &Path, hasher: &mut Sha256) -> eyre::Result<()> {
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+        .map_err(|err| eyre::eyre!("cannot read `{}`: {err}", dir.display()))?
+        .flatten()
+        .collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let file_type = entry
+            .file_type()
+            .map_err(|err| eyre::eyre!("cannot inspect `{}`: {err}", path.display()))?;
+        if file_type.is_symlink() {
+            hasher.update(rel.as_os_str().as_encoded_bytes());
+            let target = std::fs::read_link(&path)
+                .map_err(|err| eyre::eyre!("cannot read the link `{}`: {err}", path.display()))?;
+            hasher.update(target.as_os_str().as_encoded_bytes());
+            continue;
+        }
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || matches!(name.as_ref(), "target" | "mutants.out") {
+                continue;
+            }
+            hash_tree(root, &path, hasher)?;
+            continue;
+        }
+        hash_file(rel, &path, hasher)?;
+    }
+    Ok(())
 }
 
 /// The cached helper for a source revision and target triple.
-pub(crate) fn cached_helper(source: &Path, triple: &str) -> eyre::Result<PathBuf> {
+///
+/// Returns the binary **and** the revision it was built from, so the staging
+/// path can reuse the exact key the cache used.
+pub(crate) fn cached_helper(source: &Path, triple: &str) -> eyre::Result<(PathBuf, String)> {
     let revision = source_revision(source)?;
     let dir = cache_dir().join(format!("helper-{revision}-{triple}"));
     let binary = dir.join("shellflow");
     if binary.exists() {
-        return Ok(binary);
+        return Ok((binary, revision));
     }
     std::fs::create_dir_all(&dir)
         .map_err(|err| eyre::eyre!("cannot create `{}`: {err}", dir.display()))?;
     build_helper(source, triple, &binary)?;
-    Ok(binary)
+    Ok((binary, revision))
 }
 
 /// Build the target-side helper.
@@ -532,12 +665,12 @@ pub(super) async fn run_helper_step(
     // The build blocks; keep it off the async runtime's worker threads.
     let source_for_build = source.clone();
     let triple_for_build = triple.clone();
-    let built = match tokio::task::spawn_blocking(move || {
+    let (built, revision) = match tokio::task::spawn_blocking(move || {
         cached_helper(&source_for_build, &triple_for_build)
     })
     .await
     {
-        Ok(Ok(path)) => path,
+        Ok(Ok((path, revision))) => (path, revision),
         Ok(Err(err)) => {
             crate::ui::step_failed(0, &err.to_string(), log_file);
             return Err(err);
@@ -549,7 +682,6 @@ pub(super) async fn run_helper_step(
     };
     ui.lock().await.masked_note(&format!("==> helper staged: {}", built.display()));
 
-    let revision = source_revision(&source).unwrap_or_else(|_| "unknown".to_string());
     let staged = helper_staging_path(&revision);
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -696,10 +828,9 @@ async fn ship_helper(request: HelperShip<'_>) -> eyre::Result<()> {
     }
     let mut rsync = Command::new("rsync");
     rsync.args(["-a", "-z"]);
-    let remote_shell = host.spec.rsync_remote_shell();
-    if let Some(shell) = &remote_shell {
-        rsync.args(["-e", shell]);
-    }
+    // The copy must fail closed like every other transfer: rsync starts its
+    // own ssh, so it has to be told not to prompt.
+    rsync.args(["-e", &host.spec.rsync_transport()]);
     rsync.arg(built).arg(format!("{}:{staged}", host.spec.dest()));
     rsync.stdout(Stdio::piped()).stderr(Stdio::piped());
     rsync.stdin(Stdio::null());
@@ -735,7 +866,8 @@ async fn ship_helper(request: HelperShip<'_>) -> eyre::Result<()> {
 mod tests {
     use super::{
         ServiceActions, backup_command, credstore_command, helper_install_command, install_command,
-        install_fallback, service_command, service_fallback, unit_inventory_command,
+        install_fallback, service_command, service_fallback, source_revision,
+        unit_inventory_command,
     };
 
     #[test]
@@ -761,7 +893,7 @@ mod tests {
 
     #[test]
     fn a_service_fallback_never_starts_a_stopped_unit() {
-        let fallback = service_fallback("dufs.service", false, false, false);
+        let fallback = service_fallback("dufs.service", false, false, false, false, 300);
         assert!(fallback.contains("was=0"), "{fallback}");
         assert!(fallback.contains("left it stopped"), "{fallback}");
         assert!(fallback.contains("[ \"0\" = 1 ]"), "{fallback}");
@@ -773,8 +905,35 @@ mod tests {
 
     #[test]
     fn a_forced_service_may_start_a_stopped_unit() {
-        let fallback = service_fallback("dufs.service", false, false, true);
+        let fallback = service_fallback("dufs.service", false, false, false, true, 300);
         assert!(fallback.contains("[ \"1\" = 1 ]"), "{fallback}");
+    }
+
+    #[test]
+    fn a_service_fallback_waits_for_readiness_and_elevates() {
+        let fallback = service_fallback("dufs.service", false, false, true, false, 42);
+        assert!(fallback.contains("sudo -n systemctl"), "{fallback}");
+        assert!(fallback.contains("is-active --quiet"), "{fallback}");
+        assert!(fallback.contains("is-failed --quiet"), "{fallback}");
+        assert!(fallback.contains("+ 42"), "the wait must carry the budget: {fallback}");
+        assert!(fallback.contains("left stopped: not waiting"), "{fallback}");
+    }
+
+    #[test]
+    fn a_service_fallback_restarts_a_failed_unit() {
+        let fallback = service_fallback("dufs.service", false, false, false, false, 300);
+        // The helper treats everything except an explicitly inactive state
+        // as worth restarting: a failed unit is restarted, and so is one
+        // that is still activating. The fallback must not drift from it.
+        assert!(fallback.contains("\"\"|inactive|unknown"), "{fallback}");
+        assert!(!fallback.contains("|failed)"), "{fallback}");
+    }
+
+    #[test]
+    fn an_install_fallback_quotes_the_owner() {
+        let fallback = install_fallback("/tmp/a", "/etc/b", None, Some("root;id"));
+        assert!(fallback.contains("chown 'root;id'"), "{fallback}");
+        assert!(!fallback.contains("chown root;id"), "{fallback}");
     }
 
     #[test]
@@ -782,7 +941,7 @@ mod tests {
         let fallback = install_fallback("/tmp/a", "/etc/b", Some(0o644), Some("root:root"));
         assert!(fallback.contains(".shellflow-new"), "{fallback}");
         assert!(fallback.contains("mv -f"), "{fallback}");
-        assert!(fallback.contains("chown root:root"), "{fallback}");
+        assert!(fallback.contains("chown 'root:root'"), "{fallback}");
         assert!(fallback.contains("chmod 644"), "{fallback}");
     }
 
@@ -813,6 +972,92 @@ mod tests {
     fn an_inventory_command_needs_the_helper() {
         let cmd = unit_inventory_command();
         assert!(cmd.contains("/usr/local/bin/shellflow host inventory"), "{cmd}");
+    }
+
+    #[test]
+    fn the_helper_cache_key_tracks_source_content() {
+        // A non-git tree used to be keyed by Cargo.toml's mtime: editing a
+        // .rs file kept the stale helper forever. The key now hashes the
+        // source itself.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("src");
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").expect("manifest");
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").expect("main");
+        let first = source_revision(dir.path()).expect("first revision");
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() { let _ = 1; }\n").expect("main");
+        let second = source_revision(dir.path()).expect("second revision");
+        assert_ne!(first, second, "editing a source file must invalidate the helper cache");
+    }
+
+    #[test]
+    fn the_helper_cache_key_ignores_build_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").expect("manifest");
+        let first = source_revision(dir.path()).expect("first revision");
+        std::fs::create_dir_all(dir.path().join("target/debug")).expect("target");
+        std::fs::write(dir.path().join("target/debug/shellflow"), "binary").expect("binary");
+        let second = source_revision(dir.path()).expect("second revision");
+        assert_eq!(first, second, "build output must not change the cache key");
+    }
+
+    #[test]
+    fn the_helper_cache_key_tracks_a_dirty_git_checkout() {
+        // In a checkout the input set is git's: a modified tracked file counts
+        // even though HEAD is unchanged, ignored output does not, and a new
+        // unignored source file does.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("manifest");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main");
+        std::fs::write(root.join(".gitignore"), "/target/\n").expect("gitignore");
+        for args in [["init", "-q"], ["add", "."]] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+        }
+
+        let first = source_revision(root).expect("first revision");
+        std::fs::write(root.join("src/main.rs"), "fn main() { let _ = 1; }\n").expect("main");
+        let second = source_revision(root).expect("second revision");
+        assert_ne!(first, second, "a dirty tracked file must invalidate the cache");
+
+        std::fs::create_dir_all(root.join("target/debug")).expect("target");
+        std::fs::write(root.join("target/debug/shellflow"), "binary").expect("binary");
+        let third = source_revision(root).expect("third revision");
+        assert_eq!(second, third, "ignored build output must not invalidate the cache");
+
+        std::fs::write(root.join("src/extra.rs"), "pub fn extra() {}\n").expect("extra");
+        let fourth = source_revision(root).expect("fourth revision");
+        assert_ne!(third, fourth, "an unignored new source file must invalidate the cache");
+    }
+
+    #[test]
+    fn the_helper_cache_key_ignores_generated_caches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("manifest");
+        let first = source_revision(root).expect("first revision");
+        std::fs::create_dir_all(root.join("mutants.out/diff")).expect("generated");
+        std::fs::write(root.join("mutants.out/diff/m.diff"), "diff").expect("diff");
+        std::fs::create_dir_all(root.join(".cache")).expect("cache");
+        std::fs::write(root.join(".cache/blob"), "cache").expect("blob");
+        let second = source_revision(root).expect("second revision");
+        assert_eq!(first, second, "generated trees must not invalidate the cache");
+    }
+
+    #[test]
+    fn the_helper_cache_key_does_not_follow_a_symlinked_directory() {
+        // A link back into the tree used to recurse until the stack ran out.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("manifest");
+        std::os::unix::fs::symlink(root, root.join("loop")).expect("symlink");
+        let _ = source_revision(root).expect("a symlinked directory must not be followed");
     }
 
     #[test]

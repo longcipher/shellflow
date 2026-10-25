@@ -192,7 +192,9 @@ pub fn generate_identity(path: &Path) -> Result<age::x25519::Identity, SecretsEr
     // a crash cannot leave a truncated identity behind, and the link fails
     // when the destination already exists, so the "never overwrite" rule is
     // enforced by the filesystem instead of a check-then-write race.
-    let secret = identity.to_string();
+    // The rendered key is the master key: keep it in a buffer that is
+    // scrubbed on drop even on the error paths below it.
+    let secret = Zeroizing::new(identity.to_string());
     crate::fsx::write_new_file(path, secret.expose_secret().as_bytes(), 0o600)?;
 
     Ok(identity)

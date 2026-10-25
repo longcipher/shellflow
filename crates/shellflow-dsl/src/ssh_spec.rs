@@ -98,11 +98,21 @@ impl SshSpec {
         }
     }
 
-    /// The `-e 'ssh -p N'` transport argument for `rsync`, when a custom port
-    /// is set.
+    /// The `-e` transport argument for `rsync` and `scp`-style tools that
+    /// launch their own `ssh`.
+    ///
+    /// The transport always carries `BatchMode=yes`, exactly like the `ssh`
+    /// invocations the tool builds itself: a copy must never fall back to an
+    /// interactive password or host-key prompt just because the transfer tool
+    /// starts its own client. `ConnectTimeout` bounds a dead host instead of
+    /// letting the transfer hang forever.
     #[must_use]
-    pub fn rsync_remote_shell(&self) -> Option<String> {
-        self.port.map(|port| format!("ssh -p {port}"))
+    pub fn rsync_transport(&self) -> String {
+        let mut transport = "ssh -o BatchMode=yes -o ConnectTimeout=15".to_string();
+        if let Some(port) = self.port {
+            transport.push_str(&format!(" -p {port}"));
+        }
+        transport
     }
 
     /// Arguments for `ssh`: `-p <port>` when set, then `user@host`.
@@ -226,10 +236,14 @@ mod tests {
     }
 
     #[test]
-    fn renders_rsync_dest_and_remote_shell() -> Result<(), String> {
+    fn renders_rsync_dest_and_transport() -> Result<(), String> {
         let spec = parse("deploy@10.0.0.1:2222")?;
         assert_eq!(spec.dest(), "deploy@10.0.0.1");
-        assert_eq!(spec.rsync_remote_shell().as_deref(), Some("ssh -p 2222"));
+        assert_eq!(spec.rsync_transport(), "ssh -o BatchMode=yes -o ConnectTimeout=15 -p 2222");
+        // The default port still refuses prompts: the transport is never a
+        // bare `ssh` that can ask for a password on a terminal.
+        let plain = parse("deploy@10.0.0.1")?;
+        assert_eq!(plain.rsync_transport(), "ssh -o BatchMode=yes -o ConnectTimeout=15");
         Ok(())
     }
 
@@ -249,11 +263,11 @@ mod tests {
             prop_assert_eq!(&spec.host, &host);
             prop_assert_eq!(spec.port, Some(port));
             let dest = spec.dest();
-            let shell = spec.rsync_remote_shell();
+            let shell = spec.rsync_transport();
             let want_dest = format!("{user}@{host}");
-            let want_shell = format!("ssh -p {port}");
+            let want_shell = format!("ssh -o BatchMode=yes -o ConnectTimeout=15 -p {port}");
             prop_assert_eq!(&dest, &want_dest);
-            prop_assert_eq!(shell.as_deref(), Some(want_shell.as_str()));
+            prop_assert_eq!(&shell, &want_shell);
         }
 
         /// `to_ssh_args` is always 1 or 3 elements and ends with the
