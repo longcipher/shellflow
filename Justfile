@@ -85,18 +85,23 @@ publish:
   for ((i = 0; i < n; i++)); do
     pkg=${CRATES[i]}
     published=0
-    for attempt in $(seq 1 50); do
+    for attempt in $(seq 1 60); do
+      # Drop the cached crates.io index so each attempt re-fetches the latest
+      # entry for a freshly published sibling. The `just ci` step populates the
+      # index cache before any crate is published, so without this cargo trusts
+      # a stale conditional-GET copy and never sees the new version.
+      rm -rf "${CARGO_HOME:-$HOME/.cargo}/registry/index"
       if out=$(cargo publish -p "$pkg" 2>&1); then
         echo "published $pkg (attempt $attempt)"; published=1; break
       elif echo "$out" | grep -qiE "already (uploaded|published)|already exists|is already"; then
         echo "skip $pkg (already on crates.io)"; published=1; break
       elif echo "$out" | grep -qiE "no matching package|timed out|waiting for published"; then
-        echo "$pkg blocked on dependency index propagation (attempt $attempt/40); retrying in 15s"; sleep 15
+        echo "$pkg blocked on dependency index propagation (attempt $attempt/60); retrying in 20s"; sleep 20
       else
         echo "failed to publish $pkg:"; printf '%s\n' "$out"; exit 1
       fi
     done
-    if ((published == 0)); then echo "gave up on $pkg after 50 attempts"; exit 1; fi
+    if ((published == 0)); then echo "gave up on $pkg after 60 attempts"; exit 1; fi
     if ((i < n - 1)); then sleep 60; fi
   done
 
