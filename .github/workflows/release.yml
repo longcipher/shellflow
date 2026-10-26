@@ -74,6 +74,11 @@ jobs:
         env:
           OUTPUT: CHANGELOG.md
 
+      - name: Delete existing release (idempotent re-runs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "v${{ env.VERSION }}" --yes || true
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
