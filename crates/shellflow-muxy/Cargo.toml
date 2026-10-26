@@ -9,6 +9,10 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
+# Not publishable: it depends on `muxy-client`/`muxy-protocol`, which are
+# git-only beta crates (pinned by rev) and are absent from crates.io. Only the
+# `bin/shellflow` binary consumes it, through the optional `muxy` feature.
+publish = false
 
 [dependencies]
 muxy-client = { workspace = true }

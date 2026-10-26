@@ -9,6 +9,10 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme.workspace = true
+# Not publishable: its default `muxy` feature pulls in `shellflow-muxy`, which
+# depends on git-only beta crates absent from crates.io. The binary is a
+# build-from-source product; the library crates below are the published artifacts.
+publish = false
 
 [features]
 # Event-driven systemd unit state (D-Bus). Off by default so the standard
