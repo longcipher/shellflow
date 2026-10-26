@@ -96,7 +96,7 @@ publish:
       elif echo "$out" | grep -qiE "already (uploaded|published)|already exists|is already"; then
         echo "skip $pkg (already on crates.io)"; published=1; break
       elif echo "$out" | grep -qiE "no matching package|timed out|waiting for published"; then
-        echo "$pkg blocked on dependency index propagation (attempt $attempt/60); retrying in 20s"; sleep 20
+        echo "$pkg blocked on dependency index propagation (attempt $attempt/60); last cargo output:"; printf '%s\n' "$out" | tail -n 15; echo "retrying in 20s"; sleep 20
       else
         echo "failed to publish $pkg:"; printf '%s\n' "$out"; exit 1
       fi
