@@ -71,11 +71,12 @@ publish-check:
 # registry token). Published per-crate in dependency order rather than via
 # `cargo publish --workspace` so the step is idempotent: a crate that is
 # already on crates.io is skipped instead of aborting the whole run, which is
-# what lets a retagged force-push re-run resume after a partial upload. A short
-# pause after each upload lets crates.io index the new version before its
-# dependents resolve it (cargo's built-in wait is too short under load and
-# otherwise times out). `shellflow-muxy` and the `shellflow` binary are
-# `publish = false` (their deps are git-only) and are not published here.
+# what lets a retagged force-push re-run resume after a partial upload. A crate
+# is retried while its just-published sibling is still propagating through
+# crates.io's index — cargo otherwise fails the entire run the moment a
+# dependent cannot yet resolve that dependency. `shellflow-muxy` and the
+# `shellflow` binary are `publish = false` (their deps are git-only) and are
+# not published here.
 publish:
   #!/usr/bin/env bash
   set -uo pipefail
@@ -83,14 +84,20 @@ publish:
   n=${#CRATES[@]}
   for ((i = 0; i < n; i++)); do
     pkg=${CRATES[i]}
-    if out=$(cargo publish -p "$pkg" 2>&1); then
-      echo "published $pkg"
-      if ((i < n - 1)); then sleep 90; fi
-    elif echo "$out" | grep -qiE "already (uploaded|published)|already exists|is already"; then
-      echo "skip $pkg (already on crates.io)"
-    else
-      echo "failed to publish $pkg:"; printf '%s\n' "$out"; exit 1
-    fi
+    published=0
+    for attempt in $(seq 1 50); do
+      if out=$(cargo publish -p "$pkg" 2>&1); then
+        echo "published $pkg (attempt $attempt)"; published=1; break
+      elif echo "$out" | grep -qiE "already (uploaded|published)|already exists|is already"; then
+        echo "skip $pkg (already on crates.io)"; published=1; break
+      elif echo "$out" | grep -qiE "no matching package|timed out|waiting for published"; then
+        echo "$pkg blocked on dependency index propagation (attempt $attempt/40); retrying in 15s"; sleep 15
+      else
+        echo "failed to publish $pkg:"; printf '%s\n' "$out"; exit 1
+      fi
+    done
+    if ((published == 0)); then echo "gave up on $pkg after 50 attempts"; exit 1; fi
+    if ((i < n - 1)); then sleep 60; fi
   done
 
 # Fail if Chinese characters are present in tracked files
