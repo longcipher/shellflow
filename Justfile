@@ -67,9 +67,31 @@ check:
 publish-check:
   cargo publish --workspace --dry-run --allow-dirty
 
-# Publish all crates to crates.io (irreversible: run only with a registry token)
+# Publish the library crates to crates.io (irreversible: run only with a
+# registry token). Published per-crate in dependency order rather than via
+# `cargo publish --workspace` so the step is idempotent: a crate that is
+# already on crates.io is skipped instead of aborting the whole run, which is
+# what lets a retagged force-push re-run resume after a partial upload. A short
+# pause after each upload lets crates.io index the new version before its
+# dependents resolve it (cargo's built-in wait is too short under load and
+# otherwise times out). `shellflow-muxy` and the `shellflow` binary are
+# `publish = false` (their deps are git-only) and are not published here.
 publish:
-  cargo publish --workspace
+  #!/usr/bin/env bash
+  set -uo pipefail
+  CRATES=(shellflow-text shellflow-dsl shellflow-core shellflow-secrets)
+  n=${#CRATES[@]}
+  for ((i = 0; i < n; i++)); do
+    pkg=${CRATES[i]}
+    if out=$(cargo publish -p "$pkg" 2>&1); then
+      echo "published $pkg"
+      if ((i < n - 1)); then sleep 90; fi
+    elif echo "$out" | grep -qiE "already (uploaded|published)|already exists|is already"; then
+      echo "skip $pkg (already on crates.io)"
+    else
+      echo "failed to publish $pkg:"; printf '%s\n' "$out"; exit 1
+    fi
+  done
 
 # Fail if Chinese characters are present in tracked files
 check-cn:
