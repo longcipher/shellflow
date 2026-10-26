@@ -1,0 +1,22 @@
+[package]
+name = "shellflow-muxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Muxy native-protocol transport for shellflow: frame-to-line assembly, payload delivery, and session outcomes."
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+muxy-client = { workspace = true }
+muxy-protocol = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

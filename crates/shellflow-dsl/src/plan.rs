@@ -19,18 +19,30 @@ use crate::{
 pub struct Target {
     /// The raw target text from the script (`web`, `@web`, `deploy@host`…).
     pub text: String,
+    /// The script line the target was declared on (0 for hand-built targets).
+    ///
+    /// Carried so a resolution failure (`resolve_hosts`) can point at the
+    /// step that named the target instead of an anonymous `line 0`.
+    pub line: usize,
 }
 
 impl Target {
     /// Create a target from raw script text.
     ///
     /// A leading `@` is stripped so hand-built targets (`Target::new("@web")`)
-    /// resolve the same way as parsed ones.
+    /// resolve the same way as parsed ones. Parsed targets carry their
+    /// script line; hand-built ones report line 0.
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
+        Self::at(text, 0)
+    }
+
+    /// Create a target from raw script text, remembering the script line.
+    #[must_use]
+    pub fn at(text: impl Into<String>, line: usize) -> Self {
         let raw: String = text.into();
         let stripped = raw.trim_start_matches('@').trim().to_string();
-        Self { text: stripped }
+        Self { text: stripped, line }
     }
 }
 
@@ -134,12 +146,6 @@ pub struct CopyStep {
     /// Honored by the `rsync` path; the `scp` fallback and `--local` copy
     /// cannot filter files and warn instead.
     pub excludes: Vec<String>,
-    /// Optional precondition from `@only_if`.
-    ///
-    /// `@only_if` is **not supported on `@copy`** and the parser rejects it
-    /// (see [`crate::parser`]); the field is retained for struct symmetry
-    /// with [`LocalStep`] / [`RemoteStep`] and stays `None` in valid plans.
-    pub guard: Option<String>,
     /// Optional per-step timeout in seconds from `@timeout`.
     ///
     /// `@timeout` is honored for copy steps (it bounds the `rsync`/`scp`
@@ -668,7 +674,7 @@ impl Step {
         match self {
             Self::Local(s) => s.guard.as_deref(),
             Self::Remote(s) => s.guard.as_deref(),
-            Self::Copy(s) => s.guard.as_deref(),
+            Self::Copy(_) |
             Self::Wait(_) |
             Self::Reload(_) |
             Self::Assert(_) |
@@ -788,7 +794,7 @@ pub fn resolve_hosts(
             // `resolve_hosts` is public API and must not quietly drop a host
             // when handed a hand-built plan.
             let spec = plan.servers.get(member).ok_or_else(|| ParseError::UnknownGroupMember {
-                line: 0,
+                line: target.line,
                 group: normalized.clone(),
                 server: member.clone(),
             })?;
@@ -797,7 +803,12 @@ pub fn resolve_hosts(
     } else if let Some(spec) = plan.servers.get(&normalized) {
         hosts.push(ResolvedHost { alias: normalized, spec: spec.clone() });
     } else {
-        let spec = SshSpec::parse(&normalized)?;
+        let spec = SshSpec::parse(&normalized).map_err(|mut err| {
+            if let ParseError::InvalidSshSpec { line, .. } = &mut err {
+                *line = target.line;
+            }
+            err
+        })?;
         hosts.push(ResolvedHost { alias: normalized, spec });
     }
 
@@ -828,21 +839,8 @@ fn allowed_aliases(plan: &ExecutionPlan, restrict: &[String]) -> HashSet<String>
     allowed
 }
 
-/// True for `[A-Za-z_][A-Za-z0-9_]*`.
-///
-/// This is the single definition of a shell identifier across the workspace:
-/// the parser validates `@env`/`@export` names with it, the payload renderer
-/// refuses to emit an `export` statement for anything else, and the secrets
-/// crate reuses it for the keys of a sealed env file.
-#[must_use]
-pub fn is_valid_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
+/// The shell-identifier rule, shared with the runtime and the secrets crate.
+pub use shellflow_text::is_valid_var_name;
 
 /// Interpolate `$VAR` and `${VAR}` references in a copy path against the run
 /// state.

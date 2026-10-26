@@ -157,7 +157,7 @@ fn query_host(alias: &str, dest: &SshDest, units: &[String]) -> HostQuery {
             "systemctl show {} -p Id,ActiveState,SubState,LoadState",
             units
                 .iter()
-                .map(|u| shellflow_core::env::shell_quote_single(u))
+                .map(|u| shellflow_core::shell_quote_single(u))
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
@@ -263,10 +263,10 @@ fn resolve_hosts(args: &ServiceStatusArgs) -> Result<Vec<(String, SshDest)>, Ser
     }
     if args.all {
         for (alias, spec) in repo_hosts(&args.repo)? {
-            hosts.entry(alias).or_insert_with(|| match SshSpec::parse(&spec) {
-                Ok(spec) => SshDest::Spec(spec),
-                Err(_) => SshDest::Host(spec),
-            });
+            // The spec comes from the DSL parser, so it is already valid —
+            // the silent `SshDest::Host` degradation for an invalid spec is
+            // gone with the hand-rolled scanner.
+            hosts.entry(alias).or_insert_with(|| SshDest::Spec(spec.clone()));
         }
     }
     Ok(hosts.into_iter().collect())
@@ -294,9 +294,9 @@ fn units_for_host(args: &ServiceStatusArgs, host: &str) -> Result<Vec<String>, S
 }
 
 /// The hosts the repository's playbooks declare.
-fn repo_hosts(repo: &Path) -> Result<Vec<(String, String)>, ServiceError> {
+fn repo_hosts(repo: &Path) -> Result<Vec<(String, SshSpec)>, ServiceError> {
     let dir = repo.join("playbooks");
-    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut out: BTreeMap<String, SshSpec> = BTreeMap::new();
     for script in playbook_scripts(&dir)? {
         let Ok(text) = std::fs::read_to_string(&script) else {
             continue;
@@ -360,36 +360,26 @@ fn playbook_scripts(dir: &Path) -> Result<Vec<PathBuf>, ServiceError> {
 }
 
 /// The `@server` declarations of a playbook: alias to ssh spec.
-fn declared_servers(text: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let Some(payload) = trimmed.strip_prefix("# @server") else {
-            continue;
-        };
-        let mut tokens = payload.split_whitespace();
-        let (Some(alias), Some(spec)) = (tokens.next(), tokens.next()) else {
-            continue;
-        };
-        out.push((alias.to_string(), spec.to_string()));
+///
+/// Parsed through the DSL, not a hand-rolled `strip_prefix`: the grammar owns
+/// the whole-word rule (`# @server-web` is an unknown directive, not an alias
+/// named `-web`), spec validation, and here-document awareness. A parse
+/// failure yields no hosts — this feeds a best-effort status report.
+fn declared_servers(text: &str) -> Vec<(String, SshSpec)> {
+    match shellflow_core::parse_script(text) {
+        Ok(plan) => plan.servers.into_iter().collect(),
+        Err(_) => Vec::new(),
     }
-    out
 }
 
 /// The targets the `@remote` steps of a playbook use.
 fn remote_targets(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let Some(payload) = trimmed.strip_prefix("# @remote") else {
-            continue;
-        };
-        let target = payload.trim().trim_start_matches('@').trim();
-        if !target.is_empty() {
-            out.push(target.to_string());
+    match shellflow_core::parse_script(text) {
+        Ok(plan) => {
+            plan.steps.iter().filter_map(|step| step.target_text().map(str::to_string)).collect()
         }
+        Err(_) => Vec::new(),
     }
-    out
 }
 
 /// The service a playbook installs.
@@ -523,7 +513,7 @@ mod tests {
         .expect("write");
         let hosts = repo_hosts(dir.path()).expect("hosts");
         assert_eq!(hosts.len(), 2);
-        assert!(hosts.iter().any(|(a, s)| a == "api" && s == "api"));
+        assert!(hosts.iter().any(|(a, s)| a == "api" && s.dest() == "api"));
     }
 
     #[test]

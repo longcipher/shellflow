@@ -8,10 +8,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-// The two text rules and the shell-identifier rule live in the DSL crate,
-// which owns the grammar that reads them. They are re-exported here so the
-// runtime and the grammar cannot drift apart.
-pub use shellflow_dsl::{is_valid_var_name, shell_quote_single, strip_surrounding_quotes};
+use shellflow_text::{is_valid_var_name, shell_quote_single};
 
 use crate::error::{CaptureError, RenderEnvError};
 

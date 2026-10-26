@@ -4,7 +4,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use eyre::Result;
-use shellflow_core::{ResolvedHost, RunState, render_env};
+use shellflow_core::{ResolvedHost, RunState};
 use tokio::{
     process::Command,
     sync::{Mutex, Semaphore},
@@ -119,9 +119,15 @@ pub(crate) struct RemoteEnv {
     pub(crate) shell: RemoteShell,
     pub(crate) path: Option<String>,
     pub(crate) has_rsync: bool,
+    /// The probe saw a `muxy` binary (`SHELLFLOW_MUXY=1`).
+    pub(crate) has_muxy: bool,
 }
 
 /// Shared handles threaded through a remote step's host fan-out.
+#[cfg_attr(
+    not(feature = "muxy"),
+    expect(dead_code, reason = "the ssh-only build ignores the step index")
+)]
 pub(crate) struct RemoteStepCtx<'a> {
     pub(crate) ui: &'a ArcUi,
     pub(crate) semaphore: &'a Option<Arc<Semaphore>>,
@@ -130,6 +136,25 @@ pub(crate) struct RemoteStepCtx<'a> {
     pub(crate) secrets: &'a Arc<ResolvedSecrets>,
     pub(crate) log_file: &'a LogFile,
     pub(crate) cancel: &'a Cancel,
+    /// The 1-based plan index (names the muxy payload file).
+    pub(crate) step_no: usize,
+    /// Per-run muxy state (connections cached per host).
+    #[cfg(feature = "muxy")]
+    pub(crate) muxy: &'a super::muxy::MuxyRun,
+}
+
+/// The transport half of a reload/wait step, cloned into its host fan-out.
+#[derive(Clone)]
+pub(super) struct StepTransport {
+    /// The probed remote environments (the muxy sentinel, the login `PATH`).
+    #[cfg(feature = "muxy")]
+    pub(super) shell_cache: ShellCache,
+    /// Per-run muxy state (connections cached per host).
+    #[cfg(feature = "muxy")]
+    pub(super) muxy: super::muxy::MuxyRun,
+    /// The 1-based plan index (names the muxy payload file).
+    #[cfg(feature = "muxy")]
+    pub(super) step_no: usize,
 }
 
 /// Fully-initialized per-run state, built once by [`setup_run`] so
@@ -139,12 +164,19 @@ struct RunSetup {
     log_file: LogFile,
     run_state: Arc<Mutex<RunState>>,
     shell_cache: ShellCache,
+    /// The `@secrets` masking threshold, applied to runtime-`@export`ed
+    /// values as well.
+    mask_min_len: usize,
     semaphore: Option<Arc<Semaphore>>,
     resolved: Arc<ResolvedSecrets>,
     restrict: Vec<String>,
     selected: Vec<(usize, shellflow_core::Step)>,
     total: usize,
     cancel: Cancel,
+    /// Per-run muxy state (connections cached per host, payloads named per
+    /// run).
+    #[cfg(feature = "muxy")]
+    muxy: super::muxy::MuxyRun,
     /// The managed work directory, removed when the run ends.
     ///
     /// The field exists for its `Drop`: the directory must disappear on
@@ -192,33 +224,51 @@ impl WorkdirGuard {
     ///
     /// The removal is best effort: a host that is already gone must not
     /// fail the run that just succeeded. Each removal is bounded (10s) and
-    /// never blocks shutdown past the interrupt grace period.
+    /// the removals run **concurrently** (a bounded `JoinSet`, the same
+    /// fan-out discipline every executor step uses): sequential cleanups
+    /// with an unreachable host each eat their full 10s budget, so two dead
+    /// hosts alone would outrun the interrupt grace period and the run
+    /// would report `torn_down: false` — the outcome cooperative teardown
+    /// exists to avoid.
     pub(crate) async fn cleanup(&self, plan: &shellflow_core::ExecutionPlan) {
         let aliases: Vec<String> = self.hosts.lock().await.iter().cloned().collect();
+        let workdir = self.workdir.clone();
+        let mut tasks = tokio::task::JoinSet::new();
         for alias in aliases {
             let Ok(hosts) =
                 shellflow_core::resolve_hosts(plan, &shellflow_core::Target::new(&alias), &[])
             else {
                 continue;
             };
-            let Some(host) = hosts.first() else {
+            let Some(host) = hosts.first().cloned() else {
                 continue;
             };
-            let mut cmd = Command::new("ssh");
-            cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
-            cmd.args(host.spec.to_ssh_args())
-                .arg("-T")
-                .arg(format!("rm -rf '{}'", self.workdir.path));
-            cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::null());
-            cmd.kill_on_drop(true);
-            crate::executor::process::isolate(&mut cmd);
-            let Ok(mut child) = cmd.spawn() else {
-                continue;
-            };
-            let _guard = crate::executor::process::GroupGuard::new(&child);
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
+            let workdir = workdir.clone();
+            tasks.spawn(async move {
+                let mut cmd = Command::new("ssh");
+                cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
+                cmd.args(host.spec.to_ssh_args())
+                    .arg("-T")
+                    .arg(format!("rm -rf '{}'", workdir.path));
+                cmd.stdin(std::process::Stdio::null());
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+                cmd.kill_on_drop(true);
+                crate::executor::process::isolate(&mut cmd);
+                let Ok(mut child) = cmd.spawn() else {
+                    return;
+                };
+                let _guard = crate::executor::process::GroupGuard::new(&child);
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            // Best effort by contract; a panicking cleanup task is logged so
+            // the operator knows the staging directory may remain.
+            if let Err(err) = result {
+                crate::ui::warn(&format!("workdir cleanup task failed: {err}"), &None);
+            }
         }
     }
 }
@@ -253,6 +303,10 @@ async fn create_workdir(
 ///
 /// Returns `None` when setup itself fails (the failure is already reported);
 /// every setup failure maps to [`RunError::Config`].
+#[expect(
+    clippy::print_stderr,
+    reason = "fatal run-configuration failures abort the run before any step; stderr is the channel operators grep"
+)]
 async fn setup_run(
     run: &crate::cli::RunArgs,
     plan: &shellflow_core::ExecutionPlan,
@@ -287,6 +341,8 @@ async fn setup_run(
     let host_aliases = host_targets.aliases;
     let uses_per_host = plan.secrets.iter().any(|entry| entry.file.contains("{host}"));
     if !flags.check && uses_per_host && !host_targets.raw.is_empty() {
+        // A hard run-configuration failure, not a streamed warning: the run
+        // is aborting, and the operator greps stderr for it.
         eprintln!(
             "error: per-host `@secrets` ({{host}}) need a named `@server` alias; these targets \
              are raw SSH specs and cannot key a secret file: {}",
@@ -309,7 +365,7 @@ async fn setup_run(
         ) {
             Ok(resolved) => resolved,
             Err(err) => {
-                eprintln!("error: {err:#}");
+                crate::ui::warn(&format!("error: {err:#}"), &log_file);
                 return None;
             }
         }
@@ -339,6 +395,7 @@ async fn setup_run(
     ui.lock().await.set_secret_values(secrets, resolved.shorts().to_vec());
 
     if flags.local && resolved.has_per_host() && host_aliases.len() > 1 {
+        // Hard run-configuration failure, same rationale as above.
         eprintln!(
             "error: `--local` cannot resolve per-host `@secrets` ({{host}}) across {} hosts; \
              re-run with `-t <host>`",
@@ -371,7 +428,7 @@ async fn setup_run(
                 hosts: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             }),
             Err(err) => {
-                eprintln!("error: {err}");
+                crate::ui::warn(&format!("error: {err}"), &log_file);
                 return None;
             }
         },
@@ -380,6 +437,7 @@ async fn setup_run(
 
     if ui.lock().await.verbosity().info() {
         ui.lock().await.plan_preview(plan, &selected);
+        ui.lock().await.masked_note(&format!("  transport {}", run.effective_transport()));
     }
 
     Some(RunSetup {
@@ -387,21 +445,88 @@ async fn setup_run(
         log_file,
         run_state,
         shell_cache,
+        mask_min_len: run.mask_min_len(),
         semaphore,
         resolved,
         restrict,
         selected,
         total,
         cancel: cancel.clone(),
+        #[cfg(feature = "muxy")]
+        muxy: super::muxy::MuxyRun::new(),
         workdir,
     })
 }
 
-/// Dispatch one selected step to its executor (local / remote / copy).
+/// The `(error, outcome)` pair a step returns when host resolution fails:
+/// the caller records a fail-fast plan error and moves on.
+const fn plan_failure() -> (Option<RunError>, eyre::Result<Vec<(String, HostOutcome)>>) {
+    (Some(RunError::Plan), Ok(Vec::new()))
+}
+
+/// Resolve a step's target to concrete hosts, reporting a resolution failure
+/// inline via the UI. Returns `None` after reporting; the caller then returns
+/// [`plan_failure`].
+fn resolve_or_report(
+    plan: &shellflow_core::ExecutionPlan,
+    setup: &RunSetup,
+    step_no: usize,
+    target: &shellflow_core::Target,
+) -> Option<Vec<shellflow_core::ResolvedHost>> {
+    match shellflow_core::resolve_hosts(plan, target, &setup.restrict) {
+        Ok(hosts) => Some(hosts),
+        Err(err) => {
+            crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+            None
+        }
+    }
+}
+
+/// Run one target-command step (`@service`, `@install`, `@backup`, …) on
+/// already-resolved hosts.
 ///
-/// Target-resolution failures are reported inline and returned as
-/// `Some(RunError::Script)` with an empty outcome, so the caller records a
-/// fail-fast error and moves on.
+/// The transport choice (ssh/muxy) and the per-host fan-out are owned by
+/// [`super::host::run_target_command`]; this wrapper only threads the shared
+/// per-run state, so a new verb contributes its `command`, `label`, and
+/// [`super::transport::StepClass`] and nothing else.
+#[cfg_attr(
+    not(feature = "muxy"),
+    expect(
+        unused_variables,
+        reason = "the ssh-only build never classifies steps; the class drives only the muxy policy"
+    )
+)]
+async fn run_target_step(
+    setup: &RunSetup,
+    step_no: usize,
+    config: StepConfig,
+    hosts: Vec<shellflow_core::ResolvedHost>,
+    command: String,
+    label: String,
+    class: super::transport::StepClass,
+) -> eyre::Result<Vec<(String, HostOutcome)>> {
+    super::host::run_target_command(super::host::TargetCommand {
+        ui: &setup.ui,
+        command,
+        hosts,
+        config,
+        semaphore: &setup.semaphore,
+        log_file: &setup.log_file,
+        cancel: &setup.cancel,
+        secrets: &setup.resolved,
+        shell_cache: &setup.shell_cache,
+        label: &label,
+        #[cfg(feature = "muxy")]
+        step_class: class,
+        #[cfg(feature = "muxy")]
+        muxy: &setup.muxy,
+        #[cfg(feature = "muxy")]
+        step_no,
+    })
+    .await
+}
+
+/// Dispatch one selected step to its executor (local / remote / copy).
 async fn run_single_step(
     setup: &RunSetup,
     plan: &shellflow_core::ExecutionPlan,
@@ -412,6 +537,15 @@ async fn run_single_step(
     // `@timeout` overrides the run-wide default: a long build or health
     // check must be able to widen the budget the CLI set for ordinary steps.
     let config = StepConfig::new(run, step.timeout().or(run.flags.timeout));
+    #[cfg(not(feature = "muxy"))]
+    if config.transport == super::transport::TransportPolicy::Muxy {
+        crate::ui::step_failed(
+            step_no,
+            "--transport muxy needs a shellflow built with the `muxy` feature (use --transport ssh)",
+            &setup.log_file,
+        );
+        return (Some(RunError::Plan), Ok(Vec::new()));
+    }
     match step {
         shellflow_core::Step::Local(local) => {
             let outcome = super::local::run_local_step(
@@ -419,445 +553,365 @@ async fn run_single_step(
                 &setup.run_state,
                 local,
                 config,
+                setup.mask_min_len,
                 &setup.cancel,
             )
             .await;
             (None, outcome)
         }
         shellflow_core::Step::Remote(remote) => {
-            match shellflow_core::resolve_hosts(plan, &remote.target, &setup.restrict) {
-                Ok(hosts) => {
-                    let ctx = RemoteStepCtx {
-                        ui: &setup.ui,
-                        semaphore: &setup.semaphore,
-                        run_state: &setup.run_state,
-                        shell_cache: &setup.shell_cache,
-                        secrets: &setup.resolved,
-                        log_file: &setup.log_file,
-                        cancel: &setup.cancel,
-                    };
-                    (None, run_remote_step(&ctx, remote, hosts, config).await)
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &remote.target) else {
+                return plan_failure();
+            };
+            let ctx = RemoteStepCtx {
+                ui: &setup.ui,
+                semaphore: &setup.semaphore,
+                run_state: &setup.run_state,
+                shell_cache: &setup.shell_cache,
+                secrets: &setup.resolved,
+                log_file: &setup.log_file,
+                cancel: &setup.cancel,
+                step_no,
+                #[cfg(feature = "muxy")]
+                muxy: &setup.muxy,
+            };
+            (None, run_remote_step(&ctx, remote, hosts, config).await)
         }
         shellflow_core::Step::Copy(copy) => {
-            match shellflow_core::resolve_hosts(plan, &copy.target, &setup.restrict) {
-                Ok(hosts) => {
-                    let copy_args = CopyStepArgs {
-                        ui: Arc::clone(&setup.ui),
-                        semaphore: setup.semaphore.clone(),
-                        run_state: Arc::clone(&setup.run_state),
-                        shell_cache: Arc::clone(&setup.shell_cache),
-                        log_file: setup.log_file.clone(),
-                        cancel: setup.cancel.clone(),
-                        workdir: setup.workdir.clone(),
-                    };
-                    super::copy::run_copy_step(&copy_args, copy, hosts, config).await
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &copy.target) else {
+                return plan_failure();
+            };
+            let copy_args = CopyStepArgs {
+                ui: Arc::clone(&setup.ui),
+                semaphore: setup.semaphore.clone(),
+                run_state: Arc::clone(&setup.run_state),
+                shell_cache: Arc::clone(&setup.shell_cache),
+                log_file: setup.log_file.clone(),
+                cancel: setup.cancel.clone(),
+                workdir: setup.workdir.clone(),
+            };
+            super::copy::run_copy_step(&copy_args, copy, hosts, config).await
         }
         shellflow_core::Step::Wait(wait) => {
-            match shellflow_core::resolve_hosts(plan, &wait.target, &setup.restrict) {
-                Ok(hosts) => (
-                    None,
-                    run_wait_step(
-                        &setup.ui,
-                        wait,
-                        hosts,
-                        config,
-                        &setup.semaphore,
-                        &setup.log_file,
-                        &setup.cancel,
-                    )
-                    .await,
-                ),
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &wait.target) else {
+                return plan_failure();
+            };
+            (
+                None,
+                run_wait_step(
+                    &setup.ui,
+                    wait,
+                    hosts,
+                    config,
+                    &setup.semaphore,
+                    &setup.log_file,
+                    &setup.cancel,
+                    &StepTransport {
+                        #[cfg(feature = "muxy")]
+                        shell_cache: Arc::clone(&setup.shell_cache),
+                        #[cfg(feature = "muxy")]
+                        muxy: setup.muxy.clone(),
+                        #[cfg(feature = "muxy")]
+                        step_no,
+                    },
+                )
+                .await,
+            )
         }
         shellflow_core::Step::Assert(assert) => {
-            match shellflow_core::resolve_hosts(plan, &assert.target, &setup.restrict) {
-                Ok(hosts) => (
-                    None,
-                    super::assert_step::run_assert_step(super::assert_step::AssertStepArgs {
-                        ui: &setup.ui,
-                        assert,
-                        hosts,
-                        config,
-                        semaphore: &setup.semaphore,
-                        log_file: &setup.log_file,
-                        cancel: &setup.cancel,
-                        run_state: &setup.run_state,
-                    })
-                    .await,
-                ),
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
-        }
-        shellflow_core::Step::Service(service) => {
-            match shellflow_core::resolve_hosts(plan, &service.target, &setup.restrict) {
-                Ok(hosts) => {
-                    let command = super::host::service_command(
-                        &service.unit,
-                        super::host::ServiceActions {
-                            enable: service.enable,
-                            restart: service.restart,
-                            reload: service.reload,
-                            wait: service.wait,
-                            verify: service.verify,
-                            force_start: service.force_start,
-                        },
-                        service.timeout.unwrap_or(DEFAULT_WAIT_SECS),
-                    );
-                    (
-                        None,
-                        super::host::run_target_command(super::host::TargetCommand {
-                            ui: &setup.ui,
-                            command,
-                            hosts,
-                            config,
-                            semaphore: &setup.semaphore,
-                            log_file: &setup.log_file,
-                            cancel: &setup.cancel,
-                            secrets: &setup.resolved,
-                            shell_cache: &setup.shell_cache,
-                            label: &format!("service {}", service.unit),
-                        })
-                        .await,
-                    )
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
-        }
-        shellflow_core::Step::Install(install) => {
-            match shellflow_core::resolve_hosts(plan, &install.target, &setup.restrict) {
-                Ok(hosts) => {
-                    // The paths may name a captured variable (`$WORKDIR/…`).
-                    // In check mode the local blocks never ran, so the run
-                    // state is empty: the paths are left uninterpolated and
-                    // the step is a no-op, exactly like a copy step.
-                    let (src, dst) = if config.check || config.dry_run {
-                        (install.src.clone(), install.dst.clone())
-                    } else {
-                        let state = setup.run_state.lock().await;
-                        let src = shellflow_core::interpolate(&install.src, &state)
-                            .map_err(eyre::Error::from);
-                        let dst = shellflow_core::interpolate(&install.dst, &state)
-                            .map_err(eyre::Error::from);
-                        match (src, dst) {
-                            (Ok(src), Ok(dst)) => (src, dst),
-                            (Err(err), _) | (_, Err(err)) => {
-                                crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                                return (Some(RunError::Plan), Ok(Vec::new()));
-                            }
-                        }
-                    };
-                    let command = super::host::install_command(
-                        &src,
-                        &dst,
-                        install.mode,
-                        install.owner.as_deref(),
-                        install.dir_mode,
-                    );
-                    (
-                        None,
-                        super::host::run_target_command(super::host::TargetCommand {
-                            ui: &setup.ui,
-                            command,
-                            hosts,
-                            config,
-                            semaphore: &setup.semaphore,
-                            log_file: &setup.log_file,
-                            cancel: &setup.cancel,
-                            secrets: &setup.resolved,
-                            shell_cache: &setup.shell_cache,
-                            label: &format!("install {dst}"),
-                        })
-                        .await,
-                    )
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
-        }
-        shellflow_core::Step::Backup(backup) => {
-            match shellflow_core::resolve_hosts(plan, &backup.target, &setup.restrict) {
-                Ok(hosts) => {
-                    let paths = if config.check || config.dry_run {
-                        backup.paths.clone()
-                    } else {
-                        let state = setup.run_state.lock().await;
-                        let mut resolved = Vec::with_capacity(backup.paths.len());
-                        for path in &backup.paths {
-                            match shellflow_core::interpolate(path, &state) {
-                                Ok(path) => resolved.push(path),
-                                Err(err) => {
-                                    crate::ui::step_failed(
-                                        step_no,
-                                        &err.to_string(),
-                                        &setup.log_file,
-                                    );
-                                    return (Some(RunError::Plan), Ok(Vec::new()));
-                                }
-                            }
-                        }
-                        resolved
-                    };
-                    let command = super::host::backup_command(
-                        &paths,
-                        backup.service.as_deref(),
-                        backup.dir.as_deref(),
-                        backup.keep,
-                        backup.seal,
-                    );
-                    (
-                        None,
-                        super::host::run_target_command(super::host::TargetCommand {
-                            ui: &setup.ui,
-                            command,
-                            hosts,
-                            config,
-                            semaphore: &setup.semaphore,
-                            log_file: &setup.log_file,
-                            cancel: &setup.cancel,
-                            secrets: &setup.resolved,
-                            shell_cache: &setup.shell_cache,
-                            label: "backup",
-                        })
-                        .await,
-                    )
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
-        }
-        shellflow_core::Step::Credstore(credstore) => {
-            match shellflow_core::resolve_hosts(plan, &credstore.target, &setup.restrict) {
-                Ok(hosts) => {
-                    let command =
-                        super::host::credstore_command(&credstore.service, &credstore.require);
-                    (
-                        None,
-                        super::host::run_target_command(super::host::TargetCommand {
-                            ui: &setup.ui,
-                            command,
-                            hosts,
-                            config,
-                            semaphore: &setup.semaphore,
-                            log_file: &setup.log_file,
-                            cancel: &setup.cancel,
-                            secrets: &setup.resolved,
-                            shell_cache: &setup.shell_cache,
-                            label: &format!("credstore {}", credstore.service),
-                        })
-                        .await,
-                    )
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
-        }
-        shellflow_core::Step::UnitInventory(inventory) => {
-            match shellflow_core::resolve_hosts(plan, &inventory.target, &setup.restrict) {
-                Ok(hosts) => (
-                    None,
-                    super::host::run_target_command(super::host::TargetCommand {
-                        ui: &setup.ui,
-                        command: super::host::unit_inventory_command(),
-                        hosts,
-                        config,
-                        semaphore: &setup.semaphore,
-                        log_file: &setup.log_file,
-                        cancel: &setup.cancel,
-                        secrets: &setup.resolved,
-                        shell_cache: &setup.shell_cache,
-                        label: "unit inventory",
-                    })
-                    .await,
-                ),
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &assert.target) else {
+                return plan_failure();
+            };
+            (
+                None,
+                super::assert_step::run_assert_step(super::assert_step::AssertStepArgs {
+                    ui: &setup.ui,
+                    assert,
+                    hosts,
+                    config,
+                    semaphore: &setup.semaphore,
+                    log_file: &setup.log_file,
+                    cancel: &setup.cancel,
+                    run_state: &setup.run_state,
+                })
+                .await,
+            )
         }
         shellflow_core::Step::Helper(helper) => {
-            match shellflow_core::resolve_hosts(plan, &helper.target, &setup.restrict) {
-                Ok(hosts) => (
-                    None,
-                    super::host::run_helper_step(
-                        &setup.ui,
-                        helper,
-                        hosts,
-                        config,
-                        &setup.semaphore,
-                        &setup.log_file,
-                        &setup.cancel,
-                    )
-                    .await,
-                ),
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &helper.target) else {
+                return plan_failure();
+            };
+            (
+                None,
+                super::host::run_helper_step(
+                    &setup.ui,
+                    helper,
+                    hosts,
+                    config,
+                    &setup.semaphore,
+                    &setup.log_file,
+                    &setup.cancel,
+                )
+                .await,
+            )
         }
         shellflow_core::Step::Reload(reload) => {
-            match shellflow_core::resolve_hosts(plan, &reload.target, &setup.restrict) {
-                Ok(hosts) => (
-                    None,
-                    run_reload_step(
-                        &setup.ui,
-                        reload,
-                        hosts,
-                        config,
-                        &setup.semaphore,
-                        &setup.log_file,
-                        &setup.cancel,
-                    )
-                    .await,
-                ),
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &reload.target) else {
+                return plan_failure();
+            };
+            (
+                None,
+                run_reload_step(
+                    &setup.ui,
+                    reload,
+                    hosts,
+                    config,
+                    &setup.semaphore,
+                    &setup.log_file,
+                    &setup.cancel,
+                    &StepTransport {
+                        #[cfg(feature = "muxy")]
+                        shell_cache: Arc::clone(&setup.shell_cache),
+                        #[cfg(feature = "muxy")]
+                        muxy: setup.muxy.clone(),
+                        #[cfg(feature = "muxy")]
+                        step_no,
+                    },
+                )
+                .await,
+            )
+        }
+        shellflow_core::Step::Service(service) => {
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &service.target) else {
+                return plan_failure();
+            };
+            let command = super::host::service_command(
+                &service.unit,
+                super::host::ServiceActions {
+                    enable: service.enable,
+                    restart: service.restart,
+                    reload: service.reload,
+                    wait: service.wait,
+                    verify: service.verify,
+                    force_start: service.force_start,
+                },
+                service.timeout.unwrap_or(DEFAULT_WAIT_SECS),
+            );
+            (
+                None,
+                run_target_step(
+                    setup,
+                    step_no,
+                    config,
+                    hosts,
+                    command,
+                    format!("service {}", service.unit),
+                    super::transport::StepClass::Service,
+                )
+                .await,
+            )
+        }
+        shellflow_core::Step::Install(install) => {
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &install.target) else {
+                return plan_failure();
+            };
+            // The paths may name a captured variable (`$WORKDIR/…`).
+            // In check mode the local blocks never ran, so the run
+            // state is empty: the paths are left uninterpolated and
+            // the step is a no-op, exactly like a copy step.
+            let (src, dst) = if config.check || config.dry_run {
+                (install.src.clone(), install.dst.clone())
+            } else {
+                let state = setup.run_state.lock().await;
+                let src =
+                    shellflow_core::interpolate(&install.src, &state).map_err(eyre::Error::from);
+                let dst =
+                    shellflow_core::interpolate(&install.dst, &state).map_err(eyre::Error::from);
+                match (src, dst) {
+                    (Ok(src), Ok(dst)) => (src, dst),
+                    (Err(err), _) | (_, Err(err)) => {
+                        crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                        return (Some(RunError::Plan), Ok(Vec::new()));
+                    }
                 }
-            }
+            };
+            let command = super::host::install_command(
+                &src,
+                &dst,
+                install.mode,
+                install.owner.as_deref(),
+                install.dir_mode,
+            );
+            (
+                None,
+                run_target_step(
+                    setup,
+                    step_no,
+                    config,
+                    hosts,
+                    command,
+                    format!("install {dst}"),
+                    super::transport::StepClass::ShortHelper,
+                )
+                .await,
+            )
+        }
+        shellflow_core::Step::Backup(backup) => {
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &backup.target) else {
+                return plan_failure();
+            };
+            let paths = if config.check || config.dry_run {
+                backup.paths.clone()
+            } else {
+                let state = setup.run_state.lock().await;
+                let mut resolved = Vec::with_capacity(backup.paths.len());
+                for path in &backup.paths {
+                    match shellflow_core::interpolate(path, &state) {
+                        Ok(path) => resolved.push(path),
+                        Err(err) => {
+                            crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
+                            return (Some(RunError::Plan), Ok(Vec::new()));
+                        }
+                    }
+                }
+                resolved
+            };
+            let command = super::host::backup_command(
+                &paths,
+                backup.service.as_deref(),
+                backup.dir.as_deref(),
+                backup.keep,
+                backup.seal,
+            );
+            (
+                None,
+                run_target_step(
+                    setup,
+                    step_no,
+                    config,
+                    hosts,
+                    command,
+                    "backup".to_string(),
+                    super::transport::StepClass::LongHelper,
+                )
+                .await,
+            )
+        }
+        shellflow_core::Step::Credstore(credstore) => {
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &credstore.target) else {
+                return plan_failure();
+            };
+            let command = super::host::credstore_command(&credstore.service, &credstore.require);
+            (
+                None,
+                run_target_step(
+                    setup,
+                    step_no,
+                    config,
+                    hosts,
+                    command,
+                    format!("credstore {}", credstore.service),
+                    super::transport::StepClass::ShortHelper,
+                )
+                .await,
+            )
+        }
+        shellflow_core::Step::UnitInventory(inventory) => {
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &inventory.target) else {
+                return plan_failure();
+            };
+            (
+                None,
+                run_target_step(
+                    setup,
+                    step_no,
+                    config,
+                    hosts,
+                    super::host::unit_inventory_command(),
+                    "unit inventory".to_string(),
+                    super::transport::StepClass::ShortHelper,
+                )
+                .await,
+            )
         }
         shellflow_core::Step::Release(release) => {
-            match shellflow_core::resolve_hosts(plan, &release.target, &setup.restrict) {
-                Ok(hosts) => {
-                    let command = super::release::release_command(
-                        &release.repo,
-                        &release.installed_cmd,
-                        &release.asset,
-                        &release.to_dir,
-                        release.base_url.as_deref(),
-                    );
-                    (
-                        None,
-                        super::host::run_target_command(super::host::TargetCommand {
-                            ui: &setup.ui,
-                            command,
-                            hosts,
-                            config,
-                            semaphore: &setup.semaphore,
-                            log_file: &setup.log_file,
-                            cancel: &setup.cancel,
-                            secrets: &setup.resolved,
-                            shell_cache: &setup.shell_cache,
-                            label: &format!("release {}", release.repo),
-                        })
-                        .await,
-                    )
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &release.target) else {
+                return plan_failure();
+            };
+            let command = super::release::release_command(
+                &release.repo,
+                &release.installed_cmd,
+                &release.asset,
+                &release.to_dir,
+                release.base_url.as_deref(),
+            );
+            (
+                None,
+                run_target_step(
+                    setup,
+                    step_no,
+                    config,
+                    hosts,
+                    command,
+                    format!("release {}", release.repo),
+                    super::transport::StepClass::LongHelper,
+                )
+                .await,
+            )
         }
         shellflow_core::Step::Build(build) => {
-            match shellflow_core::resolve_hosts(plan, &build.target, &setup.restrict) {
-                Ok(hosts) => {
-                    let command = super::build::build_command(build);
-                    (
-                        None,
-                        super::host::run_target_command(super::host::TargetCommand {
-                            ui: &setup.ui,
-                            command,
-                            hosts,
-                            config,
-                            semaphore: &setup.semaphore,
-                            log_file: &setup.log_file,
-                            cancel: &setup.cancel,
-                            secrets: &setup.resolved,
-                            shell_cache: &setup.shell_cache,
-                            label: &format!("build {}", build.repo),
-                        })
-                        .await,
-                    )
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &build.target) else {
+                return plan_failure();
+            };
+            (
+                None,
+                run_target_step(
+                    setup,
+                    step_no,
+                    config,
+                    hosts,
+                    super::build::build_command(build),
+                    format!("build {}", build.repo),
+                    super::transport::StepClass::LongHelper,
+                )
+                .await,
+            )
         }
         shellflow_core::Step::Toolchain(toolchain) => {
-            match shellflow_core::resolve_hosts(plan, &toolchain.target, &setup.restrict) {
-                Ok(hosts) => {
-                    let command = super::toolchain::toolchain_command(&toolchain.tools);
-                    (
-                        None,
-                        super::host::run_target_command(super::host::TargetCommand {
-                            ui: &setup.ui,
-                            command,
-                            hosts,
-                            config,
-                            semaphore: &setup.semaphore,
-                            log_file: &setup.log_file,
-                            cancel: &setup.cancel,
-                            secrets: &setup.resolved,
-                            shell_cache: &setup.shell_cache,
-                            label: "toolchain update",
-                        })
-                        .await,
-                    )
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &toolchain.target) else {
+                return plan_failure();
+            };
+            (
+                None,
+                run_target_step(
+                    setup,
+                    step_no,
+                    config,
+                    hosts,
+                    super::toolchain::toolchain_command(&toolchain.tools),
+                    "toolchain update".to_string(),
+                    super::transport::StepClass::LongHelper,
+                )
+                .await,
+            )
         }
         shellflow_core::Step::Image(image) => {
-            match shellflow_core::resolve_hosts(plan, &image.target, &setup.restrict) {
-                Ok(hosts) => {
-                    let command = super::image::image_command(&image.images, image.prune);
-                    (
-                        None,
-                        super::host::run_target_command(super::host::TargetCommand {
-                            ui: &setup.ui,
-                            command,
-                            hosts,
-                            config,
-                            semaphore: &setup.semaphore,
-                            log_file: &setup.log_file,
-                            cancel: &setup.cancel,
-                            secrets: &setup.resolved,
-                            shell_cache: &setup.shell_cache,
-                            label: "image update",
-                        })
-                        .await,
-                    )
-                }
-                Err(err) => {
-                    crate::ui::step_failed(step_no, &err.to_string(), &setup.log_file);
-                    (Some(RunError::Plan), Ok(Vec::new()))
-                }
-            }
+            let Some(hosts) = resolve_or_report(plan, setup, step_no, &image.target) else {
+                return plan_failure();
+            };
+            (
+                None,
+                run_target_step(
+                    setup,
+                    step_no,
+                    config,
+                    hosts,
+                    super::image::image_command(&image.images, image.prune),
+                    "image update".to_string(),
+                    super::transport::StepClass::LongHelper,
+                )
+                .await,
+            )
         }
     }
 }
@@ -868,6 +922,10 @@ async fn run_single_step(
 /// `ExecReload=` first, then an explicit `--signal`, and never a silent
 /// fallback to a restart — a restart drops the connections the reload exists
 /// to preserve, so failing is the honest answer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transport context is an additional parameter to the existing seven"
+)]
 pub(super) async fn run_reload_step(
     ui: &ArcUi,
     reload: &shellflow_core::ReloadStep,
@@ -876,6 +934,11 @@ pub(super) async fn run_reload_step(
     semaphore: &Option<Arc<Semaphore>>,
     log_file: &LogFile,
     cancel: &Cancel,
+    #[cfg_attr(
+        not(feature = "muxy"),
+        expect(unused_variables, reason = "the ssh-only build ignores the muxy transport")
+    )]
+    transport: &StepTransport,
 ) -> eyre::Result<Vec<(String, HostOutcome)>> {
     use tokio::time::Duration;
     if config.check || config.dry_run {
@@ -892,30 +955,49 @@ pub(super) async fn run_reload_step(
         let semaphore = semaphore.clone();
         let log_file = log_file.clone();
         let cancel = cancel.clone();
+        #[cfg(feature = "muxy")]
+        let transport = transport.clone();
         tasks.spawn(async move {
-            let _permit = match semaphore.as_ref() {
-                Some(sem) => match sem.clone().acquire_owned().await {
-                    Ok(permit) => Some(permit),
-                    Err(_) => {
-                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
-                    }
-                },
-                None => None,
-            };
+            let _permit = fanout_slot!(&semaphore, &log_file, host);
             if cancel.is_cancelled() {
                 return (host.alias.clone(), HostOutcome::Cancelled);
             }
+            // Muxy first: the reload helper owns a session like any other
+            // long command; a failed connect falls back to ssh under auto.
+            #[cfg(feature = "muxy")]
+            if super::muxy::class_uses_muxy(config, super::StepClass::Reload) {
+                let remote_env = resolve_remote_env(&host, &transport.shell_cache, &cancel).await;
+                let attempt = super::muxy::exec_command(super::muxy::CommandStep {
+                    ui: &ui,
+                    host: &host,
+                    class: super::StepClass::Reload,
+                    command: reload_command(&unit, signal.as_deref(), wait, timeout.as_secs()),
+                    env: with_login_path(Vec::new(), remote_env.path.as_deref()),
+                    has_secrets: false,
+                    probe_muxy: remote_env.has_muxy,
+                    timeout: Some(timeout.as_secs() + 30),
+                    config,
+                    log_file: &log_file,
+                    cancel: &cancel,
+                    muxy: &transport.muxy,
+                    step_no: transport.step_no,
+                    transform: None,
+                    explain_exit: Some(reload_explain(&unit, timeout.as_secs())),
+                })
+                .await;
+                if let super::muxy::CommandAttempt::Done((alias, outcome)) = attempt {
+                    if outcome == HostOutcome::Ok {
+                        ui.lock().await.masked_note(&format!("[{alias}] {unit} reloaded"));
+                    }
+                    return (alias, outcome);
+                }
+            }
             // One SSH round-trip: the helper performs the reload and, with
             // `--wait`, waits for the notify handshake on the target.
-            let mut cmd = Command::new("ssh");
-            // Fail closed on an unknown host key or a missing key: never prompt.
-            cmd.args(["-o", "BatchMode=yes"]);
-            cmd.args(host.spec.to_ssh_args()).arg("-T").arg(reload_command(
-                &unit,
-                signal.as_deref(),
-                wait,
-                timeout.as_secs(),
-            ));
+            let cmd = super::transport::ssh_argv_command(
+                &host,
+                &reload_command(&unit, signal.as_deref(), wait, timeout.as_secs()),
+            );
             let args = stream::PipedArgs {
                 ui: &ui,
                 host: &host.alias,
@@ -974,17 +1056,7 @@ pub(super) async fn run_reload_step(
             }
         });
     }
-    let mut out = Vec::new();
-    while let Some(res) = tasks.join_next().await {
-        match res {
-            Ok(pair) => {
-                ui.lock().await.host_finished(&pair.0);
-                out.push(pair);
-            }
-            Err(_) => out.push(("unknown".to_string(), HostOutcome::Failed(RunError::Transport))),
-        }
-    }
-    Ok(out)
+    Ok(stream::collect_hosts(ui, log_file, tasks).await)
 }
 
 /// The remote command that reloads a unit.
@@ -1182,7 +1254,7 @@ pub(super) struct PayloadParts {
     pub(super) script: String,
     pub(super) guard: Option<String>,
     pub(super) env: Vec<(String, String)>,
-    pub(super) trace_line: &'static str,
+    pub(super) trace: bool,
 }
 
 /// Default wait budget in seconds when neither `@timeout` nor `--timeout`
@@ -1193,19 +1265,6 @@ const DEFAULT_WAIT_SECS: u64 = 300;
 /// The default budget for a graceful reload handshake.
 const DEFAULT_RELOAD_SECS: u64 = 120;
 
-/// Poll `systemctl is-active <unit>` on every target host until it reports
-/// active or the budget expires. One slow host never blocks others (fan-out
-/// with the run semaphore); a host that never reports active is `FAILED`
-/// (script class: the unit is broken, not the transport).
-///
-/// The unit name is validated at parse time (`[A-Za-z0-9._-]` plus `@`/`:`,
-/// no leading dots, no `..`), so interpolating it into the poll command is
-/// safe.
-///
-/// The poll runs through the shared child supervisor, so the `ssh` is spawned
-/// in its own process group, is killed when the run is interrupted, and
-/// cannot outlive the budget: a blackholed connection used to block the poll
-/// loop indefinitely.
 /// The remote command that waits for a unit to become ready.
 ///
 /// The helper does the waiting **on the target**: it polls systemd there and
@@ -1272,6 +1331,39 @@ fn wait_collector(unit: &str) -> stream::LineCollector {
     })
 }
 
+/// The per-class exit-code vocabulary of a `@wait` helper, for the muxy path
+/// (the ssh path names the same codes inline).
+#[cfg(feature = "muxy")]
+fn wait_explain(unit: &str, secs: u64) -> super::muxy::ExplainExit {
+    let unit = unit.to_string();
+    std::sync::Arc::new(move |code: i32| {
+        Some(match code {
+            3 => format!("{unit} failed"),
+            4 => format!("{unit} not ready after {secs}s"),
+            5 => format!("{unit} does not exist"),
+            other => format!("{unit} wait failed (exit {other})"),
+        })
+    })
+}
+
+/// The per-class exit-code vocabulary of a `@reload` helper, for the muxy
+/// path (the ssh path names the same codes inline).
+#[cfg(feature = "muxy")]
+fn reload_explain(unit: &str, secs: u64) -> super::muxy::ExplainExit {
+    let unit = unit.to_string();
+    std::sync::Arc::new(move |code: i32| {
+        Some(match code {
+            3 => format!("{unit} reload failed"),
+            4 => format!("{unit} did not finish reloading within {secs}s"),
+            other => format!("{unit} reload failed (exit {other})"),
+        })
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transport context is an additional parameter to the existing seven"
+)]
 pub(super) async fn run_wait_step(
     ui: &ArcUi,
     wait: &shellflow_core::WaitStep,
@@ -1280,6 +1372,11 @@ pub(super) async fn run_wait_step(
     semaphore: &Option<Arc<Semaphore>>,
     log_file: &LogFile,
     cancel: &Cancel,
+    #[cfg_attr(
+        not(feature = "muxy"),
+        expect(unused_variables, reason = "the ssh-only build ignores the muxy transport")
+    )]
+    transport: &StepTransport,
 ) -> eyre::Result<Vec<(String, HostOutcome)>> {
     use tokio::time::Duration;
     if config.check || config.dry_run {
@@ -1301,27 +1398,50 @@ pub(super) async fn run_wait_step(
         let semaphore = semaphore.clone();
         let log_file = log_file.clone();
         let cancel = cancel.clone();
+        #[cfg(feature = "muxy")]
+        let transport = transport.clone();
         tasks.spawn(async move {
-            let _permit = match semaphore.as_ref() {
-                Some(sem) => match sem.clone().acquire_owned().await {
-                    Ok(permit) => Some(permit),
-                    Err(_) => {
-                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
-                    }
-                },
-                None => None,
-            };
+            let _permit = fanout_slot!(&semaphore, &log_file, host);
             if cancel.is_cancelled() {
                 return (host.alias.clone(), HostOutcome::Cancelled);
+            }
+            // Muxy first: a readiness wait is exactly the long command the
+            // transport exists for; the collector still turns its `SFW` state
+            // lines into progress.
+            #[cfg(feature = "muxy")]
+            if super::muxy::class_uses_muxy(config, super::StepClass::Wait) {
+                let remote_env = resolve_remote_env(&host, &transport.shell_cache, &cancel).await;
+                let attempt = super::muxy::exec_command(super::muxy::CommandStep {
+                    ui: &ui,
+                    host: &host,
+                    class: super::StepClass::Wait,
+                    command: wait_command(&unit, budget.as_secs()),
+                    env: with_login_path(Vec::new(), remote_env.path.as_deref()),
+                    has_secrets: false,
+                    probe_muxy: remote_env.has_muxy,
+                    timeout: Some(budget.as_secs() + 30),
+                    config,
+                    log_file: &log_file,
+                    cancel: &cancel,
+                    muxy: &transport.muxy,
+                    step_no: transport.step_no,
+                    transform: Some(wait_collector(&unit)),
+                    explain_exit: Some(wait_explain(&unit, budget.as_secs())),
+                })
+                .await;
+                if let super::muxy::CommandAttempt::Done((alias, outcome)) = attempt {
+                    if outcome == HostOutcome::Ok {
+                        ui.lock().await.masked_note(&format!("[{alias}] {unit} active"));
+                    }
+                    return (alias, outcome);
+                }
             }
             // The wait runs *on the target*: the helper polls systemd there and
             // streams one state line per poll. The whole wait therefore costs
             // a single SSH round-trip instead of one per poll, and the
             // operator sees the service's own `STATUS=` text while it starts.
-            let mut cmd = Command::new("ssh");
-            // Fail closed on an unknown host key or a missing key: never prompt.
-            cmd.args(["-o", "BatchMode=yes"]);
-            cmd.args(host.spec.to_ssh_args()).arg("-T").arg(wait_command(&unit, budget.as_secs()));
+            let cmd =
+                super::transport::ssh_argv_command(&host, &wait_command(&unit, budget.as_secs()));
             let args = stream::PipedArgs {
                 ui: &ui,
                 host: &host.alias,
@@ -1386,17 +1506,7 @@ pub(super) async fn run_wait_step(
             }
         });
     }
-    let mut out = Vec::new();
-    while let Some(res) = tasks.join_next().await {
-        match res {
-            Ok(pair) => {
-                ui.lock().await.host_finished(&pair.0);
-                out.push(pair);
-            }
-            Err(_) => out.push(("unknown".to_string(), HostOutcome::Failed(RunError::Transport))),
-        }
-    }
-    Ok(out)
+    Ok(stream::collect_hosts(ui, log_file, tasks).await)
 }
 
 pub(super) async fn run_remote_step(
@@ -1428,14 +1538,17 @@ pub(super) async fn run_remote_step(
     }
 
     let env = build_env(ctx.run_state, &remote.env).await;
-    let trace_line = if config.verbose >= 3 { "set -x\n" } else { "" };
     let parts = PayloadParts {
         script: remote.script.clone(),
         guard: remote.guard.clone(),
         env,
-        trace_line,
+        trace: config.verbose >= 3,
     };
     let mut tasks = JoinSet::new();
+    #[cfg(feature = "muxy")]
+    let step_no = ctx.step_no;
+    #[cfg(feature = "muxy")]
+    let muxy = ctx.muxy.clone();
     for host in hosts {
         let ui = Arc::clone(ctx.ui);
         let semaphore = ctx.semaphore.clone();
@@ -1444,6 +1557,8 @@ pub(super) async fn run_remote_step(
         let secrets = Arc::clone(ctx.secrets);
         let log_file = ctx.log_file.clone();
         let cancel = ctx.cancel.clone();
+        #[cfg(feature = "muxy")]
+        let muxy = muxy.clone();
         tasks.spawn(async move {
             // Never run unthrottled when the semaphore is closed.
             let _permit = fanout_slot!(&semaphore, &log_file, host);
@@ -1456,12 +1571,16 @@ pub(super) async fn run_remote_step(
                 secrets: &secrets,
                 log_file: &log_file,
                 cancel,
+                #[cfg(feature = "muxy")]
+                step_no,
+                #[cfg(feature = "muxy")]
+                muxy: &muxy,
             })
             .await
         });
     }
 
-    Ok(stream::collect_hosts(ctx.ui, tasks).await)
+    Ok(stream::collect_hosts(ctx.ui, ctx.log_file, tasks).await)
 }
 
 /// The parameters of a remote block that runs on the controller (`--local`).
@@ -1546,9 +1665,14 @@ async fn run_remote_step_local(args: RemoteLocalArgs<'_>) -> Result<Vec<(String,
         script: &remote.script,
         env: &remote.env,
         config,
+        // A `--local` remote block never captures (`@export` requires a
+        // local block), so the threshold is irrelevant here; `0` would mask
+        // everything, which is the safe direction if a capture is ever
+        // added.
         capture: &[],
         extra: &extra,
         log_file,
+        mask_min_len: 0,
         cancel: cancel.clone(),
     };
     match run_local_block(&args).await {
@@ -1579,76 +1703,162 @@ struct RemoteHostArgs<'a> {
     secrets: &'a Arc<ResolvedSecrets>,
     log_file: &'a LogFile,
     cancel: Cancel,
+    /// The 1-based plan index (names the muxy payload file).
+    #[cfg(feature = "muxy")]
+    step_no: usize,
+    /// Per-run muxy state.
+    #[cfg(feature = "muxy")]
+    muxy: &'a super::muxy::MuxyRun,
 }
 
 async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
-    let RemoteHostArgs { ui, host, parts, config, shell_cache, secrets, log_file, cancel } = args;
-    if config.check || config.dry_run {
-        let env_header = match render_env(&parts.env) {
-            Ok(header) => header,
-            Err(err) => {
-                crate::ui::warn(&format!("[{}] {err}", host.alias), log_file);
-                return (host.alias.clone(), HostOutcome::Failed(RunError::Plan));
+    let RemoteHostArgs {
+        ui,
+        host,
+        parts,
+        config,
+        shell_cache,
+        secrets,
+        log_file,
+        cancel,
+        #[cfg(feature = "muxy")]
+        step_no,
+        #[cfg(feature = "muxy")]
+        muxy,
+    } = args;
+    if config.dry_run {
+        return run_syntax_check(SyntaxCheckArgs { ui, host, parts, config, log_file, cancel })
+            .await;
+    }
+    if config.check {
+        // `--check` is `bash -n -s`: byte-exact stdin, no PTY, no session.
+        // On a muxy host that is the `exec` channel; anything else is ssh.
+        #[cfg(feature = "muxy")]
+        if super::muxy::class_uses_muxy(config, super::StepClass::Check) {
+            let remote_env = resolve_remote_env(host, &shell_cache, &cancel).await;
+            // The check payload is the session payload minus the guard and
+            // the environment header: `bash -n` needs neither, and leaving
+            // them out keeps secret material off the wire entirely.
+            let check_payload = super::transport::Payload {
+                script: &parts.script,
+                guard: None,
+                trace: parts.trace,
+                env: Vec::new(),
+                timeout: config.timeout,
             }
-        };
-        let payload = format!("set -eu\n{}{}{}", env_header, parts.trace_line, parts.script);
-        if config.verbose >= 2 {
-            let cmd = build_ssh_cmd(host, RemoteShell::Bash, true, config);
-            ui.lock().await.masked_note(&format!(
-                "  [{}] ssh {}",
-                host.alias,
-                super::display_args(&cmd)
-            ));
-        }
-        return match run_ssh_child(SshChildArgs {
-            ui,
-            host,
-            cmd: build_ssh_cmd(host, RemoteShell::Bash, true, config),
-            payload: &payload,
-            timeout: config.timeout,
-            // A syntax check has no guard: exit 42 in user code is an
-            // ordinary failure, never a skip.
-            has_guard: false,
-            log_file,
-            cancel,
-        })
-        .await
-        {
-            Ok(()) => {
-                crate::ui::note(&format!("[{}] syntax check (bash -n): OK", host.alias), log_file);
-                for finding in crate::lint::lint_block(&parts.script) {
-                    crate::ui::warn(
-                        &format!("[{}] line {}: {}", host.alias, finding.line, finding.message),
-                        log_file,
-                    );
+            .render_check();
+            match super::muxy::ensure_host(muxy, host, remote_env.has_muxy, false, config, log_file)
+                .await
+            {
+                super::muxy::EnsureOutcome::Muxy(conn) => {
+                    match super::muxy::check_via_muxy(&conn, &check_payload, config.timeout).await {
+                        Ok(()) => {
+                            report_syntax_ok(host, &parts.script, log_file);
+                            return (host.alias.clone(), HostOutcome::Ok);
+                        }
+                        Err(err) => {
+                            crate::ui::warn(&format!("[{}] {err}", host.alias), log_file);
+                            // A check changes nothing, so under `auto` the
+                            // ssh syntax check is still a valid fallback.
+                            if config.transport == super::transport::TransportPolicy::Muxy {
+                                return (
+                                    host.alias.clone(),
+                                    HostOutcome::Failed(RunError::Transport),
+                                );
+                            }
+                        }
+                    }
                 }
-                (host.alias.clone(), HostOutcome::Ok)
+                super::muxy::EnsureOutcome::Ssh => {}
+                super::muxy::EnsureOutcome::Fail(message) => {
+                    crate::ui::warn(&message, log_file);
+                    return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
+                }
             }
-            Err(outcome) => {
-                crate::ui::warn(&format!("[{}] {outcome:?}", host.alias), log_file);
-                (host.alias.clone(), classify_ssh(outcome))
-            }
-        };
+        }
+        return run_syntax_check(SyntaxCheckArgs { ui, host, parts, config, log_file, cancel })
+            .await;
     }
 
     let remote_env = resolve_remote_env(host, &shell_cache, &cancel).await;
     let mut payload_env = with_login_path(parts.env.clone(), remote_env.path.as_deref());
     secrets.overlay(&mut payload_env, &host.alias);
 
-    let env_header = match render_env(&payload_env) {
-        Ok(header) => header,
+    // The guard is folded into the payload: evaluating it used to cost a
+    // second SSH round trip, so a guarded step paid double for one
+    // precondition.
+    let has_guard = parts.guard.is_some();
+    let payload = super::transport::Payload {
+        script: &parts.script,
+        guard: parts.guard.as_deref(),
+        trace: parts.trace,
+        env: payload_env,
+        timeout: config.timeout,
+    };
+
+    // Muxy first: one session for the block, environment applied by the
+    // server (never written to disk), lines streamed through the same Ui.
+    #[cfg(feature = "muxy")]
+    if super::muxy::class_uses_muxy(config, super::StepClass::Remote) {
+        let has_secrets = secrets.has_for_host(&host.alias);
+        match super::muxy::ensure_host(
+            muxy,
+            host,
+            remote_env.has_muxy,
+            has_secrets,
+            config,
+            log_file,
+        )
+        .await
+        {
+            super::muxy::EnsureOutcome::Muxy(conn) => {
+                let attempt = super::muxy::attempt_step(super::muxy::MuxyStep {
+                    ui: &ui,
+                    host: host.clone(),
+                    conn,
+                    script: payload.script.to_string(),
+                    guard: payload.guard.map(str::to_string),
+                    env: payload.env.clone(),
+                    has_secrets,
+                    has_guard,
+                    timeout: payload.timeout,
+                    config,
+                    transform: None,
+                    explain_exit: None,
+                    log_file: log_file.clone(),
+                    cancel: cancel.clone(),
+                    run_id: muxy.run_id.clone(),
+                    step_id: format!("step-{step_no}"),
+                })
+                .await;
+                match attempt {
+                    super::muxy::MuxyAttempt::Done(pair) => return pair,
+                    // Nothing was created on the target: the ssh path below
+                    // runs the block exactly once.
+                    super::muxy::MuxyAttempt::Fallback => {}
+                }
+            }
+            super::muxy::EnsureOutcome::Ssh => {}
+            super::muxy::EnsureOutcome::Fail(message) => {
+                crate::ui::warn(&message, log_file);
+                return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
+            }
+        }
+    }
+
+    let payload = match payload.render_ssh() {
+        Ok(payload) => payload,
         Err(err) => {
             crate::ui::warn(&format!("[{}] {err}", host.alias), log_file);
             return (host.alias.clone(), HostOutcome::Failed(RunError::Plan));
         }
     };
-    // The guard is folded into the payload: evaluating it used to cost a
-    // second SSH round trip, so a guarded step paid double for one
-    // precondition.
-    let has_guard = parts.guard.is_some();
-    let guard = parts.guard.as_ref().map_or_else(String::new, |guard| folded_guard(guard));
-    let payload = format!("set -eu\n{env_header}{guard}{}{}", parts.trace_line, parts.script);
-    let cmd = build_ssh_cmd(host, remote_env.shell, false, config);
+    let cmd = super::transport::ssh_stdin_command(
+        host,
+        remote_env.shell.invoke(false),
+        config.ssh_reuse,
+        config.verbose >= 3,
+    );
     if config.verbose >= 2 {
         ui.lock().await.masked_note(&format!(
             "  [{}] ssh {}",
@@ -1688,7 +1898,91 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
     }
 }
 
-fn with_login_path(mut env: Vec<(String, String)>, path: Option<&str>) -> Vec<(String, String)> {
+/// The parameters of a `bash -n` syntax check on one host.
+struct SyntaxCheckArgs<'a> {
+    ui: ArcUi,
+    host: &'a ResolvedHost,
+    parts: &'a PayloadParts,
+    config: StepConfig,
+    log_file: &'a LogFile,
+    cancel: Cancel,
+}
+
+/// `bash -n` over ssh: the `--check`/`--dry-run` path, and the `auto`
+/// fallback when the muxy `exec` channel is unavailable.
+async fn run_syntax_check(args: SyntaxCheckArgs<'_>) -> (String, HostOutcome) {
+    let SyntaxCheckArgs { ui, host, parts, config, log_file, cancel } = args;
+    let payload = match (super::transport::Payload {
+        script: &parts.script,
+        guard: None,
+        trace: parts.trace,
+        env: parts.env.clone(),
+        timeout: config.timeout,
+    })
+    .render_ssh()
+    {
+        Ok(payload) => payload,
+        Err(err) => {
+            crate::ui::warn(&format!("[{}] {err}", host.alias), log_file);
+            return (host.alias.clone(), HostOutcome::Failed(RunError::Plan));
+        }
+    };
+    let cmd = || {
+        super::transport::ssh_stdin_command(
+            host,
+            RemoteShell::Bash.invoke(true),
+            config.ssh_reuse,
+            config.verbose >= 3,
+        )
+    };
+    if config.verbose >= 2 {
+        let cmd = cmd();
+        ui.lock().await.masked_note(&format!(
+            "  [{}] ssh {}",
+            host.alias,
+            super::display_args(&cmd)
+        ));
+    }
+    match run_ssh_child(SshChildArgs {
+        ui,
+        host,
+        cmd: cmd(),
+        payload: &payload,
+        timeout: config.timeout,
+        // A syntax check has no guard: exit 42 in user code is an
+        // ordinary failure, never a skip.
+        has_guard: false,
+        log_file,
+        cancel,
+    })
+    .await
+    {
+        Ok(()) => {
+            report_syntax_ok(host, &parts.script, log_file);
+            (host.alias.clone(), HostOutcome::Ok)
+        }
+        Err(outcome) => {
+            crate::ui::warn(&format!("[{}] {outcome:?}", host.alias), log_file);
+            (host.alias.clone(), classify_ssh(outcome))
+        }
+    }
+}
+
+/// The verdict of a successful syntax check, plus the local lint findings.
+fn report_syntax_ok(host: &ResolvedHost, script: &str, log_file: &LogFile) {
+    crate::ui::note(&format!("[{}] syntax check (bash -n): OK", host.alias), log_file);
+    for finding in crate::lint::lint_block(script) {
+        crate::ui::warn(
+            &format!("[{}] line {}: {}", host.alias, finding.line, finding.message),
+            log_file,
+        );
+    }
+}
+
+pub(super) fn with_login_path(
+    mut env: Vec<(String, String)>,
+    path: Option<&str>,
+) -> Vec<(String, String)> {
     if env.iter().any(|(k, _)| k == "PATH") {
         return env;
     }
@@ -1698,57 +1992,28 @@ fn with_login_path(mut env: Vec<(String, String)>, path: Option<&str>) -> Vec<(S
     env
 }
 
-fn build_ssh_cmd(
-    host: &ResolvedHost,
-    shell: RemoteShell,
-    syntax_only: bool,
-    config: StepConfig,
-) -> Command {
-    let mut cmd = Command::new("ssh");
-    // Fail closed on an unknown host key or a missing key: never prompt.
-    cmd.args(["-o", "BatchMode=yes"]);
-    cmd.args(host.spec.to_ssh_args()).arg("-T");
-    if config.ssh_reuse {
-        // Connection reuse: later steps in the same run share the first
-        // step's authenticated connection instead of re-handshaking.
-        //
-        // `ControlMaster=auto` is safe by construction: OpenSSH reuses the
-        // master when it is alive and creates a new one when it is not (a
-        // dead control socket is detected and replaced), so a stale socket
-        // cannot break a deploy. rsync/scp copies always go direct.
-        cmd.args([
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            "ControlPath=~/.ssh/shellflow-%r@%h-%p",
-            "-o",
-            "ControlPersist=60",
-        ]);
-    }
-    if config.verbose >= 3 {
-        cmd.arg("-v");
-    }
-    cmd.arg(shell.invoke(syntax_only));
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-    isolate(&mut cmd);
-    cmd
-}
-
 pub(crate) async fn resolve_remote_env(
     host: &ResolvedHost,
     cache: &ShellCache,
     cancel: &Cancel,
 ) -> RemoteEnv {
     let key = super::shell_cache_key(host);
-    if let Some(env) = cache.lock().await.get(&key) {
+    // The lock is held across get-or-probe so concurrent steps on the same
+    // destination probe once, as the `ShellCache` contract promises. Only a
+    // *completed* probe is cached: a failed probe yields the default
+    // environment below and is retried by the next caller instead of being
+    // pinned on the host for the rest of the run.
+    let mut cache = cache.lock().await;
+    if let Some(env) = cache.get(&key) {
         return env.clone();
     }
-    let env = probe_remote_env(host, cancel).await;
-    cache.lock().await.insert(key, env.clone());
-    env
+    match probe_remote_env(host, cancel).await {
+        Some(env) => {
+            cache.insert(key, env.clone());
+            env
+        }
+        None => RemoteEnv::default(),
+    }
 }
 
 const PROBE_SCRIPT: &str = r#"
@@ -1768,6 +2033,11 @@ const PROBE_SCRIPT: &str = r#"
         if [ -n "$d" ] && [ -d "$d" ]; then printf '%s\n' "$d"; fi
     done;
     printf '%s\n' 'SHELLFLOW_PATH_END';
+    if command -v muxy >/dev/null 2>&1; then
+        printf '%s\n' 'SHELLFLOW_MUXY=1'
+    else
+        printf '%s\n' 'SHELLFLOW_MUXY=0'
+    fi;
 }
 "#;
 
@@ -1809,12 +2079,13 @@ const PROBE_ATTEMPTS: usize = 2;
 ///
 /// # Errors
 ///
-/// Never fails: an unreachable host yields the default environment, which
-/// the caller treats as "probe did not complete".
-async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
+/// Returns `None` when the probe did not complete (an unreachable host): the
+/// caller must **not** cache that outcome, or one transient failure would pin
+/// `has_rsync = false` and no login `PATH` on the host for the rest of the run.
+async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> Option<RemoteEnv> {
     for attempt in 1..=PROBE_ATTEMPTS {
         if let Some(env) = probe_once(host, cancel).await {
-            return env;
+            return Some(env);
         }
         if cancel.is_cancelled() {
             break;
@@ -1823,7 +2094,7 @@ async fn probe_remote_env(host: &ResolvedHost, cancel: &Cancel) -> RemoteEnv {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
-    RemoteEnv::default()
+    None
 }
 
 /// One probe attempt.
@@ -1877,30 +2148,21 @@ async fn probe_once(host: &ResolvedHost, cancel: &Cancel) -> Option<RemoteEnv> {
     let status =
         super::process::wait_child(&mut child, Some(PROBE_ATTEMPT_BUDGET_SECS), &mut cancel_probe)
             .await;
-    let output = match status {
-        super::process::ChildOutcome::Finished(Ok(status)) if status.success() => {
-            group.disarm();
-            match tokio::time::timeout(Duration::from_secs(2), reader).await {
-                Ok(Ok(buf)) => buf,
-                _ => return None,
-            }
+    // A completed ssh — zero or not — still carries a usable probe when the
+    // marker is present (e.g. a host without rsync): fall through to parsing
+    // rather than discarding the login shell and PATH with it. Anything else
+    // (timeout, cancellation, spawn failure) kills the probe.
+    let output = if let super::process::ChildOutcome::Finished(Ok(_)) = status {
+        group.disarm();
+        match tokio::time::timeout(Duration::from_secs(2), reader).await {
+            Ok(Ok(buf)) => buf,
+            _ => return None,
         }
-        super::process::ChildOutcome::Finished(Ok(_)) => {
-            // Non-zero exit still carries a usable probe when the marker is
-            // present (e.g. a host without rsync): fall through to parsing
-            // rather than discarding the login shell and PATH with it.
-            group.disarm();
-            match tokio::time::timeout(Duration::from_secs(2), reader).await {
-                Ok(Ok(buf)) => buf,
-                _ => return None,
-            }
-        }
-        _ => {
-            super::process::terminate(&mut child).await;
-            group.disarm();
-            reader.abort();
-            return None;
-        }
+    } else {
+        super::process::terminate(&mut child).await;
+        group.disarm();
+        reader.abort();
+        return None;
     };
     let text = String::from_utf8_lossy(&output);
     let mut lines = text.lines();
@@ -1910,12 +2172,15 @@ async fn probe_once(host: &ResolvedHost, cancel: &Cancel) -> Option<RemoteEnv> {
     let mut dirs: Vec<&str> = Vec::new();
     let mut in_path = false;
     let mut has_rsync = false;
+    let mut has_muxy = false;
     let mut completed = false;
     for line in lines {
         match line.trim() {
             "SHELLFLOW_PATH_BEGIN" => in_path = true,
             "SHELLFLOW_PATH_END" => in_path = false,
             "SHELLFLOW_HAS_RSYNC" => has_rsync = true,
+            "SHELLFLOW_MUXY=1" => has_muxy = true,
+            "SHELLFLOW_MUXY=0" => has_muxy = false,
             other if other == PROBE_END_MARKER => completed = true,
             other if in_path && !other.is_empty() => dirs.push(other),
             _ => {}
@@ -1927,7 +2192,7 @@ async fn probe_once(host: &ResolvedHost, cancel: &Cancel) -> Option<RemoteEnv> {
         return None;
     }
     let path = if dirs.is_empty() { None } else { Some(dirs.join(":")) };
-    Some(RemoteEnv { shell, path, has_rsync })
+    Some(RemoteEnv { shell, path, has_rsync, has_muxy })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1974,7 +2239,7 @@ const GUARD_SKIP_EXIT: i32 = 42;
 /// The guard keeps its own relaxed shell options (`set +u`), so a guard that
 /// reads an unset variable behaves as it did before, and its output stays
 /// hidden.
-fn folded_guard(guard: &str) -> String {
+pub(crate) fn folded_guard(guard: &str) -> String {
     format!(
         "trap 'rc=$?; if [ \"$rc\" = {GUARD_SKIP_EXIT} ]; then exit 1; fi' EXIT\n\
          if ! ( set +u; {guard} ) >/dev/null 2>&1; then trap - EXIT; exit {GUARD_SKIP_EXIT}; fi\n"

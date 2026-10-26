@@ -67,20 +67,24 @@ pub(super) fn section_id(unit: &str, kind: &str) -> String {
 /// Add every question about one unit to the batch.
 fn add_unit_sections(batch: &mut Batch, service: &str, unit: &str, journal_lines: usize) {
     let socket_unit = unit.replace(".service", ".socket");
+    // Every name is interpolated into a single-quoted remote shell word, so
+    // it is quoted with the shared rule — the same discipline the executor
+    // uses. A unit or service name arriving from a manifest directory cannot
+    // close the quote and inject shell.
+    let q_unit = shellflow_core::shell_quote_single(unit);
+    let q_socket = shellflow_core::shell_quote_single(&socket_unit);
+    let q_service = shellflow_core::shell_quote_single(service);
 
-    batch.section(&section_id(unit, "unit_state"), &format!("systemctl is-active '{unit}'"));
+    batch.section(&section_id(unit, "unit_state"), &format!("systemctl is-active {q_unit}"));
     batch.section(
         &section_id(unit, "socket_load"),
-        &format!("systemctl show '{socket_unit}' -p LoadState --value"),
+        &format!("systemctl show {q_socket} -p LoadState --value"),
     );
-    batch.section(
-        &section_id(unit, "socket_state"),
-        &format!("systemctl is-active '{socket_unit}'"),
-    );
+    batch.section(&section_id(unit, "socket_state"), &format!("systemctl is-active {q_socket}"));
     batch.section(
         &section_id(unit, "props"),
         &format!(
-            "sudo -n systemctl show '{unit}' -p \
+            "sudo -n systemctl show {q_unit} -p \
              ExecStart,Environment,EnvironmentFile,LoadCredentialEncrypted,ImportCredential,\
              User,Type,NotifyAccess,WatchdogUSec,TimeoutStartSec,TimeoutStartUSec,\
              ExecReload,StatusText,ActiveState,Result,Restart,RestartUSec,\
@@ -88,14 +92,14 @@ fn add_unit_sections(batch: &mut Batch, service: &str, unit: &str, journal_lines
              RuntimeDirectory,NoNewPrivileges,ProtectSystem,PrivateTmp"
         ),
     );
-    batch.section(&section_id(unit, "unit_file"), &format!("sudo -n systemctl cat '{unit}'"));
+    batch.section(&section_id(unit, "unit_file"), &format!("sudo -n systemctl cat {q_unit}"));
     batch.section(
         &section_id(unit, "credstore"),
-        &format!("sudo -n ls -l '/etc/credstore.encrypted/{service}/'"),
+        &format!("sudo -n ls -l '/etc/credstore.encrypted/{q_service}/'"),
     );
     batch.section(
         &section_id(unit, "journal"),
-        &format!("sudo -n journalctl -u '{unit}' --no-pager -n {journal_lines}"),
+        &format!("sudo -n journalctl -u {q_unit} --no-pager -n {journal_lines}"),
     );
     // Path-existence preflight. systemd fails a unit with
     // `226/NAMESPACE` when `ReadWritePaths=` (or `WorkingDirectory=`, or
@@ -108,7 +112,7 @@ fn add_unit_sections(batch: &mut Batch, service: &str, unit: &str, journal_lines
     // checked: their absence is normal.
     let paths_cmd = format!(
         "sfw_paths() {{\n\
-         u='{unit}'\n\
+         u={q_unit}\n\
          for prop in WorkingDirectory ReadWritePaths ReadOnlyPaths InaccessiblePaths; do\n\
          sudo -n systemctl show \"$u\" -p \"$prop\" --value 2>/dev/null | tr ' ' '\\n' | \
          while IFS= read -r p; do\n\

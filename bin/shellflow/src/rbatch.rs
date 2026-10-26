@@ -40,6 +40,14 @@ use crate::service::ServiceError;
 /// on the synchronous path, a runtime worker) forever.
 const BATCH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The total response a batch may collect before the transport gives up.
+///
+/// The answers come from a remote host, so the volume is remote-controlled;
+/// a cap (far above any legitimate audit answer — a 1000-line journal is a
+/// few MiB) keeps a hostile or broken target from driving the controller's
+/// allocation without bound.
+const MAX_BATCH_ANSWER_BYTES: usize = 64 * 1024 * 1024;
+
 /// Where a batch is sent.
 #[derive(Clone, Debug)]
 pub(crate) enum SshDest {
@@ -231,12 +239,29 @@ impl Batch {
         // expected answer is in rather than after a trailing query that may
         // be slow.
         let mut reader = AnswerReader::new(self);
+        let mut collected: usize = 0;
         if let Some(stdout) = child.stdout.take() {
             use std::io::BufRead as _;
             for line in std::io::BufReader::new(stdout).lines() {
                 let Ok(line) = line else {
                     break;
                 };
+                collected = collected.saturating_add(line.len());
+                if collected > MAX_BATCH_ANSWER_BYTES {
+                    // A remote-controlled response must not be able to drive
+                    // the controller's allocation without bound (a journal
+                    // query answers with whatever the host holds).
+                    crate::executor::process::signal_group(
+                        child.id(),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                    let _ = child.wait();
+                    finished.store(true, Ordering::Relaxed);
+                    return Err(ServiceError::Transport(eyre::eyre!(
+                        "ssh {host}: the batch response exceeded {} MiB",
+                        MAX_BATCH_ANSWER_BYTES / (1024 * 1024)
+                    )));
+                }
                 reader.push_line(&line);
                 if reader.is_complete() {
                     // Every answer is in: kill the whole group, not only ssh.

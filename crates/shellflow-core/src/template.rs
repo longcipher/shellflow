@@ -18,6 +18,8 @@
 
 use std::{collections::HashMap, hash::BuildHasher};
 
+use crate::error::{MissingKey, MissingKeysError};
+
 /// A `${NAME}` placeholder occurrence in template text.
 struct Placeholder {
     /// The referenced key (`NAME`).
@@ -84,8 +86,9 @@ pub fn template_keys(content: &str) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Returns the sorted list of keys the template references but `values` does
-/// not provide. Callers must treat this as fatal (fail closed): nothing is
+/// Returns [`MissingKeysError`] naming every key the template references but
+/// `values` does not provide, with the byte offset of each key's first
+/// occurrence. Callers must treat this as fatal (fail closed): nothing is
 /// rendered, so a service never starts with a half-substituted config.
 ///
 /// # Examples
@@ -103,18 +106,21 @@ pub fn template_keys(content: &str) -> Vec<String> {
 pub fn render_template<S: BuildHasher>(
     content: &str,
     values: &HashMap<String, String, S>,
-) -> Result<String, Vec<String>> {
+) -> Result<String, MissingKeysError> {
     let spans = placeholders(content);
 
-    let mut missing: Vec<String> = Vec::new();
+    let mut missing: Vec<MissingKey> = Vec::new();
     for placeholder in &spans {
-        if !values.contains_key(&placeholder.key) && !missing.contains(&placeholder.key) {
-            missing.push(placeholder.key.clone());
+        if values.contains_key(&placeholder.key) {
+            continue;
+        }
+        if !missing.iter().any(|key| key.key == placeholder.key) {
+            missing.push(MissingKey { key: placeholder.key.clone(), offset: placeholder.start });
         }
     }
     if !missing.is_empty() {
-        missing.sort();
-        return Err(missing);
+        missing.sort_by(|a, b| a.key.cmp(&b.key));
+        return Err(MissingKeysError { missing });
     }
 
     let mut out = String::with_capacity(content.len());
@@ -270,7 +276,11 @@ mod tests {
             &values(&[("A", "present"), ("UNUSED", "extra")]),
         )
         .expect_err("missing keys");
-        assert_eq!(err, vec!["M", "Z"], "missing keys are reported sorted");
+        let keys: Vec<&str> = err.missing.iter().map(|key| key.key.as_str()).collect();
+        assert_eq!(keys, vec!["M", "Z"], "missing keys are reported sorted");
+        // Each key carries the byte offset of its first occurrence.
+        assert_eq!(err.missing[0].offset, 15, "first M occurrence");
+        assert_eq!(err.missing[1].offset, 0, "first Z occurrence");
     }
 
     #[test]
@@ -278,7 +288,9 @@ mod tests {
         // Fail closed: no partial output is produced on error.
         let err = render_template("keep ${A} drop ${B}", &values(&[("A", "1")]))
             .expect_err("one missing key");
-        assert_eq!(err, vec!["B"]);
+        assert_eq!(err.missing.len(), 1);
+        assert_eq!(err.missing[0].key, "B");
+        assert_eq!(err.missing[0].offset, 15);
     }
 
     #[test]
@@ -366,7 +378,8 @@ mod tests {
             let err = render_template(&template, &HashMap::new()).expect_err("no values");
             let mut expected = keys.clone();
             expected.sort();
-            proptest::prop_assert_eq!(err, expected);
+            let got: Vec<String> = err.missing.iter().map(|key| key.key.clone()).collect();
+            proptest::prop_assert_eq!(got, expected);
         }
     }
 }

@@ -94,12 +94,8 @@ fn render(args: &TemplateRenderArgs, ui: &Ui) -> Result<()> {
         .wrap_err_with(|| format!("failed to read template `{}`", args.template.display()))?;
     let pairs = decrypt_env(&args.file, args.identity.as_deref())?;
     let map: HashMap<String, String> = pairs.into_iter().collect();
-    let rendered = render_template(&content, &map).map_err(|missing| {
-        eyre!(
-            "template references missing credential(s): {} (unit would fail to start)",
-            missing.join(", ")
-        )
-    })?;
+    let rendered =
+        render_template(&content, &map).map_err(|err| eyre!("{err} (unit would fail to start)"))?;
     match args.format {
         RenderFormat::Toml => {
             use std::str::FromStr as _;

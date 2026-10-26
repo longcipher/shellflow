@@ -21,8 +21,9 @@ use std::{sync::Arc, time::Duration};
 use shellflow_core::{AssertStep, Assertion, ResolvedHost};
 use tokio::sync::Semaphore;
 
+use super::stream;
 use crate::{
-    executor::{ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel},
+    executor::{ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel, fanout_slot},
     rbatch::{Batch, SshDest},
 };
 
@@ -124,15 +125,7 @@ pub(super) async fn run_assert_step(
         let log_file = log_file.clone();
         let cancel = cancel.clone();
         tasks.spawn(async move {
-            let _permit = match semaphore.as_ref() {
-                Some(sem) => match sem.clone().acquire_owned().await {
-                    Ok(permit) => Some(permit),
-                    Err(_) => {
-                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
-                    }
-                },
-                None => None,
-            };
+            let _permit = fanout_slot!(&semaphore, &log_file, host);
             if cancel.is_cancelled() {
                 return (host.alias.clone(), HostOutcome::Cancelled);
             }
@@ -142,20 +135,7 @@ pub(super) async fn run_assert_step(
         });
     }
 
-    let mut out = Vec::new();
-    while let Some(res) = tasks.join_next().await {
-        match res {
-            Ok(pair) => {
-                ui.lock().await.host_finished(&pair.0);
-                out.push(pair);
-            }
-            Err(err) => {
-                crate::ui::warn(&format!("assert task failed: {err}"), log_file);
-                out.push(("unknown".to_string(), HostOutcome::Failed(RunError::Transport)));
-            }
-        }
-    }
-    Ok(out)
+    Ok(stream::collect_hosts(ui, log_file, tasks).await)
 }
 
 /// Run every check on one host and report the verdicts.
@@ -468,7 +448,7 @@ fn status_glob(pattern: &str) -> String {
 /// is quoted rather than trusted: a unit name with a space must not become
 /// two arguments.
 fn quote(value: &str) -> String {
-    shellflow_core::env::shell_quote_single(value)
+    shellflow_core::shell_quote_single(value)
 }
 
 #[cfg(test)]

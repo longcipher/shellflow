@@ -50,7 +50,8 @@ fn production_sources(root: &Path) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let src = entry.path().join("src");
             if src.is_dir() {
-                collect_rs(&src, &mut out);
+                let test_only = test_only_modules(&src);
+                collect_rs(&src, &test_only, &mut out);
             }
         }
     }
@@ -58,8 +59,38 @@ fn production_sources(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Collect the `.rs` files under `dir`, skipping build output.
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+/// The modules a crate declares as test-only (`#[cfg(test)] mod harness;`).
+///
+/// A file that is only compiled under `cfg(test)` is a test fixture, not
+/// production code: a fixture may bluntly unwrap its own setup, and panicking
+/// there fails the test instead of the deploy.
+fn test_only_modules(src: &Path) -> Vec<String> {
+    let mut root = src.join("lib.rs");
+    if !root.exists() {
+        root = src.join("main.rs");
+    }
+    let Ok(text) = fs::read_to_string(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut gated = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#[cfg(test)]" {
+            gated = true;
+            continue;
+        }
+        if gated && let Some(rest) = trimmed.strip_prefix("mod ") {
+            out.push(rest.trim_end_matches(';').trim().to_string());
+        }
+        gated = false;
+    }
+    out
+}
+
+/// Collect the `.rs` files under `dir`, skipping build output and the
+/// crate's test-only modules.
+fn collect_rs(dir: &Path, test_only: &[String], out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -71,7 +102,11 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
             if name == "target" || name == "fuzz" {
                 continue;
             }
-            collect_rs(&path, out);
+            collect_rs(&path, test_only, out);
+            continue;
+        }
+        let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or_default();
+        if test_only.iter().any(|name| name == stem) {
             continue;
         }
         if path.extension().is_some_and(|ext| ext == "rs") {

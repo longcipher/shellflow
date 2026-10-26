@@ -51,6 +51,28 @@ pub(crate) enum OutputMode {
     Grouped,
 }
 
+/// Which transport a command step takes to its host.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub(crate) enum TransportArg {
+    /// Muxy where a compatible server answers, ssh everywhere else (default).
+    #[default]
+    Auto,
+    /// Every command step through muxy; fail fast when it is unavailable.
+    Muxy,
+    /// Never attempt muxy.
+    Ssh,
+}
+
+impl std::fmt::Display for TransportArg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(formatter, "auto"),
+            Self::Muxy => write!(formatter, "muxy"),
+            Self::Ssh => write!(formatter, "ssh"),
+        }
+    }
+}
+
 /// Flags shared by the `run` and `deploy` subcommands.
 #[derive(Debug, Args, Clone, Default)]
 pub(crate) struct RunFlags {
@@ -153,6 +175,31 @@ pub(crate) struct RunFlags {
     /// silently ignore it.
     #[arg(short = 'l', long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
+
+    /// Which transport a command step takes to its host.
+    ///
+    /// `auto` (default) uses muxy where a compatible server answers and ssh
+    /// everywhere else, never failing a green run because of muxy; `muxy`
+    /// routes every command step through muxy and fails fast (exit 3) when a
+    /// selected host cannot do it; `ssh` never attempts muxy.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub transport: Option<TransportArg>,
+
+    /// Alias for `--transport ssh`, for muscle memory.
+    #[arg(long)]
+    pub no_muxy: bool,
+
+    /// Leave a cancelled step's muxy session running instead of ending it.
+    #[arg(long)]
+    pub muxy_keep: bool,
+
+    /// Muxy session width in columns (default 200, max 4096).
+    #[arg(long, value_name = "N")]
+    pub muxy_cols: Option<u16>,
+
+    /// Muxy session height in rows (default 50, max 1024).
+    #[arg(long, value_name = "N")]
+    pub muxy_rows: Option<u16>,
 }
 
 /// Arguments for the `run` subcommand (also the default).
@@ -985,7 +1032,7 @@ pub(crate) struct AuditArgs {
     pub path: PathBuf,
 }
 /// The `service` subcommands.
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ServiceCmd {
     /// Scaffold a new service in the flat layout (config template, systemd
     /// unit, deploy playbook skeleton) in the current repository.
@@ -1028,7 +1075,7 @@ pub(crate) enum ServicePattern {
 }
 
 /// Arguments for `service init`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct ServiceInitArgs {
     /// Service name (`[a-z][a-z0-9-]*`).
     #[arg(value_name = "SVC")]
@@ -1048,7 +1095,7 @@ pub(crate) struct ServiceInitArgs {
 }
 
 /// Arguments for `service check`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct ServiceCheckArgs {
     /// Service name (systemd unit `<svc>.service` on the target).
     ///
@@ -1075,7 +1122,7 @@ pub(crate) struct ServiceCheckArgs {
 }
 
 /// Arguments for `service diff`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct ServiceDiffArgs {
     /// Service name: compares the repository's unit with the deployed one.
     ///
@@ -1106,7 +1153,7 @@ pub(crate) struct ServiceDiffArgs {
 }
 
 /// Arguments for `service manifest`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct ServiceManifestArgs {
     /// SSH target (alias, `[user@]host[:port]`, or `~/.ssh/config` entry).
     #[arg(long = "host", value_name = "HOST")]
@@ -1122,7 +1169,7 @@ pub(crate) struct ServiceManifestArgs {
 }
 
 /// Arguments for `service status`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct ServiceStatusArgs {
     /// Every host the repository's playbooks declare (with `--all`).
     #[arg(long)]
@@ -1144,7 +1191,7 @@ pub(crate) struct ServiceStatusArgs {
 }
 
 /// Arguments for `service verify`.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct ServiceVerifyArgs {
     /// SSH target (alias, `[user@]host[:port]`, or `~/.ssh/config` entry).
     #[arg(long = "host", value_name = "HOST")]
@@ -1230,6 +1277,23 @@ impl RunArgs {
     #[must_use]
     pub(crate) fn mask_min_len(&self) -> usize {
         self.flags.mask_min_len.unwrap_or_else(default_mask_min_len)
+    }
+
+    /// The effective transport: `--no-muxy` wins, then `--transport`, then
+    /// `$SHELLFLOW_TRANSPORT`, else `auto`.
+    #[must_use]
+    pub(crate) fn effective_transport(&self) -> TransportArg {
+        if self.flags.no_muxy {
+            return TransportArg::Ssh;
+        }
+        if let Some(transport) = self.flags.transport {
+            return transport;
+        }
+        match std::env::var("SHELLFLOW_TRANSPORT").as_deref() {
+            Ok("muxy") => TransportArg::Muxy,
+            Ok("ssh") => TransportArg::Ssh,
+            _ => TransportArg::Auto,
+        }
     }
 }
 

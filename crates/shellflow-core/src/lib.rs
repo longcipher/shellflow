@@ -24,7 +24,7 @@ pub use env::{
     CAPTURE_SEPARATOR, MASK, SecretMasker, mask_keyed, mask_line, mask_token,
     parse_capture_records, parse_capture_records_checked, prepare_masks, render_env,
 };
-pub use error::{CaptureError, RenderEnvError};
+pub use error::{CaptureError, MissingKey, MissingKeysError, RenderEnvError};
 // The deploy-script grammar and the plan model live in `shellflow-dsl`.
 // They are re-exported here so that a consumer of the runtime helpers does
 // not have to know which of the two crates owns which half of the language.
@@ -32,8 +32,11 @@ pub use shellflow_dsl::{
     AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
     ExecutionPlan, HelperStep, ImageStep, InstallStep, InterpolateError, LocalStep, ParseError,
     ReleaseStep, ReloadStep, RemoteStep, ResolvedHost, RunState, SecretEntry, ServiceStep, SshSpec,
-    Step, Target, ToolchainStep, UnitInventoryStep, WaitStep, Workdir, interpolate,
-    is_valid_var_name, parse_script, shell_quote_single, strip_surrounding_quotes,
+    Step, Target, ToolchainStep, UnitInventoryStep, WaitStep, Workdir, interpolate, parse_script,
 };
 pub use shellflow_dsl::{Heredoc, HeredocTracker, resolve_hosts};
+// The shell-text rules are re-exported from their owning crate, so there is
+// exactly one authoritative path per symbol (`shellflow_text`, surfaced here
+// and through `shellflow_dsl` for its own grammar).
+pub use shellflow_text::{is_valid_var_name, shell_quote_single, strip_surrounding_quotes};
 pub use template::{render_template, template_keys};

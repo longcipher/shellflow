@@ -16,10 +16,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use age::x25519::Identity;
 use eyre::{Context as _, Result, eyre};
 use shellflow_core::SecretEntry;
 use shellflow_secrets::{
+    Identity,
     crypto::decrypt_string,
     env::parse_env_file,
     identity::{effective_identity_path, expand_home, load_x25519_identity},
@@ -78,6 +78,16 @@ impl ResolvedSecrets {
     /// `--local` target to resolve unambiguously).
     pub(crate) fn has_per_host(&self) -> bool {
         !self.per_host.is_empty()
+    }
+
+    /// Whether this host's step carries secret values (shared pairs apply to
+    /// every host; `{host}` pairs only to their own).
+    #[cfg_attr(
+        not(feature = "muxy"),
+        expect(dead_code, reason = "the ssh-only build never classifies steps by secret presence")
+    )]
+    pub(crate) fn has_for_host(&self, alias: &str) -> bool {
+        !self.shared.is_empty() || self.per_host.contains_key(alias)
     }
 
     /// Shared `(key, value)` pairs for run-state env injection.
@@ -254,9 +264,8 @@ fn decrypt_file(
 
 #[cfg(test)]
 mod tests {
-    use age::x25519::Identity;
     use shellflow_core::SecretEntry;
-    use shellflow_secrets::{crypto::encrypt_bytes, identity::generate_identity};
+    use shellflow_secrets::{Identity, crypto::encrypt_bytes, identity::generate_identity};
 
     use super::{SECRET_KEYS_VAR, resolve_secrets};
 

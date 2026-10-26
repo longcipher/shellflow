@@ -1,4 +1,5 @@
-//! Error types for the runtime helpers: payload rendering and capture parsing.
+//! Error types for the runtime helpers: payload rendering, capture parsing,
+//! and credential-template rendering.
 //!
 //! The script parser's own errors live in `shellflow-dsl`, next to the
 //! grammar that produces them.
@@ -38,4 +39,69 @@ pub enum CaptureError {
         /// The name found in the capture file.
         name: String,
     },
+}
+
+/// A template references a `${KEY}` placeholder the value map does not
+/// provide.
+///
+/// Rendering is fail closed: nothing is rendered, so a service never starts
+/// with a half-substituted config.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[error("missing template key(s): {}", Self::join(.missing))]
+pub struct MissingKeysError {
+    /// Every missing key with the byte offset of its first `${KEY}`
+    /// occurrence, sorted by key.
+    pub missing: Vec<MissingKey>,
+}
+
+impl MissingKeysError {
+    fn join(missing: &[MissingKey]) -> String {
+        missing.iter().map(|key| key.key.as_str()).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// One missing `${KEY}` placeholder.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[error("`{key}` (byte {offset})")]
+pub struct MissingKey {
+    /// The referenced key.
+    pub key: String,
+    /// Byte offset of the `$` that opens the first `${KEY}` occurrence.
+    pub offset: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MissingKey, MissingKeysError};
+
+    fn keys(names: &[&str]) -> Vec<MissingKey> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| MissingKey { key: (*name).to_string(), offset: index })
+            .collect()
+    }
+
+    #[test]
+    fn the_missing_keys_error_names_every_key() {
+        // The message is the operator's only pointer at the placeholders the
+        // value map did not provide; dropping the list would name nothing.
+        let message = MissingKeysError { missing: keys(&["DB_PASSWORD", "API_TOKEN"]) }.to_string();
+        assert!(message.contains("DB_PASSWORD"), "{message}");
+        assert!(message.contains("API_TOKEN"), "{message}");
+        assert!(message.contains("missing template key(s)"), "{message}");
+    }
+
+    #[test]
+    fn several_keys_are_joined_with_a_comma() {
+        let message = MissingKeysError { missing: keys(&["A", "B"]) }.to_string();
+        assert!(message.ends_with("A, B"), "the keys must be joined, not concatenated: {message}");
+    }
+
+    #[test]
+    fn one_missing_key_reports_its_offset() {
+        let message = keys(&["ONLY"])[0].to_string();
+        assert!(message.contains("`ONLY`"), "{message}");
+        assert!(message.contains("byte 0"), "{message}");
+    }
 }

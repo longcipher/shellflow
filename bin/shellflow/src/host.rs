@@ -414,7 +414,6 @@ fn backup(args: &HostBackupArgs) -> Result<(), HostError> {
     let dir_path = PathBuf::from(&dir);
     create_dir_all_elevated(&dir_path, 0o700)?;
 
-    let mut written: Vec<PathBuf> = Vec::new();
     for path in &args.paths {
         if !path.starts_with('/') {
             return Err(HostError::usage(format!("the path must be absolute (got `{path}`)")));
@@ -441,7 +440,6 @@ fn backup(args: &HostBackupArgs) -> Result<(), HostError> {
                 .map_err(|err| HostError::internal(format!("cannot back up `{path}`: {err}")))?;
             write_file_elevated(&target, &contents, 0o600)?;
         }
-        written.push(target.clone());
         println!("==> backed up {path} -> {}", target.display());
     }
 
@@ -463,8 +461,6 @@ fn backup(args: &HostBackupArgs) -> Result<(), HostError> {
             unexpected.join(", ")
         )));
     }
-    let _ = written;
-
     if let Some(keep) = args.keep {
         prune_snapshots(&dir, &service, keep)?;
     }
