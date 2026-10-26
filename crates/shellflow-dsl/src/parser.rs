@@ -30,6 +30,8 @@ struct State {
     mode: Mode,
     /// Target text when `mode` is [`Mode::Remote`]; empty in local mode.
     target: String,
+    /// Script line of the `@remote` that set `target`.
+    target_line: usize,
     /// Lines of the current (unflushed) block.
     pending: Vec<String>,
     /// `@name` for the next block.
@@ -55,6 +57,7 @@ impl State {
             plan: ExecutionPlan::default(),
             mode: Mode::Local,
             target: String::new(),
+            target_line: 0,
             pending: Vec::new(),
             pending_name: None,
             pending_guard: None,
@@ -103,7 +106,7 @@ impl State {
             Mode::Local => Step::Local(LocalStep { name, script, guard, timeout, export, env }),
             Mode::Remote => Step::Remote(RemoteStep {
                 name,
-                target: Target::new(self.target.clone()),
+                target: Target::at(self.target.clone(), self.target_line),
                 script,
                 guard,
                 timeout,
@@ -122,31 +125,26 @@ impl State {
         payload: &str,
         line: usize,
     ) -> Result<(), ParseError> {
+        // Every directive except `@export` flushes the pending block first.
+        // The rule lives here, once, instead of being repeated in each arm:
+        // a new directive cannot forget it and silently merge blocks.
+        // (`@export` binds to the *preceding* local block, so it must not
+        // flush — design §4.1 rule 4.)
+        if keyword != "export" {
+            self.flush();
+        }
         match keyword {
-            "server" => {
-                self.flush();
-                self.declare_server(payload, line)
-            }
-            "group" => {
-                self.flush();
-                self.declare_group(payload, line)
-            }
-            "env" => {
-                self.flush();
-                self.declare_env(payload, line)
-            }
-            "secrets" => {
-                self.flush();
-                self.declare_secrets(payload, line)
-            }
+            "server" => self.declare_server(payload, line),
+            "group" => self.declare_group(payload, line),
+            "env" => self.declare_env(payload, line),
+            "secrets" => self.declare_secrets(payload, line),
             "local" => {
-                self.flush();
                 self.mode = Mode::Local;
                 self.target.clear();
+                self.target_line = 0;
                 Ok(())
             }
             "remote" => {
-                self.flush();
                 self.mode = Mode::Remote;
                 let target = payload.trim_start_matches('@').trim();
                 if target.is_empty() {
@@ -157,10 +155,10 @@ impl State {
                     });
                 }
                 self.target = target.to_string();
+                self.target_line = line;
                 Ok(())
             }
             "copy" => {
-                self.flush();
                 // A copy step is self-contained: it carries its own target in
                 // its payload and is not a script block. The block mode
                 // therefore returns to `local` (design §4.1 rule 3 lists
@@ -169,99 +167,33 @@ impl State {
                 // target.
                 self.mode = Mode::Local;
                 self.target.clear();
+                self.target_line = 0;
                 self.add_copy(payload, line)
             }
-            "wait_active" => {
-                self.flush();
-                self.add_wait(payload, line)
-            }
-            "reload" => {
-                self.flush();
-                self.add_reload(payload, line)
-            }
-            "assert" => {
-                self.flush();
-                self.add_assert(payload, line)
-            }
-            "assert_health" => {
-                self.flush();
-                self.add_assert_health(payload, line)
-            }
-            "assert_port" => {
-                self.flush();
-                self.add_assert_port(payload, line)
-            }
-            "assert_port_free" => {
-                self.flush();
-                self.add_assert_port_free(payload, line)
-            }
-            "assert_enabled" => {
-                self.flush();
-                self.add_assert_enabled(payload, line)
-            }
-            "assert_rendered" => {
-                self.flush();
-                self.add_assert_rendered(payload, line)
-            }
-            "service" => {
-                self.flush();
-                self.add_service(payload, line)
-            }
-            "install" => {
-                self.flush();
-                self.add_install(payload, line)
-            }
-            "backup" => {
-                self.flush();
-                self.add_backup(payload, line)
-            }
-            "credstore" => {
-                self.flush();
-                self.add_credstore(payload, line)
-            }
-            "assert_no_leak" => {
-                self.flush();
-                self.add_assert_no_leak(payload, line)
-            }
-            "assert_digest" => {
-                self.flush();
-                self.add_assert_digest(payload, line)
-            }
-            "assert_credstore" => {
-                self.flush();
-                self.add_assert_credstore(payload, line)
-            }
-            "unit_inventory" => {
-                self.flush();
-                self.add_unit_inventory(payload, line)
-            }
-            "helper" => {
-                self.flush();
-                self.add_helper(payload, line)
-            }
-            "release" => {
-                self.flush();
-                self.add_release(payload, line)
-            }
-            "build" => {
-                self.flush();
-                self.add_build(payload, line)
-            }
-            "toolchain" => {
-                self.flush();
-                self.add_toolchain(payload, line)
-            }
-            "image" => {
-                self.flush();
-                self.add_image(payload, line)
-            }
-            "workdir" => {
-                self.flush();
-                self.add_workdir(payload, line)
-            }
+            "wait_active" => self.add_wait(payload, line),
+            "reload" => self.add_reload(payload, line),
+            "assert" => self.add_assert(payload, line),
+            "assert_health" => self.add_assert_health(payload, line),
+            "assert_port" => self.add_assert_port(payload, line),
+            "assert_port_free" => self.add_assert_port_free(payload, line),
+            "assert_enabled" => self.add_assert_enabled(payload, line),
+            "assert_rendered" => self.add_assert_rendered(payload, line),
+            "service" => self.add_service(payload, line),
+            "install" => self.add_install(payload, line),
+            "backup" => self.add_backup(payload, line),
+            "credstore" => self.add_credstore(payload, line),
+            "assert_no_leak" => self.add_assert_no_leak(payload, line),
+            "assert_digest" => self.add_assert_digest(payload, line),
+            "assert_credstore" => self.add_assert_credstore(payload, line),
+            "unit_inventory" => self.add_unit_inventory(payload, line),
+            "helper" => self.add_helper(payload, line),
+            "release" => self.add_release(payload, line),
+            "build" => self.add_build(payload, line),
+            "toolchain" => self.add_toolchain(payload, line),
+            "image" => self.add_image(payload, line),
+            "workdir" => self.add_workdir(payload, line),
             "export" => self.declare_export(payload, line),
             "timeout" => {
-                self.flush();
                 let seconds =
                     payload.trim().parse::<u64>().map_err(|_| ParseError::InvalidDirective {
                         line,
@@ -575,31 +507,17 @@ impl State {
         }
 
         // Grammar: `src -> dst @target [--delete] [--exclude <glob>]…`.
-        // The target is the last token once the trailing flags are peeled off.
-        let mut tokens: Vec<&str> = rest.split_whitespace().collect();
+        // The target is the last positional once the flags are split off;
+        // a dst with spaces is joined from the remaining positional tokens.
+        let (positional, flags) = split_flags(rest, &["--delete"], "copy", line)?;
         let mut delete = false;
         let mut excludes: Vec<String> = Vec::new();
-        loop {
-            match tokens.last().copied() {
-                Some("--delete") => {
-                    delete = true;
-                    tokens.pop();
-                }
-                Some("--exclude") => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "copy".to_string(),
-                        reason: "`--exclude` requires a glob pattern".to_string(),
-                    });
-                }
-                _ if tokens.len() >= 2 && tokens[tokens.len() - 2] == "--exclude" => {
-                    let glob = tokens.pop().ok_or_else(|| ParseError::InvalidDirective {
-                        line,
-                        directive: "copy".to_string(),
-                        reason: "`--exclude` requires a glob pattern".to_string(),
-                    })?;
-                    tokens.pop(); // the `--exclude` flag itself
-                    let glob = strip_surrounding_quotes(glob).trim().to_string();
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--delete" => delete = true,
+                "--exclude" => {
+                    let glob = flag_value(value, flag, "copy", line)?;
+                    let glob = shellflow_text::strip_surrounding_quotes(glob).trim().to_string();
                     if glob.is_empty() {
                         return Err(ParseError::InvalidDirective {
                             line,
@@ -609,17 +527,21 @@ impl State {
                     }
                     excludes.push(glob);
                 }
-                _ => break,
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "copy".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
             }
         }
-        // Flags are peeled from the right, so restore the written order.
-        excludes.reverse();
-        let target = tokens.pop().ok_or_else(|| ParseError::InvalidDirective {
+        let target = positional.last().ok_or_else(|| ParseError::InvalidDirective {
             line,
             directive: "copy".to_string(),
             reason: "missing target".to_string(),
         })?;
-        let target = target.trim_start_matches('@').trim();
+        let target = target.trim_start_matches('@').trim().to_string();
         if target.is_empty() {
             return Err(ParseError::InvalidDirective {
                 line,
@@ -628,7 +550,7 @@ impl State {
             });
         }
 
-        let dst = tokens.join(" ");
+        let dst = positional[..positional.len() - 1].join(" ");
         if dst.is_empty() {
             return Err(ParseError::InvalidDirective {
                 line,
@@ -637,7 +559,7 @@ impl State {
             });
         }
 
-        self.last_target = Some(target.to_string());
+        self.last_target = Some(target.clone());
         let entry = CopyEntry { src: src.to_string(), dst };
         // Consecutive copies that share a target *and* their options travel
         // in one transfer: a playbook that ships five templates to the same
@@ -660,10 +582,9 @@ impl State {
         self.plan.steps.push(Step::Copy(CopyStep {
             name,
             entries: vec![entry],
-            target: Target::new(target),
+            target: Target::at(target, line),
             delete,
             excludes,
-            guard: None,
             timeout,
             env,
         }));
@@ -679,70 +600,43 @@ impl State {
         reject_guard(self.pending_guard.is_some(), "wait_active", line)?;
         let name = self.pending_name.take();
         let pending_timeout = self.pending_timeout.take();
-        let mut tokens: Vec<&str> = payload.split_whitespace().collect();
-        let timeout = if tokens.len() >= 2 && tokens[tokens.len() - 2] == "--timeout" {
-            // Peel an optional trailing `--timeout SECS`.
-            let secs_str = tokens.pop().unwrap_or_default();
-            let flag = tokens.pop().unwrap_or_default();
-            debug_assert_eq!(flag, "--timeout");
-            let secs: u64 = secs_str.parse().map_err(|_| ParseError::InvalidDirective {
-                line,
-                directive: "wait_active".to_string(),
-                reason: format!("invalid seconds `{secs_str}`"),
-            })?;
-            if secs == 0 {
-                return Err(ParseError::InvalidDirective {
-                    line,
-                    directive: "wait_active".to_string(),
-                    reason: "must be greater than zero".to_string(),
-                });
+        let (positional, flags) = split_flags(payload, &[], "wait_active", line)?;
+        let mut timeout = pending_timeout;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--timeout" => {
+                    let secs = flag_value(value, flag, "wait_active", line)?;
+                    timeout = Some(parse_secs(secs, "wait_active", line)?);
+                }
+                other => {
+                    return Err(ParseError::InvalidDirective {
+                        line,
+                        directive: "wait_active".to_string(),
+                        reason: format!("unknown flag `{other}`"),
+                    });
+                }
             }
-            Some(secs)
-        } else {
-            pending_timeout
-        };
-        if tokens.len() != 2 {
+        }
+        if positional.len() != 2 {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "wait_active".to_string(),
                 reason: "expected `<unit> @<target> [--timeout SECS]`".to_string(),
             });
         }
-        let mut unit = tokens[0].trim().to_string();
-        if unit.is_empty() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "wait_active".to_string(),
-                reason: "missing unit name".to_string(),
-            });
-        }
-        if !unit.ends_with(".service") {
-            unit.push_str(".service");
-        }
-        if !unit
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':')) ||
-            unit.starts_with('.') ||
-            unit.contains("..")
-        {
+        let unit = normalize_unit(&positional[0]);
+        if !is_safe_unit(&unit) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "wait_active".to_string(),
                 reason: format!("unsafe unit name `{unit}`"),
             });
         }
-        let target = tokens[1].trim_start_matches('@').trim();
-        if target.is_empty() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "wait_active".to_string(),
-                reason: "missing target".to_string(),
-            });
-        }
-        self.last_target = Some(target.to_string());
+        let target = require_target(&positional[1], "wait_active", line)?;
+        self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Wait(WaitStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             unit,
             timeout,
             interval_secs: 5,
@@ -822,7 +716,7 @@ impl State {
             });
         }
         let target = self.resolve_assert_target(target, "assert", line)?;
-        self.push_assertion(name, target, Assertion::UnitState { unit, state }, timeout);
+        self.push_assertion(name, target, line, Assertion::UnitState { unit, state }, timeout);
         Ok(())
     }
 
@@ -890,7 +784,7 @@ impl State {
                             reason: "`--body` requires a request body".to_string(),
                         });
                     };
-                    body = Some(strip_surrounding_quotes(raw));
+                    body = Some(shellflow_text::strip_surrounding_quotes(raw));
                 }
                 "--header" => {
                     let Some(raw) = tokens.next() else {
@@ -907,7 +801,7 @@ impl State {
                             reason: format!("invalid header `{raw}` (want `Name:value`)"),
                         });
                     }
-                    headers.push(strip_surrounding_quotes(raw));
+                    headers.push(shellflow_text::strip_surrounding_quotes(raw));
                 }
                 other if other.starts_with("--") => {
                     return Err(ParseError::InvalidDirective {
@@ -941,7 +835,7 @@ impl State {
                             reason: "expected `<url> [@<target>] [--expect CODES]`".to_string(),
                         });
                     }
-                    url = Some(strip_surrounding_quotes(other));
+                    url = Some(shellflow_text::strip_surrounding_quotes(other));
                 }
             }
         }
@@ -971,6 +865,7 @@ impl State {
         self.push_assertion(
             name,
             target,
+            line,
             Assertion::Health { url, expect, method, body, headers },
             timeout,
         );
@@ -1044,7 +939,7 @@ impl State {
             });
         }
         let target = self.resolve_assert_target(target, "assert_port", line)?;
-        self.push_assertion(name, target, Assertion::Port { ports, udp }, timeout);
+        self.push_assertion(name, target, line, Assertion::Port { ports, udp }, timeout);
         Ok(())
     }
 
@@ -1086,7 +981,7 @@ impl State {
                     reason: "expected `<path> [@<target>]`".to_string(),
                 });
             }
-            path = Some(strip_surrounding_quotes(token));
+            path = Some(shellflow_text::strip_surrounding_quotes(token));
         }
         let Some(path) = path else {
             return Err(ParseError::InvalidDirective {
@@ -1103,7 +998,7 @@ impl State {
             });
         }
         let target = self.resolve_assert_target(target, "assert_rendered", line)?;
-        self.push_assertion(name, target, Assertion::Rendered { path }, timeout);
+        self.push_assertion(name, target, line, Assertion::Rendered { path }, timeout);
         Ok(())
     }
 
@@ -1141,6 +1036,7 @@ impl State {
         &mut self,
         name: Option<String>,
         target: String,
+        line: usize,
         check: Assertion,
         timeout: Option<u64>,
     ) {
@@ -1156,7 +1052,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Assert(AssertStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             checks: vec![check],
             timeout,
         }));
@@ -1175,70 +1071,42 @@ impl State {
     fn add_reload(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
         reject_guard(self.pending_guard.is_some(), "reload", line)?;
         let name = self.pending_name.take();
-        let pending_timeout = self.pending_timeout.take();
-        let mut tokens: Vec<&str> = payload.split_whitespace().collect();
+        let mut timeout = self.pending_timeout.take();
+        let (positional, flags) = split_flags(payload, &["--wait"], "reload", line)?;
         let mut signal: Option<String> = None;
         let mut wait = false;
-        let mut timeout = pending_timeout;
-
-        // Peel the optional trailing flags. They are peeled from the end so the
-        // `<unit> @<target>` prefix stays where the operator expects it.
-        loop {
-            let last = tokens.last().copied();
-            let flag_before = if tokens.len() >= 2 { tokens[tokens.len() - 2] } else { "" };
-            match last {
-                Some("--wait") => {
-                    tokens.pop();
-                    wait = true;
+        for (flag, value) in &flags {
+            match flag.as_str() {
+                "--wait" => wait = true,
+                "--timeout" => {
+                    let secs = flag_value(value, flag, "reload", line)?;
+                    timeout = Some(parse_secs(secs, "reload", line)?);
                 }
-                Some(value)
-                    if (flag_before == "--timeout" || flag_before == "--signal") &&
-                        value != "--wait" =>
-                {
-                    tokens.pop();
-                    let flag = tokens.pop().unwrap_or_default();
-                    if flag == "--timeout" {
-                        let secs: u64 =
-                            value.parse().map_err(|_| ParseError::InvalidDirective {
-                                line,
-                                directive: "reload".to_string(),
-                                reason: format!("invalid seconds `{value}`"),
-                            })?;
-                        if secs == 0 {
-                            return Err(ParseError::InvalidDirective {
-                                line,
-                                directive: "reload".to_string(),
-                                reason: "must be greater than zero".to_string(),
-                            });
-                        }
-                        timeout = Some(secs);
-                    } else {
-                        // The signal is interpolated into a remote command, so
-                        // only a bare signal name is accepted.
-                        if value.is_empty() ||
-                            !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        {
-                            return Err(ParseError::InvalidDirective {
-                                line,
-                                directive: "reload".to_string(),
-                                reason: format!("invalid signal `{value}` (want e.g. SIGUSR1)"),
-                            });
-                        }
-                        signal = Some(value.to_string());
+                "--signal" => {
+                    // The signal is interpolated into a remote command, so
+                    // only a bare signal name is accepted.
+                    let sig = flag_value(value, flag, "reload", line)?;
+                    if sig.is_empty() || !sig.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        return Err(ParseError::InvalidDirective {
+                            line,
+                            directive: "reload".to_string(),
+                            reason: format!("invalid signal `{sig}` (want e.g. SIGUSR1)"),
+                        });
                     }
+                    signal = Some(sig.to_string());
                 }
-                Some(flag) if flag == "--timeout" || flag == "--signal" => {
+                other => {
                     return Err(ParseError::InvalidDirective {
                         line,
                         directive: "reload".to_string(),
-                        reason: format!("`{flag}` expects a value"),
+                        reason: format!("unknown flag `{other}`"),
                     });
                 }
-                _ => break,
             }
         }
 
-        if tokens.len() != 2 {
+        if positional.len() != 2 {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "reload".to_string(),
@@ -1246,41 +1114,19 @@ impl State {
                     .to_string(),
             });
         }
-        let mut unit = tokens[0].trim().to_string();
-        if unit.is_empty() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "reload".to_string(),
-                reason: "missing unit name".to_string(),
-            });
-        }
-        if !unit.ends_with(".service") {
-            unit.push_str(".service");
-        }
-        if !unit
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':')) ||
-            unit.starts_with('.') ||
-            unit.contains("..")
-        {
+        let unit = normalize_unit(&positional[0]);
+        if !is_safe_unit(&unit) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "reload".to_string(),
                 reason: format!("unsafe unit name `{unit}`"),
             });
         }
-        let target = tokens[1].trim_start_matches('@').trim();
-        if target.is_empty() {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "reload".to_string(),
-                reason: "missing target".to_string(),
-            });
-        }
-        self.last_target = Some(target.to_string());
+        let target = require_target(&positional[1], "reload", line)?;
+        self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Reload(ReloadStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             unit,
             signal,
             wait,
@@ -1356,7 +1202,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Service(ServiceStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             unit,
             enable,
             restart,
@@ -1441,7 +1287,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Install(InstallStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             src: src.to_string(),
             dst: dst.to_string(),
             mode,
@@ -1539,7 +1385,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Backup(BackupStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             paths,
             service,
             keep,
@@ -1605,7 +1451,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Credstore(CredstoreStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             service,
             require,
             timeout,
@@ -1668,7 +1514,7 @@ impl State {
             "assert_no_leak",
             line,
         )?;
-        self.push_assertion(name, target, Assertion::NoLeak { unit, lines }, timeout);
+        self.push_assertion(name, target, line, Assertion::NoLeak { unit, lines }, timeout);
         Ok(())
     }
 
@@ -1728,7 +1574,7 @@ impl State {
             "assert_digest",
             line,
         )?;
-        self.push_assertion(name, target, Assertion::Digest { path, sha256, local }, timeout);
+        self.push_assertion(name, target, line, Assertion::Digest { path, sha256, local }, timeout);
         Ok(())
     }
 
@@ -1759,7 +1605,7 @@ impl State {
             "assert_credstore",
             line,
         )?;
-        self.push_assertion(name, target, Assertion::Credstore { service }, timeout);
+        self.push_assertion(name, target, line, Assertion::Credstore { service }, timeout);
         Ok(())
     }
 
@@ -1778,7 +1624,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::UnitInventory(UnitInventoryStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             timeout,
         }));
         Ok(())
@@ -1840,7 +1686,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Helper(HelperStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             source,
             triple,
             install_path,
@@ -1961,7 +1807,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Release(ReleaseStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             repo,
             installed_cmd,
             asset,
@@ -2131,7 +1977,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Build(BuildStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             repo,
             workdir,
             git_ref,
@@ -2214,7 +2060,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Toolchain(ToolchainStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             tools,
             timeout,
         }));
@@ -2284,7 +2130,7 @@ impl State {
         self.last_target = Some(target.clone());
         self.plan.steps.push(Step::Image(ImageStep {
             name,
-            target: Target::new(target),
+            target: Target::at(target, line),
             images,
             prune,
             timeout,
@@ -2363,7 +2209,7 @@ impl State {
             });
         }
         let target = self.resolve_assert_target(target, "assert_enabled", line)?;
-        self.push_assertion(name, target, Assertion::Enabled { unit, state }, timeout);
+        self.push_assertion(name, target, line, Assertion::Enabled { unit, state }, timeout);
         Ok(())
     }
 
@@ -2424,7 +2270,7 @@ impl State {
             });
         }
         let target = self.resolve_assert_target(target, "assert_port_free", line)?;
-        self.push_assertion(name, target, Assertion::PortFree { ports }, timeout);
+        self.push_assertion(name, target, line, Assertion::PortFree { ports }, timeout);
         Ok(())
     }
 
@@ -2524,7 +2370,6 @@ fn split_flags(
             Some(next) if !next.starts_with("--") => tokens.next(),
             _ => None,
         };
-        let _ = (directive, line);
         flags.push((token, value));
     }
     Ok((positional, flags))
@@ -2733,23 +2578,16 @@ fn reject_guard(has_guard: bool, directive: &str, line: usize) -> Result<(), Par
 /// Whether a unit name is safe to hand to `systemctl`.
 ///
 /// The name ends up inside a remote shell command, so it must not be able to
-/// carry shell syntax.
+/// carry shell syntax. Template units (`getty@tty1.service`) and specifier
+/// escapes (`foo@:1.service`) are legitimate systemd names, so `@` and `:`
+/// are accepted — the single charset shared by `@wait_active`, `@reload`,
+/// `@service` and the target-side validators.
 fn is_safe_unit(unit: &str) -> bool {
     !unit.is_empty() &&
         !unit.starts_with('.') &&
         !unit.contains("..") &&
-        unit.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-}
-
-/// Strip one layer of surrounding `"` or `'` quotes.
-///
-/// A directive is a comment line, so no shell quoting applies and quotes are
-/// literal characters; stripping them lets `--exclude '*.key'` read naturally.
-///
-/// The rule lives in [`crate::text::strip_surrounding_quotes`] so the parser
-/// and the secrets crate share one definition.
-fn strip_surrounding_quotes(raw: &str) -> String {
-    crate::text::strip_surrounding_quotes(raw)
+        unit.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
 }
 
 /// Extract `(keyword, payload)` from a possible directive line.
@@ -2822,7 +2660,10 @@ pub fn parse_script(input: &str) -> Result<ExecutionPlan, ParseError> {
     state.flush();
 
     for (group, members) in &state.plan.groups {
-        let line = state.group_lines[group];
+        // The key is always inserted when the group is declared, so the
+        // lookup cannot miss; `copied` keeps the invariant cheap to uphold
+        // rather than trusting it unguarded.
+        let line = state.group_lines.get(group).copied().unwrap_or_default();
         for member in members {
             if !state.plan.servers.contains_key(member) {
                 return Err(ParseError::UnknownGroupMember {
@@ -3362,15 +3203,16 @@ mod tests {
     }
 
     #[test]
-    fn copy_exclude_quotes_are_stripped_only_when_matched() -> Result<(), String> {
-        // Matching quotes are stripped; a single-sided quote is a literal
-        // character of the glob (rsync patterns legitimately contain neither).
+    fn copy_exclude_quotes_are_stripped_and_quote_aware() -> Result<(), String> {
+        // `@copy` shares the workspace flag parser (`split_flags`), so
+        // matching quotes are stripped and a quoted glob may contain spaces —
+        // the same word rules every other directive's flag values follow.
         let plan = parse(
             "# @copy a -> /srv/b @web --exclude \"*.log\" --exclude '*.tmp' \
-             --exclude 'oops --exclude oops'\n",
+             --exclude 'my *.log'\n",
         )?;
         let copy = as_copy(&plan.steps[0])?;
-        assert_eq!(copy.excludes, vec!["*.log", "*.tmp", "'oops", "oops'"]);
+        assert_eq!(copy.excludes, vec!["*.log", "*.tmp", "my *.log"]);
         Ok(())
     }
 
@@ -3829,7 +3671,7 @@ mod tests {
             ("# @copy a -> @web\n", "copy", "missing destination path"),
             ("# @copy a ->\n", "copy", "missing target"),
             ("# @copy a -> /dst @\n", "copy", "missing target"),
-            ("# @copy a -> /dst @web --exclude\n", "copy", "`--exclude` requires a glob"),
+            ("# @copy a -> /dst @web --exclude\n", "copy", "`--exclude` expects a value"),
             ("# @copy a -> /dst @web --exclude ''\n", "copy", "glob must not be empty"),
         ];
         for (script, directive, reason) in cases {
@@ -4356,6 +4198,45 @@ mod tests {
             let err = parse(&format!("# @server api api\n# @reload {unit} @api\n")).unwrap_err();
             assert!(err.contains("unsafe unit name"), "{unit}: {err}");
         }
+    }
+
+    #[test]
+    fn template_units_are_accepted_by_every_unit_directive() {
+        // systemd template units (`getty@tty1.service`) are legitimate names,
+        // so `@` and `:` are part of the single shared unit charset —
+        // `@service` accepts them exactly like `@reload`/`@wait_active`.
+        let plan = parse("# @server api api\n# @service getty@tty1 @api\n").unwrap();
+        let Step::Service(step) = &plan.steps[0] else {
+            panic!("expected a service step");
+        };
+        assert_eq!(step.unit, "getty@tty1.service");
+
+        let plan = parse("# @server api api\n# @reload getty@tty1 @api\n").unwrap();
+        let Step::Reload(step) = &plan.steps[0] else {
+            panic!("expected a reload step");
+        };
+        assert_eq!(step.unit, "getty@tty1.service");
+
+        let plan = parse("# @server api api\n# @wait_active getty@tty1 @api\n").unwrap();
+        let Step::Wait(step) = &plan.steps[0] else {
+            panic!("expected a wait step");
+        };
+        assert_eq!(step.unit, "getty@tty1.service");
+    }
+
+    #[test]
+    fn reload_flags_parse_in_any_position() {
+        // The flag vocabulary is `split_flags`, so flags may appear anywhere
+        // after `<unit> @<target>` and quoted values are honoured.
+        let plan =
+            parse("# @server api api\n# @reload dufs @api --wait --signal SIGUSR1 --timeout 30\n")
+                .unwrap();
+        let Step::Reload(step) = &plan.steps[0] else {
+            panic!("expected a reload step");
+        };
+        assert!(step.wait);
+        assert_eq!(step.signal.as_deref(), Some("SIGUSR1"));
+        assert_eq!(step.timeout, Some(30));
     }
 
     #[test]

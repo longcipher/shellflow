@@ -188,9 +188,8 @@ pub(crate) fn render(template: &Path, output: &Path) -> Result<()> {
     let creds = load_credentials()?;
     let values = credential_strings(&creds)?;
     let map: HashMap<String, String> = values.into_iter().collect();
-    let rendered = shellflow_core::render_template(&content, &map).map_err(|missing| {
-        eyre!("cred-env: template references missing credential(s): {}", missing.join(", "))
-    })?;
+    let rendered =
+        shellflow_core::render_template(&content, &map).map_err(|err| eyre!("cred-env: {err}"))?;
     write_secret_file(output, rendered.as_bytes())
 }
 

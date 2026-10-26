@@ -21,9 +21,9 @@ fn build_state(blob: &str) -> RunState {
     for pair in blob.split('\0') {
         if let Some((key, value)) = pair.split_once('=') {
             let key = key.trim();
-            let valid = !key.is_empty()
-                && !key.starts_with(|c: char| c.is_ascii_digit())
-                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            let valid = !key.is_empty() &&
+                !key.starts_with(|c: char| c.is_ascii_digit()) &&
+                key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
             if valid {
                 state.vars.insert(key.to_string(), value.to_string());
             }

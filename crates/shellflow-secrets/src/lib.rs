@@ -17,5 +17,7 @@ pub mod env;
 pub mod error;
 pub mod fsx;
 pub mod identity;
+pub mod recipients;
 
+pub use age::x25519::{Identity, Recipient};
 pub use error::SecretsError;

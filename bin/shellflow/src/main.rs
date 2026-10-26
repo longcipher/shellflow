@@ -2,44 +2,75 @@
 //!
 //! The binary owns the I/O boundary: it parses the CLI, runs preflight,
 //! dispatches to subcommands (`run`/`keys`/`secret`), and drives the
-//! execution engine. CLI crates may print to stdout/stderr for user-facing
-//! streaming output (the workspace denies this by default for library code).
+//! execution engine. The `run` path streams everything through the `ui`
+//! module (masked, audited); the report subcommands print terminal reports
+//! directly, which each module declares below with a scoped `expect` — a new
+//! `println!` outside those modules fails the lint instead of silently
+//! bypassing the masker.
 
-#![allow(clippy::print_stdout)]
-#![allow(clippy::print_stderr)]
 // The workspace denies `panic`/`unwrap`/`expect` in production code; the unit
 // test modules use them pervasively and opt out explicitly rather than
 // relying on the lint gate skipping test targets. `pedantic` is scoped the
 // same way — see `shellflow-core` for the rationale.
 #![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used, clippy::expect_used))]
 #![cfg_attr(test, allow(clippy::pedantic, clippy::nursery))]
+// `main` itself prints the fatal-error and interrupt banners; the executor
+// and the library crates never do.
+#![expect(
+    clippy::print_stderr,
+    reason = "fatal errors before/independent of the Ui handle must reach a possibly-broken stderr"
+)]
 
+// The report subcommands render terminal reports directly (they are not the
+// streamed run output); each printing module declares that here, so a new
+// `println!` anywhere else fails the lint instead of bypassing the masker.
+#[expect(clippy::print_stdout, reason = "report subcommand terminal output")]
 mod audit;
 mod cli;
+#[expect(clippy::print_stdout, reason = "cred-env progress and verdict lines")]
 mod cred_env;
 mod diffutil;
+#[expect(clippy::print_stdout, reason = "emit writes generated files and reports the path")]
 mod emit;
 mod executor;
 mod fsx;
+#[expect(clippy::print_stdout, reason = "host command report output")]
 mod host;
+#[expect(clippy::print_stdout, reason = "keys generate prints the public key")]
 mod keys;
 mod lint;
 mod manifest;
 mod preflight;
 mod rbatch;
+#[expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "secret subcommand output (decrypt prints plaintext by design)"
+)]
 mod secret;
 mod secrets;
+#[expect(clippy::print_stdout, reason = "service subcommand progress lines")]
 mod service;
+#[expect(clippy::print_stdout, reason = "service check report output")]
 mod service_check;
+#[expect(clippy::print_stdout, reason = "service diff report output")]
 mod service_diff;
+#[expect(clippy::print_stdout, reason = "service manifest report output")]
 mod service_manifest;
+#[expect(clippy::print_stdout, reason = "service status report output")]
 mod service_status;
+
+#[expect(clippy::print_stdout, reason = "systemd subcommand progress and errors")]
 mod systemd;
 #[cfg(feature = "dbus")]
+#[expect(clippy::print_stdout, reason = "systemd D-Bus path progress lines")]
 mod systemd_dbus;
 mod template;
+// `ui` is the output sink itself: it writes through the locked stdout/stderr
+// handles (not `println!`), so no print lint fires here by construction.
 mod ui;
 mod unit;
+#[expect(clippy::print_stdout, reason = "unit subcommand report output")]
 mod unit_cmd;
 mod unit_verify;
 
@@ -140,13 +171,25 @@ async fn main() -> Result<()> {
                 1
             }
         },
-        Some(Command::Service(cmd)) => match service::run(&cmd.command) {
-            Ok(()) => 0,
-            Err(err) => {
-                eprintln!("error: {err:#}");
-                err.exit_code()
+        Some(Command::Service(cmd)) => {
+            // The service subcommands drive the synchronous `rbatch` SSH
+            // batches (blocking writes, blocking line loops, an OS watchdog
+            // thread) — blocking work must not sit on a tokio runtime
+            // worker. The OS-thread pattern is what `service_status` uses
+            // internally; `spawn_blocking` is the entry-point equivalent.
+            let command = cmd.command.clone();
+            match tokio::task::spawn_blocking(move || service::run(&command)).await {
+                Ok(Ok(())) => 0,
+                Ok(Err(err)) => {
+                    eprintln!("error: {err:#}");
+                    err.exit_code()
+                }
+                Err(join_err) => {
+                    eprintln!("error: the service worker stopped unexpectedly: {join_err}");
+                    1
+                }
             }
-        },
+        }
         Some(Command::Audit(cmd)) => match audit::audit(cmd) {
             Ok(()) => 0,
             Err(err) => {

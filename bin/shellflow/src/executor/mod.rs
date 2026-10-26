@@ -17,11 +17,14 @@ mod copy;
 mod host;
 mod image;
 mod local;
+#[cfg(feature = "muxy")]
+pub(crate) mod muxy;
 pub(crate) mod process;
 mod release;
 mod remote;
 mod stream;
 mod toolchain;
+mod transport;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -30,6 +33,9 @@ pub(crate) use process::StepStats;
 pub(crate) use remote::{RunError, RunOutcome, execute_plan};
 use shellflow_core::ResolvedHost;
 use tokio::sync::Mutex;
+#[cfg(feature = "muxy")]
+pub(crate) use transport::StepClass;
+pub(crate) use transport::{TransportPolicy, policy_from_cli};
 
 use crate::{
     cli::RunArgs,
@@ -79,6 +85,10 @@ pub(crate) struct LocalBlockArgs<'a> {
     pub capture: &'a [String],
     pub extra: &'a [(String, String)],
     pub log_file: &'a LogFile,
+    /// The `@secrets` masking threshold; a runtime-`@export`ed value under a
+    /// secret-looking name at or above it joins the global mask registry
+    /// (see `capture_exports`).
+    pub mask_min_len: usize,
     /// The cooperative cancellation signal.
     pub cancel: Cancel,
 }
@@ -88,6 +98,10 @@ pub(crate) type Progress = Arc<Mutex<Vec<StepStats>>>;
 
 /// Per-step execution settings threaded into host tasks.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    not(feature = "muxy"),
+    expect(dead_code, reason = "the ssh-only build ignores the muxy policy and sizing flags")
+)]
 pub(crate) struct StepConfig {
     /// No writes: syntax-check payloads and use `rsync --dry-run -i`.
     pub(crate) dry_run: bool,
@@ -106,10 +120,18 @@ pub(crate) struct StepConfig {
     /// Accept the scp fallback on a host without rsync, dropping the
     /// `--delete` / `--exclude` contract the copy step asked for.
     pub(crate) allow_unfiltered_copy: bool,
+    /// Which transport a command step takes to its host.
+    pub(crate) transport: TransportPolicy,
+    /// Leave a cancelled muxy session running (`--muxy-keep`).
+    pub(crate) muxy_keep: bool,
+    /// Muxy session width in columns.
+    pub(crate) muxy_cols: u16,
+    /// Muxy session height in rows.
+    pub(crate) muxy_rows: u16,
 }
 
 impl StepConfig {
-    pub(crate) const fn new(run: &RunArgs, timeout: Option<u64>) -> Self {
+    pub(crate) fn new(run: &RunArgs, timeout: Option<u64>) -> Self {
         Self {
             dry_run: run.flags.dry_run || run.flags.diff,
             diff: run.flags.diff,
@@ -119,6 +141,10 @@ impl StepConfig {
             local: run.flags.local,
             ssh_reuse: run.flags.ssh_reuse && !run.flags.no_ssh_reuse,
             allow_unfiltered_copy: run.flags.allow_unfiltered_copy,
+            transport: policy_from_cli(run.effective_transport()),
+            muxy_keep: run.flags.muxy_keep,
+            muxy_cols: run.flags.muxy_cols.unwrap_or(200),
+            muxy_rows: run.flags.muxy_rows.unwrap_or(50),
         }
     }
 }

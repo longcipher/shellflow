@@ -11,7 +11,7 @@
 ## Scope
 
 - `shellflow` is a shell-native, agentless automation CLI: it drives a plain Bash script whose blocks are delimited by `# @` comment directives, over the system `ssh`/`rsync`/`scp`/`bash`. Targets need only `bash`; there is no agent, no SSH library and no YAML.
-- `crates/shellflow-dsl` owns the directive scanner and the plan model, `crates/shellflow-core` the templating and exported-variable handling, `crates/shellflow-secrets` the `age`-encrypted secret store, and `bin/shellflow` the CLI, executors and service management.
+- `crates/shellflow-dsl` owns the directive scanner and the plan model, `crates/shellflow-core` the templating and exported-variable handling, `crates/shellflow-secrets` the `age`-encrypted secret store (the only crate that touches `age`), `crates/shellflow-muxy` the optional native transport, `crates/shellflow-text` the shared shell-text rules (the zero-dependency leaf), and `bin/shellflow` the CLI, executors and service management.
 - `examples/env-app` and `examples/secret-app` are `publish = false` demo targets; `playbooks/deploy.sh` exercises every DSL feature against the `trade`/`api` hosts from `~/.ssh/config`; `SKILL.md` is the agent-facing skill; `docs/design.md` holds the architecture (Part I DSL/engine, Part II `S1`-`S12` secrets).
 - English only in code, comments, docs, and commit messages.
 
@@ -51,6 +51,7 @@ just mutation
 - Remote execution shells out to the system `ssh`/`rsync`/`scp` through `tokio::process::Command`; never add an SSH client crate.
 - Secrets use `age` for encryption and `zeroize` for in-memory wiping. Secret values are masked in every preview, including local blocks.
 - `nix` covers process/signal/user/fs handling, `sd-notify` the systemd readiness protocol, `zbus` the optional D-Bus path, `tokio` (`full`) the async runtime, `clap` (derive) the CLI, `colored` the output. There is no logging framework: `ui` is the one output path (streaming, masking, audit log).
+- The muxy transport is tested against an in-crate fake peer (`crates/shellflow-muxy/src/harness.rs`, `#[cfg(test)]`) that speaks the real wire protocol over a socket pair. `muxy-server` is **not** a usable dev-dependency (its `muxy-terminal` builds ghostty's VT with `zig` and a network fetch); do not re-add it.
 - Errors: `thiserror` in the library crates, `eyre` in `bin/shellflow`. Concrete error types through `?`; never string errors.
 - Forbidden here: `anyhow`, `log`, `reqwest`, `dashmap`.
 
@@ -60,5 +61,7 @@ just mutation
 - Directives are defined in `docs/design.md` section 4.1 (`shellflow-dsl` owns the scanner); add new ones to `shellflow-dsl` with a parse test, never ad hoc in the executors.
 - Multi-host fan-out goes through `JoinSet` plus a semaphore; never spawn one task per host without the bound.
 - The `dbus` feature (systemd unit state over D-Bus) is off by default so the standard build stays a single static binary; the CLI polls instead. Keep D-Bus code behind the feature.
-- `unsafe` appears only in `shellflow-secrets` test helpers that call `std::env::set_var`/`remove_var`; they hold `ENV_LOCK` and carry a `// SAFETY:` comment. Keep that pattern.
-- `proptest` properties live next to the crate logic they exercise and run in the ordinary `cargo test` loop; the fuzz targets cover the hostile-input parsers (`fuzz_parse_script`, `fuzz_interpolate`, `fuzz_parse_env_file`).
+- Do not introduce `unsafe` anywhere; there is none today. If `std::env::set_var` is ever needed in tests, hold an `ENV_LOCK` and carry a `// SAFETY:` comment.
+- `proptest` properties live next to the crate logic they exercise and run in the ordinary `cargo test` loop; the fuzz targets cover the hostile-input parsers (`fuzz_parse_script`, `fuzz_interpolate`, `fuzz_parse_ssh_spec`, `fuzz_parse_env_file`).
+- Directive parsing lives only in `shellflow-dsl`: never hand-roll a `strip_prefix("# @…")` scanner elsewhere (the whole-word rule, spec validation, and here-document awareness live in the grammar). A status/verify subcommand reads a playbook through `parse_script`.
+- The `run` path prints only through the `ui` module (masked, audited). Report subcommands that render terminal output directly declare it with a module-level `#[expect(clippy::print_stdout, …, reason = "…")]` in `main.rs`; a `println!` anywhere else fails the lint.

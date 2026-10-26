@@ -10,15 +10,17 @@
 //! * [`ssh_spec`] — the ssh destination model the targets resolve to.
 //! * [`heredoc`] — the here-document tracker that keeps a `# @` line inside a here-document body
 //!   from being read as a directive.
-//! * [`text`] — the two text rules the grammar and the runtime share (shell quoting,
-//!   surrounding-quote stripping).
 //! * [`error`] — the errors the scanner and the interpolator report.
 //!
-//! The crate has no I/O and no dependencies beyond `thiserror`: it is
-//! unit- and property-testable without a network or a shell. The runtime
-//! helpers that *do* touch the environment (rendering the payload header,
-//! masking secret values) live in `shellflow-core`, which builds on this
-//! crate.
+//! The shell-text rules (shell quoting, surrounding-quote stripping, the
+//! shell-identifier rule) live in `shellflow-text`, the zero-dependency leaf
+//! the DSL, the runtime, and the secrets crate all share; they are
+//! re-exported here so the public API is unchanged.
+//!
+//! The crate has no I/O: it is unit- and property-testable without a network
+//! or a shell. The runtime helpers that *do* touch the environment (rendering
+//! the payload header, masking secret values) live in `shellflow-core`, which
+//! builds on this crate.
 
 // The workspace denies `panic`/`unwrap`/`expect` in production code. Unit
 // tests need them by construction (`assert!`, `.expect("...")` on fixtures),
@@ -36,7 +38,6 @@ pub mod heredoc;
 pub mod parser;
 pub mod plan;
 pub mod ssh_spec;
-pub mod text;
 
 pub use error::{InterpolateError, ParseError};
 pub use heredoc::{Heredoc, HeredocTracker};
@@ -45,7 +46,7 @@ pub use plan::{
     AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
     ExecutionPlan, HelperStep, ImageStep, InstallStep, LocalStep, ReleaseStep, ReloadStep,
     RemoteStep, ResolvedHost, RunState, SecretEntry, ServiceStep, Step, Target, ToolchainStep,
-    UnitInventoryStep, WaitStep, Workdir, interpolate, is_valid_var_name, resolve_hosts,
+    UnitInventoryStep, WaitStep, Workdir, interpolate, resolve_hosts,
 };
+pub use shellflow_text::{is_valid_var_name, shell_quote_single, strip_surrounding_quotes};
 pub use ssh_spec::SshSpec;
-pub use text::{shell_quote_single, strip_surrounding_quotes};

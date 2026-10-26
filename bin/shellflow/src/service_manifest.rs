@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use shellflow_core::env::shell_quote_single;
+use shellflow_core::shell_quote_single;
 
 use crate::{
     cli::{ServiceManifestArgs, ServiceVerifyArgs},

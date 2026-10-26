@@ -202,7 +202,7 @@ pub(crate) async fn run_copy_step(
         });
     }
 
-    (None, Ok(stream::collect_hosts(&args.ui, tasks).await))
+    (None, Ok(stream::collect_hosts(&args.ui, &args.log_file, tasks).await))
 }
 
 /// A group of files that travel in one rsync invocation.
@@ -340,7 +340,7 @@ async fn run_copy_step_local(args: LocalCopyArgs<'_>) -> Result<Vec<(String, Hos
         // after `cp` succeeded. Wiping first (the previous behaviour) meant a
         // failed copy left the destination empty — the worst possible outcome
         // for a `--delete` deploy.
-        return run_local_copy_delete(src, dst, config, log_file, cancel).await;
+        return run_local_copy_delete(src, dst, config, cancel).await;
     }
 
     if let Some(parent) = std::path::Path::new(dst).parent() &&
@@ -371,7 +371,6 @@ async fn run_local_copy_delete(
     src: &str,
     dst: &str,
     config: StepConfig,
-    log_file: &LogFile,
     cancel: &super::Cancel,
 ) -> Result<Vec<(String, HostOutcome)>> {
     let dst_path = std::path::Path::new(dst);
@@ -401,9 +400,13 @@ async fn run_local_copy_delete(
     }
 
     // The replacement is complete: only now is it safe to drop the old tree.
+    // A failed removal is *terminal*: continuing to the rename would fail
+    // anyway (the destination is still present), destroy the whole staging
+    // tree, and report the misleading "failed to move staged copy" instead
+    // of the real cause.
     if let Err(err) = remove_path(dst_path).await {
         remove_path(&staging).await?;
-        crate::ui::warn(&format!("could not remove old destination {dst}: {err}"), log_file);
+        bail!("could not remove old destination {dst}: {err}");
     }
     if let Err(err) = tokio::fs::rename(&staging, dst_path).await {
         remove_path(&staging).await?;

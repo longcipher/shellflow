@@ -163,9 +163,7 @@ fn init(cmd: &ServiceInitArgs) -> Result<()> {
     if hosts.is_empty() {
         hosts.push("api".to_string());
     }
-    if cmd.pattern == ServicePattern::Oneshot && cmd.timer.is_none() {
-        // A timer is optional; without one the unit is a run-once task.
-    }
+    // A timer is optional; without one an oneshot unit is a run-once task.
     if let Some(schedule) = &cmd.timer {
         validate_schedule(schedule)?;
     }

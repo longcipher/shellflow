@@ -2,7 +2,9 @@
 
 > Part I covers the DSL and execution engine; **Part II** (sections `S1`–`S12`)
 > covers the embedded `age` integration (`keys`/`secret`), the `@secrets`
-> directive, `--local` mode, and the target-side `cred-env` helpers.
+> directive, `--local` mode, and the target-side `cred-env` helpers. The
+> optional native transport (`shellflow-muxy`, the `muxy` feature) is
+> documented in `docs/muxy-transport.md`.
 
 ## 1. Executive Summary
 
@@ -39,9 +41,11 @@ Design constraints:
 - Concurrent multi-host execution with live, host-prefixed, color-coded output.
 - `-v / -vv / -vvv` realtime debugging with zero extra architecture.
 - `--dry-run` / `--diff` idempotent previews before any change.
-- Lean, auditable codebase: four crates (`shellflow-dsl`, `shellflow-core`,
-  `shellflow-secrets`, `bin/shellflow`) of roughly 4.2k / 1.4k / 1.2k / 13.5k
-  lines, of which about a third is tests. The target is clarity and test coverage, not line-count
+- Lean, auditable codebase: the library crates `shellflow-text` (shared
+  shell-text rules, the zero-dependency leaf), `shellflow-dsl`, `shellflow-core`,
+  `shellflow-secrets`, `shellflow-muxy` (the optional native transport, behind
+  the `muxy` feature) plus the `bin/shellflow` CLI, of which about a third is
+  tests. The target is clarity and test coverage, not line-count
   gymnastics — "lightweight" means a single static binary with no runtime
   dependencies, not minimal source lines.- Production-safe lifecycle: global and per-step timeouts, Ctrl-C/SIGTERM
   handling that never leaves orphan processes, and a friendly preflight check.
@@ -427,21 +431,32 @@ shellflow/
     │       ├── plan.rs        # data model (§4.3), resolve_hosts, interpolate
     │       ├── heredoc.rs     # here-document body tracking (§4.1 rule 8)
     │       ├── ssh_spec.rs    # SshSpec parse / to_args / rsync dest
-    │       ├── text.rs        # shell quoting + quote stripping
     │       └── error.rs       # ParseError / InterpolateError
+    ├── shellflow-text/        # the shared shell-text rules (zero-dependency leaf)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       └── lib.rs         # shell_quote_single, strip_surrounding_quotes, is_valid_var_name
     ├── shellflow-core/        # runtime helpers (pure, no I/O)
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs
     │       ├── env.rs         # env rendering, @export capture parser, masking
     │       ├── template.rs    # ${KEY} placeholder scanner + render_template (S12)
-    │       └── error.rs       # CaptureError / RenderEnvError
-    └── shellflow-secrets/     # age wrapper (encrypt/decrypt, env parser)
+    │       └── error.rs       # CaptureError / RenderEnvError / MissingKeysError
+    ├── shellflow-muxy/        # the native transport session (muxy feature; see muxy-transport.md)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── conn.rs        # ssh + bridge handshake, event pump, reconnect
+    │       ├── lines.rs       # scrollback assembler, budget, gap-fill
+    │       ├── session.rs     # payload upload, step run, teardown
+    │       └── error.rs       # classified transport errors
+    └── shellflow-secrets/     # age wrapper (encrypt/decrypt, env parser, recipients)
         ├── Cargo.toml
         └── src/
             ├── lib.rs         # identity load, crypto, KEY=VALUE env parsing
             ├── identity.rs    # X25519 identity resolution and generation
             ├── crypto.rs      # age encrypt/decrypt
+            ├── recipients.rs  # `age1…` recipient parsing and `*.pub` collection
             ├── env.rs         # KEY=VALUE env file parser
             ├── fsx.rs         # atomic writes with an explicit mode
             └── error.rs
@@ -449,13 +464,21 @@ shellflow/
 
 ### 5.2 Crate responsibilities
 
+**`shellflow-text`** — the shared shell-text rules, the zero-dependency leaf.
+
+- Owns `shell_quote_single`, `strip_surrounding_quotes`, and the
+  shell-identifier rule. The DSL (which reads directive payloads), the
+  runtime (which renders payload headers), and the secrets crate (which
+  reads sealed env files) all depend on it, so the rules cannot drift apart
+  — and the secrets crate can share them without dragging in the plan model.
+
 **`shellflow-dsl`** — the grammar, pure, synchronous, dependency-light.
 
 - Owns the deploy-script language: the scanner, the plan model, the target
   resolution, the ssh-destination model, and the errors the scanner reports.
-  It is a leaf crate (`thiserror` only), so the grammar can be read, tested
-  and fuzzed without the runtime — and the runtime cannot grow a second
-  opinion about what a script means.
+  It depends only on `shellflow-text` and `thiserror`, so the grammar can be
+  read, tested and fuzzed without the runtime — and the runtime cannot grow
+  a second opinion about what a script means.
 - `shellflow-core` re-exports its public API, so a consumer of the runtime
   helpers does not have to know which crate owns which half of the language.
 
@@ -499,16 +522,26 @@ shellflow/
   `write_new_file`) that every secret-bearing file uses.
 - `shellflow-core` stays free of async, I/O, and crypto.
 
+**`shellflow-muxy`** — the optional native transport (the `muxy` feature).
+
+- One connection per host: ssh carries the muxy bridge, a pump thread is the
+  only consumer of the client's events, and a step's output streams as
+  complete lines over the session. Documented in `docs/muxy-transport.md`;
+  the ssh transport covers every step when the feature is off.
+
 **`bin/shellflow`** — the I/O boundary.
 
 - clap parsing and script loading.
 - The execution engine: spawns `bash`, `ssh`, `rsync` via
   `tokio::process::Command`; fans out to hosts with `tokio::task::JoinSet`;
   streams prefixed output.
-- `eyre` for application errors. There is no logging framework: the CLI owns
-  one output path (`ui`), which streams user-facing lines, applies masking,
-  and writes the audit log (`#![allow(clippy::print_stdout)]`, as permitted
-  for CLI crates in the workspace lint config).
+- `eyre` for application errors. There is no logging framework: the `run`
+  path owns one output path (`ui`), which streams user-facing lines, applies
+  masking, and writes the audit log. The report subcommands render terminal
+  output directly, and each printing module declares that with a scoped
+  `#[expect(clippy::print_stdout, …, reason = "…")]` in `main.rs`, so a new
+  print outside those modules fails the lint instead of bypassing the
+  masker.
 
 ### 5.3 Dependencies
 
@@ -540,14 +573,24 @@ cargo add tempfile -p shellflow-secrets --workspace --dev
 | `clap` (derive) | bin | CLI parsing |
 | `tokio` | bin | async process supervision, `JoinSet` |
 | `eyre` | bin | application error handling (per AGENTS.md) |
-| `thiserror` | core/secrets | library error types (per AGENTS.md) |
+| `thiserror` | text/dsl/core/secrets/muxy | library error types (per AGENTS.md) |
 | `colored` | bin | host-prefix and step-header ANSI styling |
 | `age` | secrets | embedded X25519 encryption (no `rage` binary) |
-| `shellflow-dsl` | bin | local path dependency (the grammar + the plan model) |
-| `shellflow-core` | bin | local path dependency (runtime helpers; re-exports the DSL) |
-| `shellflow-secrets` | bin | local path dependency (crypto + env parser) |
-| `proptest` (dev) | core/secrets | property tests in the normal test loop |
-| `tempfile` (dev) | secrets | temp-file fixtures in tests |
+| `zeroize` | bin, secrets | in-memory scrubbing of plaintext secrets |
+| `nix` | bin | process groups, signals, user/fs handling |
+| `sd-notify` | bin | the systemd readiness protocol (`Type=notify` supervision) |
+| `sha2` | bin | credential-store fingerprints (`cred-env`) |
+| `serde_json` | bin | structured outputs (state lines, summaries) |
+| `toml_edit` | bin | service manifests and rendered TOML templates |
+| `shellflow-text` | dsl/core/secrets | the shared shell-text rules (the zero-dependency leaf) |
+| `shellflow-dsl` | bin, core | local path dependency (the grammar + the plan model) |
+| `shellflow-core` | bin, secrets | local path dependency (runtime helpers; re-exports the DSL) |
+| `shellflow-secrets` | bin | local path dependency (crypto + env parser + recipients) |
+| `shellflow-muxy` | bin (`muxy` feature) | local path dependency (optional native transport; see `muxy-transport.md`) |
+| `muxy-client` / `muxy-protocol` | muxy (`muxy` feature) | third-party beta, pinned to an exact rev (the supply-chain boundary) |
+| `zbus` (optional) | bin (`dbus` feature) | event-driven systemd unit state over D-Bus; the CLI polls without it |
+| `proptest` (dev) | dsl/core/secrets | property tests in the normal test loop |
+| `tempfile` (dev) | secrets, bin | temp-file fixtures in tests |
 
 Explicitly **not** used: `anyhow` (forbidden), `russh`/`libssh2`/`ssh2` (we wrap
 system `ssh`), `futures` (unnecessary — `JoinSet` covers fan-out), `scc`

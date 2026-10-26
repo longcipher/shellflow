@@ -93,6 +93,26 @@ pub(crate) fn install_masks(masks: Vec<String>, shorts: Vec<(String, String)>) {
     *guard = Arc::new(MaskSet { masks: Arc::new(prepare_masks(&masks)), shorts: Arc::new(shorts) });
 }
 
+/// Register additional secret values discovered **during** the run.
+///
+/// A local block can pull a value from an external store and `@export` it;
+/// that value was unknown when [`install_masks`] ran before step 1. Without
+/// this, a later step echoing the value (or `-vvv`'s `bash -x`) would print
+/// it unredacted to the stream and the `--log-file` audit trail. Values are
+/// merged with the existing set and re-normalized (longest-first).
+pub(crate) fn extend_masks(values: Vec<String>, shorts: Vec<(String, String)>) {
+    if values.is_empty() && shorts.is_empty() {
+        return;
+    }
+    let mut guard = mask_set().write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut masks = guard.masks.as_ref().clone();
+    let mut all_shorts = guard.shorts.as_ref().clone();
+    masks.extend(values);
+    all_shorts.extend(shorts);
+    *guard =
+        Arc::new(MaskSet { masks: Arc::new(prepare_masks(&masks)), shorts: Arc::new(all_shorts) });
+}
+
 /// Redact every known secret in `text`.
 ///
 /// This is the single redaction entry point. Notes, warnings, step headers,
@@ -288,6 +308,21 @@ impl Ui {
     /// free functions that have no `Ui` handle — redacts the same values.
     pub(crate) fn set_secret_values(&mut self, masks: Vec<String>, shorts: Vec<(String, String)>) {
         install_masks(masks, shorts);
+        self.maskers.clear();
+    }
+
+    /// Register secret values discovered **during** the run (`@export`).
+    ///
+    /// Extends the process-wide registry and drops the cached per-host
+    /// maskers, exactly like [`Self::set_secret_values`]: a masker created
+    /// for an earlier block holds a snapshot of the old set and would
+    /// otherwise keep the new values unredacted.
+    pub(crate) fn extend_secret_values(
+        &mut self,
+        masks: Vec<String>,
+        shorts: Vec<(String, String)>,
+    ) {
+        extend_masks(masks, shorts);
         self.maskers.clear();
     }
 
@@ -683,6 +718,21 @@ mod tests {
         super::install_masks(vec!["s3cr3tvalue".to_string()], Vec::new());
         assert_eq!(super::redact("value s3cr3tvalue here"), "value *** here");
         assert!(!super::redact("value s3cr3tvalue here").contains("s3cr3tvalue"));
+    }
+
+    #[test]
+    fn extend_masks_registers_runtime_values() {
+        // A value discovered mid-run (`@export`) joins the registry: the
+        // free redaction path — which shares no state with the `Ui` handle —
+        // must redact it too.
+        colored::control::set_override(false);
+        super::install_masks(Vec::new(), Vec::new());
+        assert!(
+            super::redact("the value is hunter2secret").contains("hunter2secret"),
+            "unregistered values are not masked"
+        );
+        super::extend_masks(vec!["hunter2secret".to_string()], Vec::new());
+        assert_eq!(super::redact("the value is hunter2secret"), "the value is ***");
     }
 
     #[test]

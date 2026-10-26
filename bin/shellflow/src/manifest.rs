@@ -123,11 +123,14 @@ impl ServiceManifest {
     /// Returns [`ManifestError`] when the text is not valid TOML, when a
     /// required key is missing, or when a key has the wrong shape.
     pub(crate) fn parse(service: &str, text: &str) -> Result<Self, ManifestError> {
+        validate_service_name(service)?;
         let doc: toml_edit::DocumentMut =
             text.parse().map_err(|err| ManifestError::new(format!("invalid TOML: {err}")))?;
 
         let host = require_str(&doc, "host", service)?;
+        validate_host_alias(&host, service)?;
         let unit = require_str(&doc, "unit", service)?;
+        validate_unit_name(&unit, service)?;
 
         // `[[render]]` is an array of tables: one entry per rendered file.
         let renders = match doc.get("render") {
@@ -218,6 +221,58 @@ impl ServiceManifest {
 #[must_use]
 pub(crate) fn manifest_path(repo: &Path, service: &str, unit: &str) -> PathBuf {
     repo.join("services").join(service).join(format!("{unit}{MANIFEST_SUFFIX}"))
+}
+
+/// Whether a manifest-declared service name is safe to interpolate into a
+/// remote shell word and a filesystem path.
+///
+/// The name reaches `systemctl`, the credential-store directory, and the
+/// check scripts; the single shared charset (`[A-Za-z0-9._-]`, no leading
+/// dot, no `..`) keeps it from carrying shell syntax or escaping the store
+/// directory.
+fn validate_service_name(name: &str) -> Result<(), ManifestError> {
+    let ok = !name.is_empty() &&
+        !name.starts_with('.') &&
+        !name.contains("..") &&
+        name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ManifestError::new(format!(
+            "invalid service name `{name}` (allowed: letters, digits, `-`, `_`, `.`)"
+        )))
+    }
+}
+
+/// Whether a manifest-declared host alias is safe to interpolate into a
+/// generated playbook: a newline would inject a root-level unit directive
+/// (the same attack the playbook-side alias validator prevents).
+fn validate_host_alias(name: &str, service: &str) -> Result<(), ManifestError> {
+    let ok = !name.is_empty() &&
+        name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ManifestError::new(format!(
+            "manifest `{service}`: invalid host alias `{name}` (allowed: letters, digits, \
+             `_`, `-`, `.`)"
+        )))
+    }
+}
+
+/// Whether a manifest-declared unit name is safe to hand to `systemctl`: the
+/// single shared unit charset, template units and specifiers included.
+fn validate_unit_name(name: &str, service: &str) -> Result<(), ManifestError> {
+    let ok = !name.is_empty() &&
+        !name.starts_with('.') &&
+        !name.contains("..") &&
+        name.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ManifestError::new(format!("manifest `{service}`: invalid unit name `{name}`")))
+    }
 }
 
 /// Every manifest of a repository, keyed by `<service>/<unit>`.

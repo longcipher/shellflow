@@ -11,7 +11,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::{ArcUi, Cancel, HostOutcome};
+use super::{ArcUi, Cancel, HostOutcome, LogFile};
 use crate::ui::Stream;
 
 /// How long the reader tasks may take to drain after the child exited.
@@ -87,7 +87,8 @@ pub(super) struct PipedArgs<'a> {
 /// Interprets a child's output lines on their way to the UI.
 ///
 /// The closure returns the line to display, or `None` to drop it.
-pub(super) struct LineCollector {
+#[derive(Clone)]
+pub(crate) struct LineCollector {
     inner: std::sync::Arc<std::sync::Mutex<LineInterpreter>>,
 }
 
@@ -160,9 +161,9 @@ pub(super) async fn run_piped_child(args: PipedArgs<'_>, mut cmd: Command) -> Re
         let Some(payload) = payload
     {
         let write = with_deadline(deadline, stdin.write_all(payload.as_bytes()));
-        let delivered = tokio::select! {
+        tokio::select! {
             result = write => match result {
-                Ok(Ok(())) => true,
+                Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     crate::ui::warn(&format!("[{host}] stdin write failed"), log_file);
                     super::process::terminate(&mut child).await;
@@ -183,8 +184,7 @@ pub(super) async fn run_piped_child(args: PipedArgs<'_>, mut cmd: Command) -> Re
                 drain_started(readers.take(), pid).await;
                 return Ok(PipedRun::Cancelled);
             }
-        };
-        let _ = delivered;
+        }
     }
     drop(child.stdin.take());
 
@@ -322,9 +322,13 @@ where
 /// A join error (a host task panicked or was aborted) must not discard the
 /// statuses of hosts that already finished — the caller renders those in the
 /// step summary, and dropping them would misreport the fan-out. The error is
-/// reported and the affected host is reported as failed.
+/// reported and the affected host is reported as failed with
+/// `RunError::Transport`: a join failure is a controller-side event, and
+/// classifying it `Script` (exit 4) would misattribute it to the remote
+/// command.
 pub(super) async fn collect_hosts(
     ui: &ArcUi,
+    log_file: &LogFile,
     mut tasks: JoinSet<(String, HostOutcome)>,
 ) -> Vec<(String, HostOutcome)> {
     let mut results = Vec::with_capacity(tasks.len());
@@ -337,8 +341,9 @@ pub(super) async fn collect_hosts(
                 results.push((alias, outcome));
             }
             Err(join_err) => {
-                crate::ui::warn(&format!("host task failed: {join_err}"), &None);
-                results.push(("unknown".to_string(), HostOutcome::Failed(super::RunError::Script)));
+                crate::ui::warn(&format!("host task failed: {join_err}"), log_file);
+                results
+                    .push(("unknown".to_string(), HostOutcome::Failed(super::RunError::Transport)));
             }
         }
     }

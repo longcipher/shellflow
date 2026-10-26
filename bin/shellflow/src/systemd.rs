@@ -26,7 +26,9 @@
 use std::{
     fmt,
     io::{Read, Write},
+    os::unix::process::CommandExt as _,
     process::{Command, Stdio},
+    sync::Arc,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -378,6 +380,14 @@ fn exec(args: &SystemdExecArgs) -> Result<(), SystemdError> {
     if args.command.is_empty() {
         return Err(SystemdError::usage("no command to run"));
     }
+    if args.ready_url.as_deref().is_some_and(|url| url.starts_with("https://")) {
+        // The readiness probe is a plain HTTP/1.0 TCP client and cannot do
+        // TLS; an https URL would silently never become ready and burn the
+        // whole budget before the kill. Refuse it up front instead.
+        return Err(SystemdError::usage(
+            "https readiness URLs are not supported (probe the plain-HTTP port instead)",
+        ));
+    }
     let (program, rest) =
         args.command.split_first().ok_or_else(|| SystemdError::usage("no command to run"))?;
 
@@ -386,6 +396,10 @@ fn exec(args: &SystemdExecArgs) -> Result<(), SystemdError> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        // Own process group: the timeout path can then signal the whole tree.
+        // `SIGTERM` to the leader alone leaves whatever the child spawned
+        // (`sudo`, a wrapper script) alive.
+        .process_group(0)
         .spawn()
         .map_err(|err| SystemdError::internal(format!("cannot start `{program}`: {err}")))?;
     let pid = child.id() as i32;
@@ -396,15 +410,10 @@ fn exec(args: &SystemdExecArgs) -> Result<(), SystemdError> {
     let watchdog = args.watchdog.then(|| Duration::from_secs(args.watchdog_interval.max(1)));
     let deadline = Instant::now() + Duration::from_secs(args.timeout);
 
-    // The watchdog keeps running while the child does.
-    let watchdog_handle = watchdog.map(|interval| {
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(interval);
-                let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
-            }
-        })
-    });
+    // The watchdog keeps running while the child does. The guard joins it on
+    // *every* exit path — an early `?` before an explicit join used to leave
+    // it pinging forever.
+    let watchdog_guard = WatchdogGuard::spawn(watchdog);
 
     // Wait for readiness, but notice the child dying in the meantime: a
     // process that exits before it is ready must fail the unit, not hang
@@ -414,7 +423,7 @@ fn exec(args: &SystemdExecArgs) -> Result<(), SystemdError> {
             .try_wait()
             .map_err(|err| SystemdError::internal(format!("cannot wait for the child: {err}")))?
         {
-            let _ = watchdog_handle.map(|handle| handle.join());
+            drop(watchdog_guard);
             return Err(SystemdError {
                 message: format!(
                     "`{program}` exited with {status} before it became ready",
@@ -433,11 +442,8 @@ fn exec(args: &SystemdExecArgs) -> Result<(), SystemdError> {
     };
 
     if !ready {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGTERM,
-        );
-        let _ = watchdog_handle.map(|handle| handle.join());
+        terminate_supervised_child(&mut child);
+        drop(watchdog_guard);
         return Err(SystemdError {
             message: format!("`{program}` did not become ready within {}s", args.timeout),
             code: EXIT_TIMEOUT,
@@ -455,7 +461,7 @@ fn exec(args: &SystemdExecArgs) -> Result<(), SystemdError> {
     let status = child
         .wait()
         .map_err(|err| SystemdError::internal(format!("cannot wait for the child: {err}")))?;
-    let _ = watchdog_handle.map(|handle| handle.join());
+    drop(watchdog_guard);
     match status.code() {
         Some(code) => {
             if code == 0 {
@@ -471,6 +477,67 @@ fn exec(args: &SystemdExecArgs) -> Result<(), SystemdError> {
             message: format!("`{program}` was killed by a signal"),
             code: EXIT_FAILED,
         }),
+    }
+}
+
+/// The grace period between `SIGTERM` and `SIGKILL` on the timeout path
+/// (matching the executor's [`crate::executor::KILL_GRACE`] discipline).
+const EXEC_KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// `SIGTERM` the child's whole process group, wait a grace period, then
+/// `SIGKILL` the group and reap.
+///
+/// The old path sent a bare `SIGTERM` to the child pid and never waited: a
+/// child that traps or blocks `SIGTERM` survived the timeout, and the
+/// supervisor held a zombie until its own exit.
+fn terminate_supervised_child(child: &mut std::process::Child) {
+    let group = nix::unistd::Pid::from_raw(child.id() as i32);
+    let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGTERM);
+    let deadline = Instant::now() + EXEC_KILL_GRACE;
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+    let _ = child.wait();
+}
+
+/// Owns the watchdog thread: the flag stops the loop and the `Drop` joins.
+///
+/// A bare `std::thread` running an unbounded loop leaked on every exit path
+/// between spawn and an explicit join (an early `?` never reached the join).
+struct WatchdogGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WatchdogGuard {
+    fn spawn(interval: Option<Duration>) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = interval.map(|interval| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(interval);
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
+                }
+            })
+        });
+        Self { stop, handle }
+    }
+}
+
+impl Drop for WatchdogGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 

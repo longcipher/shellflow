@@ -6,16 +6,18 @@ use std::{
     os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     process::Command,
-    str::FromStr,
 };
 
 use eyre::{Result, WrapErr, bail, eyre};
 use shellflow_secrets::{
+    Identity,
     crypto::{decrypt_bytes, decrypt_string, encrypt_bytes},
     env::parse_env_file,
     error::SecretsError,
     identity::{effective_identity_path, load_x25519_identity},
+    recipients::collect_recipients,
 };
+use zeroize::Zeroizing;
 
 use crate::{
     cli::{
@@ -42,46 +44,6 @@ pub(crate) fn run(cmd: &SecretCmd) -> Result<()> {
         SecretCmd::KeysCheck(args) => keys_check(args),
         SecretCmd::FindDuplicates(args) => find_duplicates(args),
     }
-}
-
-/// Parse a single `age1…` recipient string.
-fn parse_recipient(raw: &str) -> Result<age::x25519::Recipient, SecretsError> {
-    let raw = raw.trim();
-    age::x25519::Recipient::from_str(raw).map_err(|reason| SecretsError::InvalidRecipient {
-        recipient: raw.to_string(),
-        reason: reason.to_string(),
-    })
-}
-
-/// Collect recipients from explicit `-r` arguments and a directory of `*.pub`
-/// files.
-fn collect_recipients(
-    explicit: &[String],
-    dir: Option<&Path>,
-) -> Result<Vec<age::x25519::Recipient>, SecretsError> {
-    let mut recipients: Vec<age::x25519::Recipient> = Vec::new();
-    for raw in explicit {
-        recipients.push(parse_recipient(raw)?);
-    }
-    if let Some(dir) = dir {
-        let entries = fs::read_dir(dir).map_err(|source| SecretsError::ReadInput { source })?;
-        for entry in entries {
-            let entry = entry.map_err(|source| SecretsError::ReadInput { source })?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "pub") {
-                let content = fs::read_to_string(&path).map_err(|source| {
-                    SecretsError::ReadIdentity { path: path.display().to_string(), source }
-                })?;
-                for line in content.lines() {
-                    let line = line.trim();
-                    if !line.is_empty() && !line.starts_with('#') {
-                        recipients.push(parse_recipient(line)?);
-                    }
-                }
-            }
-        }
-    }
-    Ok(recipients)
 }
 
 fn read_input(file: Option<&Path>) -> Result<Vec<u8>, SecretsError> {
@@ -134,7 +96,7 @@ fn decrypt(args: &SecretDecryptArgs) -> Result<()> {
 ///
 /// Shared by every subcommand that decrypts, so the identity path is resolved
 /// and reported the same way everywhere.
-pub(crate) fn load_identity(explicit: Option<&Path>) -> Result<age::x25519::Identity> {
+pub(crate) fn load_identity(explicit: Option<&Path>) -> Result<Identity> {
     let id_path = effective_identity_path(explicit).map_err(|err| eyre!("{err}"))?;
     load_x25519_identity(&id_path).map_err(|err| eyre!("{err} (identity: {})", id_path.display()))
 }
@@ -203,7 +165,10 @@ fn edit(args: &SecretEditArgs) -> Result<()> {
     let temp_path = temp.path().to_path_buf();
     let result = (|| -> Result<()> {
         run_editor(&temp_path)?;
-        let edited = fs::read(&temp_path).wrap_err("failed to read edited plaintext")?;
+        // The edited plaintext is held in a `Zeroizing` buffer so the user's
+        // work does not linger in the heap after re-encryption.
+        let edited =
+            Zeroizing::new(fs::read(&temp_path).wrap_err("failed to read edited plaintext")?);
         // Validate before re-encrypting: a malformed edit must fail while the
         // editor just exited (pointing at the temp file), not at the next
         // deploy's `@secrets` parse step.

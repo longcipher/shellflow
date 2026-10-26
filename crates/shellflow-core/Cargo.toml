@@ -12,6 +12,7 @@ readme.workspace = true
 
 [dependencies]
 shellflow-dsl = { workspace = true }
+shellflow-text = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

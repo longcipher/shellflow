@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 use shellflow_core::ResolvedHost;
 use tokio::{process::Command, sync::Semaphore};
 
-use crate::executor::{ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel, stream};
+use crate::executor::{
+    ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel, fanout_slot, stream,
+};
 
 /// The exit code the target helper uses for "the condition did not hold".
 const EXIT_FAILED: i32 = 3;
@@ -30,7 +32,7 @@ pub(crate) const HELPER_PATH: &str = "/usr/local/bin/shellflow";
 
 /// Quote a value for the remote shell.
 pub(super) fn quote(value: &str) -> String {
-    shellflow_core::env::shell_quote_single(value)
+    shellflow_core::shell_quote_single(value)
 }
 
 /// The command that runs a host verb through the target-side helper.
@@ -85,6 +87,15 @@ pub(super) struct TargetCommand<'a> {
     pub secrets: &'a Arc<crate::secrets::ResolvedSecrets>,
     /// The probed remote environments (the shell, the login PATH).
     pub shell_cache: &'a crate::executor::ShellCache,
+    /// Which step class this command is (drives the muxy policy).
+    #[cfg(feature = "muxy")]
+    pub step_class: crate::executor::StepClass,
+    /// Per-run muxy state.
+    #[cfg(feature = "muxy")]
+    pub muxy: &'a crate::executor::muxy::MuxyRun,
+    /// The 1-based plan index (names the muxy payload file).
+    #[cfg(feature = "muxy")]
+    pub step_no: usize,
 }
 
 /// Run one target-side command on every host.
@@ -106,6 +117,12 @@ pub(super) async fn run_target_command(
         label,
         secrets,
         shell_cache,
+        #[cfg(feature = "muxy")]
+        step_class,
+        #[cfg(feature = "muxy")]
+        muxy,
+        #[cfg(feature = "muxy")]
+        step_no,
     } = args;
     if config.check || config.dry_run {
         crate::ui::note(&format!("  {label}: no-op in check/dry-run"), log_file);
@@ -123,16 +140,10 @@ pub(super) async fn run_target_command(
         let label = label.to_string();
         let secrets = Arc::clone(secrets);
         let shell_cache = Arc::clone(shell_cache);
+        #[cfg(feature = "muxy")]
+        let muxy = muxy.clone();
         tasks.spawn(async move {
-            let _permit = match semaphore.as_ref() {
-                Some(sem) => match sem.clone().acquire_owned().await {
-                    Ok(permit) => Some(permit),
-                    Err(_) => {
-                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
-                    }
-                },
-                None => None,
-            };
+            let _permit = fanout_slot!(&semaphore, &log_file, host);
             if cancel.is_cancelled() {
                 return (host.alias.clone(), HostOutcome::Cancelled);
             }
@@ -144,16 +155,55 @@ pub(super) async fn run_target_command(
                 crate::executor::remote::resolve_remote_env(&host, &shell_cache, &cancel).await;
             let mut payload_env = Vec::new();
             secrets.overlay(&mut payload_env, &host.alias);
-            let env_header = match shellflow_core::env::render_env(&payload_env) {
-                Ok(header) => header,
+            #[cfg(feature = "muxy")]
+            {
+                let muxy_env = crate::executor::remote::with_login_path(
+                    payload_env.clone(),
+                    remote_env.path.as_deref(),
+                );
+                match super::muxy::exec_command(super::muxy::CommandStep {
+                    ui: &ui,
+                    host: &host,
+                    class: step_class,
+                    command: command.clone(),
+                    env: muxy_env,
+                    has_secrets: secrets.has_for_host(&host.alias),
+                    probe_muxy: remote_env.has_muxy,
+                    timeout: Some(budget.as_secs() + 30),
+                    config,
+                    log_file: &log_file,
+                    cancel: &cancel,
+                    muxy: &muxy,
+                    step_no,
+                    transform: None,
+                    explain_exit: None,
+                })
+                .await
+                {
+                    super::muxy::CommandAttempt::Done(pair) => return pair,
+                    super::muxy::CommandAttempt::Fallback => {}
+                }
+            }
+            let payload = match (super::transport::Payload {
+                script: &command,
+                guard: None,
+                trace: false,
+                env: payload_env,
+                timeout: Some(budget.as_secs() + 30),
+            })
+            .render_ssh()
+            {
+                Ok(payload) => payload,
                 Err(_) => {
                     return (host.alias.clone(), HostOutcome::Failed(RunError::Plan));
                 }
             };
-            let payload = format!("set -eu\n{env_header}{command}\n");
-            let mut cmd = Command::new("ssh");
-            cmd.args(["-o", "BatchMode=yes"]);
-            cmd.args(host.spec.to_ssh_args()).arg("-T").arg(remote_env.shell.invoke(false));
+            let mut cmd = super::transport::ssh_stdin_command(
+                &host,
+                remote_env.shell.invoke(false),
+                config.ssh_reuse,
+                config.verbose >= 3,
+            );
             // The command travels as the remote shell's standard input. With
             // the default (inherited) stdin there is nothing to write to,
             // the remote shell reads EOF, exits 0 -- and the step reports
@@ -217,17 +267,7 @@ pub(super) async fn run_target_command(
             }
         });
     }
-    let mut out = Vec::new();
-    while let Some(res) = tasks.join_next().await {
-        match res {
-            Ok(pair) => {
-                ui.lock().await.host_finished(&pair.0);
-                out.push(pair);
-            }
-            Err(_) => out.push(("unknown".to_string(), HostOutcome::Failed(RunError::Transport))),
-        }
-    }
-    Ok(out)
+    Ok(stream::collect_hosts(ui, log_file, tasks).await)
 }
 
 // === the individual verbs ===
@@ -694,15 +734,7 @@ pub(super) async fn run_helper_step(
         let log_file = log_file.clone();
         let cancel = cancel.clone();
         tasks.spawn(async move {
-            let _permit = match semaphore.as_ref() {
-                Some(sem) => match sem.clone().acquire_owned().await {
-                    Ok(permit) => Some(permit),
-                    Err(_) => {
-                        return (host.alias.clone(), HostOutcome::Failed(RunError::Transport));
-                    }
-                },
-                None => None,
-            };
+            let _permit = fanout_slot!(&semaphore, &log_file, host);
             if cancel.is_cancelled() {
                 return (host.alias.clone(), HostOutcome::Cancelled);
             }
@@ -711,8 +743,6 @@ pub(super) async fn run_helper_step(
                 built: &built,
                 staged: &staged,
                 install_path: &install_path,
-                ui: &ui,
-                log_file: &log_file,
                 config,
                 cancel: &cancel,
             };
@@ -730,17 +760,7 @@ pub(super) async fn run_helper_step(
             }
         });
     }
-    let mut out = Vec::new();
-    while let Some(res) = tasks.join_next().await {
-        match res {
-            Ok(pair) => {
-                ui.lock().await.host_finished(&pair.0);
-                out.push(pair);
-            }
-            Err(_) => out.push(("unknown".to_string(), HostOutcome::Failed(RunError::Transport))),
-        }
-    }
-    Ok(out)
+    Ok(stream::collect_hosts(ui, log_file, tasks).await)
 }
 
 /// The source tree to build the helper from.
@@ -775,15 +795,13 @@ struct HelperShip<'a> {
     built: &'a Path,
     staged: &'a str,
     install_path: &'a str,
-    ui: &'a ArcUi,
-    log_file: &'a LogFile,
     config: StepConfig,
     cancel: &'a Cancel,
 }
 
 /// Copy the helper to the target and install it atomically.
 async fn ship_helper(request: HelperShip<'_>) -> eyre::Result<()> {
-    let HelperShip { host, built, staged, install_path, ui, log_file, config, cancel } = request;
+    let HelperShip { host, built, staged, install_path, config, cancel } = request;
     use crate::executor::process::{GroupGuard, isolate};
     async fn supervised_output(
         mut cmd: Command,
@@ -841,8 +859,6 @@ async fn ship_helper(request: HelperShip<'_>) -> eyre::Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(eyre::eyre!("rsync exited with {}: {}", output.status, stderr.trim()));
     }
-    let _ = ui;
-    let _ = log_file;
 
     if cancel.is_cancelled() {
         return Err(eyre::eyre!("cancelled"));

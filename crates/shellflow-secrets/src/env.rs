@@ -5,10 +5,10 @@ use crate::error::SecretsError;
 
 /// Strip one layer of surrounding `"` or `'` quotes.
 ///
-/// The rule lives in `shellflow-core` so the parser and this crate share one
+/// The rule lives in `shellflow-text` so the parser and this crate share one
 /// definition.
 fn strip_quotes(value: &str) -> String {
-    shellflow_core::strip_surrounding_quotes(value)
+    shellflow_text::strip_surrounding_quotes(value)
 }
 
 /// Parse an env file into ordered `(key, value)` pairs.
@@ -49,7 +49,7 @@ pub fn parse_env_file(content: &str) -> Result<Vec<(String, String)>, SecretsErr
         };
 
         let key = key.trim();
-        if !shellflow_core::is_valid_var_name(key) {
+        if !shellflow_text::is_valid_var_name(key) {
             return Err(SecretsError::MalformedEnv {
                 line: idx + 1,
                 reason: format!("invalid variable name `{key}`"),

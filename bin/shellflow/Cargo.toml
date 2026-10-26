@@ -14,11 +14,14 @@ readme.workspace = true
 # Event-driven systemd unit state (D-Bus). Off by default so the standard
 # build stays a single static binary with no D-Bus dependency; the CLI path
 # produces the same output by polling.
-default = []
+default = ["muxy"]
 dbus = ["dep:zbus", "dep:futures-util"]
+# Native Muxy protocol transport (one connection per host, frame streaming).
+# Off (`--no-default-features`) for lean static musl builds and air-gapped
+# packaging; the ssh transport then covers every step.
+muxy = ["dep:shellflow-muxy"]
 
 [dependencies]
-age = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 colored = { workspace = true }
 eyre = { workspace = true }
@@ -28,6 +31,7 @@ sd-notify = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 shellflow-core = { workspace = true }
+shellflow-muxy = { workspace = true, optional = true }
 shellflow-secrets = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 toml_edit = { workspace = true }

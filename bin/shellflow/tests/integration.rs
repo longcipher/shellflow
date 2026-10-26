@@ -268,6 +268,36 @@ fn env_secret_is_masked_in_streamed_output() -> TestResult<()> {
 }
 
 #[test]
+fn a_runtime_exported_secret_is_masked_in_later_output() -> TestResult<()> {
+    // A local block that pulls a secret from an external store and exports
+    // it registers the value for masking: the value was unknown when the
+    // `@secrets` masks were installed before step 1, and a later block that
+    // echoes it (or `-vvv`'s `bash -x`) must not print it unredacted —
+    // streamed output *and* the `--log-file` audit trail both go through the
+    // same registry.
+    let sb = Sandbox::new("mask-export")?;
+    let script = sb.script(
+        "RUNTIME_SECRET=hunter2secret\n\
+         echo captured\n\
+         # @export RUNTIME_SECRET\n\
+         # @name reveal\n\
+         echo \"the value is $RUNTIME_SECRET\"\n",
+    )?;
+    let log_path = sb.dir.join("run.log");
+    let out = sb.run(&script, &["--log-file", log_path.to_str().expect("utf8")])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("hunter2secret"), "runtime-exported secret leaked: {stdout}");
+    assert!(stdout.contains("***"), "mask not applied: {stdout}");
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !log.contains("hunter2secret"),
+        "runtime-exported secret leaked into the audit log: {log}"
+    );
+    Ok(())
+}
+
+#[test]
 fn check_mode_runs_bash_n_not_execution() -> TestResult<()> {
     let sb = Sandbox::new("check")?;
     let script = sb.script(

@@ -39,15 +39,6 @@ pub enum SecretsError {
         source: std::io::Error,
     },
 
-    /// The identity file could not be written.
-    #[error("failed to write identity file {path}: {source}")]
-    WriteIdentity {
-        /// The identity file path.
-        path: String,
-        /// The underlying I/O error.
-        source: std::io::Error,
-    },
-
     /// The encrypted file could not be read.
     #[error("failed to read input: {source}")]
     ReadInput {

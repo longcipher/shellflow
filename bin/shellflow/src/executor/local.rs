@@ -108,9 +108,11 @@ fn append_capture(script: &str, vars: &[String]) -> String {
 /// Deletion is the guard's job (see [`CaptureFile`]), so every early return
 /// here — including the "variable was not exported" error — still cleans up.
 pub(crate) async fn capture_exports(
+    ui: &super::ArcUi,
     run_state: &Arc<Mutex<RunState>>,
     vars: &[String],
     capture: &super::CaptureFile,
+    mask_min_len: usize,
 ) -> Result<()> {
     let content = fs::read(capture.path())
         .await
@@ -118,14 +120,47 @@ pub(crate) async fn capture_exports(
     let table = shellflow_core::parse_capture_records_checked(&content, Some(vars))
         .wrap_err("failed to parse `@export` capture records")?;
 
+    // The captured values enter the run state and are injected into every
+    // later step, so a secret-looking one must join the mask registry now:
+    // the value was unknown before the step ran, and a later block that
+    // echoes it would otherwise print it unredacted. The threshold rule
+    // matches `secrets::decrypt_file`: at-or-above the threshold is masked
+    // globally, below it is redacted only as a standalone token / under its
+    // own key.
+    let mut masks: Vec<String> = Vec::new();
+    let mut shorts: Vec<(String, String)> = Vec::new();
     let mut state = run_state.lock().await;
     for var in vars {
         let Some(value) = table.get(var.as_str()) else {
             return Err(eyre::eyre!("variable `{var}` was not exported by the local step"));
         };
+        if is_secretish_name(var) {
+            if value.len() >= mask_min_len && !masks.contains(value) {
+                masks.push(value.clone());
+            } else if !value.is_empty() {
+                shorts.retain(|(k, _)| k != var);
+                shorts.push((var.clone(), value.clone()));
+            }
+        }
         state.vars.insert(var.clone(), value.clone());
     }
+    drop(state);
+    ui.lock().await.extend_secret_values(masks, shorts);
     Ok(())
+}
+
+/// Whether a variable name plausibly carries a credential.
+///
+/// `@export` is a general mechanism — `VERSION`, `COMMIT`, an image tag — and
+/// masking every exported value would shred ordinary deploy output (`v1.2.3`
+/// in a log line becomes `***`). Only names that look secret-bearing are
+/// registered; the needle list errs toward masking, because a missed mask
+/// leaks while a spurious one only redacts.
+fn is_secretish_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["SECRET", "TOKEN", "PASSWD", "PASSWORD", "PASS", "KEY", "CRED", "PRIVATE"]
+        .iter()
+        .any(|needle| upper.contains(needle))
 }
 
 pub(crate) fn create_capture_file(path: &Path) -> Result<()> {
@@ -205,7 +240,7 @@ pub(super) async fn run_local_block(args: &LocalBlockArgs<'_>) -> Result<(), Loc
     }
 
     if let Some(capture) = &capture {
-        capture_exports(args.run_state, args.capture, capture)
+        capture_exports(args.ui, args.run_state, args.capture, capture, args.mask_min_len)
             .await
             .map_err(LocalFailure::Failed)?;
     }
@@ -217,6 +252,7 @@ pub(crate) async fn run_local_step(
     run_state: &Arc<Mutex<RunState>>,
     local: &LocalStep,
     config: StepConfig,
+    mask_min_len: usize,
     cancel: &Cancel,
 ) -> Result<Vec<(String, HostOutcome)>> {
     let log_file = ui.lock().await.log_file();
@@ -269,6 +305,7 @@ pub(crate) async fn run_local_step(
         capture: &local.export,
         extra: &[],
         log_file: &log_file,
+        mask_min_len,
         cancel: cancel.clone(),
     };
     // Every failure mode is reported as a *status* rather than an error, so

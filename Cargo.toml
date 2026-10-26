@@ -7,7 +7,7 @@ members = ["bin/*", "crates/*", "examples/*"]
 exclude = [".github/", "crates/*/fuzz"]
 resolver = "3"
 [workspace.package]
-version = "0.4.11"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/longcipher/shellflow"
@@ -17,10 +17,23 @@ categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
 [workspace.dependencies]
+# The muxy transport is a third-party beta pinned to an exact rev: the rev is
+# the supply-chain boundary (a `cargo update` cannot silently change it), and
+# the version req only documents the protocol line this build speaks. The
+# dependency is optional (`muxy` feature); the ssh transport covers every step
+# without it. Re-evaluate the pin on each muxy stable release.
+muxy-client = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "d1bffca5f218526a9f1f6bc94a2583676f3808b5" }
+muxy-protocol = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "d1bffca5f218526a9f1f6bc94a2583676f3808b5" }
+# Note: the same rev's `muxy-server` is *not* usable as a dev-dependency — it
+# pulls `muxy-terminal`, whose `libghostty-vt-sys` builds ghostty's VT with
+# `zig` and a network fetch. The transport tests therefore drive the real
+# protocol with an in-crate fake peer (see `crates/shellflow-muxy/src/harness.rs`).
 # local crates
-shellflow-core = { path = "crates/shellflow-core", version = "0.4.11" }
-shellflow-dsl = { path = "crates/shellflow-dsl", version = "0.4.11" }
-shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.4.11" }
+shellflow-core = { path = "crates/shellflow-core", version = "0.5.0" }
+shellflow-dsl = { path = "crates/shellflow-dsl", version = "0.5.0" }
+shellflow-muxy = { path = "crates/shellflow-muxy", version = "0.5.0" }
+shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.5.0" }
+shellflow-text = { path = "crates/shellflow-text", version = "0.5.0" }
 
 # external crates
 age = "0.12.1"
@@ -32,6 +45,9 @@ nix = "0.31.3"
 proptest = "1.11.0"
 sd-notify = "0.5.0"
 serde_json = "1.0.143"
+# 0.11 (not the long-lived 0.10 line): the credential-fingerprint hashing
+# (`cred-env`) wants the current API; it is not a security boundary — the
+# fingerprint only names a store, the secrets themselves are age-encrypted.
 sha2 = "0.11.1"
 tempfile = "3.27.0"
 thiserror = "2.0.21"

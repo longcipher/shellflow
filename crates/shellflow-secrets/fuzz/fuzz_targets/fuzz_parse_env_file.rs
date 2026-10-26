@@ -8,8 +8,8 @@
 //! caller relies on:
 //!
 //! - parsing never panics, whatever the bytes;
-//! - every accepted key is a valid shell identifier — a key that is not would
-//!   produce an unassignable `export` line in a remote payload;
+//! - every accepted key is a valid shell identifier — a key that is not would produce an
+//!   unassignable `export` line in a remote payload;
 //! - parsing is deterministic;
 //! - a file with no assignment cannot produce pairs.
 
