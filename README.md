@@ -19,7 +19,7 @@ target-side daemon.
 # @local
 VERSION=$(git rev-parse --short HEAD)
 
-# @export VERSION
+# @export VERSION --public
 
 # @copy target/release/myapp-$VERSION -> /tmp/shellflow/myapp-$VERSION @all
 
@@ -64,7 +64,10 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
   warning instead of being performed: a dry run never writes to a target.
 - **State passing** — `@export VAR` captures a variable from a local block and
   injects it into later `@copy` paths, `@remote` blocks, and `@only_if` guards
-  as `$VAR` / `${VAR}` / env.
+  as `$VAR` / `${VAR}` / env. A captured value is **masked in all output** by
+  default (it is a value the tool did not see at parse time, and a playbook
+  routinely exports a credential it just fetched); add `--public` for a value
+  that is meant to be read, such as a version or a commit.
 - **Graceful file copies** — `@copy` uses rsync when the target has it (with a
   `mkdir -p` remote wrapper), and automatically falls back to
   `ssh mkdir -p` + `scp` on hosts without rsync. Destination directories are
@@ -142,7 +145,7 @@ lines belong to the current block.
 | `@local` | `# @local` | Following lines run locally (default) |
 | `@remote` | `# @remote <target>` | Following lines stream to the target (alias, group, or raw spec) |
 | `@copy` | `# @copy <src> -> <dst> @<target> [--delete] [--exclude <glob>]` | Copy a local path to the target (rsync, or scp fallback); a directory source is flattened into `dst` (contents semantics, identical on GNU rsync and macOS openrsync); supports `$VAR` interpolation; `--exclude` is repeatable and honored by rsync (warned as ignored on the scp fallback and in `--local` mode) |
-| `@export` | `# @export <VAR>[,<VAR>…]` | Capture variables from the preceding local block into run state |
+| `@export` | `# @export <VAR>[,<VAR>…] [--public]` | Capture variables from the preceding local block into run state. Captured values are masked in all output by default; `--public` opts out for a value that is meant to be read |
 | `@timeout` | `# @timeout <seconds>` | Per-step timeout for the next block |
 | `@name` | `# @name <label>` | Name the next block (for `--only`/`--skip` and reporting) |
 | `@only_if` | `# @only_if <command>` | Skip the next block where `<command>` fails |

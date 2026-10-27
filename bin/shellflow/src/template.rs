@@ -15,6 +15,7 @@ use shellflow_secrets::{
     env::parse_env_file,
     identity::{effective_identity_path, load_x25519_identity},
 };
+use zeroize::Zeroizing;
 
 use crate::{
     cli::{RenderFormat, TemplateCheckArgs, TemplateCmd, TemplateRenderArgs},
@@ -94,8 +95,12 @@ fn render(args: &TemplateRenderArgs, ui: &Ui) -> Result<()> {
         .wrap_err_with(|| format!("failed to read template `{}`", args.template.display()))?;
     let pairs = decrypt_env(&args.file, args.identity.as_deref())?;
     let map: HashMap<String, String> = pairs.into_iter().collect();
-    let rendered =
-        render_template(&content, &map).map_err(|err| eyre!("{err} (unit would fail to start)"))?;
+    // The rendered document is every credential in the clear. `Zeroizing`
+    // scrubs it when this function returns instead of leaving a plaintext copy
+    // for the allocator to hand to the next caller.
+    let rendered = Zeroizing::new(
+        render_template(&content, &map).map_err(|err| eyre!("{err} (unit would fail to start)"))?,
+    );
     match args.format {
         RenderFormat::Toml => {
             use std::str::FromStr as _;

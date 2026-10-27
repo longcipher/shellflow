@@ -100,8 +100,8 @@ impl ServiceError {
     #[must_use]
     pub(crate) const fn exit_code(&self) -> i32 {
         match self {
-            Self::Transport(_) => 3,
-            Self::Other(_) => 1,
+            Self::Transport(_) => crate::exit::Code::Transport.code(),
+            Self::Other(_) => crate::exit::Code::Plan.code(),
         }
     }
 }

@@ -6,7 +6,7 @@
 //! installed binary, and downloads the matching asset only when they differ.
 //! No download means nothing downstream needs a restart.
 
-use super::host::quote;
+use crate::executor::quote;
 
 /// The remote command for `@release`.
 ///

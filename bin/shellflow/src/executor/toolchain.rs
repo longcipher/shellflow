@@ -10,7 +10,7 @@
 //! - `foundry` skips the toolchain install while `anvil` is running (the installer refuses to
 //!   replace a running binary, and stopping a live service is never the updater's call).
 
-use super::host::quote;
+use crate::executor::quote;
 
 /// The remote command for `@toolchain`.
 ///

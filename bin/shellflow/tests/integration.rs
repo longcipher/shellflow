@@ -120,6 +120,12 @@ fn run_with_env(
     cmd.output().map_err(|e| e.to_string())
 }
 
+/// Exit code 5: a step exceeded `--timeout`/`@timeout` (design §6).
+///
+/// Distinct from 4 ("the step ran and failed") so a CI retry policy can tell a
+/// slow host from a broken deploy.
+const EXIT_TIMEOUT: i32 = 5;
+
 fn status_code(output: &Output) -> i32 {
     output.status.code().unwrap_or(-1)
 }
@@ -298,6 +304,31 @@ fn a_runtime_exported_secret_is_masked_in_later_output() -> TestResult<()> {
 }
 
 #[test]
+fn a_runtime_export_is_masked_whatever_its_name_and_public_opts_out() -> TestResult<()> {
+    // The masking decision must not depend on the variable *name*: a playbook
+    // that pulls a credential from a vault exports it as `DATABASE_URL`, not
+    // as `DB_PASSWORD`, and printing it in the clear (plus writing it to
+    // `--log-file`) is the exact failure the masker exists to prevent.
+    // `--public` is the explicit opt-out for a value that is meant to be read.
+    let sb = Sandbox::new("mask-export-name")?;
+    let script = sb.script(
+        "DATABASE_URL=postgres://u:hunter2secret@h/db\n\
+         RELEASE=v9.9.9\n\
+         # @export DATABASE_URL\n\
+         # @export RELEASE --public\n\
+         # @name reveal\n\
+         echo \"db=$DATABASE_URL release=$RELEASE\"\n",
+    )?;
+    let out = sb.run(&script, &[])?;
+    assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("hunter2secret"), "a non-secret-looking name leaked: {stdout}");
+    assert!(stdout.contains("***"), "mask not applied: {stdout}");
+    assert!(stdout.contains("v9.9.9"), "`--public` must stay readable: {stdout}");
+    Ok(())
+}
+
+#[test]
 fn check_mode_runs_bash_n_not_execution() -> TestResult<()> {
     let sb = Sandbox::new("check")?;
     let script = sb.script(
@@ -466,7 +497,10 @@ fn rsync_copy_creates_parent_dir_via_rsync_path() -> TestResult<()> {
     assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let log = sb.rsync_log();
     assert!(log.contains("--rsync-path"), "rsync-path wrapper missing: {log}");
-    assert!(log.contains("mkdir -p '/srv' && rsync"), "mkdir should target the parent dir: {log}");
+    assert!(
+        log.contains("mkdir -p -- '/srv' && rsync"),
+        "mkdir should target the parent dir: {log}"
+    );
     Ok(())
 }
 
@@ -547,7 +581,7 @@ fn timeout_kills_hanging_host() -> TestResult<()> {
          sleep 1\n",
     )?;
     let out = sb.run(&script, &["--timeout", "2"])?;
-    assert_eq!(status_code(&out), 4, "timeout is a failure");
+    assert_eq!(status_code(&out), EXIT_TIMEOUT, "a timeout has its own exit code");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("TIMEOUT") || stdout.contains("timed out"),
@@ -717,7 +751,7 @@ fn guard_timeout_is_failure() -> TestResult<()> {
          echo hi\n",
     )?;
     let out = sb.run(&script, &["--timeout", "1"])?;
-    assert_eq!(status_code(&out), 4, "a hanging guard must be a timeout failure");
+    assert_eq!(status_code(&out), EXIT_TIMEOUT, "a hanging guard must be a timeout failure");
     Ok(())
 }
 
@@ -1540,7 +1574,7 @@ fn timeout_kills_the_whole_process_group() -> TestResult<()> {
         pid_file.display()
     ))?;
     let out = sb.run(&script, &["--timeout", "1"])?;
-    assert_eq!(status_code(&out), 4, "timeout is a failure: {out:?}");
+    assert_eq!(status_code(&out), EXIT_TIMEOUT, "a timeout has its own exit code: {out:?}");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !pid_file.exists() && std::time::Instant::now() < deadline {
@@ -1575,7 +1609,7 @@ fn stubborn_child_is_escalated_to_sigkill() -> TestResult<()> {
         pid_file.display()
     ))?;
     let out = sb.run(&script, &["--timeout", "1"])?;
-    assert_eq!(status_code(&out), 4, "timeout is a failure: {out:?}");
+    assert_eq!(status_code(&out), EXIT_TIMEOUT, "a timeout has its own exit code: {out:?}");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !pid_file.exists() && std::time::Instant::now() < deadline {
@@ -1880,8 +1914,9 @@ fn export_capture_file_is_removed_when_the_step_fails() -> TestResult<()> {
 #[test]
 fn export_capture_file_is_removed_on_success() -> TestResult<()> {
     let sb = Sandbox::new("capture-cleanup-ok")?;
-    let script = sb
-        .script("# @local\nOKVAR=value\n# @export OKVAR\necho done\n# @local\necho \"$OKVAR\"\n")?;
+    let script = sb.script(
+        "# @local\nOKVAR=value\n# @export OKVAR\necho done\n# @local\necho \"len=${#OKVAR}\"\n",
+    )?;
     let before = export_capture_files();
     let out = sb.run(&script, &[])?;
     assert_eq!(status_code(&out), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -1889,9 +1924,13 @@ fn export_capture_file_is_removed_on_success() -> TestResult<()> {
     for path in &after {
         assert!(!before.contains(path), "capture file leaked: {}", path.display());
     }
+    // The value reaches the next step; its *length* is asserted rather than
+    // its text because a captured value is masked by default now (and a short
+    // one would be redacted as a standalone token).
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("value"),
-        "the exported value must reach the next step"
+        String::from_utf8_lossy(&out.stdout).contains("len=5"),
+        "the exported value must reach the next step: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
     Ok(())
 }
@@ -1901,8 +1940,10 @@ fn export_value_cannot_forge_a_sibling_variable() -> TestResult<()> {
     // NUL-delimited records (design §7.6): a newline inside one exported value
     // must never be read as a second `NAME=VALUE` record.
     let sb = Sandbox::new("export-forgery")?;
+    // `--public` keeps both values readable in the output: this test is about
+    // the NUL framing, not about masking (which would redact them).
     let script = sb.script(
-        "# @local\nB=real-B-value\nA=$'legit-a\nB=FORGED-BY-A'\n# @export A,B\necho step-one\n\
+        "# @local\nB=real-B-value\nA=$'legit-a\nB=FORGED-BY-A'\n# @export A,B --public\necho step-one\n\
          # @local\nprintf 'SEEN_A=[%s] SEEN_B=[%s]\\n' \"$A\" \"$B\"\n",
     )?;
     let out = sb.run(&script, &[])?;

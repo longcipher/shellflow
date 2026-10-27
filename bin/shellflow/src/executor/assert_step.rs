@@ -23,7 +23,9 @@ use tokio::sync::Semaphore;
 
 use super::stream;
 use crate::{
-    executor::{ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel, fanout_slot},
+    executor::{
+        ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel, fanout_slot, quote,
+    },
     rbatch::{Batch, SshDest},
 };
 
@@ -42,15 +44,10 @@ fn check_budget(check: &Assertion, step_timeout: Option<u64>) -> u64 {
     match check {
         Assertion::Port { .. } => step_timeout.unwrap_or(DEFAULT_PORT_TIMEOUT_SECS),
         Assertion::Health { .. } => step_timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS),
-        // The unit-state, enablement, port-free, and rendered checks answer
-        // at once.
-        Assertion::UnitState { .. } |
-        Assertion::Enabled { .. } |
-        Assertion::PortFree { .. } |
-        Assertion::Rendered { .. } |
-        Assertion::NoLeak { .. } |
-        Assertion::Digest { .. } |
-        Assertion::Credstore { .. } => 0,
+        // The unit-state, enablement, port-free, rendered, leak, digest and
+        // credential-store checks all answer at once — and so would a variant
+        // this build does not know (`Assertion` is `#[non_exhaustive]`).
+        _ => 0,
     }
 }
 
@@ -393,6 +390,11 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
             helper = quote(crate::executor::host::HELPER_PATH),
             service = quote(service),
         ),
+        // `Assertion` is `#[non_exhaustive]`: an unknown check cannot be
+        // evaluated, and reporting it as passed would be a lie — the command
+        // fails and says why.
+        _ => "echo 'this build does not recognise the assertion (upgrade shellflow)'; false"
+            .to_string(),
     }
 }
 
@@ -442,14 +444,9 @@ fn status_glob(pattern: &str) -> String {
     pattern.to_string()
 }
 
-/// Quote a value for the remote shell.
-///
-/// The value comes from the playbook (a unit name, a state, a URL), so it
-/// is quoted rather than trusted: a unit name with a space must not become
-/// two arguments.
-fn quote(value: &str) -> String {
-    shellflow_core::shell_quote_single(value)
-}
+// `quote` is the executor-wide helper (`super::quote`): the value comes from
+// the playbook (a unit name, a state, a URL), so it is quoted rather than
+// trusted — a unit name with a space must not become two arguments.
 
 #[cfg(test)]
 mod tests {

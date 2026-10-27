@@ -3,7 +3,7 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -109,6 +109,48 @@ pub fn effective_identity_path(explicit: Option<&Path>) -> Result<PathBuf, Secre
     }
 }
 
+/// Why an identity file's owner/mode pair is unacceptable.
+///
+/// Kept as a value rather than an inline `if` so both rules are testable: the
+/// ownership rule cannot be exercised with a real file in an unprivileged test
+/// (it needs a second uid), and a security check whose negative branch is
+/// untestable is a check nobody can regression-proof.
+#[derive(Debug, Eq, PartialEq)]
+enum IdentityFault {
+    /// Owned by another local user: that file decides which secrets this
+    /// process can decrypt, and a `0400` mode passes a mode-only check.
+    NotOwned { owner: u32, euid: u32 },
+    /// Group- or world-accessible: anyone who can read it holds the master key.
+    Accessible { mode: u32 },
+}
+
+impl IdentityFault {
+    fn describe(self, path: &Path) -> String {
+        match self {
+            Self::NotOwned { owner, euid } => format!(
+                "identity file is owned by uid {owner}, not by the current user (uid {euid}); \
+                 copy it into your own account (or set {ALLOW_UNSAFE_IDENTITY_ENV}=1 to override)"
+            ),
+            Self::Accessible { mode } => format!(
+                "identity file is group/world-accessible (mode {mode:o}); run `chmod 600 {}` \
+                 (or set {ALLOW_UNSAFE_IDENTITY_ENV}=1 to override)",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// The first rule the identity's metadata violates, if any.
+const fn identity_fault(owner: u32, mode: u32, euid: u32) -> Option<IdentityFault> {
+    if owner != euid {
+        Some(IdentityFault::NotOwned { owner, euid })
+    } else if mode & 0o077 != 0 {
+        Some(IdentityFault::Accessible { mode })
+    } else {
+        None
+    }
+}
+
 /// Load an X25519 identity from an age identity file.
 ///
 /// The identity is the master key for every sealed env file the operator
@@ -127,24 +169,32 @@ pub fn load_x25519_identity(path: &Path) -> Result<age::x25519::Identity, Secret
     // The file is opened once and inspected through the open descriptor.
     // Stat-then-open would allow the file to be replaced in between, so the
     // mode that was checked could belong to a different file than the one
-    // that is actually read.
-    let mut file = fs::File::open(path).map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => SecretsError::MissingIdentity(path.display().to_string()),
-        _ => SecretsError::ReadIdentity { path: path.display().to_string(), source: err },
-    })?;
+    // that is actually read. `O_NOFOLLOW` closes the other half of that
+    // window: without it a symlink planted at the identity path (or at
+    // `$SHELLFLOW_AGE_IDENTITY`) is followed, and the descriptor that passes
+    // the mode check is the link target's, not the operator's file.
+    let mut file =
+        fs::OpenOptions::new().read(true).custom_flags(nix::libc::O_NOFOLLOW).open(path).map_err(
+            |err| match err.kind() {
+                std::io::ErrorKind::NotFound => {
+                    SecretsError::MissingIdentity(path.display().to_string())
+                }
+                _ => SecretsError::ReadIdentity { path: path.display().to_string(), source: err },
+            },
+        )?;
     let metadata = file.metadata().map_err(|source| SecretsError::ReadIdentity {
         path: path.display().to_string(),
         source,
     })?;
     let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 && !allow_unsafe_identity() {
+    let owner = metadata.uid();
+    let euid = nix::unistd::geteuid().as_raw();
+    if let Some(fault) = identity_fault(owner, mode, euid) &&
+        !allow_unsafe_identity()
+    {
         return Err(SecretsError::InvalidIdentity {
             path: path.display().to_string(),
-            reason: format!(
-                "identity file is group/world-accessible (mode {mode:o}); run `chmod 600 {}` \
-                 (or set {ALLOW_UNSAFE_IDENTITY_ENV}=1 to override)",
-                path.display()
-            ),
+            reason: fault.describe(path),
         });
     }
 
@@ -284,6 +334,46 @@ mod tests {
         let path = dir.path().join("keys.txt");
         generate_identity(&path).expect("first write");
         assert!(matches!(generate_identity(&path), Err(SecretsError::WriteFile { .. })));
+    }
+
+    #[test]
+    fn the_identity_fault_checks_ownership_before_mode() {
+        // A 0400 file owned by somebody else passes a mode-only check, and it
+        // decides which secrets this process can decrypt.
+        assert_eq!(identity_fault(1000, 0o600, 1000), None);
+        assert_eq!(
+            identity_fault(0, 0o400, 1000),
+            Some(IdentityFault::NotOwned { owner: 0, euid: 1000 })
+        );
+        assert_eq!(
+            identity_fault(1000, 0o644, 1000),
+            Some(IdentityFault::Accessible { mode: 0o644 })
+        );
+        assert_eq!(
+            identity_fault(1000, 0o640, 1000),
+            Some(IdentityFault::Accessible { mode: 0o640 })
+        );
+    }
+
+    #[test]
+    fn a_symlinked_identity_is_refused() {
+        // A symlink planted at the identity path used to be followed, so the
+        // descriptor that passed the mode check was the link target's.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real = dir.path().join("real-keys.txt");
+        generate_identity(&real).expect("generate");
+        let link = dir.path().join("keys.txt");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let err = match load_x25519_identity(&link) {
+            Err(err) => err,
+            Ok(_) => panic!("a symlinked identity must be refused"),
+        };
+        assert!(
+            matches!(err, SecretsError::ReadIdentity { .. } | SecretsError::InvalidIdentity { .. }),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

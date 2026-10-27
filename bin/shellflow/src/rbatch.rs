@@ -77,7 +77,7 @@ pub(crate) struct Section {
 }
 
 /// A framed batch of remote queries.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Batch {
     script: String,
     nonce: String,
@@ -172,13 +172,29 @@ impl Batch {
         &self,
         dest: &SshDest,
     ) -> Result<BTreeMap<String, Section>, ServiceError> {
+        self.run_dest_within(dest, BATCH_TIMEOUT)
+    }
+
+    /// Run the batch against one destination with an explicit budget.
+    ///
+    /// The budget is a parameter because the executor's assertion path has its
+    /// own `@assert_health --timeout` budget and must not be held to the
+    /// maintenance subcommand's 300 s.
+    pub(crate) fn run_dest_within(
+        &self,
+        dest: &SshDest,
+        timeout: Duration,
+    ) -> Result<BTreeMap<String, Section>, ServiceError> {
         let host = dest_label(dest);
         let mut cmd = Command::new("ssh");
-        cmd.arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=15")
-            .args(dest.args())
+        // The same `ssh` policy every other invocation uses (`BatchMode`, `-T`,
+        // the connect bound). A batch owns its channel, so it neither opens nor
+        // joins a multiplexed one.
+        crate::executor::transport::apply_options(
+            crate::executor::transport::SshPolicy::batch(),
+            &mut cmd,
+        );
+        cmd.args(dest.args())
             .arg("sh")
             .arg("-s")
             .stdin(Stdio::piped())
@@ -219,7 +235,7 @@ impl Batch {
             let timed_out = Arc::clone(&timed_out);
             let finished = Arc::clone(&finished);
             std::thread::spawn(move || {
-                let deadline = Instant::now() + BATCH_TIMEOUT;
+                let deadline = Instant::now() + timeout;
                 while !finished.load(Ordering::Relaxed) {
                     if Instant::now() >= deadline {
                         timed_out.store(true, Ordering::Relaxed);
@@ -284,113 +300,38 @@ impl Batch {
         if timed_out.load(Ordering::Relaxed) {
             return Err(ServiceError::Transport(eyre::eyre!(
                 "ssh {host} timed out after {}s",
-                BATCH_TIMEOUT.as_secs()
+                timeout.as_secs()
             )));
         }
 
         Self::finish(&host, status, reader.finish(), stderr_text)
     }
 
-    /// Run the batch against one destination, asynchronously.
+    /// Run the batch against one destination from an async caller.
+    ///
+    /// The blocking implementation is the *only* implementation. A second
+    /// async copy of "spawn ssh, drain stderr, watch the process group, parse
+    /// as the answers arrive" is a second place for the stderr deadlock to
+    /// hide, and the two copies had already drifted. `spawn_blocking` keeps
+    /// the executor's runtime worker free while the batch runs.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError::Transport`] when the SSH transport is
-    /// unavailable or when the host answered with nothing that looks like a
-    /// batch.
+    /// unavailable, when the host answered with nothing that looks like a
+    /// batch, or when the blocking worker did not finish.
     pub(crate) async fn run_async_dest(
         &self,
         dest: &SshDest,
         timeout: Duration,
     ) -> Result<BTreeMap<String, Section>, ServiceError> {
-        use tokio::io::AsyncWriteExt as _;
-
-        let host = dest_label(dest);
-        let mut cmd = tokio::process::Command::new("ssh");
-        cmd.arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=15")
-            .args(dest.args())
-            .arg("sh")
-            .arg("-s")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        crate::executor::process::isolate(&mut cmd);
-        let mut child = cmd.spawn().map_err(|err| {
-            ServiceError::Transport(eyre::eyre!("failed to run ssh {host}: {err}"))
-        })?;
-        let mut guard = crate::executor::process::GroupGuard::new(&child);
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(self.script().as_bytes()).await;
-        }
-        // stderr is drained concurrently (see the synchronous path): reading
-        // it only after `wait()` deadlocks once ssh fills the stderr pipe.
-        let stderr_task = child.stderr.take().map(|mut stderr| {
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt as _;
-                let mut text = String::new();
-                let _ = stderr.read_to_string(&mut text).await;
-                text
-            })
-        });
-
-        // The answers are parsed **as they arrive**: the response is never
-        // held twice, and the connection is closed as soon as the last
-        // expected answer is in.
-        let mut reader = AnswerReader::new(self);
-        let read = async {
-            if let Some(stdout) = child.stdout.take() {
-                use tokio::io::AsyncBufReadExt as _;
-                let mut lines = tokio::io::BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    reader.push_line(&line);
-                    if reader.is_complete() {
-                        // See the synchronous path: the group goes, so a
-                        // ProxyCommand cannot outlive the answer.
-                        if let Some(pid) = child.id() {
-                            crate::executor::process::signal_group(
-                                pid,
-                                nix::sys::signal::Signal::SIGKILL,
-                            );
-                        }
-                        break;
-                    }
-                }
-            }
-            child.wait().await
-        };
-        let status = match tokio::time::timeout(timeout, read).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(err)) => {
-                crate::executor::process::terminate(&mut child).await;
-                guard.disarm();
-                if let Some(task) = stderr_task {
-                    task.abort();
-                }
-                return Err(ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")));
-            }
-            Err(_) => {
-                crate::executor::process::terminate(&mut child).await;
-                guard.disarm();
-                if let Some(task) = stderr_task {
-                    task.abort();
-                }
-                return Err(ServiceError::Transport(eyre::eyre!(
-                    "ssh {host} timed out after {}s",
-                    timeout.as_secs()
-                )));
-            }
-        };
-        guard.disarm();
-        let stderr_text = match stderr_task {
-            Some(task) => task.await.unwrap_or_default(),
-            None => String::new(),
-        };
-
-        Self::finish(&host, status, reader.finish(), stderr_text)
+        let batch = self.clone();
+        let dest = dest.clone();
+        tokio::task::spawn_blocking(move || batch.run_dest_within(&dest, timeout)).await.map_err(
+            |err| {
+                ServiceError::Transport(eyre::eyre!("the batch worker stopped unexpectedly: {err}"))
+            },
+        )?
     }
 
     /// Turn the parsed answers of a batch into its result.

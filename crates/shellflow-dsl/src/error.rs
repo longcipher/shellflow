@@ -5,6 +5,7 @@ use thiserror::Error;
 /// Errors produced while parsing a deploy script into an
 /// [`crate::plan::ExecutionPlan`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ParseError {
     /// An ssh spec was malformed.
     #[error("line {line}: invalid ssh spec `{spec}`: {reason}")]
@@ -75,6 +76,7 @@ pub enum ParseError {
 /// Errors produced while interpolating `$VAR` / `${VAR}` references in copy
 /// paths against captured run state.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum InterpolateError {
     /// A referenced variable is not present in the run state.
     #[error("unresolved variable `{var}` in `{template}`")]

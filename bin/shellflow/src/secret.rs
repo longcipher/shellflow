@@ -385,11 +385,6 @@ fn validate_plaintext_env(bytes: &[u8]) -> Result<()> {
 /// exactly how zombie passwords are born. Returns an error when any group is
 /// found (CI gate).
 fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
-    use std::{
-        collections::{HashMap, hash_map::RandomState},
-        hash::{Hash, Hasher as _},
-    };
-
     let mut files: Vec<PathBuf> = Vec::new();
     collect_env_age_files(&args.dir, &mut files)?;
     files.sort();
@@ -398,13 +393,7 @@ fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
     }
     let identity = load_identity(args.identity.as_deref())?;
 
-    let mut by_hash: HashMap<u64, Vec<String>> = HashMap::new();
-    // One hasher state for the whole scan: `RandomState` is randomly keyed
-    // per instance, so building a fresh one per value would give identical
-    // values different digests and the shared-value gate would never fire.
-    // The random key still holds across runs (no offline oracle), while
-    // equality within this run is exact.
-    let hash_state = RandomState::new();
+    let mut locations: Vec<(String, String)> = Vec::new();
     for file in &files {
         let cipher =
             fs::read(file).wrap_err_with(|| format!("failed to read `{}`", file.display()))?;
@@ -415,10 +404,46 @@ fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
             if value.is_empty() {
                 continue;
             }
-            let mut hasher = std::hash::BuildHasher::build_hasher(&hash_state);
-            value.hash(&mut hasher);
-            by_hash.entry(hasher.finish()).or_default().push(format!("{}:{key}", file.display()));
+            locations.push((format!("{}:{key}", file.display()), value));
         }
+    }
+    let groups = shared_value_groups(&locations);
+    if groups.is_empty() {
+        println!("OK: all credential values unique across {} file(s)", files.len());
+        return Ok(());
+    }
+    for group in &groups {
+        println!("shared value (rotate together):");
+        for loc in group {
+            println!("  {loc}");
+        }
+    }
+    bail!("found {} shared credential value(s) under {}", groups.len(), args.dir.display());
+}
+
+/// Group the `(location, value)` pairs that share a value.
+///
+/// Split out of [`find_duplicates`] so the gate itself is testable: the
+/// grouping is what decides whether CI fails, and doing it here keeps the
+/// values inside one function that never prints them.
+///
+/// One hasher state for the whole scan: [`std::collections::hash_map::RandomState`]
+/// is randomly keyed per instance, so building a fresh one per value would give
+/// identical values different digests and the gate would never fire. The random
+/// key still holds across runs (no offline oracle), while equality within this
+/// run is exact.
+fn shared_value_groups(locations: &[(String, String)]) -> Vec<Vec<String>> {
+    use std::{
+        collections::{HashMap, hash_map::RandomState},
+        hash::{Hash as _, Hasher as _},
+    };
+
+    let hash_state = RandomState::new();
+    let mut by_hash: HashMap<u64, Vec<String>> = HashMap::new();
+    for (location, value) in locations {
+        let mut hasher = std::hash::BuildHasher::build_hasher(&hash_state);
+        value.hash(&mut hasher);
+        by_hash.entry(hasher.finish()).or_default().push(location.clone());
     }
     let mut groups: Vec<Vec<String>> = by_hash
         .into_values()
@@ -429,18 +454,8 @@ fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
             unique.len() > 1
         })
         .collect();
-    if groups.is_empty() {
-        println!("OK: all credential values unique across {} file(s)", files.len());
-        return Ok(());
-    }
     groups.sort();
-    for group in &groups {
-        println!("shared value (rotate together):");
-        for loc in group {
-            println!("  {loc}");
-        }
-    }
-    bail!("found {} shared credential value(s) under {}", groups.len(), args.dir.display());
+    groups
 }
 
 /// Recursively collect `*.env.age` files.
@@ -479,6 +494,33 @@ mod tests {
         os::unix::fs::PermissionsExt as _,
         path::{Path, PathBuf},
     };
+
+    #[test]
+    fn shared_values_group_together_and_unique_ones_do_not() {
+        let locations = vec![
+            ("a.env:KEY".to_string(), "shared".to_string()),
+            ("b.env:KEY".to_string(), "shared".to_string()),
+            ("a.env:OTHER".to_string(), "shared".to_string()),
+            ("c.env:KEY".to_string(), "unique".to_string()),
+            ("d.env:EMPTYISH".to_string(), String::new()),
+        ];
+        let groups = super::shared_value_groups(&locations);
+        // The order inside a group is the scan order (files sorted, keys in
+        // file order), which is what the operator reads.
+        assert_eq!(
+            groups,
+            vec![vec!["a.env:KEY".to_string(), "b.env:KEY".to_string(), "a.env:OTHER".to_string()]]
+        );
+    }
+
+    #[test]
+    fn a_value_that_appears_once_is_not_a_shared_value() {
+        let locations = vec![
+            ("a.env:KEY".to_string(), "one".to_string()),
+            ("b.env:KEY".to_string(), "two".to_string()),
+        ];
+        assert!(super::shared_value_groups(&locations).is_empty());
+    }
 
     use shellflow_secrets::identity::{generate_identity, public_recipient};
 

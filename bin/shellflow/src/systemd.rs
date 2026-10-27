@@ -37,17 +37,15 @@ use crate::cli::{
     SystemdCmd, SystemdExecArgs, SystemdNotifyArgs, SystemdReloadArgs, SystemdStatusArgs,
     SystemdTransientArgs, SystemdWaitArgs, SystemdWatchArgs, SystemdWatchdogArgs,
 };
-
-/// The unit reached the wanted state.
-pub(crate) const EXIT_READY: i32 = 0;
-/// Usage or internal error.
-pub(crate) const EXIT_USAGE: i32 = 1;
-/// The unit failed.
-pub(crate) const EXIT_FAILED: i32 = 3;
-/// The budget expired.
-pub(crate) const EXIT_TIMEOUT: i32 = 4;
-/// The unit does not exist.
-pub(crate) const EXIT_NOT_FOUND: i32 = 5;
+/// The target-side helper protocol (`crate::exit::helper`): the `systemd`
+/// verbs run on the target and report on a unit, so their codes are a wire
+/// contract with `remote::wait_command`/`remote::reload_command` and with the
+/// template payloads — not the CLI's own codes. They are aliased here so the
+/// ~60 call sites keep reading as `EXIT_FAILED` etc.
+pub(crate) use crate::exit::helper::{
+    FAILED as EXIT_FAILED, NOT_FOUND as EXIT_NOT_FOUND, OK as EXIT_READY, TIMEOUT as EXIT_TIMEOUT,
+    USAGE as EXIT_USAGE,
+};
 
 /// Prefix of the machine-readable state line the wait loop streams.
 pub(crate) const STATE_PREFIX: &str = "SFW";

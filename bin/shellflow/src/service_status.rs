@@ -367,7 +367,9 @@ fn playbook_scripts(dir: &Path) -> Result<Vec<PathBuf>, ServiceError> {
 /// failure yields no hosts — this feeds a best-effort status report.
 fn declared_servers(text: &str) -> Vec<(String, SshSpec)> {
     match shellflow_core::parse_script(text) {
-        Ok(plan) => plan.servers.into_iter().collect(),
+        Ok(plan) => {
+            plan.servers().iter().map(|(name, spec)| (name.clone(), spec.clone())).collect()
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -376,7 +378,7 @@ fn declared_servers(text: &str) -> Vec<(String, SshSpec)> {
 fn remote_targets(text: &str) -> Vec<String> {
     match shellflow_core::parse_script(text) {
         Ok(plan) => {
-            plan.steps.iter().filter_map(|step| step.target_text().map(str::to_string)).collect()
+            plan.steps().iter().filter_map(|step| step.target_text().map(str::to_string)).collect()
         }
         Err(_) => Vec::new(),
     }

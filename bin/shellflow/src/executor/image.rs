@@ -5,7 +5,7 @@
 //! hand-writes, owned by the runner instead. The runtime is detected on the
 //! target (`podman` first, then `docker`).
 
-use super::host::quote;
+use crate::executor::quote;
 
 /// The remote command for `@image`.
 pub(super) fn image_command(images: &[String], prune: bool) -> String {

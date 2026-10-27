@@ -106,6 +106,13 @@ impl ResolvedSecrets {
 
     /// Layer this host's `{host}` pairs onto `env` (a later value wins on a
     /// duplicate key), and extend `LT_SECRET_KEYS` with this host's keys.
+    /// # Plaintext lifetime
+    ///
+    /// The `clone` below is one of the documented escapes from the zeroizing
+    /// set: the value lands in the step's environment map, which lives for the
+    /// whole run and is not scrubbed (design §9 accepts the same exposure for
+    /// the child environment and the mask registry). Do not add another copy
+    /// without saying why in the same place.
     pub(crate) fn overlay(&self, env: &mut Vec<(String, String)>, alias: &str) {
         let Some(pairs) = self.per_host.get(alias) else {
             return;

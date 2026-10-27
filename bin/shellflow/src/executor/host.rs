@@ -18,7 +18,7 @@ use shellflow_core::ResolvedHost;
 use tokio::{process::Command, sync::Semaphore};
 
 use crate::executor::{
-    ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel, fanout_slot, stream,
+    ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel, fanout_slot, quote, stream,
 };
 
 /// The exit code the target helper uses for "the condition did not hold".
@@ -29,11 +29,6 @@ const EXIT_TIMEOUT: i32 = 4;
 
 /// Where the target-side helper is installed.
 pub(crate) const HELPER_PATH: &str = "/usr/local/bin/shellflow";
-
-/// Quote a value for the remote shell.
-pub(super) fn quote(value: &str) -> String {
-    shellflow_core::shell_quote_single(value)
-}
 
 /// The command that runs a host verb through the target-side helper.
 ///
@@ -847,8 +842,15 @@ async fn ship_helper(request: HelperShip<'_>) -> eyre::Result<()> {
     let mut rsync = Command::new("rsync");
     rsync.args(["-a", "-z"]);
     // The copy must fail closed like every other transfer: rsync starts its
-    // own ssh, so it has to be told not to prompt.
-    rsync.args(["-e", &host.spec.rsync_transport()]);
+    // own ssh, so it has to be told not to prompt. Same policy builder as the
+    // step transport, so the connect bound and `--no-ssh-reuse` apply here too.
+    rsync.args([
+        "-e",
+        &super::transport::rsync_transport(
+            super::transport::SshPolicy::step(config.ssh_reuse, false),
+            &host.spec,
+        ),
+    ]);
     rsync.arg(built).arg(format!("{}:{staged}", host.spec.dest()));
     rsync.stdout(Stdio::piped()).stderr(Stdio::piped());
     rsync.stdin(Stdio::null());
@@ -863,9 +865,11 @@ async fn ship_helper(request: HelperShip<'_>) -> eyre::Result<()> {
     if cancel.is_cancelled() {
         return Err(eyre::eyre!("cancelled"));
     }
-    let mut cmd = Command::new("ssh");
-    cmd.args(["-o", "BatchMode=yes"]);
-    cmd.args(host.spec.to_ssh_args()).arg("-T").arg(helper_install_command(staged, install_path));
+    let mut cmd = Command::from(super::transport::ssh_command(
+        super::transport::SshPolicy::step(config.ssh_reuse, config.verbose >= 3),
+        &host.spec,
+    ));
+    cmd.arg(helper_install_command(staged, install_path));
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
     let output = supervised_output(cmd, timeout, cancel)
