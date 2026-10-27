@@ -2,10 +2,18 @@
 //! previews, and summaries.
 //!
 //! Every byte that reaches the terminal or the audit log goes through this
-//! module, and every line that carries user content is redacted on the way
-//! out. That is a deliberate structural choice: a secret leaked because some
-//! call site forgot to mask is a bug the compiler cannot catch, so masking is
-//! applied by the *sink* rather than requested by the caller.
+//! module, and every line is redacted on the way out **by the sink itself**
+//! ([`print_line`] for control lines, [`Ui::emit_host_line`] for host output).
+//! That is the structural half of the guarantee: a secret leaked because some
+//! call site forgot to mask is a bug the compiler cannot catch, so the sink
+//! does not rely on the call site.
+//!
+//! The call sites redact as well, *before* they add colour codes: a
+//! below-threshold value is only redacted where it stands alone as a token,
+//! and the ANSI prefix would otherwise look like an identifier character and
+//! hide the value from the narrow rules. The two passes cannot unmask
+//! anything — a redacted value no longer matches — so the pair is
+//! belt-and-braces rather than duplication.
 //!
 //! The mask set itself lives in a process-wide registry ([`install_masks`] /
 //! [`redact`]) so the free functions — which have no `Ui` handle — redact
@@ -78,6 +86,14 @@ static MASK_SET: OnceLock<RwLock<Arc<MaskSet>>> = OnceLock::new();
 /// The number of lines that could not be written to the audit log.
 static AUDIT_WRITE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
+/// The number of lines that could not be written to the terminal.
+///
+/// A closed stdout (`shellflow … | head`) is not a failure of the run, but it
+/// must not be reported as a clean one: a truncated stream that exits 0 is
+/// indistinguishable from a complete run in CI. The count is reported next to
+/// the audit-log one.
+static TERMINAL_WRITE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
 fn mask_set() -> &'static RwLock<Arc<MaskSet>> {
     MASK_SET.get_or_init(Default::default)
 }
@@ -134,6 +150,14 @@ pub(crate) fn redact(text: &str) -> String {
 /// operator believes the run was recorded in full.
 pub(crate) fn audit_write_failures() -> usize {
     AUDIT_WRITE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// How many lines could not be written to the terminal.
+///
+/// Same rationale as [`audit_write_failures`]: a stream truncated by a closed
+/// pipe must not look like a complete run.
+pub(crate) fn terminal_write_failures() -> usize {
+    TERMINAL_WRITE_FAILURES.load(Ordering::Relaxed)
 }
 
 /// Aggregated per-host result for a step summary.
@@ -360,14 +384,14 @@ impl Ui {
             return;
         }
         self.log_line("Plan:".dimmed().to_string());
-        for (name, spec) in &plan.servers {
+        for (name, spec) in plan.servers() {
             self.log_line(
                 format!("  server  {name:>12} -> {}", redact(&format!("{spec:?}")))
                     .dimmed()
                     .to_string(),
             );
         }
-        for (name, members) in &plan.groups {
+        for (name, members) in plan.groups() {
             self.log_line(
                 format!("  group   {name:>12} -> {}", redact(&members.join(",")))
                     .dimmed()
@@ -377,11 +401,14 @@ impl Ui {
         for (plan_index, step) in selected {
             let target = step.target_text().map_or_default(|t| format!(" -> {t}"));
             let name = step.name().map_or_default(|n| format!(" ({n})"));
-            self.log_line(
-                format!("  step    {:>2}: {}{}{}", plan_index + 1, step.kind(), name, target)
-                    .dimmed()
-                    .to_string(),
-            );
+            // A step name or target can carry a captured value (`@name
+            // deploy-$VERSION`), so the line is redacted like the server and
+            // group lines above it — the sink redacts too, but the call-site
+            // pass is what handles a below-threshold value before the colour
+            // codes are interleaved.
+            let line =
+                format!("  step    {:>2}: {}{}{}", plan_index + 1, step.kind(), name, target);
+            self.log_line(redact(&line).dimmed().to_string());
         }
     }
 
@@ -458,11 +485,15 @@ impl Ui {
         match stream {
             Stream::Stdout => {
                 let mut out = stdout().lock();
-                let _ = writeln!(out, "{rendered}");
+                if writeln!(out, "{rendered}").is_err() {
+                    TERMINAL_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Stream::Stderr => {
                 let mut out = stderr().lock();
-                let _ = writeln!(out, "{rendered}");
+                if writeln!(out, "{rendered}").is_err() {
+                    TERMINAL_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         if let Some(file) = &self.log_file {
@@ -517,15 +548,62 @@ fn colorize_itemize(text: &str) -> String {
 /// When a `--log-file` is configured, the line is also appended to the audit
 /// log so that step headers, notes, warnings, and summaries are captured
 /// alongside host output.
+///
+/// # Masking
+///
+/// The line is redacted here, not only at the call site. The call sites mask
+/// before they colour the text (see the module docs), so this pass is the
+/// guarantee rather than the only defence: a render function that forgets to
+/// mask — the `plan_preview` step line used to — still cannot write a known
+/// secret to the terminal or the audit file.
 fn print_line(text: String, log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>) {
+    let text = redact(&text);
     let mut out = stdout().lock();
-    let _ = writeln!(out, "{text}");
+    if writeln!(out, "{text}").is_err() {
+        TERMINAL_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
     if let Some(file) = log_file {
         let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if file.write_all(text.as_bytes()).is_err() || file.write_all(b"\n").is_err() {
             AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Report a fatal run-path error: masked, on stderr, and in the audit trail.
+///
+/// A run-configuration failure (`@secrets` needing a named `@server`, a
+/// `--local` run against per-host secrets) aborts before any step runs. It
+/// belongs on stderr — the operator greps for it — but it must not be the one
+/// output path that skips the masker, and the audit trail should record why
+/// the run never started.
+pub(crate) fn fatal(message: &str, log_file: &Option<Arc<std::sync::Mutex<std::fs::File>>>) {
+    let text = format!("error: {}", redact(message));
+    let mut out = stderr().lock();
+    if writeln!(out, "{text}").is_err() {
+        TERMINAL_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(file) = log_file {
+        let mut file = file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if file.write_all(text.as_bytes()).is_err() || file.write_all(b"\n").is_err() {
+            AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Report a fatal error reaching stderr, with every known secret masked.
+///
+/// The `run` path prints through [`Ui`], but an error that arrives before the
+/// run started (or after it torn down) has no `Ui` handle. It still must not
+/// carry a value that the mask registry knows: `eyre` reports embed child
+/// stderr, and child stderr can echo a credential.
+pub(crate) fn error_line(report: &eyre::Report) {
+    eprintln!("error: {}", redact(&format!("{report:#}")));
+}
+
+/// Report a fatal error that is plain text, masked like [`error_line`].
+pub(crate) fn error_text(message: &str) {
+    eprintln!("error: {}", redact(message));
 }
 
 /// Print a step header.
@@ -614,6 +692,20 @@ pub(crate) fn step_failed(
 #[cfg(test)]
 mod tests {
     use super::{HostStatus, Outcome, host_parts};
+
+    /// Serializes the tests that install or assert on the mask registry.
+    ///
+    /// The registry is a process-wide `OnceLock<RwLock<..>>` on purpose (the
+    /// free render functions have no `Ui` handle), so two tests that mutate it
+    /// race: one test's `install_masks` replaces the set another test is
+    /// asserting against, and the assertion then fails only when the suite runs
+    /// in parallel. The lock makes the shared state explicit, exactly like
+    /// `ENV_LOCK` in `shellflow-secrets`.
+    static MASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn mask_lock() -> std::sync::MutexGuard<'static, ()> {
+        MASK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn status(alias: &str, outcome: Outcome) -> HostStatus {
         HostStatus { alias: alias.to_string(), outcome }
@@ -711,6 +803,7 @@ mod tests {
 
     #[test]
     fn every_render_path_redacts_a_registered_secret() {
+        let _lock = mask_lock();
         // The masking guarantee is structural: the free functions have no
         // `Ui` handle and still redact, so no call site can leak by
         // forgetting to ask for masking.
@@ -722,6 +815,7 @@ mod tests {
 
     #[test]
     fn extend_masks_registers_runtime_values() {
+        let _lock = mask_lock();
         // A value discovered mid-run (`@export`) joins the registry: the
         // free redaction path — which shares no state with the `Ui` handle —
         // must redact it too.
@@ -737,6 +831,7 @@ mod tests {
 
     #[test]
     fn a_secret_split_across_two_preview_lines_is_redacted_as_a_whole() {
+        let _lock = mask_lock();
         // The preview is a multi-line render of user content, so it must use
         // the *stateful* masker: two fragments that would reassemble into the
         // secret must not survive separately.

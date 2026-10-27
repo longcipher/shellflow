@@ -8,9 +8,9 @@ use shellflow_core::{CopyStep, ResolvedHost};
 use tokio::{process::Command, task::JoinSet};
 
 use super::{
-    ArcUi, CopyStepArgs, DiffFilter, HostOutcome, LogFile, StepConfig, fanout_slot,
+    ArcUi, CopyStepArgs, DiffFilter, HostOutcome, LogFile, RunError, StepConfig, fanout_slot,
     process::{GroupGuard, isolate},
-    remote::{RunError, resolve_remote_env},
+    remote::resolve_remote_env,
     stream,
 };
 
@@ -340,7 +340,7 @@ async fn run_copy_step_local(args: LocalCopyArgs<'_>) -> Result<Vec<(String, Hos
         // after `cp` succeeded. Wiping first (the previous behaviour) meant a
         // failed copy left the destination empty — the worst possible outcome
         // for a `--delete` deploy.
-        return run_local_copy_delete(src, dst, config, cancel).await;
+        return run_local_copy_delete(src, dst, config, cancel, log_file).await;
     }
 
     if let Some(parent) = std::path::Path::new(dst).parent() &&
@@ -354,7 +354,7 @@ async fn run_copy_step_local(args: LocalCopyArgs<'_>) -> Result<Vec<(String, Hos
     let mut cmd = Command::new("cp");
     cmd.arg("-a").arg(src).arg(dst);
     cmd.kill_on_drop(true);
-    let status = run_command_status(cmd, config.timeout, "local copy", cancel).await?;
+    let status = run_command_status(cmd, config.timeout, "local copy", cancel, log_file).await?;
     if !status.success() {
         bail!("local copy exited with status {status}");
     }
@@ -372,6 +372,7 @@ async fn run_local_copy_delete(
     dst: &str,
     config: StepConfig,
     cancel: &super::Cancel,
+    log_file: &LogFile,
 ) -> Result<Vec<(String, HostOutcome)>> {
     let dst_path = std::path::Path::new(dst);
     if let Some(parent) = dst_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -392,7 +393,7 @@ async fn run_local_copy_delete(
     let mut cmd = Command::new("cp");
     cmd.arg("-a").arg(src).arg(&staging);
     cmd.kill_on_drop(true);
-    let status = run_command_status(cmd, config.timeout, "local copy", cancel).await?;
+    let status = run_command_status(cmd, config.timeout, "local copy", cancel, log_file).await?;
     if !status.success() {
         // The old destination is untouched; drop the half-built staging tree.
         remove_path(&staging).await?;
@@ -430,6 +431,7 @@ async fn run_command_status(
     timeout: Option<u64>,
     label: &str,
     cancel: &super::Cancel,
+    log_file: &LogFile,
 ) -> Result<std::process::ExitStatus> {
     isolate(&mut cmd);
     cmd.kill_on_drop(true);
@@ -447,7 +449,7 @@ async fn run_command_status(
             return Err(err).wrap_err(format!("failed to run {label}"));
         }
         super::process::ChildOutcome::TimedOut => {
-            crate::ui::warn(&format!("{label} timed out — killed"), &None);
+            crate::ui::warn(&format!("{label} timed out — killed"), log_file);
             super::process::terminate(&mut child).await;
             guard.disarm();
             bail!("{label} timed out");
@@ -479,8 +481,13 @@ struct RsyncHostArgs<'a> {
 async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
     let RsyncHostArgs { ui, host, srcs, dst, opts, config, has_rsync, log_file, cancel } = args;
     // Never a bare `ssh`: a transport without BatchMode can stop at a
-    // password or host-key prompt in the middle of an unattended deploy.
-    let remote_shell = host.spec.rsync_transport();
+    // password or host-key prompt in the middle of an unattended deploy. The
+    // string comes from the one policy builder, so `--no-ssh-reuse` and the
+    // connect bound reach the transfer too.
+    let remote_shell = super::transport::rsync_transport(
+        super::transport::SshPolicy::step(config.ssh_reuse, false),
+        &host.spec,
+    );
 
     if config.verbose >= 2 {
         crate::ui::note(
@@ -510,7 +517,7 @@ async fn run_rsync_host(args: RsyncHostArgs<'_>) -> (String, HostOutcome) {
                 ),
                 log_file,
             );
-            return (host.alias.clone(), HostOutcome::Failed(super::remote::RunError::Config));
+            return (host.alias.clone(), HostOutcome::Failed(super::RunError::Config));
         }
         crate::ui::warn(
             &format!(
@@ -615,8 +622,9 @@ async fn run_rsync_transfer(args: RsyncTransferArgs<'_>) -> std::result::Result<
             _ => dst.as_str(),
         }
     };
-    let quoted = dir.replace('\'', "'\\''");
-    let mkdir_rsync = format!("mkdir -p '{quoted}' && rsync");
+    // The remote shell parses `--rsync-path` verbatim, so the directory goes
+    // through the one quoting helper instead of a hand-rolled `'\''` swap.
+    let mkdir_rsync = format!("mkdir -p -- {} && rsync", super::quote(dir));
     cmd.args(["--rsync-path", &mkdir_rsync, "-e", args.remote_shell]);
     let dest = format!("{}:{dst}", args.host.spec.dest());
     // Several sources land in one destination directory; rsync keeps each
@@ -727,12 +735,11 @@ async fn run_scp_transfer(
     let scp_srcs: Vec<String> =
         if srcs.len() == 1 && is_dir_src { vec![format!("{first}/.")] } else { srcs.to_vec() };
 
-    let quoted_dir = dir.replace('\'', "'\\''");
-    let mut mkdir = Command::new("ssh");
-    // Fail closed on an unknown host key or a missing key: never prompt.
-    mkdir.args(["-o", "BatchMode=yes"]);
-    mkdir.args(host.spec.to_ssh_args()).arg("-T");
-    mkdir.arg(format!("mkdir -p '{quoted_dir}'"));
+    let mut mkdir = Command::from(super::transport::ssh_command(
+        super::transport::SshPolicy::step(config.ssh_reuse, false),
+        &host.spec,
+    ));
+    mkdir.arg(format!("mkdir -p -- {}", super::quote(&dir)));
     mkdir
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -744,7 +751,7 @@ async fn run_scp_transfer(
     // Routed through `run_command_status` so the mkdir honours the per-step
     // timeout and owns a `GroupGuard`: an unbounded `ssh` here used to hang a
     // `--timeout`-bounded copy step forever.
-    let status = run_command_status(mkdir, mkdir_timeout, "remote mkdir", &cancel)
+    let status = run_command_status(mkdir, mkdir_timeout, "remote mkdir", &cancel, log_file)
         .await
         .map_err(|err| CopyFailure::transport(format!("failed to create remote dir: {err:#}")))?;
     if !status.success() {

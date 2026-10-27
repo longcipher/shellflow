@@ -7,7 +7,7 @@
 //! runner, so a new service adds one declarative block instead of a new
 //! build script.
 
-use super::host::quote;
+use crate::executor::quote;
 
 /// The remote command for `@build`.
 ///
@@ -161,22 +161,27 @@ pub(super) fn build_command(build: &shellflow_core::BuildStep) -> String {
 mod tests {
     use super::build_command;
 
+    /// Build a `BuildStep` through the parser.
+    ///
+    /// The payload structs are `#[non_exhaustive]`, so the DSL is the only
+    /// constructor a consumer has — which is the point: a step carries
+    /// invariants the parser enforced (a declared target, a required
+    /// `--build`), and a struct literal would skip them.
+    fn step(directive: &str) -> shellflow_core::BuildStep {
+        let script = format!("# @server api api\n{directive}\n");
+        let plan = shellflow_core::parse_script(&script).expect("the fixture parses");
+        match &plan.steps()[0] {
+            shellflow_core::Step::Build(step) => step.clone(),
+            other => panic!("expected a build step, got {other:?}"),
+        }
+    }
+
     fn sample() -> String {
-        build_command(&shellflow_core::BuildStep {
-            name: None,
-            target: shellflow_core::Target::new("api"),
-            repo: "https://github.com/x/y.git".to_string(),
-            git_ref: "abc123".to_string(),
-            build_cmd: "cargo build --release -p app".to_string(),
-            prep_cmd: None,
-            workdir: None,
-            artifacts: vec!["target/release/app".to_string()],
-            install_dirs: vec!["/opt/app/bin".to_string()],
-            units: vec!["app.service".to_string()],
-            version_flag: "--version".to_string(),
-            min_free_gb: 8,
-            timeout: None,
-        })
+        build_command(&step(
+            "# @build https://github.com/x/y.git @api --ref abc123 \
+             --build 'cargo build --release -p app' --artifacts target/release/app \
+             --install-dirs /opt/app/bin --units app.service --version-flag=--version",
+        ))
     }
 
     #[test]
@@ -209,41 +214,19 @@ mod tests {
         let cmd = sample();
         assert!(cmd.contains("--version"), "{cmd}");
         // …and falls back to the flag chain when no flag is declared.
-        let noflag = build_command(&shellflow_core::BuildStep {
-            name: None,
-            target: shellflow_core::Target::new("api"),
-            repo: "https://github.com/x/y.git".to_string(),
-            git_ref: "r".to_string(),
-            build_cmd: "make".to_string(),
-            prep_cmd: None,
-            workdir: None,
-            artifacts: vec!["app".to_string()],
-            install_dirs: vec!["/opt/a".to_string()],
-            units: vec![],
-            version_flag: String::new(),
-            min_free_gb: 8,
-            timeout: None,
-        });
+        let noflag = build_command(&step(
+            "# @build https://github.com/x/y.git @api --ref r --build make \
+             --artifacts app --install-dirs /opt/a",
+        ));
         assert!(noflag.contains("--version -V -v -version version"), "{noflag}");
     }
 
     #[test]
     fn build_values_are_quoted() {
-        let cmd = build_command(&shellflow_core::BuildStep {
-            name: None,
-            target: shellflow_core::Target::new("api"),
-            repo: "https://github.com/x/y.git".to_string(),
-            git_ref: "r; evil".to_string(),
-            build_cmd: "make".to_string(),
-            prep_cmd: None,
-            workdir: None,
-            artifacts: vec!["a".to_string()],
-            install_dirs: vec!["/opt/a".to_string()],
-            units: vec![],
-            version_flag: String::new(),
-            min_free_gb: 8,
-            timeout: None,
-        });
+        let cmd = build_command(&step(
+            "# @build https://github.com/x/y.git @api --ref 'r; evil' --build make \
+             --artifacts a --install-dirs /opt/a",
+        ));
         assert!(cmd.contains("'r; evil'"), "{cmd}");
     }
 
@@ -255,21 +238,12 @@ mod tests {
 
     #[test]
     fn build_installs_renamed_artifacts_under_the_new_name() {
-        let mut step = shellflow_core::BuildStep {
-            name: None,
-            target: shellflow_core::Target::new("ai"),
-            repo: "https://github.com/bnb-chain/reth.git".to_string(),
-            git_ref: "5710c1f".to_string(),
-            build_cmd: "cargo build --release -p reth".to_string(),
-            prep_cmd: None,
-            workdir: None,
-            artifacts: vec!["target/release/reth=reth-bsc".to_string()],
-            install_dirs: vec!["/usr/local/bin".to_string()],
-            units: vec!["bsc-reth-testnet.service".to_string()],
-            version_flag: "--version".to_string(),
-            min_free_gb: 20,
-            timeout: None,
-        };
+        let mut step = step(
+            "# @build https://github.com/bnb-chain/reth.git @api --ref 5710c1f \
+             --build 'cargo build --release -p reth' \
+             --artifacts target/release/reth=reth-bsc --install-dirs /usr/local/bin \
+             --units bsc-reth-testnet.service --version-flag=--version --min-free-gb 20",
+        );
         let cmd = build_command(&step);
         // The installed file and its backup carry the *new* name; the
         // built file keeps the workspace name.

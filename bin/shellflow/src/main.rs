@@ -33,6 +33,7 @@ mod diffutil;
 #[expect(clippy::print_stdout, reason = "emit writes generated files and reports the path")]
 mod emit;
 mod executor;
+mod exit;
 mod fsx;
 #[expect(clippy::print_stdout, reason = "host command report output")]
 mod host;
@@ -74,7 +75,7 @@ mod unit;
 mod unit_cmd;
 mod unit_verify;
 
-use std::{sync::Arc, time::Duration};
+use std::{process::ExitCode, sync::Arc, time::Duration};
 
 use clap::Parser;
 use eyre::{Context as _, Result};
@@ -87,9 +88,6 @@ use crate::{
     ui::HostStatus,
 };
 
-/// The exit code used when interrupted by a signal.
-const EXIT_INTERRUPTED: i32 = 130;
-
 /// How long the executor is given to tear down its children after an
 /// interrupt.
 ///
@@ -99,7 +97,7 @@ const EXIT_INTERRUPTED: i32 = 130;
 const INTERRUPT_GRACE: Duration = Duration::from_secs(15);
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let code = match &cli.command {
@@ -108,15 +106,15 @@ async fn main() -> Result<()> {
         Some(Command::Keys(cmd)) => match keys::run(&cmd.command) {
             Ok(()) => 0,
             Err(err) => {
-                eprintln!("error: {err:#}");
-                1
+                ui::error_line(&err);
+                exit::Code::Plan.code()
             }
         },
         Some(Command::Secret(cmd)) => match secret::run(&cmd.command) {
             Ok(()) => 0,
             Err(err) => {
-                eprintln!("error: {err:#}");
-                1
+                ui::error_line(&err);
+                exit::Code::Plan.code()
             }
         },
         Some(Command::Template(cmd)) => {
@@ -124,14 +122,14 @@ async fn main() -> Result<()> {
                 Ok(ui) => match template::run(&cmd.command, &ui) {
                     Ok(()) => 0,
                     Err(err) => {
-                        eprintln!("error: {err:#}");
+                        ui::error_line(&err);
                         1
                     }
                 },
                 // An unwritable audit target or a broken terminal must fail
                 // the command; returning `Ok(())` here used to exit 0.
                 Err(err) => {
-                    eprintln!("error: {err:#}");
+                    ui::error_line(&err);
                     1
                 }
             }
@@ -139,36 +137,36 @@ async fn main() -> Result<()> {
         Some(Command::Emit(cmd)) => match emit::run(&cmd.command) {
             Ok(()) => 0,
             Err(err) => {
-                eprintln!("error: {err:#}");
-                1
+                ui::error_line(&err);
+                exit::Code::Plan.code()
             }
         },
         Some(Command::CredEnv(cmd)) => match cred_env::run(&cmd.command) {
             Ok(()) => 0,
             Err(err) => {
-                eprintln!("error: {err:#}");
-                1
+                ui::error_line(&err);
+                exit::Code::Plan.code()
             }
         },
         Some(Command::Systemd(cmd)) => match systemd::run(&cmd.command).await {
             Ok(()) => 0,
             Err(err) => {
-                eprintln!("error: {err:#}");
+                ui::error_text(&err.to_string());
                 err.exit_code()
             }
         },
         Some(Command::Host(cmd)) => match host::run(&cmd.command) {
             Ok(()) => 0,
             Err(err) => {
-                eprintln!("error: {err}");
+                ui::error_text(&err.to_string());
                 err.exit_code()
             }
         },
         Some(Command::Unit(cmd)) => match unit_cmd::run(&cmd.command) {
             Ok(code) => code,
             Err(err) => {
-                eprintln!("error: {err:#}");
-                1
+                ui::error_line(&err);
+                exit::Code::Plan.code()
             }
         },
         Some(Command::Service(cmd)) => {
@@ -181,11 +179,11 @@ async fn main() -> Result<()> {
             match tokio::task::spawn_blocking(move || service::run(&command)).await {
                 Ok(Ok(())) => 0,
                 Ok(Err(err)) => {
-                    eprintln!("error: {err:#}");
+                    ui::error_text(&err.to_string());
                     err.exit_code()
                 }
                 Err(join_err) => {
-                    eprintln!("error: the service worker stopped unexpectedly: {join_err}");
+                    ui::error_text(&format!("the service worker stopped unexpectedly: {join_err}"));
                     1
                 }
             }
@@ -193,34 +191,57 @@ async fn main() -> Result<()> {
         Some(Command::Audit(cmd)) => match audit::audit(cmd) {
             Ok(()) => 0,
             Err(err) => {
-                eprintln!("error: {err:#}");
-                1
+                ui::error_line(&err);
+                exit::Code::Plan.code()
             }
         },
     };
-    report_audit_failures();
-    std::process::exit(code);
+    report_truncation();
+    // Returning from `main` instead of `std::process::exit` lets every guard
+    // that is still alive run its destructor: a captured step's
+    // `CaptureFile`, the audit-log handle, the tokio runtime shutdown. The
+    // interrupt path relies on `abort()` plus a bounded wait, and that
+    // guarantee only holds if exiting does not jump over the teardown.
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
-/// Report a truncated audit trail.
+/// Report a truncated audit trail or a truncated terminal stream.
 ///
 /// A silently truncated audit log is worse than no audit log: the operator
-/// believes the run was recorded in full.
-fn report_audit_failures() {
-    let failures = ui::audit_write_failures();
-    if failures > 0 {
+/// believes the run was recorded in full. The same holds for the terminal —
+/// a run piped into `head` must not look complete.
+fn report_truncation() {
+    let audit = ui::audit_write_failures();
+    if audit > 0 {
         eprintln!(
-            "warning: {failures} line(s) could not be written to the audit log — the trail is \
+            "warning: {audit} line(s) could not be written to the audit log — the trail is \
              incomplete"
+        );
+    }
+    let terminal = ui::terminal_write_failures();
+    if terminal > 0 {
+        eprintln!(
+            "warning: {terminal} line(s) could not be written to the terminal — the output \
+             stream is incomplete"
         );
     }
 }
 
 /// Run a deploy script (the default `run` path).
 async fn run_or_deploy(run: &RunArgs, globals: &GlobalFlags) -> i32 {
-    if let Err(msg) = run_preflight(run) {
-        eprintln!("error: {msg}");
-        return 3;
+    // The probes spawn processes and poll them with a blocking sleep, so they
+    // must not run on a runtime worker: `main` awaits them here instead.
+    let flags = run.flags.clone();
+    match tokio::task::spawn_blocking(move || run_preflight_flags(&flags)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => {
+            ui::error_text(&msg);
+            return exit::Code::Transport.code();
+        }
+        Err(join_err) => {
+            ui::error_text(&format!("the preflight worker stopped unexpectedly: {join_err}"));
+            return exit::Code::Transport.code();
+        }
     }
 
     let content = match tokio::fs::read_to_string(&run.script)
@@ -229,16 +250,16 @@ async fn run_or_deploy(run: &RunArgs, globals: &GlobalFlags) -> i32 {
     {
         Ok(content) => content,
         Err(err) => {
-            eprintln!("error: {err:#}");
-            return 1;
+            ui::error_line(&err);
+            return exit::Code::Plan.code();
         }
     };
 
     let plan = match shellflow_core::parse_script(&content) {
         Ok(plan) => plan,
         Err(err) => {
-            eprintln!("error: {err}");
-            return 1;
+            ui::error_text(&err.to_string());
+            return exit::Code::Plan.code();
         }
     };
 
@@ -246,10 +267,6 @@ async fn run_or_deploy(run: &RunArgs, globals: &GlobalFlags) -> i32 {
 }
 
 /// Preflight for the `run` path; `--local` needs only `bash`.
-fn run_preflight(run: &RunArgs) -> Result<(), String> {
-    run_preflight_flags(&run.flags)
-}
-
 fn run_preflight_flags(flags: &cli::RunFlags) -> Result<(), String> {
     if flags.local { preflight_check_local() } else { preflight_check() }
 }
@@ -260,7 +277,7 @@ async fn run_plan(
     globals: &GlobalFlags,
     plan: shellflow_core::ExecutionPlan,
 ) -> i32 {
-    let total_steps = plan.steps.len();
+    let total_steps = plan.steps().len();
 
     let progress: Arc<Mutex<Vec<StepStats>>> = Arc::new(Mutex::new(Vec::new()));
     let cancel = Cancel::new();
@@ -277,7 +294,7 @@ async fn run_plan(
     ) {
         Ok(ui) => Arc::new(Mutex::new(ui)),
         Err(err) => {
-            eprintln!("error: {err:#}");
+            ui::error_line(&err);
             return executor::RunError::Config.into_exit_code();
         }
     };
@@ -301,26 +318,34 @@ async fn run_plan(
         result = &mut executor => match result {
             Ok(outcome) => outcome,
             Err(join_err) => {
-                eprintln!("error: the executor stopped unexpectedly: {join_err}");
+                ui::error_text(&format!("the executor stopped unexpectedly: {join_err}"));
                 RunOutcome::Failed(executor::RunError::Script)
             }
         },
         signal = wait_for_signal() => {
             match signal {
                 Ok(()) => {
-                    eprintln!("\ninterrupted — aborting; in-flight processes are being terminated");
+                    eprintln!(
+                        "\n{}",
+                        ui::redact("interrupted — aborting; in-flight processes are being terminated")
+                    );
                     cancel.cancel();
                     // Wait for the teardown: this is what guarantees that no
                     // process group outlives the run.
                     match tokio::time::timeout(INTERRUPT_GRACE, &mut executor).await {
                         Ok(Ok(outcome)) => outcome,
                         Ok(Err(join_err)) => {
-                            eprintln!("error: the executor stopped unexpectedly: {join_err}");
+                            ui::error_text(&format!(
+                                "the executor stopped unexpectedly: {join_err}"
+                            ));
                             executor.abort();
                             RunOutcome::Interrupted { total: total_steps, torn_down: false }
                         }
                         Err(_) => {
-                            eprintln!("warning: the teardown did not finish in time");
+                            eprintln!(
+                                "warning: {}",
+                                ui::redact("the teardown did not finish in time")
+                            );
                             // The executor task is still running with live
                             // process groups: abort it so it cannot outlive
                             // the CLI, and report honestly that groups may
@@ -336,7 +361,7 @@ async fn run_plan(
                     // run with a misleading exit code. The executor task is
                     // already running, so cancel it and wait it out rather
                     // than exiting past live process groups.
-                    eprintln!("error: cannot install the signal handler: {err}");
+                    ui::error_text(&format!("cannot install the signal handler: {err}"));
                     cancel.cancel();
                     executor.abort();
                     let _ = executor.await;
@@ -347,16 +372,15 @@ async fn run_plan(
     };
 
     match outcome {
-        RunOutcome::Success => 0,
+        RunOutcome::Success => exit::Code::Success.code(),
         RunOutcome::Failed(err) => err.into_exit_code(),
         RunOutcome::Interrupted { total, torn_down } => {
-            if torn_down {
-                eprintln!("interrupted — {total} total steps; in-flight processes were terminated");
+            let state = if torn_down {
+                "in-flight processes were terminated"
             } else {
-                eprintln!(
-                    "interrupted — {total} total steps; in-flight processes are being terminated"
-                );
-            }
+                "in-flight processes are being terminated"
+            };
+            eprintln!("{}", ui::redact(&format!("interrupted — {total} total steps; {state}")));
             let done = progress.lock().await;
             if !done.is_empty() {
                 let summary: Vec<(usize, Duration, Vec<HostStatus>)> =
@@ -366,7 +390,7 @@ async fn run_plan(
                 // aborted deploy.
                 crate::ui::final_summary(&summary, &log_file);
             }
-            EXIT_INTERRUPTED
+            exit::Code::Interrupted.code()
         }
     }
 }

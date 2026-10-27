@@ -14,6 +14,8 @@ mod assert_step;
 mod build;
 mod cancel;
 mod copy;
+mod error;
+mod helper;
 mod host;
 mod image;
 mod local;
@@ -24,13 +26,14 @@ mod release;
 mod remote;
 mod stream;
 mod toolchain;
-mod transport;
+pub(crate) mod transport;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 pub(crate) use cancel::Cancel;
+pub(crate) use error::{RunError, RunOutcome};
 pub(crate) use process::StepStats;
-pub(crate) use remote::{RunError, RunOutcome, execute_plan};
+pub(crate) use remote::execute_plan;
 use shellflow_core::ResolvedHost;
 use tokio::sync::Mutex;
 #[cfg(feature = "muxy")]
@@ -51,7 +54,26 @@ pub(crate) type ArcUi = Arc<Mutex<Ui>>;
 
 /// Shared, per-run cache of probed remote environments, keyed by ssh
 /// destination so a multi-step playbook probes each host exactly once.
-pub(crate) type ShellCache = Arc<Mutex<std::collections::HashMap<String, remote::RemoteEnv>>>;
+/// Per-destination login environment, probed at most once per run.
+///
+/// The map holds a [`tokio::sync::OnceCell`] per destination rather than the
+/// value itself: the *cell* is created under the map lock and the probe runs
+/// outside it, so one slow (or unreachable) host no longer serialises every
+/// other host's probe behind a single mutex while still honouring "probe each
+/// destination once".
+pub(crate) type ShellCache = Arc<
+    Mutex<std::collections::HashMap<String, Arc<tokio::sync::OnceCell<Option<remote::RemoteEnv>>>>>,
+>;
+
+/// Shell-quote one value for a command line that a remote shell will parse.
+///
+/// Single implementation on purpose: the copy path, the helper install, the
+/// workdir teardown and the assertion payloads all interpolate paths into a
+/// remote command, and a second hand-rolled `replace('\'', "'\\''")` is how a
+/// path with an apostrophe turns into two commands.
+pub(crate) fn quote(value: &str) -> String {
+    shellflow_core::shell_quote_single(value)
+}
 
 /// Filter closure for diff-mode output (e.g. rsync itemize lines).
 pub(crate) type DiffFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -82,12 +104,14 @@ pub(crate) struct LocalBlockArgs<'a> {
     pub script: &'a str,
     pub env: &'a [shellflow_core::EnvEntry],
     pub config: StepConfig,
-    pub capture: &'a [String],
+    pub capture: &'a [shellflow_core::ExportVar],
     pub extra: &'a [(String, String)],
     pub log_file: &'a LogFile,
-    /// The `@secrets` masking threshold; a runtime-`@export`ed value under a
-    /// secret-looking name at or above it joins the global mask registry
-    /// (see `capture_exports`).
+    /// The masking threshold for a captured `@export` value.
+    ///
+    /// Every captured value joins the mask registry unless the playbook
+    /// declared it `--public`; the threshold only decides *how* a value below
+    /// it is redacted (see `capture_exports`).
     pub mask_min_len: usize,
     /// The cooperative cancellation signal.
     pub cancel: Cancel,
@@ -243,7 +267,10 @@ pub(crate) fn is_rsync_itemize_line(line: &str) -> bool {
 pub(crate) fn step_error_if_failed(hosts: &[(String, HostOutcome)]) -> Option<RunError> {
     hosts.iter().find_map(|(_, outcome)| match outcome {
         HostOutcome::Failed(err) => Some(*err),
-        HostOutcome::TimedOut => Some(RunError::Script),
+        // A timeout is not a script failure: the step did not decide anything,
+        // the budget ran out. Keeping the two apart is what lets a retry
+        // policy distinguish "the box was slow" from "the deploy broke".
+        HostOutcome::TimedOut => Some(RunError::Timeout),
         // A cancelled host is the consequence of the interrupt, not a
         // failure of the step: the run is already aborting.
         HostOutcome::Ok | HostOutcome::Skipped | HostOutcome::Cancelled => None,

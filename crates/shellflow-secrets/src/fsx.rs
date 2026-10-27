@@ -42,12 +42,28 @@ const NAME_ATTEMPTS: u32 = 10;
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), SecretsError> {
     let temp = stage(path, bytes, mode)?;
     match fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parent(path),
         Err(source) => {
             let _ = fs::remove_file(&temp);
             Err(SecretsError::WriteFile { path: path.display().to_string(), source })
         }
     }
+}
+
+/// Flush the directory that received the new name.
+///
+/// `rename`/`hard_link` makes the name visible in memory; only an fsync of the
+/// *directory* makes the entry survive a crash. Without it the tool can report
+/// "the ciphertext was written" and a power loss can leave the old file (or no
+/// file) behind — the one durability gap a write that is otherwise atomic and
+/// `fsync`ed has.
+fn sync_parent(path: &Path) -> Result<(), SecretsError> {
+    let parent =
+        path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let dir = fs::File::open(parent)
+        .map_err(|source| SecretsError::WriteFile { path: parent.display().to_string(), source })?;
+    dir.sync_all()
+        .map_err(|source| SecretsError::WriteFile { path: parent.display().to_string(), source })
 }
 
 /// Write `bytes` to `path` with `mode`, atomically, **refusing to overwrite**
@@ -67,7 +83,7 @@ pub fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Secret
     match fs::hard_link(&temp, path) {
         Ok(()) => {
             let _ = fs::remove_file(&temp);
-            Ok(())
+            sync_parent(path)
         }
         Err(source) => {
             let _ = fs::remove_file(&temp);
@@ -174,6 +190,18 @@ fn is_name_collision(err: &SecretsError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_parent_reports_a_directory_it_cannot_open() {
+        // `write_atomic`/`write_new_file` fsync the directory that received
+        // the new name: without it a crash between the rename and the flush can
+        // drop an entry the tool just reported as written. The flush must also
+        // *fail* when the directory is gone, rather than report success.
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(sync_parent(&dir.path().join("file")).is_ok());
+        let missing = dir.path().join("no-such-dir").join("file");
+        assert!(sync_parent(&missing).is_err(), "an unopenable parent must be an error");
+    }
 
     #[test]
     fn write_atomic_creates_the_file_with_the_requested_mode() {

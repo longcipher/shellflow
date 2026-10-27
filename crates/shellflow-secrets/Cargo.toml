@@ -12,6 +12,7 @@ readme.workspace = true
 
 [dependencies]
 age = { workspace = true }
+nix = { workspace = true, features = ["user", "fs"] }
 shellflow-text = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }

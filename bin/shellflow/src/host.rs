@@ -37,13 +37,12 @@ use crate::cli::{
     HostAssertCredstoreArgs, HostAssertDigestArgs, HostAssertNoLeakArgs, HostBackupArgs, HostCmd,
     HostCredstoreArgs, HostInstallArgs, HostInventoryArgs, HostServiceArgs,
 };
-
-/// Usage or internal error.
-pub(crate) const EXIT_USAGE: i32 = 1;
-/// The operation ran but the condition did not hold.
-pub(crate) const EXIT_FAILED: i32 = 3;
-/// The budget expired before the condition held.
-pub(crate) const EXIT_TIMEOUT: i32 = 4;
+/// The target-side helper protocol (`crate::exit::helper`): these verbs run on
+/// the target and report on a file or a unit, so their codes are a wire
+/// contract with the payloads that call them — not the CLI's own codes.
+pub(crate) use crate::exit::helper::{
+    FAILED as EXIT_FAILED, TIMEOUT as EXIT_TIMEOUT, USAGE as EXIT_USAGE,
+};
 
 /// The credential store root, as the `cred-env` helper uses it.
 pub(crate) const CREDSTORE_ROOT: &str = "/etc/credstore.encrypted";

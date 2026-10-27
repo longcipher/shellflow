@@ -361,7 +361,7 @@ fn playbook_facts(repo: &Path, path: &Path) -> Option<PlaybookFacts> {
         copy_sources: Vec::new(),
         ordered: Vec::new(),
     };
-    for step in &plan.steps {
+    for step in plan.steps() {
         match step {
             shellflow_core::Step::Copy(copy) => {
                 for entry in &copy.entries {

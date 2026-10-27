@@ -6,11 +6,12 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::{
     error::ParseError,
     heredoc::HeredocTracker,
+    is_valid_var_name,
     plan::{
         AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
-        ExecutionPlan, HelperStep, ImageStep, InstallStep, LocalStep, ReleaseStep, ReloadStep,
-        RemoteStep, SecretEntry, ServiceStep, Step, Target, ToolchainStep, UnitInventoryStep,
-        WaitStep, Workdir, is_valid_var_name,
+        ExecutionPlan, ExportVar, HelperStep, ImageStep, InstallStep, LocalStep, ReleaseStep,
+        ReloadStep, RemoteStep, SecretEntry, ServiceStep, Step, Target, ToolchainStep,
+        UnitInventoryStep, WaitStep, Workdir,
     },
     ssh_spec::SshSpec,
 };
@@ -41,7 +42,7 @@ struct State {
     /// `@timeout` for the next block.
     pending_timeout: Option<u64>,
     /// `@export` variables for the pending local block.
-    pending_export: Vec<String>,
+    pending_export: Vec<ExportVar>,
     /// The target of the most recent step, inherited by an assertion that
     /// does not name one.
     last_target: Option<String>,
@@ -432,11 +433,30 @@ impl State {
     }
 
     fn declare_export(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        let vars: Vec<String> = payload
+        // `# @export <name>[,<name>…] [--public]`.
+        //
+        // A captured value is masked by default: it is a runtime value, and a
+        // playbook routinely exports credentials it just fetched. `--public`
+        // is the explicit opt-out for values that are meant to be printed
+        // (`VERSION`, `COMMIT`) — the exemption is then visible in the
+        // playbook instead of hidden in a name heuristic inside the engine.
+        let payload = payload.trim();
+        let (names, public) = match payload.strip_suffix("--public") {
+            Some(rest) => (rest.trim_end(), true),
+            None => (payload, false),
+        };
+        if names.contains("--") {
+            return Err(ParseError::InvalidDirective {
+                line,
+                directive: "export".to_string(),
+                reason: format!("unknown flag in `{payload}` (only `--public` is accepted)"),
+            });
+        }
+        let vars: Vec<ExportVar> = names
             .split(',')
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned)
+            .map(|v| ExportVar { name: v.to_string(), public })
             .collect();
         if vars.is_empty() {
             return Err(ParseError::InvalidDirective {
@@ -446,11 +466,11 @@ impl State {
             });
         }
         for var in &vars {
-            if !is_valid_var_name(var) {
+            if !is_valid_var_name(&var.name) {
                 return Err(ParseError::InvalidDirective {
                     line,
                     directive: "export".to_string(),
-                    reason: format!("invalid variable name `{var}`"),
+                    reason: format!("invalid variable name `{}`", var.name),
                 });
             }
         }
@@ -2685,7 +2705,10 @@ mod tests {
     use super::{directive, is_valid_alias_name, parse_script, split_words};
     use crate::{
         error::ParseError,
-        plan::{AssertStep, Assertion, CopyStep, EnvEntry, LocalStep, RemoteStep, Step, WaitStep},
+        plan::{
+            AssertStep, Assertion, CopyStep, EnvEntry, ExportVar, LocalStep, RemoteStep, Step,
+            WaitStep,
+        },
     };
 
     fn parse(input: &str) -> Result<crate::plan::ExecutionPlan, String> {
@@ -3293,8 +3316,54 @@ mod tests {
         )?;
         assert_eq!(plan.steps.len(), 2);
         let export = &as_local(&plan.steps[0])?.export;
-        assert_eq!(export, &vec!["VERSION".to_string()]);
+        assert_eq!(export, &vec![ExportVar { name: "VERSION".to_string(), public: false }]);
         Ok(())
+    }
+
+    #[test]
+    fn the_plan_accessors_expose_what_the_parser_built() -> Result<(), String> {
+        // The plan's fields are private: every consumer reads it through these
+        // accessors, so an accessor that returned nothing would silently blank
+        // out a preview or a secrets resolution.
+        let plan = parse(
+            "# @server web1 web@h1\n\
+             # @secrets s.env.age\n\
+             # @workdir --prefix sf\n\
+             # @local\n\
+             echo hi\n",
+        )?;
+        assert_eq!(plan.steps().len(), 1);
+        assert_eq!(plan.servers().len(), 1);
+        assert!(plan.groups().is_empty());
+        assert!(plan.env().is_empty());
+        assert_eq!(plan.secrets().len(), 1);
+        assert_eq!(plan.secrets()[0].file, "s.env.age");
+        assert_eq!(plan.workdir().map(|workdir| workdir.prefix.as_str()), Some("sf"));
+        Ok(())
+    }
+
+    #[test]
+    fn export_is_masked_unless_it_says_public() -> Result<(), String> {
+        // The masking decision belongs to the playbook, not to the variable
+        // name: a credential exported from a vault is routinely called
+        // `DATABASE_URL`, so a name heuristic is not a safety property.
+        let masked = parse("# @local\nDATABASE_URL=postgres://x\n# @export DATABASE_URL\n")?;
+        assert!(!as_local(&masked.steps[0])?.export[0].public, "default must be masked");
+
+        let public = parse("# @local\nVERSION=1\n# @export VERSION --public\n")?;
+        assert!(as_local(&public.steps[0])?.export[0].public, "`--public` must opt out");
+
+        // The flag covers the whole line, so a comma-separated list is one
+        // decision rather than a per-name suffix nobody can read.
+        let list = parse("# @local\nA=1\nB=2\n# @export A,B --public\n")?;
+        assert!(as_local(&list.steps[0])?.export.iter().all(|var| var.public));
+        Ok(())
+    }
+
+    #[test]
+    fn export_rejects_an_unknown_flag() {
+        let err = parse_script("# @local\nV=1\n# @export V --quiet\n").expect_err("must fail");
+        assert!(err.to_string().contains("only `--public` is accepted"), "unexpected error: {err}");
     }
 
     #[test]
@@ -3312,7 +3381,7 @@ mod tests {
         )?;
         assert_eq!(plan.steps.len(), 1);
         let export = &as_local(&plan.steps[0])?.export;
-        assert_eq!(export, &vec!["VERSION".to_string()]);
+        assert_eq!(export, &vec![ExportVar { name: "VERSION".to_string(), public: false }]);
         Ok(())
     }
 
@@ -3337,7 +3406,10 @@ mod tests {
              # @export VERSION\n",
         )?;
         assert_eq!(plan.steps.len(), 1);
-        assert_eq!(as_local(&plan.steps[0])?.export, vec!["VERSION".to_string()]);
+        assert_eq!(
+            as_local(&plan.steps[0])?.export,
+            vec![ExportVar { name: "VERSION".to_string(), public: false }]
+        );
         Ok(())
     }
 

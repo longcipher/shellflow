@@ -116,7 +116,7 @@ All other lines (including plain comments) belong to the current block.
 | `@remote` | `# @remote <target>` | Following lines stream to `<target>` (alias, group, or raw ssh-spec; `@`-prefix optional) |
 | `@copy` | `# @copy <src> -> <dst> @<target> [--delete] [--exclude <glob>]` | Sync a local file/dir to `<dst>` on all hosts in `<target>`. `--delete` mirrors removal of remote extras; in `--local` mode it swaps a staged copy into place so a failed copy cannot empty the destination. `--exclude` (repeatable) is honored by the rsync path and warned as ignored on the scp fallback and in `--local` mode. `src`/`dst` support `$VAR`/`${VAR}` interpolation from `@export`ed state (§4.4) |
 | `@secrets` | `# @secrets <file.env.age> [--identity <path>]` | Decrypt an age-encrypted `KEY=VALUE` file into the environment of all subsequent blocks (Part II §S5). `--identity` overrides the run-wide `-i` for this entry only. |
-| `@export` | `# @export <VAR>[,<VAR>…]` | After the preceding local block, capture the named variables into run state; later `@copy` paths interpolate them and later blocks receive them as env vars (§7.6) |
+| `@export` | `# @export <VAR>[,<VAR>…] [--public]` | After the preceding local block, capture the named variables into run state; later `@copy` paths interpolate them and later blocks receive them as env vars (§7.6). A captured value is **masked by default** — the value is unknown at parse time and a playbook routinely exports a credential it just fetched; `--public` is the explicit, reviewable opt-out for a value that is meant to be read (`VERSION`, `COMMIT`) |
 | `@timeout` | `# @timeout <seconds>` | Cap the next block per host; on expiry the child is SIGTERM'd, then SIGKILL'd after a grace period (§7.5) |
 | `@name` | `# @name <label>` | Label the next block (for `--only`/`--skip` filtering and reporting) |
 | `@only_if` | `# @only_if <command>` | Guard: run next block only where `<command>` succeeds (exit 0); otherwise report `SKIPPED` |
@@ -206,7 +206,7 @@ cargo build --release --locked
 VERSION=$(git rev-parse --short HEAD)
 
 # === Capture VERSION into run state (see §4.4, §7.6) ===
-# @export VERSION
+# @export VERSION --public
 
 # === Ship the artifact ($VERSION is interpolated by shellflow, not Bash) ===
 # @name ship
@@ -388,78 +388,84 @@ Per `AGENTS.md`: `bin/` holds CLI crates, `crates/` holds reusable libraries.
 
 ```text
 shellflow/
-├── Cargo.toml                 # workspace deps & lints (already configured)
-├── Justfile                   # format/lint/test/mutation/build (already configured)
+├── Cargo.toml                 # workspace deps & lints
+├── Justfile                   # format/lint/test/mutation/build
+├── AGENTS.md                  # the non-negotiables an agent must follow
 ├── docs/
 │   ├── design.md              # this document (Part I: engine, Part II: secrets)
+│   ├── muxy-transport.md      # the optional native transport
+│   ├── infra-integration-roadmap.md # the production-adoption roadmap
 │   └── example-app.md         # worked examples: secret-app + env-app
 ├── bin/
 │   └── shellflow/             # CLI + execution engine (I/O boundary)
 │       ├── Cargo.toml
+│       ├── assets/            # embedded bash helper + scaffolding templates
+│       │   ├── cred-env.sh    # the bash fallback for `cred-env`
+│       │   └── service-*.tmpl # `service init` / `unit render` templates
 │       ├── src/
-│       │   ├── main.rs        # clap entry, orchestration
-│       │   ├── cli.rs         # Args (clap derive), all subcommands
-│       │   ├── ui.rs          # colored streaming output, plan summary, masking
-│       │   ├── fsx.rs         # atomic 0600/0755 writes (secret + helper assets)
-│       │   ├── executor/      # run_local / run_remote / run_copy, fan-out
-│       │   │   ├── mod.rs     # shared types, capture-file guard, fan-out slot
-│       │   │   ├── local.rs   # bash -c, guard, @export capture
-│       │   │   ├── remote.rs  # ssh streaming, login-shell probe, guards
-│       │   │   ├── copy.rs    # rsync + scp fallback, staged --delete swap
-│       │   │   ├── cancel.rs  # cooperative cancellation for the interrupt path
-│       │   │   ├── process.rs # process groups, terminate, GroupGuard
-│       │   │   └── stream.rs  # piped-output forwarding, timeout, drain
-│       │   ├── secrets.rs     # @secrets resolution -> run-state env + mask list
-│       │   ├── secret.rs      # `secret` subcommand (encrypt/decrypt/edit/creds/keys-check)
-│       │   ├── keys.rs        # `keys` subcommand (generate/public)
-│       │   ├── cred_env.rs    # target-side `cred-env` helpers
-│       │   ├── service.rs     # `service init` repository scaffolding
-│       │   ├── template.rs    # `template check` against an encrypted env
-│       │   ├── emit.rs        # emit the embedded bash helper (fallback)
-│       │   └── preflight.rs   # required-tool preflight check
+│       │   ├── main.rs        # clap entry, run loop, signals, final exit code
+│       │   ├── cli.rs         # clap derive: every subcommand and flag
+│       │   ├── exit.rs        # the CLI and target-helper exit-code protocols
+│       │   ├── ui.rs          # the one output sink: streaming, masking, audit
+│       │   ├── fsx.rs         # atomic 0600/0755 writes (helper assets)
+│       │   ├── executor/      # the execution engine
+│       │   │   ├── mod.rs       # shared types, fan-out slot, capture-file guard
+│       │   │   ├── error.rs     # RunError / RunOutcome (the crate taxonomy)
+│       │   │   ├── remote.rs    # step dispatch, ssh streaming, login-shell probe
+│       │   │   ├── local.rs     # bash -c, guard, @export capture
+│       │   │   ├── copy.rs      # rsync + scp fallback, staged --delete swap
+│       │   │   ├── host.rs      # @service/@install/@backup/@credstore/@helper
+│       │   │   ├── helper.rs    # the systemd helper protocol (wait/reload)
+│       │   │   ├── assert_step.rs # @assert and the --check probe
+│       │   │   ├── build.rs     # @build
+│       │   │   ├── release.rs   # @release
+│       │   │   ├── toolchain.rs # @toolchain
+│       │   │   ├── image.rs     # @image
+│       │   │   ├── muxy.rs      # the muxy adapter (same payload shape)
+│       │   │   ├── transport.rs # the one ssh argv / rsync `-e` builder
+│       │   │   ├── cancel.rs    # cooperative cancellation for the interrupt path
+│       │   │   ├── process.rs   # process groups, terminate, GroupGuard
+│       │   │   └── stream.rs    # piped-output forwarding, timeout, drain
+│       │   ├── secrets.rs     # @secrets resolution -> run-state env + masks
+│       │   ├── secret.rs      # `secret encrypt|decrypt|edit|creds|keys-check|find-duplicates`
+│       │   ├── keys.rs        # `keys generate|public`
+│       │   ├── template.rs    # `template check|render`
+│       │   ├── cred_env.rs    # `cred-env` (target-side helpers)
+│       │   ├── host.rs        # `host` (target-side helpers)
+│       │   ├── systemd.rs     # `systemd` (target-side helpers)
+│       │   ├── systemd_dbus.rs # the optional D-Bus unit-state path
+│       │   ├── service.rs     # `service init`
+│       │   ├── service_check/ # `service check` (audit + remote batch)
+│       │   ├── service_diff.rs    # `service diff`
+│       │   ├── service_manifest.rs # `service manifest`
+│       │   ├── service_status.rs   # `service status`
+│       │   ├── manifest.rs    # the `services/<svc>/<unit>.service.toml` model
+│       │   ├── unit.rs        # drop-in rendering
+│       │   ├── unit_cmd.rs    # `unit render|manifest|verify`
+│       │   ├── unit_verify.rs # the repository consistency check
+│       │   ├── rbatch.rs      # one round trip, many questions
+│       │   ├── audit.rs       # the secret-shaped-plaintext gate
+│       │   ├── lint.rs        # `--check` shell-hygiene warnings
+│       │   ├── diffutil.rs    # unified-diff rendering
+│       │   ├── emit.rs        # emit the embedded bash helper
+│       │   └── preflight.rs   # required-tool preflight
 │       └── tests/
 │           ├── integration.rs # end-to-end with mock ssh/rsync shims
-│           ├── cred_env.rs    # cred-env / emit / template check
-│           ├── service_init.rs# service init + secret keys-check
+│           ├── cred_env.rs    # cred-env / emit / template
+│           ├── service_init.rs # service init + secret keys-check
+│           ├── no_panic_in_production.rs # the lint-gate guarantee
 │           └── mockbin/       # fake ssh/rsync/scp (Bash shims recording argv)
 └── crates/
-    ├── shellflow-dsl/         # the grammar + the plan model (pure, no I/O)
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── lib.rs
-    │       ├── parser.rs      # line scanner -> ExecutionPlan
-    │       ├── plan.rs        # data model (§4.3), resolve_hosts, interpolate
-    │       ├── heredoc.rs     # here-document body tracking (§4.1 rule 8)
-    │       ├── ssh_spec.rs    # SshSpec parse / to_args / rsync dest
-    │       └── error.rs       # ParseError / InterpolateError
     ├── shellflow-text/        # the shared shell-text rules (zero-dependency leaf)
-    │   ├── Cargo.toml
-    │   └── src/
-    │       └── lib.rs         # shell_quote_single, strip_surrounding_quotes, is_valid_var_name
-    ├── shellflow-core/        # runtime helpers (pure, no I/O)
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── lib.rs
-    │       ├── env.rs         # env rendering, @export capture parser, masking
-    │       ├── template.rs    # ${KEY} placeholder scanner + render_template (S12)
-    │       └── error.rs       # CaptureError / RenderEnvError / MissingKeysError
-    ├── shellflow-muxy/        # the native transport session (muxy feature; see muxy-transport.md)
-    │   ├── Cargo.toml
-    │   └── src/
-    │       ├── conn.rs        # ssh + bridge handshake, event pump, reconnect
-    │       ├── lines.rs       # scrollback assembler, budget, gap-fill
-    │       ├── session.rs     # payload upload, step run, teardown
-    │       └── error.rs       # classified transport errors
-    └── shellflow-secrets/     # age wrapper (encrypt/decrypt, env parser, recipients)
-        ├── Cargo.toml
-        └── src/
-            ├── lib.rs         # identity load, crypto, KEY=VALUE env parsing
-            ├── identity.rs    # X25519 identity resolution and generation
-            ├── crypto.rs      # age encrypt/decrypt
-            ├── recipients.rs  # `age1…` recipient parsing and `*.pub` collection
-            ├── env.rs         # KEY=VALUE env file parser
-            ├── fsx.rs         # atomic writes with an explicit mode
-            └── error.rs
+    │   └── src/lib.rs
+    ├── shellflow-dsl/         # the grammar + the plan model (pure, no I/O)
+    │   └── src/{lib,parser,plan,heredoc,ssh_spec,error}.rs
+    ├── shellflow-core/        # runtime helpers: env, capture, templating, masking
+    │   └── src/{lib,env,template,error}.rs
+    ├── shellflow-muxy/        # the optional native transport
+    │   └── src/{lib,conn,lines,session,payload,policy,outcome,error,harness}.rs
+    └── shellflow-secrets/     # age wrapper (the only crate that links `age`)
+        └── src/{lib,identity,crypto,recipients,env,fsx,error}.rs
 ```
 
 ### 5.2 Crate responsibilities
@@ -490,10 +496,14 @@ shellflow/
   NUL-delimited `@export` capture records (with an allow-list-checked variant
   for the executor), and masks known secret values — all
   pure string logic, unit- and proptest-able.
-- Owns the workspace-wide definitions that more than one crate needs: the
-  shell-identifier check (`is_valid_var_name`) and the quote-stripping rule
-  (`strip_surrounding_quotes`). `shellflow-secrets` depends on this crate for
-  them, so the two copies that used to drift cannot.
+- Re-exports the workspace-wide shell-text rules (`is_valid_var_name`,
+  `strip_surrounding_quotes`) for its own consumers, but **owns none of them**:
+  they live in `shellflow-text`, which `shellflow-dsl` and `shellflow-secrets`
+  depend on directly. There is one definition of each rule, one authoritative
+  import path (`shellflow_text`), and `shellflow-core` is a façade, not a
+  second home. (Keeping a re-export here is what lets a consumer of the runtime
+  helpers avoid knowing which crate owns which half of the language — it must
+  not become the place a rule is *edited*.)
 - Exposes `ParseError` / `InterpolateError` / `CaptureError` / `RenderEnvError`
   (with line numbers where applicable) via `thiserror`.
 - No tokio, no stdio, no network, **no filesystem access**. `ExecutionPlan.env`
@@ -517,9 +527,13 @@ shellflow/
   matching `source` semantics; single-space `export` prefix tolerated).
 - Library-only: no `tokio`, no `std::process`. It does perform its own file
   I/O (identity load, env-file read), which is exactly its stated job (§S7);
-  it has no network or subprocess surface. `fsx` owns the atomic-write
-  primitives (staged temp file + rename for `write_atomic`, hard-link for
-  `write_new_file`) that every secret-bearing file uses.
+  it has no network or subprocess surface. `nix` is used for two facts the
+  identity loader cannot get from `std` on stable Rust: the effective uid
+  (ownership is checked, not only the mode) and `O_NOFOLLOW` (a symlink planted
+  at the identity path is refused rather than followed). `fsx` owns the
+  atomic-write primitives (staged temp file + rename for `write_atomic`,
+  hard-link for `write_new_file`, parent-directory `fsync` for both) that every
+  secret-bearing file uses.
 - `shellflow-core` stays free of async, I/O, and crypto.
 
 **`shellflow-muxy`** — the optional native transport (the `muxy` feature).
@@ -535,6 +549,14 @@ shellflow/
 - The execution engine: spawns `bash`, `ssh`, `rsync` via
   `tokio::process::Command`; fans out to hosts with `tokio::task::JoinSet`;
   streams prefixed output.
+- `executor::transport` is the one builder for every `ssh` invocation and for
+  the `-e` transport string `rsync` gets: `BatchMode=yes`, `-T`, the connect
+  bound and `ControlMaster` are decided once, instead of at each of the eight
+  call sites (which is how two of them lost `-T` and three used three different
+  timeouts).
+- `exit.rs` owns both exit-code protocols: the CLI's own (§6) and the
+  target-side helper's (the `systemd`/`host` verbs, which report on a unit or a
+  file and are a wire contract with the payloads).
 - `eyre` for application errors. There is no logging framework: the `run`
   path owns one output path (`ui`), which streams user-facing lines, applies
   masking, and writes the audit log. The report subcommands render terminal
@@ -664,7 +686,14 @@ EXIT CODES:
   3   transport/setup failure (missing ssh/rsync/bash, ssh exit 255, a broken
       payload pipe, rsync I/O error)
   4   script execution failure (a local/remote step exited non-zero)
+  5   a step exceeded --timeout/@timeout (any class: remote, local, copy,
+      guard, or the target helper's own budget)
   130 interrupted by SIGINT/SIGTERM (see §7.5)
+
+4 versus 5 matters to a CI retry policy: "the deploy broke" is a rollback,
+"the box was slow" is a retry. 1 versus 4 keeps "the playbook is wrong, nothing
+was attempted" separate from "the deployment failed". `exit.rs` is the single
+definition of these values.
 
 42 is reserved inside a guarded remote payload as the guard's "skip"
 channel; it never becomes the process exit code. The payload installs an
@@ -679,6 +708,14 @@ accepting it and silently writing nothing.
 The distinction between 1 and 4 is deliberate: 1 means "the playbook is
 wrong" (nothing was attempted), 4 means "the deployment failed". A CI gate
 can therefore tell the two apart without parsing the output.
+
+**Two protocols, deliberately separate.** The `systemd` and `host` subcommands
+run *on the target* and report on a unit or a file, so their codes are a wire
+contract with the payloads that call them (`remote::wait_command`,
+`remote::reload_command`, `executor::host`): there, `3` means "the condition
+did not hold" and `5` means "the unit does not exist". They are not the CLI's
+codes, and `exit.rs` keeps them in a separate module so a literal cannot drift
+between the two.
 
 The subcommands use the same classes: a failure that means "the request could
 not even be attempted" — a missing `ssh` in `service check`, an unreachable
@@ -990,13 +1027,21 @@ D-7):
    (`$VAR`/`${VAR}`); unresolved names are a plan-build error.
 4. Later local steps receive the values via `Command::env()`; later remote
    blocks receive them in the env header (masked, §9).
+5. **Every captured value joins the mask registry** unless the playbook
+   declared it `--public`. The decision is a property of the declaration and of
+   the value's length (`--mask-min-len`), never of the variable's *name*: the
+   ordinary name for a credential a block just fetched from a vault is
+   `DATABASE_URL`, so a name heuristic ("looks secret") reads as a safety
+   property while being a guess. `--public` is the explicit opt-out for a value
+   that is meant to be read, and it is visible in the playbook next to the
+   declaration, where a reviewer sees it.
 
 This makes versioned artifact paths work end-to-end:
 
 ```bash
 # @local
 VERSION=$(git rev-parse --short HEAD)
-# @export VERSION
+# @export VERSION --public
 # @copy target/release/myapp-$VERSION -> /srv/myapp-$VERSION @web
 ```
 
@@ -1109,12 +1154,18 @@ Three cooperating layers, deliberately *not* a state engine:
   that cannot be opened is a **hard error**, not a warning — a run that was
   asked to keep an audit trail and silently keeps none is worse than a run that
   refuses to start.
-  > **Masking is applied by the sink, not requested by the caller.** Every
-  > byte that reaches the terminal or the audit log passes through the
-  > redactor, so there is no unmasked twin of any render function and a
-  > secret cannot leak because a call site forgot to ask for masking. The
-  > process-wide mask registry is what lets the free render functions — which
-  > have no `Ui` handle — redact exactly like the `Ui` methods do.
+  > **Masking is applied by the sink *and* by the call site.** The sink
+  > (`print_line` for control lines, `Ui::emit_host_line` for host output) is
+  > the guarantee: every byte that reaches the terminal or the audit log passes
+  > through the redactor, so a secret cannot leak because a call site forgot to
+  > ask for masking — and a render function that forgets cannot reintroduce the
+  > gap the way `plan_preview`'s step line once did. The call sites also redact,
+  > *before* they add ANSI colour: a below-threshold value is only redacted
+  > where it stands alone as a token, and an escape sequence next to it would
+  > look like an identifier character and hide the value from the narrow rules.
+  > The two passes cannot unmask anything. The process-wide mask registry is
+  > what lets the free render functions — which have no `Ui` handle — redact
+  > exactly like the `Ui` methods do.
   >
   > Redaction is **stateful across output lines**: a value that a target
   > program split across two lines (`fold`, a pager, a progress bar) is
@@ -1648,7 +1699,9 @@ masking applies only to values of length ≥ a threshold. The threshold
 defaults to `6` and is configurable via `$SHELLFLOW_MASK_MIN_LEN` (or
 `--mask-min-len` on `run`, which takes precedence). An unparsable or negative
 `$SHELLFLOW_MASK_MIN_LEN` falls back to `6` rather than failing the run.
-Explicit `@env KEY=value` literals keep their current unconditional masking.
+Explicit `@env KEY=value` literals keep their unconditional masking, and a
+value captured by `@export` is masked the same way unless the playbook says
+`--public` (§7.6). Nothing about masking depends on the variable's name.
 
 Masking covers host lines, payload previews, and `--log-file` output through
 the existing `Ui` path; secrets never appear in any spawned argv. Every path

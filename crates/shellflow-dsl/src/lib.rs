@@ -44,9 +44,9 @@ pub use heredoc::{Heredoc, HeredocTracker};
 pub use parser::parse_script;
 pub use plan::{
     AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
-    ExecutionPlan, HelperStep, ImageStep, InstallStep, LocalStep, ReleaseStep, ReloadStep,
-    RemoteStep, ResolvedHost, RunState, SecretEntry, ServiceStep, Step, Target, ToolchainStep,
-    UnitInventoryStep, WaitStep, Workdir, interpolate, resolve_hosts,
+    ExecutionPlan, ExportVar, HelperStep, ImageStep, InstallStep, LocalStep, ReleaseStep,
+    ReloadStep, RemoteStep, ResolvedHost, RunState, SecretEntry, ServiceStep, Step, Target,
+    ToolchainStep, UnitInventoryStep, WaitStep, Workdir, interpolate, resolve_hosts,
 };
 pub use shellflow_text::{is_valid_var_name, shell_quote_single, strip_surrounding_quotes};
 pub use ssh_spec::SshSpec;

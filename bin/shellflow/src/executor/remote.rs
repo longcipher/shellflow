@@ -12,77 +12,13 @@ use tokio::{
 };
 
 use super::{
-    ArcUi, Cancel, CopyStepArgs, HostOutcome, LogFile, ShellCache, StepConfig, fanout_slot,
+    ArcUi, Cancel, CopyStepArgs, HostOutcome, LogFile, RunError, RunOutcome, ShellCache,
+    StepConfig, fanout_slot, helper,
     local::{GuardOutcome, build_env, run_local_block},
     process::isolate,
     stream,
 };
 use crate::{secrets::ResolvedSecrets, ui::HostStatus};
-
-/// The error classification mapped to the CLI exit code.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunError {
-    /// A configuration/plan-build failure (exit 1), e.g. secrets resolution.
-    Config,
-    /// A plan error (exit 1): a bad script, an unresolved `@export` variable,
-    /// an unresolvable target, or a syntax error found by a dry-run check.
-    ///
-    /// Design §6 assigns these to exit 1, distinct from a script that ran
-    /// and failed (exit 4): CI can tell "the playbook is wrong" from "the
-    /// deployment failed".
-    Plan,
-    /// A transport/setup failure (exit 3).
-    Transport,
-    /// A script execution failure (exit 4).
-    Script,
-}
-
-impl std::fmt::Display for RunError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Config => write!(f, "configuration failure"),
-            Self::Plan => write!(f, "plan error"),
-            Self::Transport => write!(f, "transport/setup failure"),
-            Self::Script => write!(f, "script execution failure"),
-        }
-    }
-}
-
-impl RunError {
-    /// The process exit code for this failure (design §6).
-    ///
-    /// The mapping lives with the classification so it cannot drift from it:
-    /// 1 = configuration/plan error, 3 = transport/setup failure,
-    /// 4 = script execution failure.
-    #[must_use]
-    pub(crate) const fn into_exit_code(self) -> i32 {
-        match self {
-            Self::Config | Self::Plan => 1,
-            Self::Transport => 3,
-            Self::Script => 4,
-        }
-    }
-}
-
-/// The overall run outcome.
-#[derive(Debug)]
-pub(crate) enum RunOutcome {
-    /// Everything succeeded (or was skipped).
-    Success,
-    /// At least one step failed.
-    Failed(RunError),
-    /// Interrupted by a signal; `total` is the step count for reporting.
-    ///
-    /// The audit-log handle is *not* carried here: the caller owns the UI
-    /// (and therefore the file), so the interrupt summary is recorded in the
-    /// same trail as every other line of the run — including when the
-    /// teardown did not finish inside the grace period.
-    ///
-    /// `torn_down` reports whether every in-flight process group was reaped
-    /// before returning. When the grace period expires the executor is
-    /// aborted and the run must not claim the groups are gone.
-    Interrupted { total: usize, torn_down: bool },
-}
 
 /// The login shell detected on a remote host.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -224,13 +160,18 @@ impl WorkdirGuard {
     ///
     /// The removal is best effort: a host that is already gone must not
     /// fail the run that just succeeded. Each removal is bounded (10s) and
-    /// the removals run **concurrently** (a bounded `JoinSet`, the same
-    /// fan-out discipline every executor step uses): sequential cleanups
-    /// with an unreachable host each eat their full 10s budget, so two dead
-    /// hosts alone would outrun the interrupt grace period and the run
-    /// would report `torn_down: false` — the outcome cooperative teardown
-    /// exists to avoid.
-    pub(crate) async fn cleanup(&self, plan: &shellflow_core::ExecutionPlan) {
+    /// the removals run **concurrently, under the same `--parallel` bound as
+    /// every other fan-out**: sequential cleanups with an unreachable host
+    /// each eat their full 10s budget, so two dead hosts alone would outrun
+    /// the interrupt grace period — and an unbounded fan-out over a large
+    /// fleet would open one `ssh` per host at once, which is exactly what the
+    /// semaphore exists to prevent.
+    pub(crate) async fn cleanup(
+        &self,
+        plan: &shellflow_core::ExecutionPlan,
+        semaphore: &Option<Arc<Semaphore>>,
+        log_file: &LogFile,
+    ) {
         let aliases: Vec<String> = self.hosts.lock().await.iter().cloned().collect();
         let workdir = self.workdir.clone();
         let mut tasks = tokio::task::JoinSet::new();
@@ -244,30 +185,63 @@ impl WorkdirGuard {
                 continue;
             };
             let workdir = workdir.clone();
+            let semaphore = semaphore.clone();
+            let log_file = log_file.clone();
             tasks.spawn(async move {
-                let mut cmd = Command::new("ssh");
-                cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
-                cmd.args(host.spec.to_ssh_args())
-                    .arg("-T")
-                    .arg(format!("rm -rf '{}'", workdir.path));
+                let Ok(_permit) = super::acquire_fanout_slot(&semaphore, &log_file).await else {
+                    crate::ui::warn(
+                        &format!(
+                            "workdir cleanup for `{alias}` skipped: the fan-out semaphore is closed"
+                        ),
+                        &log_file,
+                    );
+                    return;
+                };
+                let mut cmd = Command::from(super::transport::ssh_command(
+                    super::transport::SshPolicy::batch(),
+                    &host.spec,
+                ));
+                cmd
+                    // Quoted through the one helper: the staging path is
+                    // generated, but a single quote in it (a `$TMPDIR` an
+                    // operator set, a host alias) would otherwise end the
+                    // remote command early.
+                    .arg(format!("rm -rf -- {}", super::quote(&workdir.path)));
                 cmd.stdin(std::process::Stdio::null());
                 cmd.stdout(std::process::Stdio::null());
                 cmd.stderr(std::process::Stdio::null());
                 cmd.kill_on_drop(true);
                 crate::executor::process::isolate(&mut cmd);
                 let Ok(mut child) = cmd.spawn() else {
+                    crate::ui::warn(
+                        &format!("workdir cleanup on `{alias}`: ssh could not start"),
+                        &log_file,
+                    );
                     return;
                 };
                 let _guard = crate::executor::process::GroupGuard::new(&child);
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
+                match tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await {
+                    Ok(Ok(status)) if status.success() => {}
+                    Ok(Ok(status)) => crate::ui::warn(
+                        &format!("workdir cleanup on `{alias}` failed (exit {status})"),
+                        &log_file,
+                    ),
+                    Ok(Err(err)) => crate::ui::warn(
+                        &format!("workdir cleanup on `{alias}` failed: {err}"),
+                        &log_file,
+                    ),
+                    Err(_) => crate::ui::warn(
+                        &format!("workdir cleanup on `{alias}` timed out after 10s"),
+                        &log_file,
+                    ),
+                }
             });
         }
         while let Some(result) = tasks.join_next().await {
             // Best effort by contract; a panicking cleanup task is logged so
             // the operator knows the staging directory may remain.
             if let Err(err) = result {
-                crate::ui::warn(&format!("workdir cleanup task failed: {err}"), &None);
+                crate::ui::warn(&format!("workdir cleanup task failed: {err}"), log_file);
             }
         }
     }
@@ -302,11 +276,9 @@ async fn create_workdir(
 /// able to reach the same file.
 ///
 /// Returns `None` when setup itself fails (the failure is already reported);
-/// every setup failure maps to [`RunError::Config`].
-#[expect(
-    clippy::print_stderr,
-    reason = "fatal run-configuration failures abort the run before any step; stderr is the channel operators grep"
-)]
+/// every setup failure maps to [`RunError::Config`]. A run-configuration
+/// failure goes through [`crate::ui::fatal`] — stderr, masked, and in the audit
+/// trail — so this module never prints directly.
 async fn setup_run(
     run: &crate::cli::RunArgs,
     plan: &shellflow_core::ExecutionPlan,
@@ -317,11 +289,15 @@ async fn setup_run(
     let log_file = ui.lock().await.log_file();
 
     let mut secrets: Vec<String> = plan
-        .env
+        .env()
         .iter()
         .filter_map(|entry| match entry {
             shellflow_core::EnvEntry::Literal { value, .. } => Some(value.clone()),
-            shellflow_core::EnvEntry::Passthrough { .. } => None,
+            // A passthrough value comes from shellflow's own environment and is
+            // not a `@secrets` mask; an unknown variant (`EnvEntry` is
+            // `#[non_exhaustive]`) cannot be one either, and registering a
+            // non-value would only shred output.
+            _ => None,
         })
         .collect();
 
@@ -330,7 +306,7 @@ async fn setup_run(
 
     let restrict = run.target_restrict();
     let selected: Vec<(usize, shellflow_core::Step)> = plan
-        .steps
+        .steps()
         .iter()
         .enumerate()
         .filter(|(idx, step)| is_selected(run, *idx, step))
@@ -339,14 +315,20 @@ async fn setup_run(
 
     let host_targets = target_host_aliases(plan, &restrict, &selected, &log_file);
     let host_aliases = host_targets.aliases;
-    let uses_per_host = plan.secrets.iter().any(|entry| entry.file.contains("{host}"));
+    let uses_per_host = plan.secrets().iter().any(|entry| entry.file.contains("{host}"));
     if !flags.check && uses_per_host && !host_targets.raw.is_empty() {
         // A hard run-configuration failure, not a streamed warning: the run
-        // is aborting, and the operator greps stderr for it.
-        eprintln!(
-            "error: per-host `@secrets` ({{host}}) need a named `@server` alias; these targets \
-             are raw SSH specs and cannot key a secret file: {}",
-            host_targets.raw.join(", ")
+        // is aborting, and the operator greps stderr for it. `ui::fatal` is
+        // that path — stderr *and* the masker *and* the audit log, so a raw
+        // SSH spec that happens to carry a credential in its userinfo is not
+        // printed in the clear.
+        crate::ui::fatal(
+            &format!(
+                "per-host `@secrets` ({{host}}) need a named `@server` alias; these targets are \
+                 raw SSH specs and cannot key a secret file: {}",
+                host_targets.raw.join(", ")
+            ),
+            &log_file,
         );
         return None;
     }
@@ -354,11 +336,11 @@ async fn setup_run(
     // `--check` is the syntax gate: it does not execute anything, so it must
     // not need an identity or a `{host}` file. Resolving secrets here made a
     // keyless CI runner unable to run the cheapest, safest check.
-    let resolved = if flags.check || plan.secrets.is_empty() {
+    let resolved = if flags.check || plan.secrets().is_empty() {
         ResolvedSecrets::empty()
     } else {
         match crate::secrets::resolve_secrets(
-            &plan.secrets,
+            plan.secrets(),
             &host_aliases,
             flags.identity.as_deref(),
             run.mask_min_len(),
@@ -396,10 +378,13 @@ async fn setup_run(
 
     if flags.local && resolved.has_per_host() && host_aliases.len() > 1 {
         // Hard run-configuration failure, same rationale as above.
-        eprintln!(
-            "error: `--local` cannot resolve per-host `@secrets` ({{host}}) across {} hosts; \
-             re-run with `-t <host>`",
-            host_aliases.len()
+        crate::ui::fatal(
+            &format!(
+                "`--local` cannot resolve per-host `@secrets` ({{host}}) across {} hosts; re-run \
+                 with `-t <host>`",
+                host_aliases.len()
+            ),
+            &log_file,
         );
         return None;
     }
@@ -417,11 +402,11 @@ async fn setup_run(
     // index `--only`/`--skip` use. Numbering by the filtered position made
     // `--skip 1 --only 1` select a step the preview had numbered
     // differently.
-    let total = plan.steps.len();
+    let total = plan.steps().len();
 
     // The managed work directory exists before the first step, so every
     // block and every `@copy` path can name `$WORKDIR`.
-    let workdir = match &plan.workdir {
+    let workdir = match plan.workdir() {
         Some(declared) => match create_workdir(declared, &run_state).await {
             Ok(workdir) => Some(WorkdirGuard {
                 workdir,
@@ -695,7 +680,7 @@ async fn run_single_step(
                     verify: service.verify,
                     force_start: service.force_start,
                 },
-                service.timeout.unwrap_or(DEFAULT_WAIT_SECS),
+                service.timeout.unwrap_or(helper::DEFAULT_WAIT_SECS),
             );
             (
                 None,
@@ -913,6 +898,17 @@ async fn run_single_step(
                 .await,
             )
         }
+        // `Step` is `#[non_exhaustive]`. A variant this build does not know
+        // cannot be executed, and skipping it silently would report a
+        // successful deploy that never ran the step: fail the plan instead.
+        _ => {
+            crate::ui::step_failed(
+                step_no,
+                "this build does not recognise the step (upgrade shellflow)",
+                &setup.log_file,
+            );
+            plan_failure()
+        }
     }
 }
 
@@ -945,7 +941,7 @@ pub(super) async fn run_reload_step(
         crate::ui::note(&format!("  reload {} (no-op in check/dry-run)", reload.unit), log_file);
         return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
     }
-    let timeout = Duration::from_secs(reload.timeout.unwrap_or(DEFAULT_RELOAD_SECS));
+    let timeout = Duration::from_secs(reload.timeout.unwrap_or(helper::DEFAULT_RELOAD_SECS));
     let mut tasks = JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(ui);
@@ -971,7 +967,12 @@ pub(super) async fn run_reload_step(
                     ui: &ui,
                     host: &host,
                     class: super::StepClass::Reload,
-                    command: reload_command(&unit, signal.as_deref(), wait, timeout.as_secs()),
+                    command: helper::reload_command(
+                        &unit,
+                        signal.as_deref(),
+                        wait,
+                        timeout.as_secs(),
+                    ),
                     env: with_login_path(Vec::new(), remote_env.path.as_deref()),
                     has_secrets: false,
                     probe_muxy: remote_env.has_muxy,
@@ -982,7 +983,7 @@ pub(super) async fn run_reload_step(
                     muxy: &transport.muxy,
                     step_no: transport.step_no,
                     transform: None,
-                    explain_exit: Some(reload_explain(&unit, timeout.as_secs())),
+                    explain_exit: Some(helper::reload_explain(&unit, timeout.as_secs())),
                 })
                 .await;
                 if let super::muxy::CommandAttempt::Done((alias, outcome)) = attempt {
@@ -996,7 +997,8 @@ pub(super) async fn run_reload_step(
             // `--wait`, waits for the notify handshake on the target.
             let cmd = super::transport::ssh_argv_command(
                 &host,
-                &reload_command(&unit, signal.as_deref(), wait, timeout.as_secs()),
+                &helper::reload_command(&unit, signal.as_deref(), wait, timeout.as_secs()),
+                super::transport::SshPolicy::step(config.ssh_reuse, config.verbose >= 3),
             );
             let args = stream::PipedArgs {
                 ui: &ui,
@@ -1007,7 +1009,7 @@ pub(super) async fn run_reload_step(
                 log_file: &log_file,
                 cancel: cancel.clone(),
                 quiet: false,
-                collector: Some(wait_collector(&unit)),
+                collector: Some(helper::wait_collector(&unit)),
             };
             let outcome = match stream::run_piped_child(args, cmd).await {
                 Ok(outcome) => outcome,
@@ -1017,39 +1019,26 @@ pub(super) async fn run_reload_step(
             };
             match outcome {
                 stream::PipedRun::Completed(status) => {
-                    let code = status.code().unwrap_or(-1);
-                    match code {
-                        0 => {
-                            ui.lock()
-                                .await
-                                .masked_note(&format!("[{}] {unit} reloaded", host.alias));
-                            (host.alias.clone(), HostOutcome::Ok)
-                        }
-                        255 => (host.alias.clone(), HostOutcome::Failed(RunError::Transport)),
-                        3 => {
-                            ui.lock()
-                                .await
-                                .masked_note(&format!("[{}] {unit} reload failed", host.alias));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
-                        }
-                        4 => {
-                            ui.lock().await.masked_note(&format!(
-                                "[{}] {unit} did not finish reloading within {}s",
-                                host.alias,
-                                timeout.as_secs()
-                            ));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
-                        }
-                        other => {
-                            ui.lock().await.masked_note(&format!(
-                                "[{}] {unit} reload failed (exit {other})",
-                                host.alias
-                            ));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
-                        }
+                    // One ladder for both helpers (see `classify_helper_exit`):
+                    // the reload and wait paths used to spell the same
+                    // `0/255/3/4/other` vocabulary out twice, in different
+                    // words.
+                    let (outcome, note) = helper::classify_helper_exit(
+                        status.code().unwrap_or(-1),
+                        &unit,
+                        helper::HelperVerb::Reload,
+                        timeout.as_secs(),
+                        &host.alias,
+                    );
+                    if !note.is_empty() {
+                        ui.lock().await.masked_note(&note);
                     }
+                    (host.alias.clone(), outcome)
                 }
-                stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken => {
+                // The transport's own budget expiring is a timeout, not a
+                // transport failure: the ssh connection was fine.
+                stream::PipedRun::TimedOut => (host.alias.clone(), HostOutcome::TimedOut),
+                stream::PipedRun::PipeBroken => {
                     (host.alias.clone(), HostOutcome::Failed(RunError::Transport))
                 }
                 stream::PipedRun::Cancelled => (host.alias.clone(), HostOutcome::Cancelled),
@@ -1057,30 +1046,6 @@ pub(super) async fn run_reload_step(
         });
     }
     Ok(stream::collect_hosts(ui, log_file, tasks).await)
-}
-
-/// The remote command that reloads a unit.
-///
-/// The helper does the work on the target — it knows the unit's `ExecReload=`,
-/// it can send the notify handshake, and it can wait for the reload to
-/// finish. The inline fallback covers a host that has never seen this
-/// shellflow: it still refuses to degrade into a restart.
-fn reload_command(unit: &str, signal: Option<&str>, wait: bool, timeout_secs: u64) -> String {
-    let mut helper = format!("systemd reload '{unit}'");
-    if let Some(sig) = signal {
-        helper.push_str(&format!(" --signal {sig}"));
-    }
-    if wait {
-        helper.push_str(&format!(" --wait --timeout {timeout_secs}"));
-    }
-    let fallback_signal = signal.unwrap_or("SIGUSR1");
-    format!(
-        "if [ -x /usr/local/bin/shellflow ]; then exec /usr/local/bin/shellflow {helper}; fi; \
-         u='{unit}'; \
-         if [ \"$(id -u)\" = 0 ]; then SC=systemctl; else SC='sudo -n systemctl'; fi; \
-         if [ -n \"$($SC show \"$u\" -p ExecReload --value 2>/dev/null)\" ]; then $SC reload \"$u\"; \
-         else $SC kill --signal '{fallback_signal}' \"$u\"; fi"
-    )
 }
 
 /// Execute the plan and return the overall outcome.
@@ -1156,14 +1121,14 @@ pub(crate) async fn execute_plan(
         // The staging directory is removed even on an interrupt: the run
         // must not leave its scratch space behind on the target.
         if let Some(guard) = &setup.workdir {
-            guard.cleanup(&plan).await;
+            guard.cleanup(&plan, &setup.semaphore, &setup.log_file).await;
         }
         return RunOutcome::Interrupted { total, torn_down: true };
     }
 
     // The staging directory is removed when the run ends, on every path.
     if let Some(guard) = &setup.workdir {
-        guard.cleanup(&plan).await;
+        guard.cleanup(&plan, &setup.semaphore, &setup.log_file).await;
     }
 
     if flags.continue_on_error || fail_fast_error.is_none() {
@@ -1210,28 +1175,15 @@ fn target_host_aliases(
     let mut aliases = std::collections::BTreeSet::new();
     let mut raw = std::collections::BTreeSet::new();
     for (_, step) in selected {
-        let target = match step {
-            shellflow_core::Step::Remote(remote) => &remote.target,
-            shellflow_core::Step::Copy(copy) => &copy.target,
-            shellflow_core::Step::Wait(wait) => &wait.target,
-            shellflow_core::Step::Reload(reload) => &reload.target,
-            shellflow_core::Step::Assert(assert) => &assert.target,
-            shellflow_core::Step::Service(service) => &service.target,
-            shellflow_core::Step::Install(install) => &install.target,
-            shellflow_core::Step::Backup(backup) => &backup.target,
-            shellflow_core::Step::Credstore(credstore) => &credstore.target,
-            shellflow_core::Step::UnitInventory(inventory) => &inventory.target,
-            shellflow_core::Step::Helper(helper) => &helper.target,
-            shellflow_core::Step::Release(release) => &release.target,
-            shellflow_core::Step::Build(build) => &build.target,
-            shellflow_core::Step::Toolchain(toolchain) => &toolchain.target,
-            shellflow_core::Step::Image(image) => &image.target,
-            shellflow_core::Step::Local(_) => continue,
+        // One accessor instead of a sixteen-arm match: a new step variant
+        // must not have to be added here as well.
+        let Some(target) = step.target() else {
+            continue;
         };
         match shellflow_core::resolve_hosts(plan, target, restrict) {
             Ok(hosts) => {
                 for host in hosts {
-                    if plan.servers.contains_key(&host.alias) {
+                    if plan.servers().contains_key(&host.alias) {
                         aliases.insert(host.alias);
                     } else {
                         raw.insert(host.alias);
@@ -1255,109 +1207,6 @@ pub(super) struct PayloadParts {
     pub(super) guard: Option<String>,
     pub(super) env: Vec<(String, String)>,
     pub(super) trace: bool,
-}
-
-/// Default wait budget in seconds when neither `@timeout` nor `--timeout`
-/// bounds a `@wait_active` step (slow starters: substrate nodes, JVMs,
-/// container image pulls).
-const DEFAULT_WAIT_SECS: u64 = 300;
-
-/// The default budget for a graceful reload handshake.
-const DEFAULT_RELOAD_SECS: u64 = 120;
-
-/// The remote command that waits for a unit to become ready.
-///
-/// The helper does the waiting **on the target**: it polls systemd there and
-/// streams one state line per poll, so the whole wait costs a single SSH
-/// round-trip instead of one per poll.
-///
-/// When the helper is not installed yet (a host that has never seen this
-/// shellflow), a self-contained fallback polls `systemctl is-active` so the
-/// step still works — it just cannot show the service's own `STATUS=` text.
-///
-/// The unit name is validated at parse time (`[A-Za-z0-9._-]` plus `@`/`:`,
-/// no leading dots, no `..`), so interpolating it into the script cannot
-/// smuggle a quote or a shell metacharacter.
-fn wait_command(unit: &str, budget_secs: u64) -> String {
-    format!(
-        "if [ -x /usr/local/bin/shellflow ]; then exec /usr/local/bin/shellflow systemd wait '{unit}' --timeout {budget_secs} --for ready; fi; \
-         u='{unit}'; d=$(( $(date +%s) + {budget_secs} )); \
-         while :; do \
-           if systemctl is-active --quiet \"$u\"; then echo 'SFW active'; exit 0; fi; \
-           if systemctl is-failed --quiet \"$u\"; then echo 'SFW failed'; exit 3; fi; \
-           echo 'SFW pending'; \
-           if [ \"$(date +%s)\" -ge \"$d\" ]; then exit 4; fi; \
-           sleep 5; \
-         done"
-    )
-}
-
-/// Interpret the state lines the target-side helper streams.
-///
-/// The helper emits `SFW<TAB>type<TAB>active<TAB>sub<TAB>result<TAB>status`;
-/// the fallback emits a single word. The operator sees the service's own
-/// `STATUS=` text when it publishes one (that is the whole point of the notify
-/// protocol) and the raw systemd state otherwise.
-fn wait_collector(unit: &str) -> stream::LineCollector {
-    let unit = unit.to_string();
-    stream::LineCollector::new(move |line| {
-        if let Some(state) = crate::systemd::parse_state_line(line) {
-            let mut bits = Vec::new();
-            if !state.unit_type.is_empty() {
-                bits.push(format!("type={}", state.unit_type));
-            }
-            if !state.active.is_empty() {
-                bits.push(format!("active={}", state.active));
-            }
-            if !state.sub.is_empty() {
-                bits.push(format!("sub={}", state.sub));
-            }
-            if !state.result.is_empty() {
-                bits.push(format!("result={}", state.result));
-            }
-            let bits = bits.join(" ");
-            return Some(if state.status.is_empty() {
-                format!("waiting {unit}: {bits}")
-            } else {
-                format!("waiting {unit}: {}", state.status)
-            });
-        }
-        let rest = line.strip_prefix("SFW")?;
-        let word = rest.trim();
-        if word.is_empty() {
-            return None;
-        }
-        Some(format!("waiting {unit}: {word}"))
-    })
-}
-
-/// The per-class exit-code vocabulary of a `@wait` helper, for the muxy path
-/// (the ssh path names the same codes inline).
-#[cfg(feature = "muxy")]
-fn wait_explain(unit: &str, secs: u64) -> super::muxy::ExplainExit {
-    let unit = unit.to_string();
-    std::sync::Arc::new(move |code: i32| {
-        Some(match code {
-            3 => format!("{unit} failed"),
-            4 => format!("{unit} not ready after {secs}s"),
-            5 => format!("{unit} does not exist"),
-            other => format!("{unit} wait failed (exit {other})"),
-        })
-    })
-}
-
-/// The per-class exit-code vocabulary of a `@reload` helper, for the muxy
-/// path (the ssh path names the same codes inline).
-#[cfg(feature = "muxy")]
-fn reload_explain(unit: &str, secs: u64) -> super::muxy::ExplainExit {
-    let unit = unit.to_string();
-    std::sync::Arc::new(move |code: i32| {
-        Some(match code {
-            3 => format!("{unit} reload failed"),
-            4 => format!("{unit} did not finish reloading within {secs}s"),
-            other => format!("{unit} reload failed (exit {other})"),
-        })
-    })
 }
 
 #[expect(
@@ -1384,13 +1233,13 @@ pub(super) async fn run_wait_step(
             &format!(
                 "  wait_active {} ({}s budget): no-op in check/dry-run",
                 wait.unit,
-                config.timeout.unwrap_or(DEFAULT_WAIT_SECS),
+                config.timeout.unwrap_or(helper::DEFAULT_WAIT_SECS),
             ),
             log_file,
         );
         return Ok(hosts.into_iter().map(|host| (host.alias, HostOutcome::Ok)).collect());
     }
-    let budget = Duration::from_secs(config.timeout.unwrap_or(DEFAULT_WAIT_SECS));
+    let budget = Duration::from_secs(config.timeout.unwrap_or(helper::DEFAULT_WAIT_SECS));
     let mut tasks = JoinSet::new();
     for host in hosts {
         let ui = Arc::clone(ui);
@@ -1415,7 +1264,7 @@ pub(super) async fn run_wait_step(
                     ui: &ui,
                     host: &host,
                     class: super::StepClass::Wait,
-                    command: wait_command(&unit, budget.as_secs()),
+                    command: helper::wait_command(&unit, budget.as_secs()),
                     env: with_login_path(Vec::new(), remote_env.path.as_deref()),
                     has_secrets: false,
                     probe_muxy: remote_env.has_muxy,
@@ -1425,8 +1274,8 @@ pub(super) async fn run_wait_step(
                     cancel: &cancel,
                     muxy: &transport.muxy,
                     step_no: transport.step_no,
-                    transform: Some(wait_collector(&unit)),
-                    explain_exit: Some(wait_explain(&unit, budget.as_secs())),
+                    transform: Some(helper::wait_collector(&unit)),
+                    explain_exit: Some(helper::wait_explain(&unit, budget.as_secs())),
                 })
                 .await;
                 if let super::muxy::CommandAttempt::Done((alias, outcome)) = attempt {
@@ -1440,8 +1289,11 @@ pub(super) async fn run_wait_step(
             // streams one state line per poll. The whole wait therefore costs
             // a single SSH round-trip instead of one per poll, and the
             // operator sees the service's own `STATUS=` text while it starts.
-            let cmd =
-                super::transport::ssh_argv_command(&host, &wait_command(&unit, budget.as_secs()));
+            let cmd = super::transport::ssh_argv_command(
+                &host,
+                &helper::wait_command(&unit, budget.as_secs()),
+                super::transport::SshPolicy::step(config.ssh_reuse, config.verbose >= 3),
+            );
             let args = stream::PipedArgs {
                 ui: &ui,
                 host: &host.alias,
@@ -1453,7 +1305,7 @@ pub(super) async fn run_wait_step(
                 log_file: &log_file,
                 cancel: cancel.clone(),
                 quiet: false,
-                collector: Some(wait_collector(&unit)),
+                collector: Some(helper::wait_collector(&unit)),
             };
             let outcome = match stream::run_piped_child(args, cmd).await {
                 Ok(outcome) => outcome,
@@ -1463,43 +1315,20 @@ pub(super) async fn run_wait_step(
             };
             match outcome {
                 stream::PipedRun::Completed(status) => {
-                    let code = status.code().unwrap_or(-1);
-                    match code {
-                        0 => {
-                            ui.lock().await.masked_note(&format!("[{}] {unit} active", host.alias));
-                            (host.alias.clone(), HostOutcome::Ok)
-                        }
-                        // ssh exits 255 when the connection itself failed:
-                        // that is a transport failure, not an inactive unit.
-                        255 => (host.alias.clone(), HostOutcome::Failed(RunError::Transport)),
-                        3 => {
-                            ui.lock().await.masked_note(&format!("[{}] {unit} failed", host.alias));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
-                        }
-                        4 => {
-                            ui.lock().await.masked_note(&format!(
-                                "[{}] {unit} not ready after {}s",
-                                host.alias,
-                                budget.as_secs()
-                            ));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
-                        }
-                        5 => {
-                            ui.lock()
-                                .await
-                                .masked_note(&format!("[{}] {unit} does not exist", host.alias));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
-                        }
-                        other => {
-                            ui.lock().await.masked_note(&format!(
-                                "[{}] {unit} wait failed (exit {other})",
-                                host.alias
-                            ));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
-                        }
+                    let (outcome, note) = helper::classify_helper_exit(
+                        status.code().unwrap_or(-1),
+                        &unit,
+                        helper::HelperVerb::Wait,
+                        budget.as_secs(),
+                        &host.alias,
+                    );
+                    if !note.is_empty() {
+                        ui.lock().await.masked_note(&note);
                     }
+                    (host.alias.clone(), outcome)
                 }
-                stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken => {
+                stream::PipedRun::TimedOut => (host.alias.clone(), HostOutcome::TimedOut),
+                stream::PipedRun::PipeBroken => {
                     (host.alias.clone(), HostOutcome::Failed(RunError::Transport))
                 }
                 stream::PipedRun::Cancelled => (host.alias.clone(), HostOutcome::Cancelled),
@@ -1998,22 +1827,24 @@ pub(crate) async fn resolve_remote_env(
     cancel: &Cancel,
 ) -> RemoteEnv {
     let key = super::shell_cache_key(host);
-    // The lock is held across get-or-probe so concurrent steps on the same
-    // destination probe once, as the `ShellCache` contract promises. Only a
-    // *completed* probe is cached: a failed probe yields the default
-    // environment below and is retried by the next caller instead of being
-    // pinned on the host for the rest of the run.
-    let mut cache = cache.lock().await;
-    if let Some(env) = cache.get(&key) {
+    // The map lock guards the map only. The probe used to run while the lock
+    // was held, which made "probe each destination once" mean "probe the whole
+    // fleet one host at a time": a single unreachable host costs its full
+    // retry budget (2 x 6s + 0.5s) and every other host task waited on the
+    // same mutex, so `--parallel N` degraded to a serial sweep. A per-key
+    // `OnceCell` keeps the de-duplication and moves the wait off the lock.
+    let cell = {
+        let mut map = cache.lock().await;
+        Arc::clone(map.entry(key.clone()).or_default())
+    };
+    if let Some(env) = cell.get_or_init(|| probe_remote_env(host, cancel)).await {
         return env.clone();
     }
-    match probe_remote_env(host, cancel).await {
-        Some(env) => {
-            cache.insert(key, env.clone());
-            env
-        }
-        None => RemoteEnv::default(),
-    }
+    // Only a *completed* probe is cached: a failed one yields the default
+    // environment and is retried by the next caller instead of being pinned on
+    // the host for the rest of the run.
+    cache.lock().await.remove(&key);
+    RemoteEnv::default()
 }
 
 const PROBE_SCRIPT: &str = r#"
@@ -2050,18 +1881,10 @@ const PROBE_SCRIPT: &str = r#"
 /// criterion, and every field degrades independently.
 const PROBE_END_MARKER: &str = "SHELLFLOW_PROBE_END";
 
-/// How long a single probe attempt may spend connecting.
-///
-/// The probe sets this explicitly instead of inheriting the operator's
-/// `~/.ssh/config`: a probe is a *cheap* question, and a dropped SYN on a
-/// long-haul link must not stall the whole run. Kept well below the interrupt
-/// grace period (main `INTERRUPT_GRACE`) so `Ctrl-C` during a probe still
-/// tears down promptly.
-const PROBE_CONNECT_TIMEOUT_SECS: u64 = 5;
-
 /// The wall-clock budget of one probe attempt.
 ///
-/// The budget must exceed [`PROBE_CONNECT_TIMEOUT_SECS`]: with the two
+/// The budget must exceed
+/// [`super::transport::PROBE_CONNECT_TIMEOUT_SECS`]: with the two
 /// equal, a slow TCP connect has `ssh` give up at the same moment the probe
 /// does, and the probe is cut off mid-flight — the host looks like it has no
 /// rsync, and a perfectly good deploy fails with a misleading message.
@@ -2112,14 +1935,13 @@ async fn probe_once(host: &ResolvedHost, cancel: &Cancel) -> Option<RemoteEnv> {
         PROBE_SCRIPT.trim(),
         marker = PROBE_END_MARKER,
     );
-    let mut cmd = Command::new("ssh");
-    // Fail closed on an unknown host key or a missing key: never prompt.
-    cmd.args(["-o", "BatchMode=yes"]);
-    // The probe bounds its own connect phase instead of inheriting the
-    // operator's `ConnectTimeout` (15s by convention): a probe is a cheap
-    // question and must not stall the run.
-    cmd.args(["-o", &format!("ConnectTimeout={PROBE_CONNECT_TIMEOUT_SECS}")]);
-    cmd.args(host.spec.to_ssh_args()).arg("-T");
+    // The probe uses its own policy: it bounds the connect phase tighter than
+    // a step does, and it never joins a multiplexed connection — a probe is a
+    // cheap question that must answer (or fail) on its own.
+    let mut cmd = Command::from(super::transport::ssh_command(
+        super::transport::SshPolicy::probe(),
+        &host.spec,
+    ));
     cmd.arg(script);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2297,7 +2119,10 @@ async fn run_ssh_child(args: SshChildArgs<'_>) -> Result<(), SshOutcome> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GUARD_SKIP_EXIT, folded_guard, wait_collector, wait_command};
+    use super::{
+        GUARD_SKIP_EXIT, folded_guard,
+        helper::{wait_collector, wait_command},
+    };
 
     /// Run a folded guard plus a body exactly as the remote payload does.
     fn run_payload(guard: &str, body: &str) -> i32 {

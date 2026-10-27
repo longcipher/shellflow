@@ -4,7 +4,7 @@
 use std::{path::Path, process::Stdio, sync::Arc};
 
 use eyre::{Context as _, Result};
-use shellflow_core::{EnvEntry, LocalStep, RunState};
+use shellflow_core::{EnvEntry, ExportVar, LocalStep, RunState};
 use tokio::{fs, process::Command, sync::Mutex};
 
 use super::{
@@ -72,6 +72,12 @@ pub(super) async fn build_env(
                     env.push((key.clone(), value));
                 }
             }
+            // `EnvEntry` is `#[non_exhaustive]`: a variant this build does not
+            // know cannot be turned into an environment pair without guessing,
+            // and guessing an environment value is exactly what this tool must
+            // not do. The planner and this build ship together, so the arm is
+            // unreachable in practice; the entry is simply not injected.
+            _ => {}
         }
     }
     env
@@ -84,7 +90,7 @@ pub(super) async fn build_env(
 /// newline cannot forge a sibling record or be silently truncated; no
 /// escaping is needed. A NUL-separated record also matches the `parse_capture_records`
 /// pure parser in `shellflow-core`, which is where the reading side is tested.
-fn append_capture(script: &str, vars: &[String]) -> String {
+fn append_capture(script: &str, vars: &[ExportVar]) -> String {
     let mut out = String::with_capacity(script.len() + 64 * vars.len());
     out.push_str(script);
     if !script.ends_with('\n') {
@@ -95,11 +101,40 @@ fn append_capture(script: &str, vars: &[String]) -> String {
         // passed as arguments, so `%`/backslash in them are never re-scanned.
         // The variable name is validated by the parser
         // (`is_valid_var_name`), so it cannot break out of the quotes.
+        let name = &var.name;
         out.push_str(&format!(
-            "printf '%s=%s\\0' \"{var}\" \"${{{var}}}\" >> \"$SHELLFLOW_CAPTURE\"\n"
+            "printf '%s=%s\\0' \"{name}\" \"${{{name}}}\" >> \"$SHELLFLOW_CAPTURE\"\n"
         ));
     }
     out
+}
+
+/// What a captured value contributes to the mask registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Masking {
+    /// At or above the threshold: redacted everywhere, substring included.
+    Global,
+    /// Below the threshold: redacted only as a standalone token / under its key.
+    Narrow,
+    /// `--public`, or empty: rendered in the clear.
+    None,
+}
+
+/// Decide how a captured `@export` value is masked.
+///
+/// The decision is a property of the *declaration* (`--public`) and of the
+/// value's length, never of the variable's name. A name heuristic ("looks like
+/// a secret") reads as a safety property while being a guess: a playbook that
+/// exports `DATABASE_URL` from a vault would print it in the clear and write it
+/// to `--log-file`, and nothing in the output would say so.
+const fn masking_for(var: &ExportVar, value: &str, mask_min_len: usize) -> Masking {
+    if var.public || value.is_empty() {
+        Masking::None
+    } else if value.len() >= mask_min_len {
+        Masking::Global
+    } else {
+        Masking::Narrow
+    }
 }
 
 /// Read the NUL-delimited capture file into the run state, then let the
@@ -110,57 +145,51 @@ fn append_capture(script: &str, vars: &[String]) -> String {
 pub(crate) async fn capture_exports(
     ui: &super::ArcUi,
     run_state: &Arc<Mutex<RunState>>,
-    vars: &[String],
+    vars: &[ExportVar],
     capture: &super::CaptureFile,
     mask_min_len: usize,
 ) -> Result<()> {
+    let names: Vec<String> = vars.iter().map(|var| var.name.clone()).collect();
     let content = fs::read(capture.path())
         .await
         .wrap_err_with(|| format!("failed to read capture file {}", capture.path().display()))?;
-    let table = shellflow_core::parse_capture_records_checked(&content, Some(vars))
+    let table = shellflow_core::parse_capture_records_checked(&content, Some(&names))
         .wrap_err("failed to parse `@export` capture records")?;
 
     // The captured values enter the run state and are injected into every
-    // later step, so a secret-looking one must join the mask registry now:
-    // the value was unknown before the step ran, and a later block that
-    // echoes it would otherwise print it unredacted. The threshold rule
-    // matches `secrets::decrypt_file`: at-or-above the threshold is masked
-    // globally, below it is redacted only as a standalone token / under its
-    // own key.
+    // later step, so they must join the mask registry now: the value was
+    // unknown before the step ran, and a later block that echoes it (or a
+    // `-vvv` trace, or `--log-file`) would otherwise print it in the clear.
+    // Every captured value is masked unless the playbook said `--public`;
+    // the threshold rule matches `secrets::decrypt_file`: at-or-above the
+    // threshold is masked globally, below it is redacted only as a standalone
+    // token / under its own key. A `--public` value is the operator's
+    // explicit, reviewable choice and is reported at `-v`.
     let mut masks: Vec<String> = Vec::new();
     let mut shorts: Vec<(String, String)> = Vec::new();
     let mut state = run_state.lock().await;
     for var in vars {
-        let Some(value) = table.get(var.as_str()) else {
-            return Err(eyre::eyre!("variable `{var}` was not exported by the local step"));
+        let name = var.name.as_str();
+        let Some(value) = table.get(name) else {
+            return Err(eyre::eyre!("variable `{name}` was not exported by the local step"));
         };
-        if is_secretish_name(var) {
-            if value.len() >= mask_min_len && !masks.contains(value) {
-                masks.push(value.clone());
-            } else if !value.is_empty() {
-                shorts.retain(|(k, _)| k != var);
-                shorts.push((var.clone(), value.clone()));
+        match masking_for(var, value, mask_min_len) {
+            Masking::Global => {
+                if !masks.contains(value) {
+                    masks.push(value.clone());
+                }
             }
+            Masking::Narrow => {
+                shorts.retain(|(key, _)| key != name);
+                shorts.push((name.to_string(), value.clone()));
+            }
+            Masking::None => {}
         }
-        state.vars.insert(var.clone(), value.clone());
+        state.vars.insert(name.to_string(), value.clone());
     }
     drop(state);
     ui.lock().await.extend_secret_values(masks, shorts);
     Ok(())
-}
-
-/// Whether a variable name plausibly carries a credential.
-///
-/// `@export` is a general mechanism — `VERSION`, `COMMIT`, an image tag — and
-/// masking every exported value would shred ordinary deploy output (`v1.2.3`
-/// in a log line becomes `***`). Only names that look secret-bearing are
-/// registered; the needle list errs toward masking, because a missed mask
-/// leaks while a spurious one only redacts.
-fn is_secretish_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    ["SECRET", "TOKEN", "PASSWD", "PASSWORD", "PASS", "KEY", "CRED", "PRIVATE"]
-        .iter()
-        .any(|needle| upper.contains(needle))
 }
 
 pub(crate) fn create_capture_file(path: &Path) -> Result<()> {
@@ -443,7 +472,21 @@ async fn run_bash_n(script: &str, log_file: &LogFile) -> Result<(), LocalFailure
 
 #[cfg(test)]
 mod tests {
-    use super::create_capture_file;
+    use super::{ExportVar, Masking, create_capture_file, masking_for};
+
+    #[test]
+    fn a_captured_value_is_masked_unless_declared_public() {
+        // The variable *name* must not decide this: `DATABASE_URL` is the
+        // ordinary name for a credential a playbook just fetched, and a name
+        // heuristic would print it in the clear and write it to `--log-file`.
+        let masked = ExportVar { name: "DATABASE_URL".to_string(), public: false };
+        assert_eq!(masking_for(&masked, "postgres://u:p@h/db", 6), Masking::Global);
+        assert_eq!(masking_for(&masked, "12345", 6), Masking::Narrow);
+        assert_eq!(masking_for(&masked, "", 6), Masking::None);
+
+        let public = ExportVar { name: "VERSION".to_string(), public: true };
+        assert_eq!(masking_for(&public, "v1.2.3", 6), Masking::None);
+    }
 
     #[test]
     fn capture_file_is_owner_only_and_create_new() {

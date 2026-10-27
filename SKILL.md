@@ -70,7 +70,7 @@ lines belong to the current block.
 | `@local` | `# @local` | Following lines run locally (default) |
 | `@remote` | `# @remote <target>` | Following lines stream to the target (alias, group, raw spec) |
 | `@copy` | `# @copy <src> -> <dst> @<target> [--delete] [--exclude <glob>]` | Copy a local path (rsync, or scp fallback); creates the destination dir; `$VAR` interpolated; `--exclude` is repeatable and honored by rsync. On a host without rsync the scp fallback cannot filter or mirror, so a step that asked for `--delete`/`--exclude` **fails closed** unless `--allow-unfiltered-copy` accepts the downgrade |
-| `@export` | `# @export <VAR>[,<VAR>…]` | Capture variables from the preceding local block into run state |
+| `@export` | `# @export <VAR>[,<VAR>…] [--public]` | Capture variables from the preceding local block into run state. Every captured value is masked in the output (terminal, previews, `--log-file`) unless the line says `--public`; use `--public` for versions, timestamps, paths and other non-secret values |
 | `@timeout` | `# @timeout <seconds>` | Per-step timeout for the next block |
 | `@name` | `# @name <label>` | Name the next block (for `--only`/`--skip`/reporting) |
 | `@only_if` | `# @only_if <command>` | Skip the next block where `<command>` fails |
@@ -112,6 +112,9 @@ Behavioral rules to remember:
 - `@copy` paths are parsed by shellflow, not Bash. Capture values with
   `@export` and reference them as `$VAR` / `${VAR}`. Unresolved variables are
   a hard error in a real run, and a warning + skip in `--dry-run`/`--check`.
+  A captured value is masked in every rendered line unless the declaration says
+  `--public`; a secret exported under an ordinary name (`DATABASE_URL`) is
+  therefore still not printed.
 - `@only_if` guards run per host with the same env as the block; a failed
   guard reports `SKIPPED`.
 - `@copy` `src`/`dst` must not contain `->`; the target is the last
@@ -141,7 +144,7 @@ mutations confined to `/tmp` unless the user explicitly asks otherwise.
 STAMP="sf-$(date +%s)"
 WORKDIR="/tmp/${STAMP}"
 mkdir -p "${WORKDIR}"
-# @export STAMP,WORKDIR
+# @export STAMP,WORKDIR --public
 
 # @copy ./playbooks/marker.txt -> $WORKDIR/marker.txt @all
 

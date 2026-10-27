@@ -16,6 +16,7 @@ use crate::{
 /// Classification happens lazily in [`resolve_hosts`] so forward references
 /// (a step using a group declared later in the script) work correctly.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Target {
     /// The raw target text from the script (`web`, `@web`, `deploy@host`…).
     pub text: String,
@@ -48,6 +49,7 @@ impl Target {
 
 /// An environment entry injected into subsequent blocks.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum EnvEntry {
     /// A literal `KEY=VALUE` from the script.
     Literal {
@@ -76,6 +78,24 @@ pub struct SecretEntry {
     pub identity: Option<String>,
 }
 
+/// One variable captured by `@export`.
+///
+/// A captured value is masked in every rendered line **by default**. It is a
+/// runtime value the parser never saw, and a playbook routinely exports
+/// credentials it just fetched (a vault lookup, a token endpoint), so the
+/// variable *name* cannot be the thing that decides whether it is safe to
+/// print. `--public` is the explicit, reviewable opt-out for values that are
+/// meant to be read in the output (`VERSION`, `COMMIT`); it lives in the
+/// playbook next to the declaration instead of in a name heuristic inside the
+/// engine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportVar {
+    /// The shell variable name (`[A-Za-z_][A-Za-z0-9_]*`, already validated).
+    pub name: String,
+    /// Whether the value may be rendered in the clear (`@export NAME --public`).
+    pub public: bool,
+}
+
 /// A block of Bash lines executed on the local machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalStep {
@@ -88,7 +108,7 @@ pub struct LocalStep {
     /// Optional per-step timeout in seconds from `@timeout`.
     pub timeout: Option<u64>,
     /// Variables captured into run state after this step (`@export`).
-    pub export: Vec<String>,
+    pub export: Vec<ExportVar>,
     /// Environment snapshot (`@env`) in effect when the block was declared.
     ///
     /// Shared, copy-on-write: the plan keeps one list and every step points
@@ -194,6 +214,7 @@ pub struct ReloadStep {
 
 /// One condition an `@assert` step checks on the target.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Assertion {
     /// The systemd unit's `ActiveState` must equal the expected state.
     UnitState {
@@ -562,6 +583,7 @@ pub struct AssertStep {
 
 /// One executable unit of the plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Step {
     /// Execute Bash locally.
     Local(LocalStep),
@@ -645,27 +667,37 @@ impl Step {
         }
     }
 
+    /// The target of the steps that run against hosts.
+    ///
+    /// Consumers that need the target itself (to resolve hosts, to key a
+    /// per-host secret file) use this instead of matching all sixteen
+    /// variants, so a new step variant does not fan out into six matches.
+    #[must_use]
+    pub const fn target(&self) -> Option<&Target> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(s) => Some(&s.target),
+            Self::Copy(s) => Some(&s.target),
+            Self::Wait(s) => Some(&s.target),
+            Self::Reload(s) => Some(&s.target),
+            Self::Assert(s) => Some(&s.target),
+            Self::Service(s) => Some(&s.target),
+            Self::Install(s) => Some(&s.target),
+            Self::Backup(s) => Some(&s.target),
+            Self::Credstore(s) => Some(&s.target),
+            Self::UnitInventory(s) => Some(&s.target),
+            Self::Helper(s) => Some(&s.target),
+            Self::Release(s) => Some(&s.target),
+            Self::Build(s) => Some(&s.target),
+            Self::Toolchain(s) => Some(&s.target),
+            Self::Image(s) => Some(&s.target),
+        }
+    }
+
     /// The target text, for remote and copy steps.
     #[must_use]
     pub fn target_text(&self) -> Option<&str> {
-        match self {
-            Self::Local(_) => None,
-            Self::Remote(s) => Some(&s.target.text),
-            Self::Copy(s) => Some(&s.target.text),
-            Self::Wait(s) => Some(&s.target.text),
-            Self::Reload(s) => Some(&s.target.text),
-            Self::Assert(s) => Some(&s.target.text),
-            Self::Service(s) => Some(&s.target.text),
-            Self::Install(s) => Some(&s.target.text),
-            Self::Backup(s) => Some(&s.target.text),
-            Self::Credstore(s) => Some(&s.target.text),
-            Self::UnitInventory(s) => Some(&s.target.text),
-            Self::Helper(s) => Some(&s.target.text),
-            Self::Release(s) => Some(&s.target.text),
-            Self::Build(s) => Some(&s.target.text),
-            Self::Toolchain(s) => Some(&s.target.text),
-            Self::Image(s) => Some(&s.target.text),
-        }
+        self.target().map(|target| target.text.as_str())
     }
 
     /// The guard command, if `@only_if` was set.
@@ -729,12 +761,18 @@ pub struct Workdir {
 }
 
 /// Fully parsed deployment plan.
+///
+/// The fields are private and read through accessors: a plan is a value with
+/// invariants (every `@export` name was validated, every target resolved to a
+/// declared alias or a valid spec), and a public mutable field would let a
+/// consumer break them and skip the validation the parser did.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ExecutionPlan {
     /// Server aliases in declaration order (BTreeMap keeps summaries stable).
-    pub servers: BTreeMap<String, SshSpec>,
+    pub(crate) servers: BTreeMap<String, SshSpec>,
     /// Group aliases to server member lists.
-    pub groups: BTreeMap<String, Vec<String>>,
+    pub(crate) groups: BTreeMap<String, Vec<String>>,
     /// All `@env` entries in declaration order.
     ///
     /// Copy-on-write behind an `Arc`: every step snapshots the list as it was
@@ -742,13 +780,51 @@ pub struct ExecutionPlan {
     /// every step costs one pointer copy rather than a deep copy of every
     /// key/value pair. A step's `env` field therefore shares one allocation
     /// with every other step declared between two `@env` directives.
-    pub env: Arc<Vec<EnvEntry>>,
+    pub(crate) env: Arc<Vec<EnvEntry>>,
     /// All `@secrets` file references in declaration order.
-    pub secrets: Vec<SecretEntry>,
+    pub(crate) secrets: Vec<SecretEntry>,
     /// The managed work directory for this run (`@workdir`).
-    pub workdir: Option<Workdir>,
+    pub(crate) workdir: Option<Workdir>,
     /// The steps, in declaration order.
-    pub steps: Vec<Step>,
+    pub(crate) steps: Vec<Step>,
+}
+
+impl ExecutionPlan {
+    /// The declared servers, keyed by alias.
+    #[must_use]
+    pub const fn servers(&self) -> &BTreeMap<String, SshSpec> {
+        &self.servers
+    }
+
+    /// The declared groups: alias to member aliases.
+    #[must_use]
+    pub const fn groups(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.groups
+    }
+
+    /// The `@env` entries in declaration order.
+    #[must_use]
+    pub const fn env(&self) -> &Arc<Vec<EnvEntry>> {
+        &self.env
+    }
+
+    /// The `@secrets` references in declaration order.
+    #[must_use]
+    pub fn secrets(&self) -> &[SecretEntry] {
+        &self.secrets
+    }
+
+    /// The managed work directory, when the playbook declared one.
+    #[must_use]
+    pub const fn workdir(&self) -> Option<&Workdir> {
+        self.workdir.as_ref()
+    }
+
+    /// The steps, in declaration order.
+    #[must_use]
+    pub fn steps(&self) -> &[Step] {
+        &self.steps
+    }
 }
 
 /// Cross-step state captured by `@export`.
@@ -840,7 +916,10 @@ fn allowed_aliases(plan: &ExecutionPlan, restrict: &[String]) -> HashSet<String>
 }
 
 /// The shell-identifier rule, shared with the runtime and the secrets crate.
-pub use shellflow_text::is_valid_var_name;
+// Owned by `shellflow-text`; imported here for `interpolate`. This used to be
+// a `pub use`, which made `shellflow_dsl::plan::is_valid_var_name` a third
+// authoritative path to the rule.
+use shellflow_text::is_valid_var_name;
 
 /// Interpolate `$VAR` and `${VAR}` references in a copy path against the run
 /// state.
