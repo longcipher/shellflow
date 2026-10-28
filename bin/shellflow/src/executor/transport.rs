@@ -191,6 +191,28 @@ pub(crate) fn rsync_transport(policy: SshPolicy, spec: &SshSpec) -> String {
     out
 }
 
+/// The `scp` command for one resolved destination.
+///
+/// scp spells the destination port `-P` and wants `-q`, but the *policy*
+/// (fail closed, bounded connect) is the same one ssh uses. The fallback path
+/// used to build this argv by hand, which is how it silently hard-coded a
+/// `ConnectTimeout` that no longer matched [`SshPolicy`] — a second copy of
+/// the transport policy is what [`apply_options`] exists to prevent.
+#[must_use]
+pub(crate) fn scp_command(policy: SshPolicy, spec: &SshSpec) -> std::process::Command {
+    let mut cmd = std::process::Command::new("scp");
+    cmd.arg("-q");
+    cmd.args(["-o", "BatchMode=yes"]);
+    cmd.arg("-o").arg(format!("ConnectTimeout={}", policy.connect_timeout));
+    // `-T` disables strict filename checking, an scp-only flag that is not
+    // part of the ssh option set; scp also opens its own channel per file, so
+    // `ControlMaster` from the policy is not applied here (see `SshPolicy`).
+    if let Some(port) = &spec.port {
+        cmd.arg("-P").arg(port.to_string());
+    }
+    cmd
+}
+
 /// Map the CLI transport flag to the policy.
 #[must_use]
 pub(crate) const fn policy_from_cli(arg: crate::cli::TransportArg) -> TransportPolicy {
@@ -352,6 +374,25 @@ mod ssh_tests {
         let verbose = args(&ssh_command(SshPolicy::step(false, true), &spec()));
         assert!(!quiet.contains(&"-v".to_string()));
         assert!(verbose.contains(&"-v".to_string()));
+    }
+
+    #[test]
+    fn the_scp_fallback_takes_its_policy_from_the_shared_builder() {
+        // The scp path is what runs when rsync is missing on the target. It
+        // used to spell `BatchMode`/`ConnectTimeout=15` itself, so a policy
+        // change reached rsync and ssh but not scp.
+        let rendered = args(&super::scp_command(SshPolicy::batch(), &spec())).join(" ");
+        assert!(rendered.contains("-q"), "{rendered}");
+        assert!(rendered.contains("-o BatchMode=yes"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("ConnectTimeout={}", super::BATCH_CONNECT_TIMEOUT_SECS)),
+            "the bound comes from the policy, not a literal: {rendered}"
+        );
+        assert!(rendered.contains("-P 2222"), "scp spells the port `-P`: {rendered}");
+        assert!(
+            !rendered.contains("-T"),
+            "`-T` is not part of the ssh option set here: {rendered}"
+        );
     }
 }
 

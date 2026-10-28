@@ -1,6 +1,9 @@
 # ShellFlow in Production: Adoption Analysis and Improvement Roadmap
 
-> Status: proposal (not yet implemented).
+> Status: **completed retrospective** — every phase below shipped (see §0). Read
+> it as the record of how the tool got here, not as a backlog; open work lives
+> in `docs/design.md` and the issue tracker. The one exception is called out
+> inline (§11, explicit non-goals).
 > Date: 2026-10-22.
 > Scope: how the `infra` repository (a private multi-host deployment repo) actually
 > uses ShellFlow today, what that usage exposes in the tool, and which changes to
@@ -241,7 +244,7 @@ lists as intentionally stopped. `update-binary.sh:471-475` gets this right:
 ```bash
 was_active="$(sudo systemctl is-active "${unit}" 2>/dev/null || true)"
 if [ "${was_active}" != "active" ]; then
-  echo "    (${unit} 当前是 ${was_active:-unknown} —— 只换二进制, 不启动它)"
+  echo "    (${unit} is currently ${was_active:-unknown} - binary swap only, do not start it)"
   continue
 fi
 ```
@@ -299,7 +302,7 @@ with the wrong item letter:
 ```bash
 ccount="$(grep -c '^FAIL<D>	' "${FINDINGS}" 2>/dev/null || true)"
 if [ "${ccount}" -eq 0 ]; then
-  ok C "unit 里没有硬编码的秘密"
+  ok C "no hard-coded secret in the unit"
 fi
 ```
 

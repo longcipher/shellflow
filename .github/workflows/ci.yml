@@ -4,6 +4,9 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  # Mutation testing runs here; see the `mutation` job.
+  schedule:
+    - cron: "0 4 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,6 +24,26 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-shear,cargo-sort,typos-cli,rumdl
+          tool: just,cargo-shear,cargo-sort,typos-cli,rumdl,cargo-fuzz
 
+      # `just ci` runs lint + test + build + fuzz-check + check-cn.
       - run: just ci
+
+  mutation:
+    # Mutation testing is slow (it rebuilds the workspace per mutant), so it
+    # runs nightly instead of on every push — but it does run, which the
+    # AGENTS.md verification loop promises and CI did not previously deliver.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-mutants
+
+      - run: just mutation

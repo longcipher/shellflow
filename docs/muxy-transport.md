@@ -565,6 +565,11 @@ Three places spawn `ssh` themselves (and `@copy` uses `rsync`/`scp`, which stays
 | `remote.rs::run_reload_step`, `run_wait_step` | daemon-reload and service waits |
 | `executor/copy.rs` | `rsync`/`scp` (stays) |
 
+The per-run state these sites need is `executor::Native` (the connection cache,
+the plan index); it is carried by every step struct in every build, so the
+seam's *shape* is feature-independent even though only the muxy build uses it.
+See design §5.2, "The transport seam".
+
 **Prerequisite refactor (M0):** collapse the first three into one
 `exec_payload` in `executor/transport.rs`, with `ssh` as the only
 implementation today:

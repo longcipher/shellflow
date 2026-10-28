@@ -294,7 +294,7 @@ fn apply_ranges(line: &str, ranges: &[(usize, usize)]) -> String {
 ///
 /// One masker belongs to one output stream. Sharing it between hosts would
 /// let a line from one host consume the pending state of another.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SecretMasker {
     /// Long values, longest-first and de-duplicated.
     masks: Arc<Vec<String>>,
@@ -305,6 +305,21 @@ pub struct SecretMasker {
     /// Values whose prefix was seen at the end of an earlier line, with the
     /// number of bytes of the value already accounted for.
     pending: Vec<(String, usize)>,
+}
+
+impl std::fmt::Debug for SecretMasker {
+    /// Hand-written on purpose: every field holds plaintext values, so a
+    /// derived `Debug` would print the secrets this type exists to hide into
+    /// any `{:?}` or error report that touches a masker. Only counts are
+    /// shown.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretMasker")
+            .field("long_masks", &self.masks.len())
+            .field("short_masks", &self.shorts.len())
+            .field("pending", &self.pending.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SecretMasker {

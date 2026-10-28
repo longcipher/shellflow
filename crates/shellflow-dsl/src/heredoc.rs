@@ -49,8 +49,10 @@ impl Heredoc {
 /// here-documents (`cat <<A <<B`), whose bodies follow on consecutive lines.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeredocTracker {
-    /// Open here-documents, in the order Bash consumes their bodies.
-    open: Vec<Heredoc>,
+    /// Open here-documents, in the order Bash consumes their bodies, each
+    /// with the 1-based line that opened it (so an unterminated body can be
+    /// reported where it starts, not where the file ends).
+    open: Vec<(usize, Heredoc)>,
 }
 
 impl HeredocTracker {
@@ -60,9 +62,19 @@ impl HeredocTracker {
         !self.open.is_empty()
     }
 
+    /// The oldest still-open here-document and the line that opened it.
+    ///
+    /// A parser must check this at end of input: an unterminated body means
+    /// every following line was swallowed as data, so the plan it produced is
+    /// silently short and must be rejected instead.
+    #[must_use]
+    pub fn unterminated(&self) -> Option<(usize, &Heredoc)> {
+        self.open.first().map(|(line, heredoc)| (*line, heredoc))
+    }
+
     /// Record every here-document opened by `line`.
-    pub fn open_in(&mut self, line: &str) {
-        self.open.extend(scan_openers(line));
+    pub fn open_in(&mut self, line: &str, line_no: usize) {
+        self.open.extend(scan_openers(line).into_iter().map(|heredoc| (line_no, heredoc)));
     }
 
     /// Consume `line` as here-document body content.
@@ -72,7 +84,7 @@ impl HeredocTracker {
     /// consumed. Returns `false` when no body is open, in which case the line
     /// must be processed normally.
     pub fn consume_body(&mut self, line: &str) -> bool {
-        let Some(head) = self.open.first() else {
+        let Some((_, head)) = self.open.first() else {
             return false;
         };
         if head.terminates(line) {
@@ -483,7 +495,7 @@ mod tests {
         assert!(!tracker.is_open());
         assert!(!tracker.consume_body("plain line"));
 
-        tracker.open_in("cat <<EOF");
+        tracker.open_in("cat <<EOF", 1);
         assert!(tracker.is_open());
         assert!(tracker.consume_body("body line"));
         assert!(tracker.is_open());
@@ -497,7 +509,7 @@ mod tests {
     #[test]
     fn tracker_drains_multiple_openers_in_order() {
         let mut tracker = HeredocTracker::default();
-        tracker.open_in("diff <(cat <<A) <(cat <<B)");
+        tracker.open_in("diff <(cat <<A) <(cat <<B)", 1);
         assert!(tracker.consume_body("first A"));
         assert!(tracker.is_open());
         assert!(tracker.consume_body("A"));
@@ -510,12 +522,17 @@ mod tests {
     #[test]
     fn unterminated_heredoc_swallows_the_rest() {
         // Mirrors Bash: a here-document left open at end of file still
-        // consumes every following line as body content.
+        // consumes every following line as body content. The tracker reports
+        // it so the parser can reject the plan instead of returning a short
+        // one.
         let mut tracker = HeredocTracker::default();
-        tracker.open_in("cat <<EOF");
+        tracker.open_in("cat <<EOF", 7);
         assert!(tracker.consume_body("anything"));
         assert!(tracker.consume_body("at all"));
         assert!(tracker.is_open());
+        let (line, heredoc) = tracker.unterminated().expect("still open");
+        assert_eq!(line, 7, "the error points at the opening line, not the EOF");
+        assert_eq!(heredoc.tag, "EOF");
     }
 
     proptest::proptest! {
@@ -539,7 +556,7 @@ mod tests {
             body in select(vec!["", "body", "# @remote web", "EOFX"]),
         ) {
             let mut tracker = HeredocTracker::default();
-            tracker.open_in(&format!("cat <<{tag}"));
+            tracker.open_in(&format!("cat <<{tag}"), 1);
             proptest::prop_assert!(tracker.is_open());
             proptest::prop_assert!(tracker.consume_body(body));
             proptest::prop_assert!(tracker.is_open());

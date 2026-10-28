@@ -543,6 +543,51 @@ fn colorize_itemize(text: &str) -> String {
     }
 }
 
+/// Write one line of *report* output: a subcommand's terminal report.
+///
+/// Report subcommands (`service status`, `host`, `unit`, `audit`, `keys`, …)
+/// used to call `println!` directly. That skipped the masker and made the
+/// "`ui` is the one output path" rule true only for the `run` path; the
+/// exemption was granted per module in `main.rs`, so any new `println!` in
+/// those modules also escaped the lint. Every report line now goes through
+/// this sink instead, which is why those module-level exemptions are gone.
+pub(crate) fn write_report(text: String) {
+    print_line(text, &None);
+}
+
+/// Write report text verbatim, without a trailing newline.
+///
+/// Used by generators that print a whole file to stdout (`service manifest`,
+/// `unit render --stdout`). Verbatim file dumps are stdout-only by design:
+/// they are not appended to the `--log-file` audit trail, which records the
+/// run transcript rather than generated file contents.
+pub(crate) fn write_report_part(text: &str) {
+    let text = redact(text);
+    let mut out = stdout().lock();
+    if write!(out, "{text}").is_err() {
+        TERMINAL_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Print one line of report output.
+///
+/// The macro exists so the call site reads like `println!` while every line
+/// still passes through [`write_report`] (redaction included).
+macro_rules! report {
+    ($($arg:tt)*) => {
+        $crate::ui::write_report(format!($($arg)*))
+    };
+}
+pub(crate) use report;
+
+/// Print report text verbatim (no trailing newline).
+macro_rules! report_part {
+    ($($arg:tt)*) => {
+        $crate::ui::write_report_part(&format!($($arg)*))
+    };
+}
+pub(crate) use report_part;
+
 /// Write one line to stdout, flushing the lock immediately.
 ///
 /// When a `--log-file` is configured, the line is also appended to the audit
@@ -597,11 +642,13 @@ pub(crate) fn fatal(message: &str, log_file: &Option<Arc<std::sync::Mutex<std::f
 /// run started (or after it torn down) has no `Ui` handle. It still must not
 /// carry a value that the mask registry knows: `eyre` reports embed child
 /// stderr, and child stderr can echo a credential.
+#[expect(clippy::print_stderr, reason = "fatal errors without a Ui handle must reach stderr")]
 pub(crate) fn error_line(report: &eyre::Report) {
     eprintln!("error: {}", redact(&format!("{report:#}")));
 }
 
 /// Report a fatal error that is plain text, masked like [`error_line`].
+#[expect(clippy::print_stderr, reason = "fatal errors without a Ui handle must reach stderr")]
 pub(crate) fn error_text(message: &str) {
     eprintln!("error: {}", redact(message));
 }

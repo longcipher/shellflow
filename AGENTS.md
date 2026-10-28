@@ -40,9 +40,11 @@ just mutation
 - Edition 2024, resolver 3. Members are `crates/*`, `bin/*` and `examples/*`; the fuzz crates under `crates/*/fuzz` are detached workspaces and are excluded from the root workspace on purpose.
 - Because the fuzz crates are detached, `cargo fmt --all` skips them: `just format` formats their `fuzz_targets/*.rs` explicitly with `rustfmt --edition 2024`. Keep it that way when a fuzz target is added.
 - `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `print_stdout`, `print_stderr` and `allow_attributes` are `deny`. The only escape hatch is `#[expect(lint, reason = "...")]`.
+- Test modules opt out of the test-only lints through one `#![cfg_attr(test, allow(...))]` per crate root (`panic`, `unwrap_used`, `expect_used`, `pedantic`, `nursery`); that is the only place a bare `allow` appears, and it never applies to production code.
+- `print_stdout` has **no** module-level exemption: every line the tool prints goes through `ui` (`Ui` on the run path, `ui::report!` for report subcommands). A `println!` in any other module fails the lint.
 - `.cargo/config.toml` sets `rustc-wrapper = "kache"`; clippy invocations must clear it (`RUSTC_WRAPPER=`) exactly as the Justfile does.
 - There is no `rust-toolchain.toml`: CI installs nightly, so use `cargo +nightly fmt` and `cargo +nightly clippy` exactly as the Justfile does.
-- `.cargo/mutants.toml` excludes `bin/shellflow/src/**` and `examples/*/src/**` because cargo-mutants only runs each crate's own test target; the orchestration logic is covered by `bin/shellflow/tests/integration.rs` instead.
+- `.cargo/mutants.toml` excludes only `bin/shellflow/src/main.rs`, `bin/shellflow/src/executor/process.rs`, and `examples/*/src/**`: every other `bin` module carries unit tests that kill mutants, so they stay in mutation scope. The orchestration paths that need a live process tree are covered by `bin/shellflow/tests/integration.rs` instead.
 - Never hand-type dependency versions. Shared crates go into root `[workspace.dependencies]` and members reference them with `workspace = true`.
 
 ## Dependency choices
@@ -61,7 +63,7 @@ just mutation
 - Directives are defined in `docs/design.md` section 4.1 (`shellflow-dsl` owns the scanner); add new ones to `shellflow-dsl` with a parse test, never ad hoc in the executors.
 - Multi-host fan-out goes through `JoinSet` plus a semaphore; never spawn one task per host without the bound.
 - The `dbus` feature (systemd unit state over D-Bus) is off by default so the standard build stays a single static binary; the CLI polls instead. Keep D-Bus code behind the feature.
-- Do not introduce `unsafe` anywhere; there is none today. If `std::env::set_var` is ever needed in tests, hold an `ENV_LOCK` and carry a `// SAFETY:` comment.
+- Do not introduce `unsafe` except where a libc-level API leaves no alternative, and then only with a `// SAFETY:` comment stating the invariant. Today there are 18 such blocks: `nix::sys::signal::signal` for the `systemd` helper's signal forwarding and for the CLI's test-only `set_var`/environment locks, plus `shellflow-secrets`' `O_NOFOLLOW` open and fchmod calls. If `std::env::set_var` is needed in tests, hold the crate's `ENV_LOCK` and carry the `// SAFETY:` comment.
 - `proptest` properties live next to the crate logic they exercise and run in the ordinary `cargo test` loop; the fuzz targets cover the hostile-input parsers (`fuzz_parse_script`, `fuzz_interpolate`, `fuzz_parse_ssh_spec`, `fuzz_parse_env_file`).
 - Directive parsing lives only in `shellflow-dsl`: never hand-roll a `strip_prefix("# @…")` scanner elsewhere (the whole-word rule, spec validation, and here-document awareness live in the grammar). A status/verify subcommand reads a playbook through `parse_script`.
-- The `run` path prints only through the `ui` module (masked, audited). Report subcommands that render terminal output directly declare it with a module-level `#[expect(clippy::print_stdout, …, reason = "…")]` in `main.rs`; a `println!` anywhere else fails the lint.
+- The `run` path prints only through the `ui` module (masked, audited); report subcommands print through the `ui::report!` / `ui::report_part!` macros, which route to the same sink. `main.rs` keeps one scoped `#[expect(clippy::print_stderr, …)]` for the fatal-error and interrupt banners, which must reach a possibly-broken stderr. A bare `println!` anywhere else fails the lint.

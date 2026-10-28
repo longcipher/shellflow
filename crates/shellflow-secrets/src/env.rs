@@ -32,6 +32,9 @@ fn strip_quotes(value: &str) -> String {
 /// Returns [`SecretsError::MalformedEnv`] when a line has no `=`, has an
 /// invalid variable name, or an `export` line has no assignment.
 pub fn parse_env_file(content: &str) -> Result<Vec<(String, String)>, SecretsError> {
+    // Editors on Windows write a UTF-8 BOM; without this the first key is
+    // `\u{feff}KEY`, fails validation, and the whole file is rejected.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut out: Vec<(String, String)> = Vec::new();
     for (idx, raw) in content.lines().enumerate() {
         let raw = raw.strip_suffix('\r').unwrap_or(raw);
@@ -87,6 +90,16 @@ mod tests {
             pairs,
             vec![("A".to_string(), "1".to_string()), ("B".to_string(), "two".to_string())]
         );
+    }
+
+    #[test]
+    fn a_utf8_bom_does_not_hide_the_first_key() {
+        // Windows editors write a BOM; the first key then failed validation
+        // and the whole file was rejected, so a store edited there looked
+        // corrupt.
+        let pairs = parse_env_file("\u{feff}A=1\nB=2\n").expect("parse");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "A");
     }
 
     #[test]

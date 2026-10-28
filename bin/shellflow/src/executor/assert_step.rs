@@ -205,7 +205,7 @@ fn interpolate_check(
         },
         Assertion::Enabled { unit, state: expected } => Assertion::Enabled {
             unit: shellflow_core::interpolate(unit, state).map_err(eyre::Error::from)?,
-            state: expected.clone(),
+            state: *expected,
         },
         Assertion::NoLeak { unit, lines } => Assertion::NoLeak {
             unit: shellflow_core::interpolate(unit, state).map_err(eyre::Error::from)?,
@@ -239,14 +239,14 @@ fn command_for(check: &Assertion, step_timeout: Option<u64>) -> String {
              if [ \"$s\" = {state} ]; then echo \"{unit} is $s\"; \
              else echo \"{unit} is $s (want {state})\"; false; fi",
             unit = quote(unit),
-            state = quote(state),
+            state = quote(state.as_str()),
         ),
         Assertion::Enabled { unit, state } => format!(
             "s=$(systemctl is-enabled {unit} 2>/dev/null); \
              if [ \"$s\" = {state} ]; then echo \"{unit} is-enabled $s\"; \
              else echo \"{unit} is-enabled $s (want {state})\"; false; fi",
             unit = quote(unit),
-            state = quote(state),
+            state = quote(state.as_str()),
         ),
         Assertion::PortFree { ports } => {
             // A bind conflict is diagnosed where it happens: the check names
@@ -450,7 +450,7 @@ fn status_glob(pattern: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use shellflow_core::Assertion;
+    use shellflow_core::{ActiveState, Assertion, EnabledState};
 
     use super::{command_for, http_probe, quote};
 
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn a_unit_check_asks_systemd_for_the_state() {
         let cmd = command_for(
-            &Assertion::UnitState { unit: "dufs.service".to_string(), state: "active".to_string() },
+            &Assertion::UnitState { unit: "dufs.service".to_string(), state: ActiveState::Active },
             Some(10),
         );
         assert!(cmd.contains("systemctl is-active 'dufs.service'"), "{cmd}");
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn an_enabled_check_asks_systemd_for_the_boot_state() {
         let cmd = command_for(
-            &Assertion::Enabled { unit: "smg.service".to_string(), state: "disabled".to_string() },
+            &Assertion::Enabled { unit: "smg.service".to_string(), state: EnabledState::Disabled },
             Some(10),
         );
         assert!(cmd.contains("systemctl is-enabled 'smg.service'"), "{cmd}");

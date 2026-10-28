@@ -21,12 +21,6 @@ use crate::executor::{
     ArcUi, HostOutcome, LogFile, RunError, StepConfig, cancel::Cancel, fanout_slot, quote, stream,
 };
 
-/// The exit code the target helper uses for "the condition did not hold".
-const EXIT_FAILED: i32 = 3;
-
-/// The exit code the target helper uses for "the budget expired".
-const EXIT_TIMEOUT: i32 = 4;
-
 /// Where the target-side helper is installed.
 pub(crate) const HELPER_PATH: &str = "/usr/local/bin/shellflow";
 
@@ -82,15 +76,12 @@ pub(super) struct TargetCommand<'a> {
     pub secrets: &'a Arc<crate::secrets::ResolvedSecrets>,
     /// The probed remote environments (the shell, the login PATH).
     pub shell_cache: &'a crate::executor::ShellCache,
-    /// Which step class this command is (drives the muxy policy).
-    #[cfg(feature = "muxy")]
+    /// Which step class this command is (drives the transport policy).
     pub step_class: crate::executor::StepClass,
-    /// Per-run muxy state.
-    #[cfg(feature = "muxy")]
-    pub muxy: &'a crate::executor::muxy::MuxyRun,
-    /// The 1-based plan index (names the muxy payload file).
-    #[cfg(feature = "muxy")]
-    pub step_no: usize,
+    /// Per-run native-transport state: the probed environments, the connection
+    /// cache and the plan index. Carried unconditionally; see
+    /// [`crate::executor::Native`].
+    pub native: &'a crate::executor::Native,
 }
 
 /// Run one target-side command on every host.
@@ -98,6 +89,10 @@ pub(super) struct TargetCommand<'a> {
 /// The exit code decides the verdict: `0` is success, `255` is a transport
 /// failure (the connection itself broke), anything else is the operation
 /// failing.
+#[cfg_attr(
+    not(feature = "muxy"),
+    expect(unused_variables, reason = "the ssh-only build has no native transport to hand it to")
+)]
 pub(super) async fn run_target_command(
     args: TargetCommand<'_>,
 ) -> eyre::Result<Vec<(String, HostOutcome)>> {
@@ -112,12 +107,8 @@ pub(super) async fn run_target_command(
         label,
         secrets,
         shell_cache,
-        #[cfg(feature = "muxy")]
         step_class,
-        #[cfg(feature = "muxy")]
-        muxy,
-        #[cfg(feature = "muxy")]
-        step_no,
+        native,
     } = args;
     if config.check || config.dry_run {
         crate::ui::note(&format!("  {label}: no-op in check/dry-run"), log_file);
@@ -135,8 +126,9 @@ pub(super) async fn run_target_command(
         let label = label.to_string();
         let secrets = Arc::clone(secrets);
         let shell_cache = Arc::clone(shell_cache);
+        let _ = step_class;
         #[cfg(feature = "muxy")]
-        let muxy = muxy.clone();
+        let native = native.clone();
         tasks.spawn(async move {
             let _permit = fanout_slot!(&semaphore, &log_file, host);
             if cancel.is_cancelled() {
@@ -168,8 +160,8 @@ pub(super) async fn run_target_command(
                     config,
                     log_file: &log_file,
                     cancel: &cancel,
-                    muxy: &muxy,
-                    step_no,
+                    muxy: &native.run,
+                    step_no: native.step_no,
                     transform: None,
                     explain_exit: None,
                 })
@@ -225,35 +217,41 @@ pub(super) async fn run_target_command(
             };
             match outcome {
                 stream::PipedRun::Completed(status) => {
-                    let code = status.code().unwrap_or(-1);
-                    match code {
-                        0 => {
+                    // A child that was killed by a signal has no exit code;
+                    // calling that "-1" hides what happened.
+                    let Some(code) = status.code() else {
+                        ui.lock().await.masked_note(&format!(
+                            "[{}] {label} terminated by a signal",
+                            host.alias
+                        ));
+                        return (host.alias.clone(), HostOutcome::Failed(RunError::Script));
+                    };
+                    let outcome = super::classify_helper_exit(code);
+                    match outcome {
+                        HostOutcome::Ok => {
                             ui.lock().await.masked_note(&format!("[{}] {label} ok", host.alias));
-                            (host.alias.clone(), HostOutcome::Ok)
                         }
-                        // ssh exits 255 when the connection itself failed:
-                        // that is a transport failure, not a failed operation.
-                        255 => (host.alias.clone(), HostOutcome::Failed(RunError::Transport)),
-                        EXIT_FAILED => {
-                            ui.lock()
-                                .await
-                                .masked_note(&format!("[{}] {label} failed", host.alias));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
-                        }
-                        EXIT_TIMEOUT => {
+                        HostOutcome::TimedOut => {
                             ui.lock()
                                 .await
                                 .masked_note(&format!("[{}] {label} timed out", host.alias));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
                         }
-                        other => {
+                        // ssh itself failed: no note, the transport layer
+                        // already reported it.
+                        HostOutcome::Failed(RunError::Transport) => {}
+                        _ if code == crate::exit::helper::FAILED => {
+                            ui.lock()
+                                .await
+                                .masked_note(&format!("[{}] {label} failed", host.alias));
+                        }
+                        _ => {
                             ui.lock().await.masked_note(&format!(
-                                "[{}] {label} failed (exit {other})",
+                                "[{}] {label} failed (exit {code})",
                                 host.alias
                             ));
-                            (host.alias.clone(), HostOutcome::Failed(RunError::Script))
                         }
                     }
+                    (host.alias.clone(), outcome)
                 }
                 stream::PipedRun::TimedOut | stream::PipedRun::PipeBroken => {
                     (host.alias.clone(), HostOutcome::Failed(RunError::Transport))

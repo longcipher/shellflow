@@ -37,6 +37,7 @@ sha2 = { workspace = true }
 shellflow-core = { workspace = true }
 shellflow-muxy = { workspace = true, optional = true }
 shellflow-secrets = { workspace = true }
+shellflow-text = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 toml_edit = { workspace = true }
 zbus = { workspace = true, optional = true }

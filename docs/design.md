@@ -297,6 +297,11 @@ pub enum Step {
     Credstore(CredstoreStep),
     UnitInventory(UnitInventoryStep),
     Helper(HelperStep),
+    // Added after this section was written; see §4.1 for the directives.
+    Build(BuildStep),
+    Release(ReleaseStep),
+    Toolchain(ToolchainStep),
+    Image(ImageStep),
 }
 
 /// A wait-for-active step (`@wait_active`).
@@ -365,6 +370,14 @@ pub fn resolve_hosts(
   untracked behavior. Quoted (`<<'TAG'`, `<<"TAG"`) and backslash-escaped
   (`<<\TAG`) delimiters are literal and are tracked exactly. See
   `crates/shellflow-dsl/src/heredoc.rs`.
+- An **unterminated** here-document is a parse error naming the line that
+  opened it. Bash only warns and treats end-of-file as the terminator; matching
+  that would let a missing terminator silently swallow every later directive,
+  producing a plan that looks valid and is missing steps. The strictness is
+  deliberate and is the one place the grammar is stricter than Bash.
+- Directive payloads are tokenized with the same quote-aware rule everywhere
+  (`'a b'` is one value), so a quoted `--body`/`--header`/path behaves the same
+  in all 33 directives.
 - No conditional/loop constructs in the DSL itself. Script authors use plain
   Bash (`if`, `for`, `command -v`, `[ -f ] || …`) for control flow, and
   `@only_if` for host-level preconditions.
@@ -619,6 +632,39 @@ system `ssh`), `futures` (unnecessary — `JoinSet` covers fan-out), `scc`
 (no shared concurrent maps in this design), `winnow`/`pest` (see D-3),
 `reqwest`/`dashmap` (forbidden by AGENTS.md).
 
+#### The target-side helper modules
+
+`bin/shellflow/src/host.rs` is a dispatch table plus the shared vocabulary
+(`HostError`, path/unit/digest helpers); the verbs live in submodules, one
+responsibility each:
+
+| Module | Responsibility |
+|---|---|
+| `host/probe.rs` | read-only state: `systemd-analyze verify`, `systemctl show` parsing, the readiness verdict, the unit inventory |
+| `host/lifecycle.rs` | verify → reload → enable → restart → wait, in that order |
+| `host/install.rs` | the atomic install (write beside, then rename) and digest assertions |
+| `host/backup.rs` | snapshots: write, seal, prune, shred |
+| `host/credstore.rs` | the credential store layout, its keys, the value-based leak check |
+| `host/privileged.rs` | `sudo -n` and the elevated filesystem/`systemctl` primitives |
+
+`HostError` is an enum keyed on the *reason* (`Usage`, `Internal`, `Failed`,
+`TimedOut`, `Delegated`) rather than a `{ message, code }` pair, so a caller can
+tell "the operator asked for something impossible" from "the condition did not
+hold" without parsing text. `exit_code()` is the wire contract with the
+controller (1 / 1 / 3 / 4 / the delegated code).
+
+#### The transport seam
+
+`executor::Native` is the **only** place the `muxy` feature forks the
+executors. Every step struct carries a `Native` unconditionally — the probed
+login environment, the per-host connection cache and the plan index — so the
+*shape* of a step does not depend on the build. What remains behind
+`#[cfg(feature = "muxy")]` is the decision itself
+(`transport::should_use_muxy`, one function) and the attempt it guards; a
+build without the feature answers `false` for every class and carries an empty
+`Native`. `--transport muxy` then fails closed at the CLI with exit 3 instead
+of silently falling back.
+
 ## 6. CLI Interface
 
 ```text
@@ -770,6 +816,10 @@ default rather than an opt-in.
 The manifest is also the fleet map: `shellflow service status --all` reads the
 host of every service from the manifests instead of parsing playbook text, and
 `service check` uses the same source of truth.
+
+`service verify` (`unit_verify`) is the repository-side checker: it reads the
+manifests, drop-ins, and playbook facts and reports what would not match the
+target. It is a sibling of `service check` (which probes a live host).
 
 ### 6.2 The repository consistency check
 
@@ -1373,11 +1423,13 @@ grammar is ~6 directives, and there is no second parser for users to learn.
 ### D-3. Line scanner instead of `winnow`/`pest`
 
 AGENTS.md prefers `winnow`/`pest` for *ad-hoc manual parsing*. Here the grammar
-is line-oriented with fixed prefixes and trivial `space`/`,`/`->`/`@`-delimited
-payloads — a deterministic ~120-line scanner is more readable and more
-testable than a combinator grammar for this shape, and keeps the dependency
-tree minimal. If the DSL ever grows nested expressions, switching the payload
-parsing to `winnow` is a contained change.
+is line-oriented with fixed prefixes and `space`/`,`/`->`/`@`-delimited
+payloads: one `match` arm per directive, a shared quote-aware tokenizer
+(`split_words`/`split_flags`), and a here-document state machine. The scanner
+is now ~2,700 lines for **33** directives (plus ~2,000 lines of tests), which
+is large but flat — each directive is independent, and none of it needs a
+combinator grammar's backtracking. If the DSL ever grows nested expressions,
+switching the payload parsing to `winnow` is a contained change.
 
 ### D-4. Shell primitives replace the fact engine
 

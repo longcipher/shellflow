@@ -43,10 +43,10 @@ pub(crate) fn audit(args: &AuditArgs) -> Result<()> {
         };
         for finding in scan_file(&content) {
             let rel = file.strip_prefix(root).unwrap_or(file);
-            println!("FAIL {}:{}: {}", rel.display(), finding.line, finding.message);
+            crate::ui::report!("FAIL {}:{}: {}", rel.display(), finding.line, finding.message);
             findings += 1;
             if findings >= 20 {
-                println!("… stopping after 20 findings");
+                crate::ui::report!("… stopping after 20 findings");
                 bail!("audit: {findings}+ secret-shaped finding(s) under {}", root.display());
             }
         }
@@ -54,7 +54,7 @@ pub(crate) fn audit(args: &AuditArgs) -> Result<()> {
     if findings > 0 {
         bail!("audit: {findings} secret-shaped finding(s) under {}", root.display());
     }
-    println!("audit: {} file(s) clean", files.len());
+    crate::ui::report!("audit: {} file(s) clean", files.len());
     Ok(())
 }
 

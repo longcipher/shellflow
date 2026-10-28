@@ -9,7 +9,7 @@
 //! channel.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::Read,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError,
@@ -58,8 +58,12 @@ pub const DEFAULT_COLS: u16 = 200;
 /// Default session height.
 pub const DEFAULT_ROWS: u16 = 50;
 
+/// How many pump messages may queue ahead of one step. Bounded on purpose:
+/// a step that stops draining (a slow operator terminal) must push back on
+/// the pump instead of growing memory without limit.
+pub(crate) const PUMP_QUEUE: usize = 256;
+
 /// A message from the pump to the step that owns a channel.
-#[derive(Debug)]
 pub(crate) enum PumpMsg {
     /// Complete lines, oldest first.
     Lines(Vec<String>),
@@ -74,12 +78,30 @@ pub(crate) enum PumpMsg {
     Disconnected,
 }
 
+impl std::fmt::Debug for PumpMsg {
+    /// Hand-written on purpose: `Lines` carries the remote program's output,
+    /// which may include anything the step printed. A derived `Debug` would
+    /// put that text into every `{:?}` and error report that touches a
+    /// message, so only the message shape is shown.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lines(lines) => {
+                write!(formatter, "Lines(<{} line(s)>)", lines.len())
+            }
+            Self::TuiRedraw => formatter.write_str("TuiRedraw"),
+            Self::BudgetExceeded => formatter.write_str("BudgetExceeded"),
+            Self::Ended(reason) => write!(formatter, "Ended({reason:?})"),
+            Self::Disconnected => formatter.write_str("Disconnected"),
+        }
+    }
+}
+
 /// Per-channel state owned by the pump thread.
 struct ChannelState {
     session: SessionId,
     grid: muxy_client::RunGrid,
     asm: LineAssembler,
-    tx: mpsc::Sender<PumpMsg>,
+    tx: mpsc::SyncSender<PumpMsg>,
     history_total: u64,
     budget_warned: bool,
 }
@@ -94,6 +116,12 @@ pub struct HostConnection {
     destination: String,
     ssh_spec: Vec<String>,
     channels: Arc<Mutex<HashMap<ChannelId, ChannelState>>>,
+    /// Channels the step thread has retired via [`Self::unregister`].
+    ///
+    /// The pump removes a channel before blocking in `forward`; without a
+    /// tombstone a step that unregisters mid-frame would be resurrected when
+    /// the pump re-inserts the state it still holds.
+    retired: Arc<Mutex<HashSet<ChannelId>>>,
     shutdown: Arc<AtomicBool>,
     /// Set when this connection's client has been adopted by another
     /// connection (`reconnect`): the `Drop` must not disconnect the *new*
@@ -176,10 +204,12 @@ impl HostConnection {
         let server_features = client.features().to_vec();
         let channels: Arc<Mutex<HashMap<ChannelId, ChannelState>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let retired: Arc<Mutex<HashSet<ChannelId>>> = Arc::new(Mutex::new(HashSet::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         spawn_pump(
             client.clone(),
             Arc::clone(&channels),
+            Arc::clone(&retired),
             Arc::clone(&shutdown),
             destination.to_string(),
         )?;
@@ -192,6 +222,7 @@ impl HostConnection {
             destination: destination.to_string(),
             ssh_spec: ssh_spec.to_vec(),
             channels,
+            retired,
             shutdown,
             abandoned: false,
         })
@@ -271,8 +302,9 @@ impl HostConnection {
         grid: muxy_client::RunGrid,
         history_total: u64,
         marker: &str,
-        tx: mpsc::Sender<PumpMsg>,
+        tx: mpsc::SyncSender<PumpMsg>,
     ) {
+        lock(&self.retired).remove(&channel);
         let mut channels = lock(&self.channels);
         channels.insert(
             channel,
@@ -290,6 +322,7 @@ impl HostConnection {
     /// Stop streaming a channel (after detach).
     pub(crate) fn unregister(&self, channel: &ChannelId) {
         lock(&self.channels).remove(channel);
+        lock(&self.retired).insert(*channel);
     }
 
     /// Reconnect once with a fresh ssh + bridge (the session survives; only
@@ -305,6 +338,7 @@ impl HostConnection {
         let mut fresh = Self::connect(&destination, &ssh_spec)?;
         self.client = fresh.client.clone();
         self.channels = Arc::clone(&fresh.channels);
+        self.retired = Arc::clone(&fresh.retired);
         self.shutdown = Arc::clone(&fresh.shutdown);
         // Adopt the new client without running its `Drop` (which would
         // disconnect the *new* connection) and without leaking the rest of
@@ -335,6 +369,7 @@ impl Drop for HostConnection {
 fn spawn_pump(
     client: Client,
     channels: Arc<Mutex<HashMap<ChannelId, ChannelState>>>,
+    retired: Arc<Mutex<HashSet<ChannelId>>>,
     shutdown: Arc<AtomicBool>,
     destination: String,
 ) -> Result<(), MuxyError> {
@@ -354,19 +389,19 @@ fn spawn_pump(
                     Ok(event) => event,
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        notify_all(&channels, PumpMsg::Disconnected);
+                        notify_all(&channels, &shutdown);
                         return;
                     }
                 };
                 match event {
                     ClientEvent::Frame { channel, frame } => {
-                        handle_frame(&client, &channels, channel, &frame);
+                        handle_frame(&client, &channels, &retired, &shutdown, channel, &frame);
                     }
                     ClientEvent::SessionEnded { session, reason } => {
-                        notify_ended(&channels, session, reason);
+                        notify_ended(&channels, session, reason, &shutdown);
                     }
                     ClientEvent::Disconnected | ClientEvent::ServerRestarting => {
-                        notify_all(&channels, PumpMsg::Disconnected);
+                        notify_all(&channels, &shutdown);
                         return;
                     }
                     _ => {}
@@ -381,6 +416,8 @@ fn spawn_pump(
 fn handle_frame(
     client: &Client,
     channels: &Arc<Mutex<HashMap<ChannelId, ChannelState>>>,
+    retired: &Arc<Mutex<HashSet<ChannelId>>>,
+    shutdown: &AtomicBool,
     channel: ChannelId,
     frame: &muxy_protocol::ScreenFrame,
 ) {
@@ -389,6 +426,11 @@ fn handle_frame(
         Some(state) => state,
         None => return,
     };
+    // A step that unregistered while an earlier frame was in flight retired
+    // the channel: drop the frame instead of resurrecting a dead entry.
+    if lock(retired).contains(&channel) {
+        return;
+    }
     state.grid.apply(frame);
     let after = state.grid.history_total;
     state.history_total = after;
@@ -398,8 +440,66 @@ fn handle_frame(
     let _ = client.ack(channel, seq);
     let rows: Vec<String> = (0..state.grid.rows.len()).map(|i| state.grid.row_text(i)).collect();
     let push = state.asm.push(&Screen { rows, reset: frame.reset, history_total: after });
-    forward_push(client, channel, &mut state, push, after);
+    forward_push(client, shutdown, channel, &mut state, push, after);
+    // The step may have unregistered while `forward_push` blocked on a full
+    // queue: re-inserting unconditionally would resurrect a channel whose
+    // receiver is gone (leaked map entry plus wasted ack/history work).
+    if lock(retired).remove(&channel) {
+        return;
+    }
     lock(channels).insert(channel, state);
+}
+
+/// Deliver one message to a step, with backpressure and a bounded wait.
+///
+/// The queue is bounded on purpose: a step that stopped draining must slow
+/// the pump down instead of growing memory. The pump also has to notice a
+/// shutdown, and must never park forever on a step whose receiver is gone,
+/// so the wait is done in short slices against the connection's flag.
+///
+/// A drop on shutdown is intentional: shutdown means the connection is being
+/// torn down (`reconnect`/`Drop`), so the step is going away and no one will
+/// consume the message. Callers that need the tail before the end (the
+/// session-end flush) run before shutdown is set.
+fn forward(tx: &mpsc::SyncSender<PumpMsg>, msg: PumpMsg, shutdown: &AtomicBool) {
+    let mut pending = msg;
+    loop {
+        match tx.try_send(pending) {
+            Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => return,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                pending = returned;
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// How many rows ride in one `PumpMsg::Lines`.
+///
+/// The queue bound (`PUMP_QUEUE`) counts messages, not bytes: one gap fill
+/// can fetch up to 64 pages × 200 rows, so an unchunked message would let a
+/// burst hold ~12k rows per queued message. Chunking keeps one queued message
+/// bounded regardless of burst size.
+pub(crate) const MAX_LINES_PER_MSG: usize = 500;
+
+/// Forward finished rows in bounded chunks, preserving order.
+fn forward_lines(tx: &mpsc::SyncSender<PumpMsg>, lines: Vec<String>, shutdown: &AtomicBool) {
+    if lines.is_empty() {
+        return;
+    }
+    if lines.len() <= MAX_LINES_PER_MSG {
+        forward(tx, PumpMsg::Lines(lines), shutdown);
+        return;
+    }
+    for chunk in lines.chunks(MAX_LINES_PER_MSG) {
+        forward(tx, PumpMsg::Lines(chunk.to_vec()), shutdown);
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+    }
 }
 
 /// Forward an assembler's output, gap-filling merged frames from history.
@@ -408,17 +508,18 @@ fn handle_frame(
 /// scrollback, oldest first), so `lines` go out before the gap.
 fn forward_push(
     client: &Client,
+    shutdown: &AtomicBool,
     channel: ChannelId,
     state: &mut ChannelState,
     push: Push,
     history_after: u64,
 ) {
     if push.tui_redraw {
-        let _ = state.tx.send(PumpMsg::TuiRedraw);
+        forward(&state.tx, PumpMsg::TuiRedraw, shutdown);
         return;
     }
     if !push.lines.is_empty() {
-        let _ = state.tx.send(PumpMsg::Lines(push.lines));
+        forward_lines(&state.tx, push.lines, shutdown);
     }
     if push.missing > 0 {
         // `before=0` fetches the newest scrollback first; older pages follow
@@ -467,13 +568,13 @@ fn forward_push(
         }
         let gap_lines = state.asm.feed_gap(&gap);
         if !gap_lines.is_empty() {
-            let _ = state.tx.send(PumpMsg::Lines(gap_lines));
+            forward_lines(&state.tx, gap_lines, shutdown);
         }
         // The 16 MiB scrollback budget evicts the head: a gap fetch that
         // under-delivers means those rows are gone for good. Warn once.
         if (gap.len() as u64) < push.missing && !state.budget_warned {
             state.budget_warned = true;
-            let _ = state.tx.send(PumpMsg::BudgetExceeded);
+            forward(&state.tx, PumpMsg::BudgetExceeded, shutdown);
         }
     }
 }
@@ -482,26 +583,38 @@ fn notify_ended(
     channels: &Arc<Mutex<HashMap<ChannelId, ChannelState>>>,
     session: SessionId,
     reason: muxy_protocol::ExitReason,
+    shutdown: &AtomicBool,
 ) {
-    let channels = lock(channels);
-    for state in channels.values() {
-        if state.session == session {
-            let _ = state.tx.send(PumpMsg::Ended(reason));
+    // Collect under the lock, deliver outside it: a bounded queue makes
+    // `forward` wait, and holding the channel map while waiting would block
+    // `unregister` (the step's own path out).
+    let ended: Vec<(mpsc::SyncSender<PumpMsg>, Vec<String>)> = {
+        let mut channels = lock(channels);
+        channels
+            .values_mut()
+            .filter(|state| state.session == session)
+            // The session is over, so the rows still on screen can never
+            // change again: flush them before the end. Without this a step
+            // whose output is shorter than one screen (`DEFAULT_ROWS`) would
+            // stream nothing at all, and every step would lose its tail.
+            .map(|state| (state.tx.clone(), state.asm.finish()))
+            .collect()
+    };
+    for (tx, tail) in ended {
+        if !tail.is_empty() {
+            forward_lines(&tx, tail, shutdown);
         }
+        forward(&tx, PumpMsg::Ended(reason), shutdown);
     }
 }
 
-fn notify_all(channels: &Arc<Mutex<HashMap<ChannelId, ChannelState>>>, msg: PumpMsg) {
-    let channels = lock(channels);
-    match msg {
-        PumpMsg::Disconnected => {
-            for state in channels.values() {
-                let _ = state.tx.send(PumpMsg::Disconnected);
-            }
-        }
-        other => {
-            let _ = other;
-        }
+fn notify_all(channels: &Arc<Mutex<HashMap<ChannelId, ChannelState>>>, shutdown: &AtomicBool) {
+    let senders: Vec<mpsc::SyncSender<PumpMsg>> = {
+        let channels = lock(channels);
+        channels.values().map(|state| state.tx.clone()).collect()
+    };
+    for tx in senders {
+        forward(&tx, PumpMsg::Disconnected, shutdown);
     }
 }
 
@@ -652,7 +765,7 @@ mod tests {
         let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
         let session = muxy_protocol::SessionId::new(11).expect("session");
         let channel = muxy_protocol::ChannelId(4);
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(PUMP_QUEUE);
         host.register(session, channel, grid(24), 0, "@@shellflow:begin:r/s@@", tx);
         assert!(
             host.channels.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&channel)
@@ -773,7 +886,7 @@ mod tests {
         let (client, bridge) = crate::harness::connect(Duration::from_secs(5));
         let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
         let channel = muxy_protocol::ChannelId(4);
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(PUMP_QUEUE);
         host.register(
             muxy_protocol::SessionId::new(11).expect("session"),
             channel,
@@ -811,7 +924,7 @@ mod tests {
         let (client, bridge) = crate::harness::connect(Duration::from_secs(5));
         let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
         let channel = muxy_protocol::ChannelId(5);
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(PUMP_QUEUE);
         host.register(
             muxy_protocol::SessionId::new(12).expect("session"),
             channel,
@@ -836,7 +949,7 @@ mod tests {
         let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
         let channel = muxy_protocol::ChannelId(6);
         let session = muxy_protocol::SessionId::new(13).expect("session");
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(PUMP_QUEUE);
         host.register(session, channel, grid(24), 0, "@@shellflow:begin:r/s@@", tx);
         // The end of a session is a control-channel notification: the client
         // turns it into `ClientEvent::SessionEnded` for the pump.
@@ -855,13 +968,68 @@ mod tests {
     }
 
     #[test]
+    fn an_ending_session_flushes_the_rows_still_on_screen() {
+        // A step whose output is shorter than one screen never scrolls a row
+        // off, so the assembler holds its entire output. The end of the
+        // session is the only place those rows can be released; without it
+        // `echo hello` streams nothing at all.
+        let (tx, rx) = mpsc::sync_channel(PUMP_QUEUE);
+        let mut asm = LineAssembler::new("@@shellflow:begin:r/s@@");
+        let marker = Screen {
+            rows: vec!["@@shellflow:begin:r/s@@".to_string()],
+            reset: false,
+            history_total: 0,
+        };
+        let short = Screen {
+            rows: vec!["@@shellflow:begin:r/s@@".to_string(), "one".to_string(), "two".to_string()],
+            reset: false,
+            history_total: 0,
+        };
+        let _ = asm.push(&marker);
+        let _ = asm.push(&short);
+        let session = muxy_protocol::SessionId::new(21).expect("session");
+        let channel = muxy_protocol::ChannelId(9);
+        let channels = Arc::new(Mutex::new(HashMap::from([(
+            channel,
+            ChannelState {
+                session,
+                grid: grid(ROWS as u16),
+                asm,
+                tx,
+                history_total: 0,
+                budget_warned: false,
+            },
+        )])));
+        notify_ended(
+            &channels,
+            session,
+            muxy_protocol::ExitReason::Exited(0),
+            &AtomicBool::new(false),
+        );
+        let messages: Vec<PumpMsg> = rx.try_iter().collect();
+        let lines: Vec<String> = messages
+            .iter()
+            .filter_map(|message| match message {
+                PumpMsg::Lines(lines) => Some(lines.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(lines, ["one", "two"], "the on-screen rows are the step's whole output");
+        assert!(
+            matches!(messages.last(), Some(PumpMsg::Ended(muxy_protocol::ExitReason::Exited(0)))),
+            "the flush precedes the end: {messages:?}"
+        );
+    }
+
+    #[test]
     fn a_disconnected_peer_wakes_every_registered_channel() {
         // A dropped ssh must not leave a step waiting on output that will
         // never arrive; every channel is told the transport is gone.
         let (client, bridge) = crate::harness::connect(Duration::from_secs(5));
         let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
         let channel = muxy_protocol::ChannelId(7);
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(PUMP_QUEUE);
         host.register(
             muxy_protocol::SessionId::new(14).expect("session"),
             channel,

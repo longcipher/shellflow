@@ -212,6 +212,115 @@ pub struct ReloadStep {
     pub timeout: Option<u64>,
 }
 
+/// The `ActiveState` a `@assert` may require.
+///
+/// A closed set rather than a free string: `@assert foo active` and
+/// `@assert_enabled foo enabled` used to validate their state with different
+/// strengths (`[A-Za-z0-9-]` on one path, four legal values on the other), so
+/// `# @assert foo banana` parsed and then failed on the target instead of at
+/// parse time. Only the steady states `systemctl is-active` reports for a
+/// loaded unit are accepted; transient spellings such as `unknown`,
+/// `enabled-runtime`, or `linked` are rejected at parse time on purpose, so a
+/// typo cannot pass as a state the check would never observe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ActiveState {
+    /// The unit is running.
+    Active,
+    /// The unit is reloading (a graceful reload in flight).
+    Reloading,
+    /// The unit is stopped.
+    Inactive,
+    /// The unit failed.
+    Failed,
+    /// The unit is starting.
+    Activating,
+    /// The unit is stopping.
+    Deactivating,
+}
+
+impl ActiveState {
+    /// The spelling compared against `systemctl is-active` output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Reloading => "reloading",
+            Self::Inactive => "inactive",
+            Self::Failed => "failed",
+            Self::Activating => "activating",
+            Self::Deactivating => "deactivating",
+        }
+    }
+
+    /// Parse a supported state, rejecting anything `is-active` would never
+    /// report for a loaded unit (including typos such as `banana`).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "active" => Some(Self::Active),
+            "reloading" => Some(Self::Reloading),
+            "inactive" => Some(Self::Inactive),
+            "failed" => Some(Self::Failed),
+            "activating" => Some(Self::Activating),
+            "deactivating" => Some(Self::Deactivating),
+            _ => None,
+        }
+    }
+
+    /// Every legal spelling, for an error message.
+    #[must_use]
+    pub const fn legal() -> &'static str {
+        "active, reloading, inactive, failed, activating, or deactivating"
+    }
+}
+
+/// The enablement a `@assert_enabled` may require.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EnabledState {
+    /// Enabled at boot.
+    Enabled,
+    /// Not enabled at boot.
+    Disabled,
+    /// Has no `[Install]` section; cannot be enabled.
+    Static,
+    /// Masked to `/dev/null`.
+    Masked,
+}
+
+impl EnabledState {
+    /// The spelling compared against `systemctl is-enabled` output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Static => "static",
+            Self::Masked => "masked",
+        }
+    }
+
+    /// Parse a supported enablement, rejecting transient spellings such as
+    /// `enabled-runtime` or `linked` (and typos) at parse time.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "enabled" => Some(Self::Enabled),
+            "disabled" => Some(Self::Disabled),
+            "static" => Some(Self::Static),
+            "masked" => Some(Self::Masked),
+            _ => None,
+        }
+    }
+
+    /// Every legal spelling, for an error message.
+    #[must_use]
+    pub const fn legal() -> &'static str {
+        "enabled, disabled, static, or masked"
+    }
+}
+
 /// One condition an `@assert` step checks on the target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -221,7 +330,7 @@ pub enum Assertion {
         /// The systemd unit name (`foo.service`).
         unit: String,
         /// The expected `ActiveState` (`active`).
-        state: String,
+        state: ActiveState,
     },
     /// The systemd unit's enablement must equal the expected state.
     ///
@@ -233,7 +342,7 @@ pub enum Assertion {
         /// The systemd unit name (`foo.service`).
         unit: String,
         /// The expected `is-enabled` output (`enabled`).
-        state: String,
+        state: EnabledState,
     },
     /// The URL must answer with an accepted HTTP status.
     Health {
@@ -1460,4 +1569,47 @@ mod tests {
         prelude::{Just, TestCaseError, prop_assert, prop_assert_eq},
         prop_oneof,
     };
+
+    #[test]
+    fn every_active_state_round_trips_through_its_spelling() {
+        // Both directions matter: `parse` decides what a playbook may say, and
+        // `as_str` is what the generated `systemctl is-active` comparison
+        // matches against. A typo in either one is a silently failing check.
+        let all = [
+            ActiveState::Active,
+            ActiveState::Reloading,
+            ActiveState::Inactive,
+            ActiveState::Failed,
+            ActiveState::Activating,
+            ActiveState::Deactivating,
+        ];
+        for state in all {
+            assert_eq!(ActiveState::parse(state.as_str()), Some(state), "{state:?}");
+        }
+        for spelling in
+            ActiveState::legal().split(", ").map(|part| part.strip_prefix("or ").unwrap_or(part))
+        {
+            assert!(ActiveState::parse(spelling).is_some(), "{spelling} must parse");
+        }
+        assert_eq!(ActiveState::parse("banana"), None);
+    }
+
+    #[test]
+    fn every_enabled_state_round_trips_through_its_spelling() {
+        let all = [
+            EnabledState::Enabled,
+            EnabledState::Disabled,
+            EnabledState::Static,
+            EnabledState::Masked,
+        ];
+        for state in all {
+            assert_eq!(EnabledState::parse(state.as_str()), Some(state), "{state:?}");
+        }
+        for spelling in
+            EnabledState::legal().split(", ").map(|part| part.strip_prefix("or ").unwrap_or(part))
+        {
+            assert!(EnabledState::parse(spelling).is_some(), "{spelling} must parse");
+        }
+        assert_eq!(EnabledState::parse("enabled-runtime"), None);
+    }
 }

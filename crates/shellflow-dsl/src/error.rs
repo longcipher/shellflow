@@ -65,6 +65,15 @@ pub enum ParseError {
         line: usize,
     },
 
+    /// A here-document was opened and never terminated.
+    #[error("line {line}: unterminated here-document `{delimiter}`")]
+    UnterminatedHeredoc {
+        /// 1-based line number of the line that opened the here-document.
+        line: usize,
+        /// The delimiter the body was waiting for.
+        delimiter: String,
+    },
+
     /// `--target` filtered out every host for a step.
     #[error("`--target` matches no host for `{target}`")]
     EmptyTarget {

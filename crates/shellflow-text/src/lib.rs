@@ -68,6 +68,71 @@ pub fn is_valid_var_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// True for a systemd unit name that is safe to interpolate into a command.
+///
+/// The parser validates `@assert`/`@service` units with it, and the target-side
+/// helpers (`host`, `systemd`) re-check what they are handed before shelling
+/// out. It used to exist three times — `is_safe_unit` in the grammar,
+/// `validate_unit` in each helper module — so a rule change (or a missed one)
+/// moved the security boundary depending on which copy ran.
+///
+/// A unit name may not be empty, start with `.`, contain `..`, or hold anything
+/// outside `[A-Za-z0-9._@:-]`; that excludes paths, whitespace, and every shell
+/// metacharacter.
+#[must_use]
+pub fn is_valid_unit_name(unit: &str) -> bool {
+    !unit.is_empty() &&
+        !unit.starts_with('.') &&
+        !unit.contains("..") &&
+        unit.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
+}
+
+/// `foo` → `foo.service`; a name that already carries the suffix is unchanged.
+///
+/// One definition for the grammar and the helpers: a playbook that says
+/// `@assert foo` and a helper that looks up `foo.service` must agree on which
+/// unit they mean.
+#[must_use]
+pub fn normalize_unit(unit: &str) -> String {
+    let unit = unit.trim();
+    if unit.ends_with(".service") { unit.to_string() } else { format!("{unit}.service") }
+}
+
+/// Whether a file name is a systemd unit file (by suffix).
+///
+/// Covers the unit types in `systemd.unit(5)` (`.service`, `.socket`,
+/// `.target`, `.device`, `.mount`, `.automount`, `.swap`, `.path`, `.timer`,
+/// `.slice`, `.scope`) plus the Quadlet types the tool manages
+/// (`.container`, `.volume`, `.network`, `.kube`, `.image`, `.build`,
+/// `.pod`). Anything else (e.g. `config.toml`, `foo.service.enc`) is not a
+/// unit file.
+#[must_use]
+pub fn is_unit_file(name: &str) -> bool {
+    [
+        ".service",
+        ".socket",
+        ".target",
+        ".device",
+        ".mount",
+        ".automount",
+        ".swap",
+        ".path",
+        ".timer",
+        ".slice",
+        ".scope",
+        ".container",
+        ".volume",
+        ".network",
+        ".kube",
+        ".image",
+        ".build",
+        ".pod",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_valid_var_name, shell_quote_single, strip_surrounding_quotes};
@@ -109,6 +174,33 @@ mod tests {
         assert_eq!(strip_surrounding_quotes("\"x'"), "\"x'");
         assert_eq!(strip_surrounding_quotes("'\"'"), "\"");
         assert_eq!(strip_surrounding_quotes("--exclude '*.key'"), "--exclude '*.key'");
+    }
+
+    #[test]
+    fn a_unit_name_accepts_systemd_shapes_and_rejects_paths() {
+        for ok in ["dufs", "dufs.service", "app@blue.service", "a_b-c.d:1"] {
+            assert!(super::is_valid_unit_name(ok), "{ok} must be accepted");
+        }
+        for bad in ["", ".hidden", "a..b", "a/b", "a b", "a;rm -rf /", "a$b", "a\nb"] {
+            assert!(!super::is_valid_unit_name(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn unit_files_are_recognized_by_suffix() {
+        for name in ["dufs.service", "pg-backup.timer", "browserless.container", "app.mount"] {
+            assert!(super::is_unit_file(name), "{name}");
+        }
+        for name in ["config.toml", "dufs.service.enc", "notes.path.bak"] {
+            assert!(!super::is_unit_file(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn unit_names_normalize_to_the_service_suffix_once() {
+        assert_eq!(super::normalize_unit("dufs"), "dufs.service");
+        assert_eq!(super::normalize_unit(" dufs "), "dufs.service");
+        assert_eq!(super::normalize_unit("dufs.service"), "dufs.service");
     }
 
     #[test]

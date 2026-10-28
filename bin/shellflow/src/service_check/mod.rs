@@ -58,7 +58,7 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
                 args.host
             )));
         }
-        println!("service check --all: {} clean", args.host);
+        crate::ui::report!("service check --all: {} clean", args.host);
         return Ok(());
     }
 
@@ -79,7 +79,7 @@ pub(crate) fn check(args: &ServiceCheckArgs) -> Result<(), ServiceError> {
             "service check: {failures} FAIL finding(s) for `{service}`"
         )));
     }
-    println!("service check: {service} clean");
+    crate::ui::report!("service check: {service} clean");
     Ok(())
 }
 
@@ -325,7 +325,7 @@ fn report(message: &str, status: Check, failures: &mut usize) {
     if status == Check::Fail {
         *failures += 1;
     }
-    println!("[{tag}] {message}");
+    crate::ui::report!("[{tag}] {message}");
 }
 
 /// Verify that `ssh` is available before the first remote check.

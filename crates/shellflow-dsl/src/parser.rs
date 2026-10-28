@@ -6,12 +6,12 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::{
     error::ParseError,
     heredoc::HeredocTracker,
-    is_valid_var_name,
+    is_valid_unit_name, is_valid_var_name, normalize_unit,
     plan::{
-        AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
-        ExecutionPlan, ExportVar, HelperStep, ImageStep, InstallStep, LocalStep, ReleaseStep,
-        ReloadStep, RemoteStep, SecretEntry, ServiceStep, Step, Target, ToolchainStep,
-        UnitInventoryStep, WaitStep, Workdir,
+        ActiveState, AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep,
+        CredstoreStep, EnabledState, EnvEntry, ExecutionPlan, ExportVar, HelperStep, ImageStep,
+        InstallStep, LocalStep, ReleaseStep, ReloadStep, RemoteStep, SecretEntry, ServiceStep,
+        Step, Target, ToolchainStep, UnitInventoryStep, WaitStep, Workdir,
     },
     ssh_spec::SshSpec,
 };
@@ -242,12 +242,13 @@ impl State {
     }
 
     fn declare_server(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        let mut parts = payload.split_whitespace();
+        let mut parts = split_words(payload).into_iter();
         let name = parts.next().ok_or_else(|| ParseError::InvalidDirective {
             line,
             directive: "server".to_string(),
             reason: "missing name".to_string(),
         })?;
+        let name = name.as_str();
         if !is_valid_alias_name(name) {
             return Err(ParseError::InvalidDirective {
                 line,
@@ -262,6 +263,7 @@ impl State {
             directive: "server".to_string(),
             reason: format!("missing ssh spec for `{name}`"),
         })?;
+        let spec = spec.as_str();
         if parts.next().is_some() {
             return Err(ParseError::InvalidDirective {
                 line,
@@ -284,12 +286,13 @@ impl State {
     }
 
     fn declare_group(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        let mut parts = payload.split_whitespace();
+        let mut parts = split_words(payload).into_iter();
         let name = parts.next().ok_or_else(|| ParseError::InvalidDirective {
             line,
             directive: "group".to_string(),
             reason: "missing name".to_string(),
         })?;
+        let name = name.as_str();
         if !is_valid_alias_name(name) {
             return Err(ParseError::InvalidDirective {
                 line,
@@ -304,6 +307,7 @@ impl State {
             directive: "group".to_string(),
             reason: format!("missing members for `{name}`"),
         })?;
+        let members = members.as_str();
         if parts.next().is_some() {
             return Err(ParseError::InvalidDirective {
                 line,
@@ -400,7 +404,7 @@ impl State {
     }
 
     fn declare_secrets(&mut self, payload: &str, line: usize) -> Result<(), ParseError> {
-        let mut parts = payload.split_whitespace();
+        let mut parts = split_words(payload).into_iter();
         let file = parts.next().ok_or_else(|| ParseError::InvalidDirective {
             line,
             directive: "secrets".to_string(),
@@ -409,14 +413,14 @@ impl State {
 
         let mut identity: Option<String> = None;
         while let Some(token) = parts.next() {
-            match token {
+            match token.as_str() {
                 "--identity" => {
                     let value = parts.next().ok_or_else(|| ParseError::InvalidDirective {
                         line,
                         directive: "secrets".to_string(),
                         reason: "`--identity` requires a path".to_string(),
                     })?;
-                    identity = Some(value.to_string());
+                    identity = Some(value);
                 }
                 other => {
                     return Err(ParseError::InvalidDirective {
@@ -428,7 +432,7 @@ impl State {
             }
         }
 
-        self.plan.secrets.push(SecretEntry { file: file.to_string(), identity });
+        self.plan.secrets.push(SecretEntry { file, identity });
         Ok(())
     }
 
@@ -440,18 +444,33 @@ impl State {
         // is the explicit opt-out for values that are meant to be printed
         // (`VERSION`, `COMMIT`) — the exemption is then visible in the
         // playbook instead of hidden in a name heuristic inside the engine.
-        let payload = payload.trim();
-        let (names, public) = match payload.strip_suffix("--public") {
-            Some(rest) => (rest.trim_end(), true),
-            None => (payload, false),
-        };
-        if names.contains("--") {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "export".to_string(),
-                reason: format!("unknown flag in `{payload}` (only `--public` is accepted)"),
-            });
+        // Same flag parser as every other directive, so `--public` is a flag
+        // wherever it stands instead of only as a trailing suffix, and a
+        // quoted name survives.
+        let (positional, flags) = split_flags(payload, &["--public"], "export", line)?;
+        // `split_flags` hands unknown flags back (rather than consuming them)
+        // so each directive can name the one it does not accept.
+        if let Some((flag, _)) = flags.iter().find(|(flag, _)| flag != "--public") {
+            return Err(unknown_flag("export", flag, line));
         }
+        let public = flags.iter().any(|(flag, _)| flag == "--public");
+        let names = match positional.as_slice() {
+            [names] => names.as_str(),
+            [] => {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "export".to_string(),
+                    reason: "missing variable name(s)".to_string(),
+                });
+            }
+            [_, extra, ..] => {
+                return Err(ParseError::InvalidDirective {
+                    line,
+                    directive: "export".to_string(),
+                    reason: format!("unexpected token `{extra}`"),
+                });
+            }
+        };
         let vars: Vec<ExportVar> = names
             .split(',')
             .map(str::trim)
@@ -548,11 +567,7 @@ impl State {
                     excludes.push(glob);
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "copy".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("copy", other, line));
                 }
             }
         }
@@ -629,11 +644,7 @@ impl State {
                     timeout = Some(parse_secs(secs, "wait_active", line)?);
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "wait_active".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("wait_active", other, line));
                 }
             }
         }
@@ -645,7 +656,7 @@ impl State {
             });
         }
         let unit = normalize_unit(&positional[0]);
-        if !is_safe_unit(&unit) {
+        if !is_valid_unit_name(&unit) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "wait_active".to_string(),
@@ -682,7 +693,7 @@ impl State {
         let mut unit: Option<String> = None;
         let mut state: Option<String> = None;
         let mut target: Option<String> = None;
-        for token in payload.split_whitespace() {
+        for token in split_words(payload) {
             if let Some(name) = token.strip_prefix('@') {
                 if name.is_empty() {
                     return Err(ParseError::InvalidDirective {
@@ -700,9 +711,9 @@ impl State {
                 }
                 target = Some(name.to_string());
             } else if unit.is_none() {
-                unit = Some(token.to_string());
+                unit = Some(token);
             } else if state.is_none() {
-                state = Some(token.to_string());
+                state = Some(token);
             } else {
                 return Err(ParseError::InvalidDirective {
                     line,
@@ -720,21 +731,24 @@ impl State {
             });
         };
         let unit = normalize_unit(&unit);
-        if !is_safe_unit(&unit) {
+        if !is_valid_unit_name(&unit) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "assert".to_string(),
                 reason: format!("unsafe unit name `{unit}`"),
             });
         }
-        let state = state.unwrap_or_else(|| "active".to_string());
-        if !state.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(ParseError::InvalidDirective {
+        // A closed set, not a charset check: `@assert foo banana` used to
+        // parse and then fail on the target, because the two assertion
+        // directives validated their state with different strengths.
+        let state = match state {
+            Some(raw) => ActiveState::parse(&raw).ok_or_else(|| ParseError::InvalidDirective {
                 line,
                 directive: "assert".to_string(),
-                reason: format!("unsafe state `{state}`"),
-            });
-        }
+                reason: format!("invalid state `{raw}` (expected {})", ActiveState::legal()),
+            })?,
+            None => ActiveState::Active,
+        };
         let target = self.resolve_assert_target(target, "assert", line)?;
         self.push_assertion(name, target, line, Assertion::UnitState { unit, state }, timeout);
         Ok(())
@@ -755,9 +769,9 @@ impl State {
         let mut method: Option<String> = None;
         let mut body: Option<String> = None;
         let mut headers: Vec<String> = Vec::new();
-        let mut tokens = payload.split_whitespace();
+        let mut tokens = split_words(payload).into_iter();
         while let Some(token) = tokens.next() {
-            match token {
+            match token.as_str() {
                 "--expect" => {
                     let Some(codes) = tokens.next() else {
                         return Err(ParseError::InvalidDirective {
@@ -804,7 +818,7 @@ impl State {
                             reason: "`--body` requires a request body".to_string(),
                         });
                     };
-                    body = Some(shellflow_text::strip_surrounding_quotes(raw));
+                    body = Some(shellflow_text::strip_surrounding_quotes(&raw));
                 }
                 "--header" => {
                     let Some(raw) = tokens.next() else {
@@ -821,14 +835,10 @@ impl State {
                             reason: format!("invalid header `{raw}` (want `Name:value`)"),
                         });
                     }
-                    headers.push(shellflow_text::strip_surrounding_quotes(raw));
+                    headers.push(shellflow_text::strip_surrounding_quotes(&raw));
                 }
                 other if other.starts_with("--") => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "assert_health".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("assert_health", other, line));
                 }
                 other if let Some(name) = other.strip_prefix('@') => {
                     if name.is_empty() {
@@ -906,7 +916,7 @@ impl State {
         let mut ports: Vec<u16> = Vec::new();
         let mut target: Option<String> = None;
         let mut udp = false;
-        for token in payload.split_whitespace() {
+        for token in split_words(payload) {
             if token == "--udp" {
                 udp = true;
                 continue;
@@ -975,7 +985,7 @@ impl State {
 
         let mut path: Option<String> = None;
         let mut target: Option<String> = None;
-        for token in payload.split_whitespace() {
+        for token in split_words(payload) {
             if let Some(alias) = token.strip_prefix('@') {
                 if alias.is_empty() {
                     return Err(ParseError::InvalidDirective {
@@ -1001,7 +1011,7 @@ impl State {
                     reason: "expected `<path> [@<target>]`".to_string(),
                 });
             }
-            path = Some(shellflow_text::strip_surrounding_quotes(token));
+            path = Some(shellflow_text::strip_surrounding_quotes(&token));
         }
         let Some(path) = path else {
             return Err(ParseError::InvalidDirective {
@@ -1117,11 +1127,7 @@ impl State {
                     signal = Some(sig.to_string());
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "reload".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("reload", other, line));
                 }
             }
         }
@@ -1135,7 +1141,7 @@ impl State {
             });
         }
         let unit = normalize_unit(&positional[0]);
-        if !is_safe_unit(&unit) {
+        if !is_valid_unit_name(&unit) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "reload".to_string(),
@@ -1192,11 +1198,7 @@ impl State {
                     timeout = Some(parse_secs(secs, "service", line)?);
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "service".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("service", other, line));
                 }
             }
         }
@@ -1211,7 +1213,7 @@ impl State {
             });
         }
         let unit = normalize_unit(&positional[0]);
-        if !is_safe_unit(&unit) {
+        if !is_valid_unit_name(&unit) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "service".to_string(),
@@ -1278,11 +1280,7 @@ impl State {
                     owner = Some(parse_owner(raw, "install", line)?);
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "install".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("install", other, line));
                 }
             }
         }
@@ -1350,7 +1348,7 @@ impl State {
                 "--seal" => seal = true,
                 "--service" => {
                     let raw = flag_value(value, flag, "backup", line)?;
-                    if !is_safe_unit(raw) {
+                    if !is_valid_unit_name(raw) {
                         return Err(ParseError::InvalidDirective {
                             line,
                             directive: "backup".to_string(),
@@ -1364,11 +1362,7 @@ impl State {
                     dir = Some(raw.to_string());
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "backup".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("backup", other, line));
                 }
             }
         }
@@ -1444,11 +1438,7 @@ impl State {
                     }
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "credstore".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("credstore", other, line));
                 }
             }
         }
@@ -1460,7 +1450,7 @@ impl State {
             });
         }
         let service = positional[0].trim().to_string();
-        if !is_safe_unit(&service) {
+        if !is_valid_unit_name(&service) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "credstore".to_string(),
@@ -1506,11 +1496,7 @@ impl State {
                     lines = Some(parsed);
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "assert_no_leak".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("assert_no_leak", other, line));
                 }
             }
         }
@@ -1522,7 +1508,7 @@ impl State {
             });
         }
         let unit = normalize_unit(&positional[0]);
-        if !is_safe_unit(&unit) {
+        if !is_valid_unit_name(&unit) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "assert_no_leak".to_string(),
@@ -1566,11 +1552,7 @@ impl State {
                     local = Some(raw.to_string());
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "assert_digest".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("assert_digest", other, line));
                 }
             }
         }
@@ -1613,7 +1595,7 @@ impl State {
             });
         }
         let service = positional[0].trim().to_string();
-        if !is_safe_unit(&service) {
+        if !is_valid_unit_name(&service) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "assert_credstore".to_string(),
@@ -1683,11 +1665,7 @@ impl State {
                     install_path = raw.to_string();
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "helper".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("helper", other, line));
                 }
             }
         }
@@ -1749,11 +1727,7 @@ impl State {
                     base_url = Some(flag_value(value, flag, "release", line)?.to_string());
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "release".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("release", other, line));
                 }
             }
         }
@@ -1906,11 +1880,7 @@ impl State {
                     })?;
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "build".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("build", other, line));
                 }
             }
         }
@@ -1986,7 +1956,7 @@ impl State {
         }
         for unit in &units {
             let normalized = normalize_unit(unit);
-            if !is_safe_unit(&normalized) {
+            if !is_valid_unit_name(&normalized) {
                 return Err(ParseError::InvalidDirective {
                     line,
                     directive: "build".to_string(),
@@ -2031,7 +2001,7 @@ impl State {
 
         let mut tools: Vec<String> = Vec::new();
         let mut target: Option<String> = None;
-        for token in payload.split_whitespace() {
+        for token in split_words(payload) {
             if let Some(alias) = token.strip_prefix('@') {
                 if alias.is_empty() {
                     return Err(ParseError::InvalidDirective {
@@ -2108,11 +2078,7 @@ impl State {
                     prune = true;
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "image".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("image", other, line));
                 }
             }
         }
@@ -2167,7 +2133,7 @@ impl State {
         let mut unit: Option<String> = None;
         let mut state: Option<String> = None;
         let mut target: Option<String> = None;
-        for token in payload.split_whitespace() {
+        for token in split_words(payload) {
             if let Some(alias) = token.strip_prefix('@') {
                 if alias.is_empty() {
                     return Err(ParseError::InvalidDirective {
@@ -2187,9 +2153,9 @@ impl State {
                 continue;
             }
             if unit.is_none() {
-                unit = Some(normalize_unit(token));
+                unit = Some(normalize_unit(&token));
             } else if state.is_none() {
-                state = Some(token.to_string());
+                state = Some(token);
             } else {
                 return Err(ParseError::InvalidDirective {
                     line,
@@ -2212,16 +2178,12 @@ impl State {
                 reason: "missing state (expected enabled, disabled, static, or masked)".to_string(),
             });
         };
-        if !matches!(state.as_str(), "enabled" | "disabled" | "static" | "masked") {
-            return Err(ParseError::InvalidDirective {
-                line,
-                directive: "assert_enabled".to_string(),
-                reason: format!(
-                    "invalid state `{state}` (expected enabled, disabled, static, or masked)"
-                ),
-            });
-        }
-        if !is_safe_unit(&unit) {
+        let state = EnabledState::parse(&state).ok_or_else(|| ParseError::InvalidDirective {
+            line,
+            directive: "assert_enabled".to_string(),
+            reason: format!("invalid state `{state}` (expected {})", EnabledState::legal()),
+        })?;
+        if !is_valid_unit_name(&unit) {
             return Err(ParseError::InvalidDirective {
                 line,
                 directive: "assert_enabled".to_string(),
@@ -2241,7 +2203,7 @@ impl State {
 
         let mut ports: Vec<u16> = Vec::new();
         let mut target: Option<String> = None;
-        for token in payload.split_whitespace() {
+        for token in split_words(payload) {
             if let Some(alias) = token.strip_prefix('@') {
                 if alias.is_empty() {
                     return Err(ParseError::InvalidDirective {
@@ -2317,11 +2279,7 @@ impl State {
                     prefix = raw.to_string();
                 }
                 other => {
-                    return Err(ParseError::InvalidDirective {
-                        line,
-                        directive: "workdir".to_string(),
-                        reason: format!("unknown flag `{other}`"),
-                    });
+                    return Err(unknown_flag("workdir", other, line));
                 }
             }
         }
@@ -2414,9 +2372,20 @@ fn split_words(payload: &str) -> Vec<String> {
             if c == q {
                 quote = None;
             } else if c == '\\' && q == '"' {
-                // Inside double quotes a backslash escapes the next char.
+                // Inside double quotes a backslash is special only before
+                // `$`, `` ` ``, `"`, `\`, or newline; otherwise it stays
+                // literal (Bash keeps `\n` as two characters).
                 if let Some(n) = chars.next() {
-                    cur.push(n);
+                    if matches!(n, '$' | '`' | '"' | '\\') {
+                        cur.push(n);
+                    } else if n == '\n' {
+                        // Line continuation: both characters disappear.
+                    } else {
+                        cur.push('\\');
+                        cur.push(n);
+                    }
+                } else {
+                    cur.push('\\');
                 }
             } else {
                 cur.push(c);
@@ -2460,6 +2429,18 @@ fn flag_value<'a>(
         directive: directive.to_string(),
         reason: format!("`{flag}` expects a value"),
     })
+}
+
+/// The error every directive reports for a flag it does not define.
+///
+/// One constructor rather than fifteen identical literals: the wording is
+/// part of what users script against, so it must not drift per directive.
+fn unknown_flag(directive: &str, flag: &str, line: usize) -> ParseError {
+    ParseError::InvalidDirective {
+        line,
+        directive: directive.to_string(),
+        reason: format!("unknown flag `{flag}`"),
+    }
 }
 
 /// The target of a mutating directive: the argument is mandatory, because a
@@ -2551,15 +2532,6 @@ fn is_status_pattern(pattern: &str) -> bool {
     pattern.parse::<u16>().is_ok_and(|code| (100..600).contains(&code))
 }
 
-/// Normalize a unit name: `foo` becomes `foo.service`.
-///
-/// A bare name is the common case in a playbook, and writing `.service`
-/// every time is noise the reader has to skip.
-fn normalize_unit(unit: &str) -> String {
-    let unit = unit.trim();
-    if unit.ends_with(".service") { unit.to_string() } else { format!("{unit}.service") }
-}
-
 /// Whether a server/group alias is syntactically valid.
 fn is_valid_alias_name(name: &str) -> bool {
     !name.is_empty() &&
@@ -2593,21 +2565,6 @@ fn reject_guard(has_guard: bool, directive: &str, line: usize) -> Result<(), Par
         });
     }
     Ok(())
-}
-
-/// Whether a unit name is safe to hand to `systemctl`.
-///
-/// The name ends up inside a remote shell command, so it must not be able to
-/// carry shell syntax. Template units (`getty@tty1.service`) and specifier
-/// escapes (`foo@:1.service`) are legitimate systemd names, so `@` and `:`
-/// are accepted — the single charset shared by `@wait_active`, `@reload`,
-/// `@service` and the target-side validators.
-fn is_safe_unit(unit: &str) -> bool {
-    !unit.is_empty() &&
-        !unit.starts_with('.') &&
-        !unit.contains("..") &&
-        unit.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
 }
 
 /// Extract `(keyword, payload)` from a possible directive line.
@@ -2672,9 +2629,16 @@ pub fn parse_script(input: &str) -> Result<ExecutionPlan, ParseError> {
         if let Some((keyword, payload)) = directive(line) {
             state.apply_directive(&keyword, &payload, line_no)?;
         } else {
-            state.heredocs.open_in(line);
+            state.heredocs.open_in(line, line_no);
             state.pending.push(line.to_string());
         }
+    }
+
+    // An unterminated here-document swallowed every following line as data,
+    // directives included. That produces a plan that looks valid but is
+    // silently missing steps, so it is an error rather than a plan.
+    if let Some((line, heredoc)) = state.heredocs.unterminated() {
+        return Err(ParseError::UnterminatedHeredoc { line, delimiter: heredoc.tag.clone() });
     }
 
     state.flush();
@@ -2706,8 +2670,8 @@ mod tests {
     use crate::{
         error::ParseError,
         plan::{
-            AssertStep, Assertion, CopyStep, EnvEntry, ExportVar, LocalStep, RemoteStep, Step,
-            WaitStep,
+            ActiveState, AssertStep, Assertion, CopyStep, EnabledState, EnvEntry, ExportVar,
+            LocalStep, RemoteStep, Step, WaitStep,
         },
     };
 
@@ -2822,7 +2786,7 @@ mod tests {
             step.checks,
             vec![Assertion::UnitState {
                 unit: "dufs.service".to_string(),
-                state: "active".to_string(),
+                state: ActiveState::Active,
             }]
         );
         Ok(())
@@ -2850,7 +2814,7 @@ mod tests {
             step.checks,
             vec![Assertion::UnitState {
                 unit: "dufs.service".to_string(),
-                state: "failed".to_string(),
+                state: ActiveState::Failed,
             }]
         );
         Ok(())
@@ -3363,7 +3327,7 @@ mod tests {
     #[test]
     fn export_rejects_an_unknown_flag() {
         let err = parse_script("# @local\nV=1\n# @export V --quiet\n").expect_err("must fail");
-        assert!(err.to_string().contains("only `--public` is accepted"), "unexpected error: {err}");
+        assert!(err.to_string().contains("unknown flag `--quiet`"), "unexpected error: {err}");
     }
 
     #[test]
@@ -3665,9 +3629,10 @@ mod tests {
     #[test]
     fn space_indented_terminator_does_not_close_a_plain_heredoc() -> Result<(), String> {
         // Only tabs close a `<<-` body; a space-indented `EOF` is body text,
-        // so the trailing directive stays inside the block.
-        let plan = parse("# @local\ncat <<-EOF\nbody\n  EOF\n# @remote web\n")?;
+        // so the directive before the real terminator stays inside the block.
+        let plan = parse("# @local\ncat <<-EOF\nbody\n  EOF\n# @remote web\n\tEOF\necho done\n")?;
         assert_eq!(plan.steps.len(), 1);
+        assert!(as_local(&plan.steps[0])?.script.contains("# @remote web"));
         Ok(())
     }
 
@@ -3830,12 +3795,16 @@ mod tests {
     }
 
     #[test]
-    fn unterminated_heredoc_consumes_the_rest() -> Result<(), String> {
-        // Bash warns and treats EOF as the terminator; matching that keeps
-        // shellflow from inventing a directive the shell never saw.
-        let plan = parse("# @local\ncat <<EOF\n# @remote web\n")?;
-        assert_eq!(plan.steps.len(), 1);
-        Ok(())
+    fn unterminated_heredoc_is_rejected() {
+        // An unterminated body swallows every following line, so the plan it
+        // yields looks valid but is silently missing steps. Reporting the
+        // opener line is the only way the user can find the missing terminator
+        // without diffing the plan against the script.
+        let err = parse("# @local\ncat <<EOF\n# @remote web\n").expect_err("must fail");
+        assert!(
+            err.contains("line 2: unterminated here-document `EOF`"),
+            "the opener line and delimiter are both reported: {err}"
+        );
     }
 
     #[test]
@@ -4172,23 +4141,20 @@ mod tests {
     }
 
     #[test]
-    fn a_state_may_contain_a_dash() -> Result<(), String> {
-        let plan = parse("# @server api api\n# @assert dufs @api not-running\n")?;
-        let step = as_assert(&plan.steps[0])?;
-        assert_eq!(
-            step.checks,
-            vec![Assertion::UnitState {
-                unit: "dufs.service".to_string(),
-                state: "not-running".to_string(),
-            }]
-        );
-        Ok(())
+    fn a_state_must_be_one_systemd_actually_prints() {
+        // The charset check used to accept anything alphanumeric, so
+        // `@assert foo banana` parsed and then failed on the target — after
+        // the deploy had run. The legal set is `systemctl is-active`'s, and it
+        // is the same set `@assert_enabled` validates against.
+        let err = parse("# @server api api\n# @assert dufs @api not-running\n").unwrap_err();
+        assert!(err.contains("invalid state `not-running`"), "{err}");
+        assert!(err.contains("active, reloading, inactive"), "{err}");
     }
 
     #[test]
     fn a_state_with_an_unsafe_character_is_rejected() {
         let err = parse("# @server api api\n# @assert dufs @api bad;state\n").unwrap_err();
-        assert!(err.contains("unsafe state"), "{err}");
+        assert!(err.contains("invalid state `bad;state`"), "{err}");
     }
 
     #[test]
@@ -4203,6 +4169,35 @@ mod tests {
         };
         assert_eq!(method.as_deref(), Some("POST"));
         assert_eq!(headers, &vec!["Content-Type:application/json".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_quoted_flag_value_survives_the_shared_tokenizer() -> Result<(), String> {
+        // Every directive tokenizes with `split_words`, so a quoted value is
+        // one word everywhere. `@assert_health … --body 'hello world'` used
+        // to split into three tokens and fail with "duplicate URL".
+        let plan = parse(
+            "# @server api api\n\
+             # @assert_health http://x/ @api --method POST --body 'hello world' --header 'X-Test: a b'\n",
+        )?;
+        let step = as_assert(&plan.steps[0])?;
+        let Assertion::Health { body, headers, .. } = &step.checks[0] else {
+            return Err("not a health check".to_string());
+        };
+        assert_eq!(body.as_deref(), Some("hello world"));
+        assert_eq!(headers, &vec!["X-Test: a b".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn export_takes_public_as_a_flag_anywhere() -> Result<(), String> {
+        // `--public` used to be a trailing-suffix special case, so the same
+        // flag in any other position was reported as an unknown flag.
+        let plan = parse("# @local\nV=1\n# @export --public VERSION,COMMIT\n")?;
+        let exported = &as_local(&plan.steps[0])?.export;
+        assert_eq!(exported.len(), 2);
+        assert!(exported.iter().all(|var| var.public), "all are public: {exported:?}");
         Ok(())
     }
 
@@ -4657,7 +4652,7 @@ mod tests {
             step.checks,
             vec![Assertion::Enabled {
                 unit: "smg.service".to_string(),
-                state: "disabled".to_string(),
+                state: EnabledState::Disabled,
             }]
         );
         Ok(())

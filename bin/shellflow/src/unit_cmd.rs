@@ -27,6 +27,7 @@ pub(crate) fn run(cmd: &crate::cli::UnitCmd) -> Result<i32> {
 }
 
 /// Check the repository's consistency.
+#[expect(clippy::print_stderr, reason = "verify problems are errors on stderr")]
 fn verify(args: &crate::cli::UnitVerifyArgs) -> Result<i32> {
     let report = crate::unit_verify::verify(&args.repo)?;
     for problem in &report.problems {
@@ -37,12 +38,13 @@ fn verify(args: &crate::cli::UnitVerifyArgs) -> Result<i32> {
     }
     if report.problems.is_empty() {
         if report.skipped.is_empty() {
-            println!(
+            crate::ui::report!(
                 "unit verify: {} unit(s) and {} playbook(s) are consistent",
-                report.units, report.playbooks
+                report.units,
+                report.playbooks
             );
         } else {
-            println!(
+            crate::ui::report!(
                 "unit verify: {} unit(s) and {} playbook(s) are consistent, {} check(s) \
                  skipped (not verified)",
                 report.units,
@@ -63,6 +65,7 @@ fn verify(args: &crate::cli::UnitVerifyArgs) -> Result<i32> {
 }
 
 /// Generate a service's drop-in.
+#[expect(clippy::print_stderr, reason = "out-of-date drop-in is an error on stderr")]
 fn render(args: &crate::cli::UnitRenderArgs) -> Result<i32> {
     let repo = &args.repo;
     let manifest = ServiceManifest::load(repo, &args.service, &args.unit)?;
@@ -83,14 +86,14 @@ fn render(args: &crate::cli::UnitRenderArgs) -> Result<i32> {
         args.output.clone().unwrap_or_else(|| unit::dropin_path(repo, &args.service, &args.unit));
 
     if args.stdout {
-        print!("{}", rendered.text);
+        crate::ui::report_part!("{}", rendered.text);
         return Ok(0);
     }
 
     if args.check {
         let current = std::fs::read_to_string(&target).unwrap_or_default();
         if current == rendered.text {
-            println!("{} is up to date", target.display());
+            crate::ui::report!("{} is up to date", target.display());
             return Ok(0);
         }
         eprintln!(
@@ -102,45 +105,45 @@ fn render(args: &crate::cli::UnitRenderArgs) -> Result<i32> {
     }
 
     write_dropin(&target, &rendered.text)?;
-    println!("==> wrote {}", target.display());
+    crate::ui::report!("==> wrote {}", target.display());
     Ok(0)
 }
 
 /// Print a service's manifest.
 fn manifest(args: &crate::cli::UnitManifestArgs) -> Result<i32> {
     let manifest = ServiceManifest::load(&args.repo, &args.service, &args.unit)?;
-    println!("service      = {}", manifest.service);
-    println!("host         = {}", manifest.host);
-    println!("unit         = {}", manifest.unit);
+    crate::ui::report!("service      = {}", manifest.service);
+    crate::ui::report!("host         = {}", manifest.host);
+    crate::ui::report!("unit         = {}", manifest.unit);
     if let Some(binary) = &manifest.binary {
-        println!("binary       = {binary}");
+        crate::ui::report!("binary       = {binary}");
     }
     if let Some(file) = &manifest.secret_file {
-        println!("secret_file  = {file}");
+        crate::ui::report!("secret_file  = {file}");
     }
     if let Some(store) = &manifest.store {
-        println!("store        = {store}");
+        crate::ui::report!("store        = {store}");
     }
     if !manifest.credentials.is_empty() {
-        println!("credentials  = {}", manifest.credentials.join(", "));
+        crate::ui::report!("credentials  = {}", manifest.credentials.join(", "));
     }
     for (template, target) in &manifest.renders {
-        println!("render       = {template} -> {target}");
+        crate::ui::report!("render       = {template} -> {target}");
     }
     if !manifest.ports.is_empty() {
-        println!(
+        crate::ui::report!(
             "ports        = {}",
             manifest.ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
         );
     }
     if let Some(health) = &manifest.health {
-        println!("health       = {health}");
+        crate::ui::report!("health       = {health}");
     }
     if let Some(user) = &manifest.user {
-        println!("user         = {user}");
+        crate::ui::report!("user         = {user}");
     }
     if let Some(dir) = &manifest.runtime_dir {
-        println!("runtime_dir  = {dir}");
+        crate::ui::report!("runtime_dir  = {dir}");
     }
     Ok(0)
 }

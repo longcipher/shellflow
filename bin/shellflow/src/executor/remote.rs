@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use super::{
-    ArcUi, Cancel, CopyStepArgs, HostOutcome, LogFile, RunError, RunOutcome, ShellCache,
+    ArcUi, Cancel, CopyStepArgs, HostOutcome, LogFile, Native, RunError, RunOutcome, ShellCache,
     StepConfig, fanout_slot, helper,
     local::{GuardOutcome, build_env, run_local_block},
     process::isolate,
@@ -60,10 +60,6 @@ pub(crate) struct RemoteEnv {
 }
 
 /// Shared handles threaded through a remote step's host fan-out.
-#[cfg_attr(
-    not(feature = "muxy"),
-    expect(dead_code, reason = "the ssh-only build ignores the step index")
-)]
 pub(crate) struct RemoteStepCtx<'a> {
     pub(crate) ui: &'a ArcUi,
     pub(crate) semaphore: &'a Option<Arc<Semaphore>>,
@@ -72,25 +68,26 @@ pub(crate) struct RemoteStepCtx<'a> {
     pub(crate) secrets: &'a Arc<ResolvedSecrets>,
     pub(crate) log_file: &'a LogFile,
     pub(crate) cancel: &'a Cancel,
-    /// The 1-based plan index (names the muxy payload file).
-    pub(crate) step_no: usize,
-    /// Per-run muxy state (connections cached per host).
-    #[cfg(feature = "muxy")]
-    pub(crate) muxy: &'a super::muxy::MuxyRun,
+    /// Per-run native-transport state (also the 1-based plan index that names
+    /// the muxy payload file).
+    pub(crate) native: &'a Native,
 }
 
 /// The transport half of a reload/wait step, cloned into its host fan-out.
+///
+/// Present in every build so the fan-out signature does not fork. Only the
+/// native transport reads it; the ssh path builds its command from the host
+/// spec, so the ssh-only build carries the (empty) state without using it.
 #[derive(Clone)]
+#[cfg_attr(
+    not(feature = "muxy"),
+    expect(dead_code, reason = "the ssh-only build has no native transport to carry")
+)]
 pub(super) struct StepTransport {
-    /// The probed remote environments (the muxy sentinel, the login `PATH`).
-    #[cfg(feature = "muxy")]
+    /// Per-destination probed login environment (the shell, the login `PATH`).
     pub(super) shell_cache: ShellCache,
-    /// Per-run muxy state (connections cached per host).
-    #[cfg(feature = "muxy")]
-    pub(super) muxy: super::muxy::MuxyRun,
-    /// The 1-based plan index (names the muxy payload file).
-    #[cfg(feature = "muxy")]
-    pub(super) step_no: usize,
+    /// Per-run native-transport state. Carried unconditionally; see [`Native`].
+    pub(super) native: Native,
 }
 
 /// Fully-initialized per-run state, built once by [`setup_run`] so
@@ -109,10 +106,9 @@ struct RunSetup {
     selected: Vec<(usize, shellflow_core::Step)>,
     total: usize,
     cancel: Cancel,
-    /// Per-run muxy state (connections cached per host, payloads named per
-    /// run).
-    #[cfg(feature = "muxy")]
-    muxy: super::muxy::MuxyRun,
+    /// Per-run native-transport state (connections cached per host, payloads
+    /// named per run).
+    native: Native,
     /// The managed work directory, removed when the run ends.
     ///
     /// The field exists for its `Drop`: the directory must disappear on
@@ -437,8 +433,7 @@ async fn setup_run(
         selected,
         total,
         cancel: cancel.clone(),
-        #[cfg(feature = "muxy")]
-        muxy: super::muxy::MuxyRun::new(),
+        native: { Native::new() },
         workdir,
     })
 }
@@ -474,13 +469,6 @@ fn resolve_or_report(
 /// [`super::host::run_target_command`]; this wrapper only threads the shared
 /// per-run state, so a new verb contributes its `command`, `label`, and
 /// [`super::transport::StepClass`] and nothing else.
-#[cfg_attr(
-    not(feature = "muxy"),
-    expect(
-        unused_variables,
-        reason = "the ssh-only build never classifies steps; the class drives only the muxy policy"
-    )
-)]
 async fn run_target_step(
     setup: &RunSetup,
     step_no: usize,
@@ -490,6 +478,7 @@ async fn run_target_step(
     label: String,
     class: super::transport::StepClass,
 ) -> eyre::Result<Vec<(String, HostOutcome)>> {
+    let native = setup.native.at_step(step_no);
     super::host::run_target_command(super::host::TargetCommand {
         ui: &setup.ui,
         command,
@@ -501,12 +490,8 @@ async fn run_target_step(
         secrets: &setup.resolved,
         shell_cache: &setup.shell_cache,
         label: &label,
-        #[cfg(feature = "muxy")]
         step_class: class,
-        #[cfg(feature = "muxy")]
-        muxy: &setup.muxy,
-        #[cfg(feature = "muxy")]
-        step_no,
+        native: &native,
     })
     .await
 }
@@ -556,9 +541,7 @@ async fn run_single_step(
                 secrets: &setup.resolved,
                 log_file: &setup.log_file,
                 cancel: &setup.cancel,
-                step_no,
-                #[cfg(feature = "muxy")]
-                muxy: &setup.muxy,
+                native: &setup.native,
             };
             (None, run_remote_step(&ctx, remote, hosts, config).await)
         }
@@ -592,12 +575,8 @@ async fn run_single_step(
                     &setup.log_file,
                     &setup.cancel,
                     &StepTransport {
-                        #[cfg(feature = "muxy")]
                         shell_cache: Arc::clone(&setup.shell_cache),
-                        #[cfg(feature = "muxy")]
-                        muxy: setup.muxy.clone(),
-                        #[cfg(feature = "muxy")]
-                        step_no,
+                        native: setup.native.at_step(step_no),
                     },
                 )
                 .await,
@@ -655,12 +634,8 @@ async fn run_single_step(
                     &setup.log_file,
                     &setup.cancel,
                     &StepTransport {
-                        #[cfg(feature = "muxy")]
                         shell_cache: Arc::clone(&setup.shell_cache),
-                        #[cfg(feature = "muxy")]
-                        muxy: setup.muxy.clone(),
-                        #[cfg(feature = "muxy")]
-                        step_no,
+                        native: setup.native.at_step(step_no),
                     },
                 )
                 .await,
@@ -980,8 +955,8 @@ pub(super) async fn run_reload_step(
                     config,
                     log_file: &log_file,
                     cancel: &cancel,
-                    muxy: &transport.muxy,
-                    step_no: transport.step_no,
+                    muxy: &transport.native.run,
+                    step_no: transport.native.step_no,
                     transform: None,
                     explain_exit: Some(helper::reload_explain(&unit, timeout.as_secs())),
                 })
@@ -1272,8 +1247,8 @@ pub(super) async fn run_wait_step(
                     config,
                     log_file: &log_file,
                     cancel: &cancel,
-                    muxy: &transport.muxy,
-                    step_no: transport.step_no,
+                    muxy: &transport.native.run,
+                    step_no: transport.native.step_no,
                     transform: Some(helper::wait_collector(&unit)),
                     explain_exit: Some(helper::wait_explain(&unit, budget.as_secs())),
                 })
@@ -1374,10 +1349,7 @@ pub(super) async fn run_remote_step(
         trace: config.verbose >= 3,
     };
     let mut tasks = JoinSet::new();
-    #[cfg(feature = "muxy")]
-    let step_no = ctx.step_no;
-    #[cfg(feature = "muxy")]
-    let muxy = ctx.muxy.clone();
+    let native = ctx.native.clone();
     for host in hosts {
         let ui = Arc::clone(ctx.ui);
         let semaphore = ctx.semaphore.clone();
@@ -1386,8 +1358,7 @@ pub(super) async fn run_remote_step(
         let secrets = Arc::clone(ctx.secrets);
         let log_file = ctx.log_file.clone();
         let cancel = ctx.cancel.clone();
-        #[cfg(feature = "muxy")]
-        let muxy = muxy.clone();
+        let native = native.clone();
         tasks.spawn(async move {
             // Never run unthrottled when the semaphore is closed.
             let _permit = fanout_slot!(&semaphore, &log_file, host);
@@ -1400,10 +1371,7 @@ pub(super) async fn run_remote_step(
                 secrets: &secrets,
                 log_file: &log_file,
                 cancel,
-                #[cfg(feature = "muxy")]
-                step_no,
-                #[cfg(feature = "muxy")]
-                muxy: &muxy,
+                native: &native,
             })
             .await
         });
@@ -1532,29 +1500,18 @@ struct RemoteHostArgs<'a> {
     secrets: &'a Arc<ResolvedSecrets>,
     log_file: &'a LogFile,
     cancel: Cancel,
-    /// The 1-based plan index (names the muxy payload file).
-    #[cfg(feature = "muxy")]
-    step_no: usize,
-    /// Per-run muxy state.
-    #[cfg(feature = "muxy")]
-    muxy: &'a super::muxy::MuxyRun,
+    /// Per-run native-transport state (also the 1-based plan index that names
+    /// the muxy payload file).
+    native: &'a Native,
 }
 
+#[cfg_attr(
+    not(feature = "muxy"),
+    expect(unused_variables, reason = "the ssh-only build has no native transport to hand it to")
+)]
 async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
-    let RemoteHostArgs {
-        ui,
-        host,
-        parts,
-        config,
-        shell_cache,
-        secrets,
-        log_file,
-        cancel,
-        #[cfg(feature = "muxy")]
-        step_no,
-        #[cfg(feature = "muxy")]
-        muxy,
-    } = args;
+    let RemoteHostArgs { ui, host, parts, config, shell_cache, secrets, log_file, cancel, native } =
+        args;
     if config.dry_run {
         return run_syntax_check(SyntaxCheckArgs { ui, host, parts, config, log_file, cancel })
             .await;
@@ -1576,8 +1533,15 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
                 timeout: config.timeout,
             }
             .render_check();
-            match super::muxy::ensure_host(muxy, host, remote_env.has_muxy, false, config, log_file)
-                .await
+            match super::muxy::ensure_host(
+                &native.run,
+                host,
+                remote_env.has_muxy,
+                false,
+                config,
+                log_file,
+            )
+            .await
             {
                 super::muxy::EnsureOutcome::Muxy(conn) => {
                     match super::muxy::check_via_muxy(&conn, &check_payload, config.timeout).await {
@@ -1631,7 +1595,7 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
     if super::muxy::class_uses_muxy(config, super::StepClass::Remote) {
         let has_secrets = secrets.has_for_host(&host.alias);
         match super::muxy::ensure_host(
-            muxy,
+            &native.run,
             host,
             remote_env.has_muxy,
             has_secrets,
@@ -1656,8 +1620,8 @@ async fn run_remote_host(args: RemoteHostArgs<'_>) -> (String, HostOutcome) {
                     explain_exit: None,
                     log_file: log_file.clone(),
                     cancel: cancel.clone(),
-                    run_id: muxy.run_id.clone(),
-                    step_id: format!("step-{step_no}"),
+                    run_id: native.run.run_id.clone(),
+                    step_id: format!("step-{}", native.step_no),
                 })
                 .await;
                 match attempt {
@@ -1976,9 +1940,17 @@ async fn probe_once(host: &ResolvedHost, cancel: &Cancel) -> Option<RemoteEnv> {
     // (timeout, cancellation, spawn failure) kills the probe.
     let output = if let super::process::ChildOutcome::Finished(Ok(_)) = status {
         group.disarm();
-        match tokio::time::timeout(Duration::from_secs(2), reader).await {
+        // A reader still blocked after the grace period is aborted rather
+        // than dropped: dropping the handle detaches the task, which would
+        // outlive the probe on a host whose pipe never closes.
+        let mut reader = reader;
+        match tokio::time::timeout(Duration::from_secs(2), &mut reader).await {
             Ok(Ok(buf)) => buf,
-            _ => return None,
+            Ok(Err(_)) => return None,
+            Err(_) => {
+                reader.abort();
+                return None;
+            }
         }
     } else {
         super::process::terminate(&mut child).await;

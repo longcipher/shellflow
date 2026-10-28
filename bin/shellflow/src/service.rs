@@ -185,13 +185,13 @@ fn init(cmd: &ServiceInitArgs) -> Result<()> {
         }
     }
 
-    println!("==> scaffolded (pattern {:?}):", cmd.pattern);
+    crate::ui::report!("==> scaffolded (pattern {:?}):", cmd.pattern);
     for (path, _, _) in &scaffold.files {
-        println!("    {}", path.display());
+        crate::ui::report!("    {}", path.display());
     }
-    println!("==> next:");
+    crate::ui::report!("==> next:");
     for step in &scaffold.next_steps {
-        println!("    {step}");
+        crate::ui::report!("    {step}");
     }
     Ok(())
 }
