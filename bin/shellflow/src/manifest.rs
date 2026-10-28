@@ -263,12 +263,7 @@ fn validate_host_alias(name: &str, service: &str) -> Result<(), ManifestError> {
 /// Whether a manifest-declared unit name is safe to hand to `systemctl`: the
 /// single shared unit charset, template units and specifiers included.
 fn validate_unit_name(name: &str, service: &str) -> Result<(), ManifestError> {
-    let ok = !name.is_empty() &&
-        !name.starts_with('.') &&
-        !name.contains("..") &&
-        name.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'));
-    if ok {
+    if shellflow_text::is_valid_unit_name(name) {
         Ok(())
     } else {
         Err(ManifestError::new(format!("manifest `{service}`: invalid unit name `{name}`")))

@@ -311,14 +311,19 @@ mod tests {
 
     #[test]
     fn multibyte_lines_never_panic_the_scan() {
-        // CJK comments are common in playbooks; a byte-index walk would
-        // panic on a split char boundary (`start byte index … is not a char
-        // boundary`). The scan must stay silent on all of these.
+        // Non-ASCII comments are common in playbooks (a localised comment is a
+        // comment); a byte-index walk would panic on a split char boundary
+        // (`start byte index … is not a char boundary`). Cyrillic is used here
+        // rather than an Asian script so the repositories' English-only gate
+        // (`just check-cn`) stays meaningful. The scan must stay silent on all
+        // of these.
         let findings = lint_block(
-            "# 需要重启: 内核已更新\nstatus=0 # 状态\nfor x in a b; do echo \u{4e2d}文; done\n",
+            "# \u{43f}\u{435}\u{440}\u{435}\u{437}\u{430}\u{433}\u{440}\u{443}\u{437}\u{43a}\u{430}: \u{44f}\u{434}\u{440}\u{43e}\n             status=0 # \u{441}\u{43e}\u{441}\u{442}\u{43e}\u{44f}\u{43d}\u{438}\u{435}\n             for x in a b; do echo \u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}; done\n",
         );
         assert!(findings.iter().any(|f| f.message.contains("read-only")));
-        let clean = lint_block("# 纯中文注释行\necho ok\n");
+        let clean = lint_block(
+            "# \u{43a}\u{43e}\u{43c}\u{43c}\u{435}\u{43d}\u{442}\u{430}\u{440}\u{438}\u{439}\necho ok\n",
+        );
         assert!(clean.is_empty());
     }
 

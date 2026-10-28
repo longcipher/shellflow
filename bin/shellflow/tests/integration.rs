@@ -106,6 +106,13 @@ fn run_with_env(
     extra: &[(&str, &str)],
 ) -> TestResult<Output> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_shellflow"));
+    // Each suite gets a private temp directory: `@export` writes a
+    // `shellflow-capture-*` file there, and the cleanup tests assert on the
+    // set of those files. With a shared `/tmp` the harness's parallel test
+    // threads see each other's live files and the assertion flakes.
+    let tmp = mock_dir.parent().unwrap_or(mock_dir).join("tmp");
+    fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    cmd.env("TMPDIR", &tmp);
     cmd.arg(script);
     cmd.args(args);
     // Tests assert on plain text; disable ANSI unless the test opts in.
@@ -362,7 +369,7 @@ fn dry_run_rsync_itemizes() -> TestResult<()> {
         "rsync's own ssh must not prompt for a password or host key: {log}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(">f++++++++"), "itemize output missing: {stdout}");
+    assert!(stdout.contains(">f+++++++++"), "itemize output missing: {stdout}");
     Ok(())
 }
 
@@ -650,7 +657,7 @@ fn diff_hides_rsync_status_lines() -> TestResult<()> {
         !stdout.contains("sending incremental file list"),
         "--diff should hide rsync status prose: {stdout}"
     );
-    assert!(stdout.contains(">f++++++++"), "--diff should keep itemize lines: {stdout}");
+    assert!(stdout.contains(">f+++++++++"), "--diff should keep itemize lines: {stdout}");
     Ok(())
 }
 

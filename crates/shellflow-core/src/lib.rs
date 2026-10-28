@@ -36,11 +36,11 @@ pub use error::{CaptureError, MissingKey, MissingKeysError, RenderEnvError};
 // They are re-exported here so that a consumer of the runtime helpers does
 // not have to know which of the two crates owns which half of the language.
 pub use shellflow_dsl::{
-    AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep, EnvEntry,
-    ExecutionPlan, ExportVar, HelperStep, ImageStep, InstallStep, InterpolateError, LocalStep,
-    ParseError, ReleaseStep, ReloadStep, RemoteStep, ResolvedHost, RunState, SecretEntry,
-    ServiceStep, SshSpec, Step, Target, ToolchainStep, UnitInventoryStep, WaitStep, Workdir,
-    interpolate, parse_script,
+    ActiveState, AssertStep, Assertion, BackupStep, BuildStep, CopyEntry, CopyStep, CredstoreStep,
+    EnabledState, EnvEntry, ExecutionPlan, ExportVar, HelperStep, ImageStep, InstallStep,
+    InterpolateError, LocalStep, ParseError, ReleaseStep, ReloadStep, RemoteStep, ResolvedHost,
+    RunState, SecretEntry, ServiceStep, SshSpec, Step, Target, ToolchainStep, UnitInventoryStep,
+    WaitStep, Workdir, interpolate, parse_script,
 };
 pub use shellflow_dsl::{Heredoc, HeredocTracker, resolve_hosts};
 // The shell-text rules are re-exported from their owning crate, so there is

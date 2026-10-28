@@ -123,17 +123,17 @@ impl std::error::Error for SystemdError {}
 /// Unit names are validated with the same charset the DSL accepts, so a unit
 /// name can never smuggle a path or a shell metacharacter into the helpers.
 fn validate_unit(unit: &str) -> Result<(), SystemdError> {
-    if unit.is_empty() {
-        return Err(SystemdError::usage("empty unit name"));
+    crate::systemctl::validate_unit(unit).map_err(into_systemd_error)
+}
+
+/// Map the shared `systemctl` error into this command's vocabulary: a usage
+/// error keeps exit 1, everything else is an operational failure.
+fn into_systemd_error(err: crate::systemctl::SystemctlError) -> SystemdError {
+    if err.is_usage() {
+        SystemdError::usage(err.to_string())
+    } else {
+        SystemdError::internal(err.to_string())
     }
-    if unit.starts_with('.') || unit.contains("..") {
-        return Err(SystemdError::usage(format!("invalid unit name `{unit}`")));
-    }
-    if !unit.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'))
-    {
-        return Err(SystemdError::usage(format!("invalid unit name `{unit}`")));
-    }
-    Ok(())
 }
 
 /// The `systemctl show` properties the helper reads.
@@ -277,7 +277,24 @@ impl WaitFor {
 }
 
 /// Run a `shellflow systemd` subcommand.
-pub(crate) async fn run(cmd: &SystemdCmd) -> Result<(), SystemdError> {
+///
+/// Only `watch` is genuinely asynchronous. Every other verb blocks (polling
+/// with `std::thread::sleep`, waiting out a daemon reload, supervising a
+/// child), so it is dispatched to a blocking thread: running it on a runtime
+/// worker stalled the whole executor for the length of a systemd cycle.
+pub(crate) async fn run(cmd: SystemdCmd) -> Result<(), SystemdError> {
+    match cmd {
+        SystemdCmd::Watch(args) => watch(&args).await,
+        blocking => {
+            tokio::task::spawn_blocking(move || run_blocking(&blocking)).await.map_err(|err| {
+                SystemdError::internal(format!("the systemd worker stopped unexpectedly: {err}"))
+            })?
+        }
+    }
+}
+
+/// The blocking half of [`run`]: every verb that sleeps or waits in place.
+fn run_blocking(cmd: &SystemdCmd) -> Result<(), SystemdError> {
     match cmd {
         SystemdCmd::Notify(args) => notify(args),
         SystemdCmd::Exec(args) => exec(args),
@@ -285,8 +302,12 @@ pub(crate) async fn run(cmd: &SystemdCmd) -> Result<(), SystemdError> {
         SystemdCmd::Wait(args) => wait(args),
         SystemdCmd::Reload(args) => reload(args),
         SystemdCmd::Status(args) => status(args),
-        SystemdCmd::Watch(args) => watch(args).await,
         SystemdCmd::Transient(args) => transient(args),
+        // `watch` is the one verb `run` awaits directly; reaching it here
+        // would mean the dispatch above lost a case.
+        SystemdCmd::Watch(_) => {
+            Err(SystemdError::internal("`watch` must be driven by the async entry point"))
+        }
     }
 }
 
@@ -402,7 +423,7 @@ fn exec(args: &SystemdExecArgs) -> Result<(), SystemdError> {
         .map_err(|err| SystemdError::internal(format!("cannot start `{program}`: {err}")))?;
     let pid = child.id() as i32;
     CHILD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
-    install_signal_forwarding();
+    install_signal_forwarding()?;
 
     let readiness = Readiness::from(args);
     let watchdog = args.watchdog.then(|| Duration::from_secs(args.watchdog_interval.max(1)));
@@ -546,7 +567,7 @@ static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::n
 ///
 /// The handler does the minimum an async-signal-safe function may do: read
 /// the pid and send a signal.
-fn install_signal_forwarding() {
+fn install_signal_forwarding() -> Result<(), SystemdError> {
     extern "C" fn forward(raw: i32) {
         let Ok(signal) = nix::sys::signal::Signal::try_from(raw) else {
             return;
@@ -560,15 +581,22 @@ fn install_signal_forwarding() {
     // SAFETY: the handler is async-signal-safe (it reads an atomic and
     // sends a signal) and stays installed for the life of the process.
     unsafe {
-        let _ = nix::sys::signal::signal(
+        nix::sys::signal::signal(
             nix::sys::signal::Signal::SIGTERM,
             nix::sys::signal::SigHandler::Handler(forward),
-        );
-        let _ = nix::sys::signal::signal(
+        )
+        .map_err(|err| {
+            SystemdError::internal(format!("cannot install the SIGTERM handler: {err}"))
+        })?;
+        nix::sys::signal::signal(
             nix::sys::signal::Signal::SIGINT,
             nix::sys::signal::SigHandler::Handler(forward),
-        );
+        )
+        .map_err(|err| {
+            SystemdError::internal(format!("cannot install the SIGINT handler: {err}"))
+        })?;
     }
+    Ok(())
 }
 
 /// The readiness condition a supervised service must satisfy.
@@ -695,13 +723,13 @@ fn wait(args: &SystemdWaitArgs) -> Result<(), SystemdError> {
     loop {
         let state = show_state(&args.unit)?;
         if state.active.is_empty() && state.unit_type.is_empty() {
-            println!("{STATE_PREFIX}\tNOTFOUND");
+            crate::ui::report!("{STATE_PREFIX}\tNOTFOUND");
             return Err(SystemdError {
                 message: format!("unit `{}` does not exist", args.unit),
                 code: EXIT_NOT_FOUND,
             });
         }
-        println!("{}", state_line(&state));
+        crate::ui::report!("{}", state_line(&state));
 
         if want.matches(&state) {
             return Ok(());
@@ -727,7 +755,7 @@ fn wait(args: &SystemdWaitArgs) -> Result<(), SystemdError> {
 fn status(args: &SystemdStatusArgs) -> Result<(), SystemdError> {
     validate_unit(&args.unit)?;
     let state = show_state(&args.unit)?;
-    println!("{}", state_line(&state));
+    crate::ui::report!("{}", state_line(&state));
     match verdict(&state) {
         Verdict::Ready => Ok(()),
         Verdict::Failed(reason) => Err(SystemdError { message: reason, code: EXIT_FAILED }),
@@ -774,53 +802,19 @@ fn reload(args: &SystemdReloadArgs) -> Result<(), SystemdError> {
     )
 }
 
-/// Run `systemctl`, elevating when the caller is not root.
-///
-/// The helper is installed for the deploy user, but `systemctl reload` and
-/// `systemctl kill` are privileged. Passwordless sudo is the same assumption
-/// the `cred-env` helper already makes, so the elevation is attempted the
-/// same way; a host without it gets a clear error instead of a silent no-op.
+/// Run `systemctl` through the shared invocation path (elevation included).
 fn systemctl_output(args: &[&str]) -> Result<std::process::Output, SystemdError> {
-    let mut cmd = if nix::unistd::Uid::effective().is_root() {
-        let mut cmd = Command::new("systemctl");
-        cmd.args(args);
-        cmd
-    } else {
-        let mut cmd = Command::new("sudo");
-        cmd.arg("-n").arg("systemctl").args(args);
-        cmd
-    };
-    cmd.stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .output()
-        .map_err(|err| SystemdError::internal(format!("cannot run `systemctl`: {err}")))
+    crate::systemctl::output(args).map_err(into_systemd_error)
 }
 
 /// Whether the unit declares a given property (`systemctl show -p X`).
 fn unit_has_property(unit: &str, property: &str) -> bool {
-    let Ok(out) = systemctl_output(&["show", unit, "-p", property]) else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().any(|line| !line.ends_with('=') && !line.is_empty())
+    crate::systemctl::has_property(unit, property)
 }
 
 /// Run `systemctl` with the given arguments, mapping a failure to an error.
 fn run_systemctl(args: &[&str]) -> Result<(), SystemdError> {
-    let out = systemctl_output(args)?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(SystemdError::internal(format!(
-            "`systemctl {}` failed: {}",
-            args.join(" "),
-            stderr.trim()
-        )));
-    }
-    Ok(())
+    crate::systemctl::run(args).map_err(into_systemd_error)
 }
 
 /// Wait for a reload handshake.
@@ -835,7 +829,7 @@ fn wait_for_reload(unit: &str, timeout: Duration, interval: Duration) -> Result<
     let mut saw_reloading = false;
     loop {
         let state = show_state(unit)?;
-        println!("{}", state_line(&state));
+        crate::ui::report!("{}", state_line(&state));
         if state.active == "reloading" || state.sub == "reload" {
             saw_reloading = true;
         }
@@ -878,7 +872,7 @@ async fn watch(args: &SystemdWatchArgs) -> Result<(), SystemdError> {
             let state = show_state(&args.unit)?;
             let line = state_line(&state);
             if line != last {
-                println!("{line}");
+                crate::ui::report!("{line}");
                 last = line;
             }
             if matches!(verdict(&state), Verdict::Ready) {

@@ -292,10 +292,13 @@ impl Batch {
                 }
             }
         }
-        let status = child
-            .wait()
-            .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
+        // Record completion before propagating a wait error: the watchdog
+        // reads this flag, and leaving it unset made a failed wait spin until
+        // the whole batch timeout elapsed.
+        let status = child.wait();
         finished.store(true, Ordering::Relaxed);
+        let status = status
+            .map_err(|err| ServiceError::Transport(eyre::eyre!("ssh {host} failed: {err}")))?;
         let stderr_text = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
         if timed_out.load(Ordering::Relaxed) {
             return Err(ServiceError::Transport(eyre::eyre!(

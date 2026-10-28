@@ -23,12 +23,12 @@ fuzz_target!(|data: &[u8]| {
     // Determinism: parsing is a pure function, so the same bytes must always
     // yield the same plan.
     let again = parse_script(text).expect("parsing must be deterministic");
-    assert_eq!(plan.steps.len(), again.steps.len(), "step count must be stable");
+    assert_eq!(plan.steps().len(), again.steps().len(), "step count must be stable");
     assert!(plan == again, "parsing must be deterministic");
 
     // A step's target must resolve without panicking. `resolve_hosts` is where
     // a raw ssh spec is parsed, which is the other byte-level scanner.
-    for step in &plan.steps {
+    for step in plan.steps() {
         if let Some(target) = step.target_text() {
             let _ = resolve_hosts(&plan, &Target::new(target), &[]);
         }
@@ -36,7 +36,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Restriction to a host nobody declared must be a clean error (exit 1),
     // never a panic.
-    for step in &plan.steps {
+    for step in plan.steps() {
         if let Some(target) = step.target_text() {
             let _ = resolve_hosts(&plan, &Target::new(target), &["no-such-host".to_string()]);
         }

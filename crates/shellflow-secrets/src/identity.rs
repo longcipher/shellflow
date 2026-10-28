@@ -232,10 +232,36 @@ pub fn generate_identity(path: &Path) -> Result<age::x25519::Identity, SecretsEr
     let identity = age::x25519::Identity::generate();
 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        // Collect the ancestors that do not exist yet, so only directories
+        // this call creates are tightened. Tightening a pre-existing
+        // directory (e.g. `/tmp`, `$HOME`, or a shared `~/.config`) would
+        // surprise its owner and can break the system.
+        let mut missing: Vec<&Path> = Vec::new();
+        let mut cursor = Some(parent);
+        while let Some(dir) = cursor {
+            if dir.as_os_str().is_empty() || dir.exists() {
+                break;
+            }
+            missing.push(dir);
+            cursor = dir.parent();
+        }
         fs::create_dir_all(parent).map_err(|source| SecretsError::WriteFile {
             path: parent.display().to_string(),
             source,
         })?;
+        // The key file is 0600, but a world-readable directory still leaks
+        // which identities exist and lets another user pre-plant a file name.
+        // `create_dir_all` uses the umask, so the mode of newly created
+        // directories is set explicitly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for dir in missing {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
+                    SecretsError::WriteFile { path: dir.display().to_string(), source }
+                })?;
+            }
+        }
     }
 
     // The key is staged in a sibling temp file and then linked into place:

@@ -1,8 +1,18 @@
 # Mutation testing configuration for cargo-mutants.
 #
-# The binary crates are exercised by `bin/shellflow/tests/integration.rs`,
-# which cargo-mutants does not run (it builds each crate's own test target
-# only). Their orchestration mutants therefore survive by construction, so
-# they are excluded and mutation stays focused on the library crates, where
-# the domain logic lives and is unit- and property-tested.
-exclude_globs = ["bin/shellflow/src/**", "examples/*/src/**"]
+# Scope: every crate with logic the unit/property tests can actually kill
+# mutants in. The previous configuration excluded **all** of
+# `bin/shellflow/src/**`, which hid 46 modules (parsing helpers, the manifest
+# reader, the masker's rendering, the helper exit ladder, …) from mutation
+# testing even though they carry unit tests. Only the modules whose behaviour
+# lives exclusively in the integration suite stay out.
+exclude_globs = [
+  # The CLI dispatch itself: every branch ends in a subcommand call whose
+  # effect is only observable end to end (`bin/shellflow/tests/integration.rs`).
+  "bin/shellflow/src/main.rs",
+  # Child-process supervision: mutants need a real spawned process tree, which
+  # the integration harness provides and the unit target cannot.
+  "bin/shellflow/src/executor/process.rs",
+  # Demo targets, not shipped logic.
+  "examples/*/src/**",
+]

@@ -34,7 +34,7 @@ fn cred_env(args: &EmitCredEnvArgs) -> Result<()> {
         // `> cred-env` redirect) must still leave it executable.
         // `OpenOptions::mode` alone would only apply at creation time.
         write_executable_file(path, CRED_ENV.as_bytes())?;
-        println!("wrote cred-env to {}", path.display());
+        crate::ui::report!("wrote cred-env to {}", path.display());
     } else {
         let mut stdout = std::io::stdout().lock();
         stdout.write_all(CRED_ENV.as_bytes()).wrap_err("failed to write to stdout")?;

@@ -81,7 +81,7 @@ pub(crate) async fn watch(
         let state = state_from_properties(&all);
         let line = state_line(&state);
         if line != last {
-            println!("{line}");
+            crate::ui::report!("{line}");
             last = line;
         }
         if verdict(&state) == Verdict::Ready {
@@ -121,7 +121,7 @@ async fn poll_until_ready(
         let state = crate::systemd::show_state(unit)?;
         let line = state_line(&state);
         if line != last {
-            println!("{line}");
+            crate::ui::report!("{line}");
             last = line;
         }
         if verdict(&state) == Verdict::Ready {

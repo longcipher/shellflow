@@ -11,7 +11,7 @@
 //! The two step functions that *run* these commands stay in `remote.rs` — they
 //! are fan-out plus muxy/ssh selection, not protocol.
 
-use super::{HostOutcome, RunError, stream};
+use super::{HostOutcome, stream};
 
 /// Default wait budget in seconds when neither `@timeout` nor `--timeout`
 /// bounds a `@wait_active` step (slow starters: substrate nodes, JVMs,
@@ -154,16 +154,10 @@ pub(super) fn classify_helper_exit(
     budget_secs: u64,
     alias: &str,
 ) -> (HostOutcome, String) {
-    let outcome = match code {
-        crate::exit::helper::OK => HostOutcome::Ok,
-        // ssh exits 255 when the connection itself failed: a transport
-        // failure, not an inactive unit.
-        255 => HostOutcome::Failed(RunError::Transport),
-        // The helper's own budget expired. A timeout, not a script failure:
-        // the exit code (5) says a retry may well succeed.
-        crate::exit::helper::TIMEOUT => HostOutcome::TimedOut,
-        _ => HostOutcome::Failed(RunError::Script),
-    };
+    // One ladder for every helper caller (`executor::classify_helper_exit`):
+    // a timeout means "retry", a non-zero script exit means "roll back", and
+    // the two paths cannot drift apart again.
+    let outcome = super::classify_helper_exit(code);
     let note = helper_note(code, unit, verb, budget_secs)
         .map_or_else(String::default, |note| format!("[{alias}] {note}"));
     (outcome, note)

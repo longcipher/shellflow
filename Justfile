@@ -31,12 +31,13 @@ lint:
 test:
   cargo test --all-features
 
-# .cargo/mutants.toml excludes the binary and example crates: cargo-mutants
-# only runs each crate's own test target.
+# .cargo/mutants.toml excludes only the modules whose behaviour lives in the
+# integration suite (`main.rs`, `executor/process.rs`) and the demo targets;
+# see the file for why.
 #
 # Run mutation tests with cargo-mutants
 mutation:
-  cargo mutants
+  cargo mutants --workspace
 
 # Type-check every fuzz target (no execution)
 fuzz-check:
@@ -116,7 +117,13 @@ check-cn:
   echo "ok: no Chinese characters found"
 
 # Full CI check
-ci: lint test build
+#
+# `fuzz-check` is part of the gate, not an optional extra: the fuzz crates are
+# detached workspaces, so neither `cargo check` nor `cargo test` at the root
+# compiles them, and a fuzz target broken by a parser change would otherwise
+# stay broken until someone ran it by hand. `check-cn` enforces AGENTS.md's
+# English-only rule.
+ci: lint test build fuzz-check check-cn
 
 # ============================================================
 # Maintenance & Tools

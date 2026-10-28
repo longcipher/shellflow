@@ -328,6 +328,23 @@ fn record_fingerprint(store: &Path, fingerprint: &str) {
     let _ = crate::fsx::write_secret_file(&store.join(FINGERPRINT_FILE), fingerprint.as_bytes());
 }
 
+/// Remove a staging or retired credential tree, reporting a failure.
+///
+/// The staging tree holds **plaintext** credentials until it is sealed, so a
+/// failed removal is not a detail to swallow: it is a leftover the operator has
+/// to know about. `NotFound` is the common case (nothing to clean) and stays
+/// quiet.
+fn discard_tree(path: &std::path::Path) {
+    if let Err(err) = std::fs::remove_dir_all(path) &&
+        err.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::ui::warn(
+            &format!("cannot remove credential staging `{}`: {err}", path.display()),
+            &None,
+        );
+    }
+}
+
 /// Atomic staging-swap installer shared by the env path
 /// (`credstore-install`) and the piped-bundle path (`__seal-bundle`).
 fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> Result<()> {
@@ -355,13 +372,13 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
         return Ok(());
     }
 
-    let _ = fs::remove_dir_all(&staging);
+    discard_tree(&staging);
     sudo(&["install", "-d", "-m", "0700", &staging.to_string_lossy()])?;
 
     let seal_result = seal_all(keys, &staging);
     if let Err(err) = seal_result {
         // The live store was never touched; drop the partial staging tree.
-        let _ = fs::remove_dir_all(&staging);
+        discard_tree(&staging);
         return Err(err);
     }
 
@@ -374,16 +391,16 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
     // previous store, so the residual is a very short availability gap
     // rather than a data-loss risk.
     if exchange_dirs(&staging, &store) {
-        let _ = fs::remove_dir_all(&staging);
+        discard_tree(&staging);
         record_fingerprint(&store, &fingerprint);
         return Ok(());
     }
 
     let retired = store.with_extension("old");
-    let _ = fs::remove_dir_all(&retired);
+    discard_tree(&retired);
     let had_previous = store.exists();
     if had_previous && fs::rename(&store, &retired).is_err() {
-        let _ = fs::remove_dir_all(&staging);
+        discard_tree(&staging);
         bail!(
             "cred-env credstore-install: cannot retire the previous store at `{}`",
             store.display()
@@ -394,13 +411,13 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
         if had_previous {
             let _ = fs::rename(&retired, &store);
         }
-        let _ = fs::remove_dir_all(&staging);
+        discard_tree(&staging);
         bail!(
             "cred-env credstore-install: cannot install the new store at `{}`: {err}",
             store.display()
         );
     }
-    let _ = fs::remove_dir_all(&retired);
+    discard_tree(&retired);
     record_fingerprint(&store, &fingerprint);
     Ok(())
 }
@@ -536,7 +553,7 @@ fn seal_all(keys: &[String], store: &Path) -> Result<()> {
             bail!("cred-env credstore-install: systemd-creds failed for `{key}` (status {status})");
         }
         sudo(&["chmod", "0600", &path])?;
-        println!("==> credential written: {key}");
+        crate::ui::report!("==> credential written: {key}");
     }
     Ok(())
 }

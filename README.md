@@ -48,7 +48,7 @@ deploy.sh` runs it unchanged, and your editor highlights it perfectly.
   `--check`/`--dry-run` stay on plain `bash -n -s`.
 - **Deployer-style pipeline** — `@local` build → `@copy` → `@remote` deploy,
   with concurrent multi-host fan-out (`JoinSet` + semaphore, `--parallel`
-  defaults to all hosts).
+  defaults to 16 hosts; `--parallel 0` means all).
 - **Detailed debugging** — `-v` / `-vv` / `-vvv`:
   - `-v`: plan preview + per-step timing.
   - `-vv`: exact `ssh`/`rsync`/`scp` argv, full payload previews, and
@@ -207,9 +207,17 @@ USAGE: shellflow [OPTIONS] [SCRIPT]
        shellflow <COMMAND>
 
 COMMANDS:
-  run     Run a deploy script (default; `shellflow deploy.sh` still works)
-  keys    Manage age identities (generate, public)
-  secret  Encrypt, decrypt, and edit age-encrypted env files
+  run       Run a deploy script (default; `shellflow deploy.sh` still works)
+  keys      Manage age identities (generate, public)
+  secret    Encrypt, decrypt, and edit age-encrypted env files
+  template  Cross-check `${KEY}` templates against encrypted env files
+  emit      Print the embedded target-side helper assets
+  cred-env  Target-side credential helpers (run on the target host)
+  systemd   Target-side systemd helpers (wait, reload, status, watch, exec)
+  host      Target-side file/unit helpers (install, backup, assert, inventory)
+  unit      Render and check systemd units from a manifest
+  service   Service manifest workflows (check, diff, verify, status, init)
+  audit     Scan a repository or host for leaked configuration
 
 ARGS:
   <SCRIPT>  Deploy script path [default: deploy.sh]
@@ -234,6 +242,11 @@ OPTIONS:
       --allow-unfiltered-copy Accept the scp fallback dropping --delete/--exclude
       --local                 Run remote blocks/copies locally (debugging)
       --no-ssh-reuse          Do not reuse SSH connections within a run
+      --transport <MODE>      auto (default) | muxy | ssh
+      --no-muxy               Alias for --transport ssh
+      --muxy-keep             Leave a cancelled step's muxy session running
+      --muxy-cols <N>         Muxy session width  [default: 200]
+      --muxy-rows <N>         Muxy session height [default: 50]
   -h, --help                  Print help
   -V, --version               Print version
 ```

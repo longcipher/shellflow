@@ -266,8 +266,12 @@ fn creds(args: &SecretCredsArgs) -> Result<()> {
             // explicit path. The path form that *decrypts* an encrypted
             // credential is `LoadCredentialEncrypted=ID:PATH` — plain
             // `LoadCredential=` expects a plaintext source (systemd.exec(5)).
-            Some(dir) => println!("LoadCredentialEncrypted={key}:{}", dir.join(&key).display()),
-            None => println!("ImportCredential={key}"),
+            Some(dir) => {
+                crate::ui::report!("LoadCredentialEncrypted={key}:{}", dir.join(&key).display());
+            }
+            None => {
+                crate::ui::report!("ImportCredential={key}");
+            }
         }
     }
     Ok(())
@@ -334,7 +338,7 @@ fn keys_check(args: &SecretKeysCheckArgs) -> Result<()> {
         if keys.is_empty() {
             bail!("`{}` contains no keys", file.display());
         }
-        println!("{host}: {}", keys.join(" "));
+        crate::ui::report!("{host}: {}", keys.join(" "));
         match &reference {
             None => reference = Some((host, keys)),
             Some((ref_host, ref_keys)) if *ref_keys != keys => {
@@ -352,7 +356,7 @@ fn keys_check(args: &SecretKeysCheckArgs) -> Result<()> {
             Some(_) => {}
         }
     }
-    println!("OK: {} host(s) share the same key set", files.len());
+    crate::ui::report!("OK: {} host(s) share the same key set", files.len());
     Ok(())
 }
 
@@ -409,13 +413,13 @@ fn find_duplicates(args: &SecretFindDuplicatesArgs) -> Result<()> {
     }
     let groups = shared_value_groups(&locations);
     if groups.is_empty() {
-        println!("OK: all credential values unique across {} file(s)", files.len());
+        crate::ui::report!("OK: all credential values unique across {} file(s)", files.len());
         return Ok(());
     }
     for group in &groups {
-        println!("shared value (rotate together):");
+        crate::ui::report!("shared value (rotate together):");
         for loc in group {
-            println!("  {loc}");
+            crate::ui::report!("  {loc}");
         }
     }
     bail!("found {} shared credential value(s) under {}", groups.len(), args.dir.display());

@@ -21,14 +21,17 @@ pub struct SshSpec {
 impl SshSpec {
     /// Parse a destination string of the form `[user@]host[:port]`.
     ///
-    /// IPv6 addresses are not supported in v1; use `~/.ssh/config` for exotic
-    /// destinations.
+    /// An IPv6 literal is written in brackets, as `ssh` accepts it:
+    /// `deploy@[2001:db8::1]:2222`. A bare IPv6 address without brackets is
+    /// ambiguous (`::1` has no port to split off), so it is rejected rather
+    /// than guessed at.
     ///
     /// # Errors
     ///
-    /// Returns a [`ParseError`] when the spec has no host, an empty user, a
-    /// non-numeric / out-of-range port, or a user or host that contains
-    /// characters outside `[A-Za-z0-9._-]`.
+    /// Returns a [`ParseError`] when the spec has no host, an empty user, an
+    /// unclosed `[`, a non-numeric / out-of-range port, or a user or host that
+    /// contains characters outside `[A-Za-z0-9._-]` (`[0-9A-Fa-f:.]` inside
+    /// brackets).
     pub fn parse(spec: &str) -> Result<Self, ParseError> {
         let (user, rest) = match spec.split_once('@') {
             Some((user, rest)) => {
@@ -53,23 +56,53 @@ impl SshSpec {
             None => (None, spec),
         };
 
-        let (host, port) = match rest.rsplit_once(':') {
-            Some((host, port)) => {
-                let port = port.parse::<u16>().map_err(|_| ParseError::InvalidSshSpec {
-                    line: 0,
-                    spec: spec.to_string(),
-                    reason: format!("invalid port `{port}`"),
-                })?;
-                if port == 0 {
+        let (host, port) = match rest.strip_prefix('[') {
+            Some(bracketed) => {
+                let Some((host, tail)) = bracketed.split_once(']') else {
                     return Err(ParseError::InvalidSshSpec {
                         line: 0,
                         spec: spec.to_string(),
-                        reason: "invalid port `0` (must be 1-65535)".to_string(),
+                        reason: "unclosed `[` in an IPv6 destination".to_string(),
+                    });
+                };
+                if host.is_empty() || !is_ipv6_literal(host) {
+                    return Err(ParseError::InvalidSshSpec {
+                        line: 0,
+                        spec: spec.to_string(),
+                        reason: format!(
+                            "invalid IPv6 address `{host}` (allowed: hex digits, `:`, `.`)"
+                        ),
                     });
                 }
-                (host.to_string(), Some(port))
+                let port = if tail.is_empty() {
+                    None
+                } else {
+                    let Some(raw) = tail.strip_prefix(':') else {
+                        return Err(ParseError::InvalidSshSpec {
+                            line: 0,
+                            spec: spec.to_string(),
+                            reason: format!("unexpected `{tail}` after `]`"),
+                        });
+                    };
+                    Some(parse_port(raw, spec)?)
+                };
+                (host.to_string(), port)
             }
-            None => (rest.to_string(), None),
+            None => match rest.rsplit_once(':') {
+                Some((host, port)) => {
+                    if host.contains(':') {
+                        return Err(ParseError::InvalidSshSpec {
+                            line: 0,
+                            spec: spec.to_string(),
+                            reason: format!(
+                                "bare IPv6 address `{rest}` is ambiguous (use `[{rest}]` or `[addr]:port`)"
+                            ),
+                        });
+                    }
+                    (host.to_string(), Some(parse_port(port, spec)?))
+                }
+                None => (rest.to_string(), None),
+            },
         };
 
         if host.is_empty() {
@@ -79,7 +112,7 @@ impl SshSpec {
                 reason: "empty host".to_string(),
             });
         }
-        if !is_valid_spec_component(&host) {
+        if !self::host_is_well_formed(&host) {
             return Err(ParseError::InvalidSshSpec {
                 line: 0,
                 spec: spec.to_string(),
@@ -91,11 +124,16 @@ impl SshSpec {
     }
 
     /// The `user@host` destination as passed to `rsync`.
+    ///
+    /// An IPv6 host is rendered back in brackets, which is the only form
+    /// `rsync` and `ssh` accept for a literal address.
     #[must_use]
     pub fn dest(&self) -> String {
+        let host =
+            if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
         match &self.user {
-            Some(user) => format!("{user}@{}", self.host),
-            None => self.host.clone(),
+            Some(user) => format!("{user}@{host}"),
+            None => host,
         }
     }
 
@@ -110,6 +148,40 @@ impl SshSpec {
         args.push(self.dest());
         args
     }
+}
+
+/// Parse a port and reject `0`, which `ssh` treats as "default" but which a
+/// playbook almost certainly did not mean.
+fn parse_port(raw: &str, spec: &str) -> Result<u16, ParseError> {
+    let port = raw.parse::<u16>().map_err(|_| ParseError::InvalidSshSpec {
+        line: 0,
+        spec: spec.to_string(),
+        reason: format!("invalid port `{raw}`"),
+    })?;
+    if port == 0 {
+        return Err(ParseError::InvalidSshSpec {
+            line: 0,
+            spec: spec.to_string(),
+            reason: "invalid port `0` (must be 1-65535)".to_string(),
+        });
+    }
+    Ok(port)
+}
+
+/// Whether a bracketed host is a plausible IPv6 literal.
+///
+/// Hex digits, `:` separators and `.` (for an embedded IPv4 tail) only: a
+/// zone index (`%eth0`) and every shell metacharacter stay out, and the
+/// address never reaches a shell unquoted in the first place.
+fn is_ipv6_literal(host: &str) -> bool {
+    host.contains(':') &&
+        host.chars().all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.')) &&
+        host.chars().any(|c| c.is_ascii_hexdigit())
+}
+
+/// A host is a DNS name, an IPv4 literal, or a bracketed IPv6 literal.
+fn host_is_well_formed(host: &str) -> bool {
+    if host.contains(':') { is_ipv6_literal(host) } else { is_valid_spec_component(host) }
 }
 
 /// Whether a user or host component contains only characters that are valid in
@@ -167,6 +239,34 @@ mod tests {
         assert_eq!(spec.host, "10.0.0.1");
         assert_eq!(spec.port, Some(2222));
         Ok(())
+    }
+
+    #[test]
+    fn parses_a_bracketed_ipv6_literal() -> Result<(), String> {
+        // `[addr]:port` is the only unambiguous IPv6 spelling: `::1:2222`
+        // could be an address or an address plus a port.
+        let spec = parse("deploy@[2001:db8::1]:2222")?;
+        assert_eq!(spec.user.as_deref(), Some("deploy"));
+        assert_eq!(spec.host, "2001:db8::1");
+        assert_eq!(spec.port, Some(2222));
+        assert_eq!(spec.dest(), "deploy@[2001:db8::1]");
+        assert_eq!(spec.to_ssh_args(), vec!["-p", "2222", "deploy@[2001:db8::1]"]);
+
+        let no_port = parse("[::1]")?;
+        assert_eq!(no_port.host, "::1");
+        assert_eq!(no_port.port, None);
+        assert_eq!(no_port.dest(), "[::1]");
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_bracket_form_is_rejected() {
+        // `[zz]` matters: without the "must contain a colon" half of
+        // `is_ipv6_literal` it falls through to the DNS-name rule and is
+        // accepted as a host called `zz`.
+        for bad in ["[::1", "[::1]x", "[::1]:", "[not:hex]:22", "[]:22", "[zz]:22"] {
+            assert!(SshSpec::parse(bad).is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]

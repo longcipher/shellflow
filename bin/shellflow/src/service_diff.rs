@@ -48,13 +48,13 @@ pub(crate) fn diff(args: &ServiceDiffArgs) -> Result<(), ServiceError> {
         let local_text = match std::fs::read_to_string(local) {
             Ok(text) => text,
             Err(err) => {
-                println!("[FAIL] cannot read {}: {err}", local.display());
+                crate::ui::report!("[FAIL] cannot read {}: {err}", local.display());
                 drift += 1;
                 continue;
             }
         };
         if !remote_ok {
-            println!("[FAIL] {remote} is not readable on {} (drift)", args.host);
+            crate::ui::report!("[FAIL] {remote} is not readable on {} (drift)", args.host);
             drift += 1;
             continue;
         }
@@ -65,13 +65,16 @@ pub(crate) fn diff(args: &ServiceDiffArgs) -> Result<(), ServiceError> {
         let local_body = local_text.trim_end_matches(['\n', '\r']);
         let remote_body = remote_body.trim_end_matches(['\n', '\r']);
         if local_body == remote_body {
-            println!("[ok] {} == {remote}", local.display());
+            crate::ui::report!("[ok] {} == {remote}", local.display());
             continue;
         }
-        println!("[FAIL] {} != {remote} (drift)", local.display());
+        crate::ui::report!("[FAIL] {} != {remote} (drift)", local.display());
         if !args.quiet {
             let local_name = local.display().to_string();
-            print!("{}", unified_diff(local_body, remote_body, &local_name, remote));
+            crate::ui::report_part!(
+                "{}",
+                unified_diff(local_body, remote_body, &local_name, remote)
+            );
         }
         drift += 1;
     }
@@ -82,7 +85,7 @@ pub(crate) fn diff(args: &ServiceDiffArgs) -> Result<(), ServiceError> {
             args.host
         )));
     }
-    println!("service diff: {} clean", args.host);
+    crate::ui::report!("service diff: {} clean", args.host);
     Ok(())
 }
 

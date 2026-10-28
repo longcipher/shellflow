@@ -485,14 +485,14 @@ pub(crate) struct EmitCredEnvArgs {
 /// round-trip instead of one per poll. Each poll streams a machine-readable
 /// state line (`SFW<TAB>type<TAB>active<TAB>sub<TAB>result<TAB>status`) and
 /// the verdict is the exit code (0 ready, 3 failed, 4 timeout, 5 not found).
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 pub(crate) struct SystemdArgs {
     #[command(subcommand)]
     pub command: SystemdCmd,
 }
 
 /// The `systemd` subcommands.
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub(crate) enum SystemdCmd {
     /// Send a systemd notification for the unit this process runs in.
     Notify(SystemdNotifyArgs),
@@ -522,7 +522,7 @@ pub(crate) enum WaitForArg {
 }
 
 /// Arguments for `systemd notify`.
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 pub(crate) struct SystemdNotifyArgs {
     /// Send `READY=1` (the unit finished starting).
     #[arg(long)]
@@ -548,7 +548,7 @@ pub(crate) struct SystemdNotifyArgs {
 }
 
 /// Arguments for `systemd wait`.
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 pub(crate) struct SystemdWaitArgs {
     /// The unit to wait for.
     #[arg(value_name = "UNIT")]
@@ -568,7 +568,7 @@ pub(crate) struct SystemdWaitArgs {
 }
 
 /// Arguments for `systemd reload`.
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 pub(crate) struct SystemdReloadArgs {
     /// The unit to reload.
     #[arg(value_name = "UNIT")]
@@ -592,7 +592,7 @@ pub(crate) struct SystemdReloadArgs {
 }
 
 /// Arguments for `systemd status`.
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 pub(crate) struct SystemdStatusArgs {
     /// The unit to inspect.
     #[arg(value_name = "UNIT")]
@@ -600,7 +600,7 @@ pub(crate) struct SystemdStatusArgs {
 }
 
 /// Arguments for `systemd watch`.
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 pub(crate) struct SystemdWatchArgs {
     /// The unit to watch.
     #[arg(value_name = "UNIT")]
@@ -616,7 +616,7 @@ pub(crate) struct SystemdWatchArgs {
 }
 
 /// Arguments for `systemd transient`.
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 pub(crate) struct SystemdTransientArgs {
     /// The command to run, with its arguments.
     #[arg(
@@ -825,7 +825,7 @@ pub(crate) struct HostAssertCredstoreArgs {
 pub(crate) struct HostInventoryArgs {}
 
 /// Arguments for `systemd exec` — the readiness supervisor.
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 pub(crate) struct SystemdExecArgs {
     /// The command to supervise, with its arguments.
     #[arg(
@@ -866,7 +866,7 @@ pub(crate) struct SystemdExecArgs {
 }
 
 /// Arguments for `systemd watchdog`.
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 pub(crate) struct SystemdWatchdogArgs {
     /// Seconds between pings.
     #[arg(long, value_name = "SECS", default_value_t = 10)]

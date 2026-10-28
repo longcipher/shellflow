@@ -107,7 +107,7 @@ pub(crate) fn status(args: &ServiceStatusArgs) -> Result<(), ServiceError> {
     failures.sort();
 
     for failure in &failures {
-        println!("[FAIL] {failure}");
+        crate::ui::report!("[FAIL] {failure}");
     }
     print_table(&rows);
     if !failures.is_empty() {
@@ -177,7 +177,7 @@ fn query_host(alias: &str, dest: &SshDest, units: &[String]) -> HostQuery {
 /// Print the table of unit states.
 fn print_table(rows: &[(String, String, UnitState)]) {
     if rows.is_empty() {
-        println!("(no units to report)");
+        crate::ui::report!("(no units to report)");
         return;
     }
     let header = vec![
@@ -216,9 +216,9 @@ fn print_table(rows: &[(String, String, UnitState)]) {
             .collect::<Vec<_>>()
             .join("  ")
     };
-    println!("{}", render(&header));
+    crate::ui::report!("{}", render(&header));
     for cells in &body {
-        println!("{}", render(cells));
+        crate::ui::report!("{}", render(cells));
     }
 }
 

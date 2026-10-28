@@ -310,6 +310,15 @@ shellflow service init <svc> [--host H]… [--pattern full|exec|no-secret|contai
 shellflow service check <svc> --host H [--journal-lines N]   read-only audit
                                             of the deployed unit (argv/env
                                             leaks, wiring, journal shapes)
+shellflow service diff <svc> --host H   diff the repository's unit/drop-ins
+                                            against the deployed ones
+shellflow service manifest <svc> [--output PATH]   print (or write) the
+                                            rendered unit + drop-ins
+shellflow service verify <svc>          repository-only consistency check:
+                                            no host needed, reports wiring
+                                            that cannot match a target
+shellflow service status [--host H]…    one-line state per unit, bounded
+                                            SSH fan-out
 shellflow audit [PATH]                  scan the repo for secret-shaped
                                             plaintext (pre-commit gate)
 ```

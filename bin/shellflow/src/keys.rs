@@ -29,8 +29,8 @@ fn generate(output: &Path) -> Result<()> {
         bail!("refusing to overwrite existing identity file {}", path.display());
     }
     let identity = generate_identity(&path).map_err(|err| eyre!("{err}"))?;
-    println!("wrote identity to {}", path.display());
-    println!("public key: {}", identity.to_public());
+    crate::ui::report!("wrote identity to {}", path.display());
+    crate::ui::report!("public key: {}", identity.to_public());
     Ok(())
 }
 
@@ -38,7 +38,7 @@ fn public(identity_path: Option<&Path>) -> Result<()> {
     let path = effective_identity_path(identity_path).map_err(|err| eyre!("{err}"))?;
     let identity =
         load_x25519_identity(&path).map_err(|err| eyre!("{err} (identity: {})", path.display()))?;
-    println!("{}", identity.to_public());
+    crate::ui::report!("{}", identity.to_public());
     Ok(())
 }
 

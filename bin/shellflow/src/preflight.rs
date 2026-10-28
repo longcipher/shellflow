@@ -134,6 +134,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::print_stderr, reason = "test-only friendly message on stderr")]
     fn preflight_succeeds_on_this_machine() {
         // The test machine runs bash and (normally) ssh/rsync; if any is
         // missing we want a friendly message rather than a panic.

@@ -36,9 +36,7 @@ pub(crate) use process::StepStats;
 pub(crate) use remote::execute_plan;
 use shellflow_core::ResolvedHost;
 use tokio::sync::Mutex;
-#[cfg(feature = "muxy")]
-pub(crate) use transport::StepClass;
-pub(crate) use transport::{TransportPolicy, policy_from_cli};
+pub(crate) use transport::{StepClass, TransportPolicy, policy_from_cli};
 
 use crate::{
     cli::RunArgs,
@@ -64,6 +62,67 @@ pub(crate) type ArcUi = Arc<Mutex<Ui>>;
 pub(crate) type ShellCache = Arc<
     Mutex<std::collections::HashMap<String, Arc<tokio::sync::OnceCell<Option<remote::RemoteEnv>>>>>,
 >;
+
+/// The native (muxy) transport state for one run.
+///
+/// **The feature fork lives here and nowhere else in the executors.** Every
+/// step struct carries a `Native` unconditionally, so the *shape* of a step no
+/// longer depends on the build — only whether the native transport exists.
+/// That is what keeps `#[cfg(feature = "muxy")]` out of the dispatch: a step
+/// that grows a new field does not also grow a cfg attribute (there were 31 of
+/// them before this type existed).
+///
+/// Without the feature the type is empty, `transport::should_use_muxy` still
+/// answers (`--transport muxy` fails closed at the CLI), and nothing reads the
+/// fields that are not there.
+#[cfg(feature = "muxy")]
+#[derive(Clone)]
+pub(crate) struct Native {
+    /// Per-run connection state, one connection per host.
+    pub(crate) run: muxy::MuxyRun,
+    /// The 1-based plan index, naming the muxy payload file.
+    pub(crate) step_no: usize,
+}
+
+/// Empty native-transport state for a build without the feature.
+#[cfg(not(feature = "muxy"))]
+#[derive(Clone, Default)]
+pub(crate) struct Native;
+
+impl Native {
+    /// State for a new run: no host connected yet.
+    #[cfg(feature = "muxy")]
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self { run: muxy::MuxyRun::new(), step_no: 0 }
+    }
+
+    /// State for a new run in a build without the native transport.
+    #[cfg(not(feature = "muxy"))]
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+
+    /// The same state, carrying the plan index of the step about to run.
+    ///
+    /// A plan index names the payload file, so it is per step, not per run;
+    /// returning a copy keeps the run-wide handle immutable.
+    #[must_use]
+    pub(crate) fn at_step(&self, step_no: usize) -> Self {
+        #[cfg(feature = "muxy")]
+        {
+            let mut next = self.clone();
+            next.step_no = step_no;
+            next
+        }
+        #[cfg(not(feature = "muxy"))]
+        {
+            let _ = step_no;
+            self.clone()
+        }
+    }
+}
 
 /// Shell-quote one value for a command line that a remote shell will parse.
 ///
@@ -188,6 +247,26 @@ pub(crate) enum HostOutcome {
     Cancelled,
 }
 
+/// Classify one target-side helper exit code.
+///
+/// The helper protocol is a wire contract (`crate::exit::helper`), and the
+/// `@service`/`@install`/`@backup` fan-out and the `@wait_active` path each
+/// used to build their own ladder — which drifted: a helper timeout was a
+/// script failure on one path and a timeout on the other. Design §6 keeps the
+/// two apart on purpose (a slow host is a retry, a failed deploy is a
+/// rollback), so the mapping is defined here once and both callers use it.
+#[must_use]
+pub(crate) const fn classify_helper_exit(code: i32) -> HostOutcome {
+    match code {
+        crate::exit::helper::OK => HostOutcome::Ok,
+        // ssh exits 255 when the connection itself failed: a transport
+        // failure, not a failed operation.
+        255 => HostOutcome::Failed(RunError::Transport),
+        crate::exit::helper::TIMEOUT => HostOutcome::TimedOut,
+        _ => HostOutcome::Failed(RunError::Script),
+    }
+}
+
 /// Cache key for a host: `user@host[:port]`.
 #[must_use]
 pub(crate) fn shell_cache_key(host: &ResolvedHost) -> String {
@@ -231,6 +310,13 @@ pub(crate) fn display_args(cmd: &tokio::process::Command) -> String {
         .join(" ")
 }
 
+/// How many columns rsync's `%i` itemize summary occupies: `YXcstpoguax`.
+///
+/// The unit tests and the mock `rsync` used ten, so the predicate accepted a
+/// shape rsync never prints and rejected the one it does — `--diff` filtered
+/// out every real change on a live host.
+const ITEMIZE_COLUMNS: usize = 11;
+
 /// Whether an rsync stdout line is an `-i` itemized change entry (as opposed
 /// to status prose like "sending incremental file list" / "sent N bytes").
 ///
@@ -241,24 +327,25 @@ pub(crate) fn display_args(cmd: &tokio::process::Command) -> String {
 /// `--diff`.
 pub(crate) fn is_rsync_itemize_line(line: &str) -> bool {
     let bytes = line.as_bytes();
-    if line.starts_with("*deleting") {
-        return bytes.len() > "*deleting".len() && bytes["*deleting".len()] == b' ';
+    if let Some(rest) = line.strip_prefix("*deleting") {
+        // `*deleting` is shorter than the summary field; rsync pads it to the
+        // same path column, so the line is still "prefix, blanks, path".
+        return rest.starts_with(' ') && rest.chars().any(|c| !c.is_whitespace());
     }
-    if bytes.len() < 12 {
+    // The summary, one space, and at least one path byte.
+    if bytes.len() < ITEMIZE_COLUMNS + 2 || bytes[ITEMIZE_COLUMNS] != b' ' {
         return false;
     }
-    if bytes[10] != b' ' {
-        return false;
-    }
-    bytes[..10].iter().all(|&b| {
-        b.is_ascii_alphanumeric() ||
-            b == b'.' ||
-            b == b'*' ||
-            b == b'<' ||
-            b == b'>' ||
-            b == b'c' ||
-            b == b'+'
-    })
+    bytes[..ITEMIZE_COLUMNS].iter().all(|&b| is_itemize_summary_byte(b))
+}
+
+/// The bytes an itemize summary column may hold: the `YXcstpoguax` alphabet.
+///
+/// A set membership test rather than a chain of `||`: the chain made every
+/// column a separate decision point, and `c` was already covered by
+/// `is_ascii_alphanumeric`.
+const fn is_itemize_summary_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'*' | b'<' | b'>' | b'+')
 }
 
 /// Convert per-host failures into a step-level error, preferring the first
@@ -355,5 +442,102 @@ impl Drop for CaptureFile {
                 &None,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_helper_ladder_separates_a_timeout_from_a_failure() {
+        // The `@service`/`@install`/`@backup` fan-out and the `@wait_active`
+        // path share this mapping. They used to build it separately and
+        // disagreed about exit 4: one called it a script failure (exit 4 of
+        // the CLI, roll back) and the other a timeout (exit 5, retry).
+        assert_eq!(classify_helper_exit(0), HostOutcome::Ok);
+        assert_eq!(classify_helper_exit(255), HostOutcome::Failed(RunError::Transport));
+        assert_eq!(classify_helper_exit(crate::exit::helper::TIMEOUT), HostOutcome::TimedOut);
+        assert_eq!(
+            classify_helper_exit(crate::exit::helper::FAILED),
+            HostOutcome::Failed(RunError::Script)
+        );
+        assert_eq!(
+            classify_helper_exit(crate::exit::helper::USAGE),
+            HostOutcome::Failed(RunError::Script)
+        );
+    }
+
+    #[test]
+    fn a_host_cache_key_is_the_destination_and_its_port() {
+        // The key decides connection sharing: two hosts that hash the same
+        // would silently share one ssh master, and a host whose port is
+        // dropped would connect to the wrong service.
+        let with_port = ResolvedHost {
+            alias: "web1".to_string(),
+            spec: shellflow_core::SshSpec::parse("deploy@10.0.0.1:2222").expect("spec"),
+        };
+        let without_port = ResolvedHost {
+            alias: "web1".to_string(),
+            spec: shellflow_core::SshSpec::parse("deploy@10.0.0.1").expect("spec"),
+        };
+        assert_eq!(shell_cache_key(&with_port), "deploy@10.0.0.1:2222");
+        assert_eq!(shell_cache_key(&without_port), "deploy@10.0.0.1");
+    }
+
+    #[test]
+    fn an_itemized_change_is_told_apart_from_status_prose() {
+        // `--diff` filters rsync output down to the itemized entries: a
+        // status line swallowed by the filter hides the transfer summary, and
+        // an itemized line dropped by it hides the actual change.
+        // `%i` is exactly 11 columns: `>f` plus nine `+` for a new file.
+        for line in [
+            ">f+++++++++ /etc/app/config.toml",
+            "*deleting   /tmp/old",
+            ".d..t...... app",
+            "cd+++++++++ x", // 11 columns, one path byte: the length boundary
+            "<f+++++++++ x", // each summary byte the alphabet allows, on its own
+            "*f+++++++++ x",
+            ".f+++++++++ x",
+            ">f.st...... x",
+        ] {
+            assert!(is_rsync_itemize_line(line), "{line} is itemized");
+        }
+        for line in [
+            "sending incremental file list",
+            "sent 1,234 bytes  received 56 bytes",
+            ">f+++++++++",       // the summary alone, no path
+            ">f+++++++++x/path", // column 11 is not a space
+            ">f++++++++:/path",  // a non-alphanumeric column
+            "deleting /tmp/old",
+            "*deleting",
+            "*deleting   ",   // padding with no path is not an entry
+            "*deletingx/foo", // the prefix must be followed by a blank
+            "!f+++++++++ x",  // a byte outside the alphabet
+            "",
+        ] {
+            assert!(!is_rsync_itemize_line(line), "{line:?} is not itemized");
+        }
+    }
+
+    #[test]
+    fn a_displayed_arg_is_quoted_only_when_it_contains_a_space() {
+        // `-v` shows this string; a path with a space must not read as two
+        // arguments, and a plain one must not gain quotes the operator did not
+        // type.
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.arg("host").arg("/srv/my app/config.toml").arg("-p").arg("22");
+        let rendered = display_args(&cmd);
+        assert_eq!(rendered, "host \"/srv/my app/config.toml\" -p 22");
+    }
+
+    #[test]
+    fn a_helper_timeout_reaches_the_timeout_exit_code() {
+        // End to end through the classifier the run uses to pick a code: a
+        // slow host must be retryable (5), not indistinguishable from a
+        // broken deploy (4).
+        let outcome = classify_helper_exit(crate::exit::helper::TIMEOUT);
+        assert_eq!(step_error_if_failed(&[("web".to_string(), outcome)]), Some(RunError::Timeout));
+        assert_eq!(RunError::Timeout.code().code(), 5);
     }
 }

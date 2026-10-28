@@ -34,7 +34,7 @@ const END_GRACE: Duration = Duration::from_secs(5);
 const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 
 /// Parameters of one step's session.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StepParams {
     /// Stable per-run id (names the payload directory).
     pub run_id: String,
@@ -67,6 +67,32 @@ impl StepParams {
     #[must_use]
     pub const fn size(&self) -> Size {
         Size { cols: self.cols, rows: self.rows }
+    }
+}
+
+impl std::fmt::Debug for StepParams {
+    /// Hand-written on purpose: `env` carries `@secrets` values, so a derived
+    /// `Debug` would put plaintext credentials into any `{:?}` of a step.
+    /// Keys are kept (they are the diagnostics) and values are counted only.
+    /// `guard` is rendered the same way: it can interpolate a secret-bearing
+    /// capture, so only its length/presence is shown.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<&str> = self.env.iter().map(|(key, _)| key.as_str()).collect();
+        formatter
+            .debug_struct("StepParams")
+            .field("run_id", &self.run_id)
+            .field("step_id", &self.step_id)
+            .field("script_bytes", &self.script.len())
+            .field("guard_bytes", &self.guard.as_ref().map(String::len))
+            .field("trace", &self.trace)
+            .field("env_keys", &keys)
+            .field("has_secrets", &self.has_secrets)
+            .field("has_guard", &self.has_guard)
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("timeout", &self.timeout)
+            .field("keep_on_cancel", &self.keep_on_cancel)
+            .finish_non_exhaustive()
     }
 }
 
@@ -207,7 +233,7 @@ fn run_attached(
 ) -> Result<StepResult, MuxyFailure> {
     let destination = host.destination().to_string();
     let marker = begin_marker(&params.run_id, &params.step_id);
-    let (tx, rx) = mpsc::channel::<PumpMsg>();
+    let (tx, rx) = mpsc::sync_channel::<PumpMsg>(super::conn::PUMP_QUEUE);
 
     let attachment = match client.attach(session, size) {
         Ok(attachment) => attachment,
@@ -248,7 +274,7 @@ fn run_attached(
     };
     loop {
         if cancelled.load(Ordering::SeqCst) {
-            return Ok(cancel_outcome(host, client, session, channel, params));
+            return Ok(cancel_outcome(host, client, session, channel, params, &rx, on_line));
         }
         if state.expired() {
             return Ok(timeout_outcome(host, client, session, channel, &rx, on_line));
@@ -306,7 +332,7 @@ struct StepCtx<'a> {
     params: &'a StepParams,
     on_line: &'a dyn Fn(String),
     rx: &'a mpsc::Receiver<PumpMsg>,
-    tx: &'a mpsc::Sender<PumpMsg>,
+    tx: &'a mpsc::SyncSender<PumpMsg>,
 }
 
 /// Handle one pump message; `Some` finishes the step.
@@ -382,9 +408,13 @@ fn timeout_outcome(
     on_line: &dyn Fn(String),
 ) -> StepResult {
     let _ = client.end_session(session);
-    let _ = wait_for_end(rx, on_line);
+    let end = wait_for_end(rx, on_line);
     host.unregister(&channel);
-    StepResult { outcome: MuxyOutcome::TimedOut, session, still_running: false }
+    // A transport drop during the grace leaves the session's fate unknown:
+    // keep `still_running` so the payload is not cleaned up from under a
+    // step that may still be running on the target.
+    let still_running = matches!(end, WaitEnd::Disconnected);
+    StepResult { outcome: MuxyOutcome::TimedOut, session, still_running }
 }
 
 /// The run was interrupted: end the session unless `--muxy-keep` leaves it.
@@ -394,6 +424,8 @@ fn cancel_outcome(
     session: SessionId,
     channel: muxy_protocol::ChannelId,
     params: &StepParams,
+    rx: &mpsc::Receiver<PumpMsg>,
+    on_line: &dyn Fn(String),
 ) -> StepResult {
     if params.keep_on_cancel {
         let _ = client.detach(channel);
@@ -401,8 +433,14 @@ fn cancel_outcome(
         return StepResult { outcome: MuxyOutcome::Cancelled, session, still_running: true };
     }
     let _ = client.end_session(session);
+    // The interrupted step still produced output up to the cancel; the end
+    // notification carries the assembler's flush, so collect it before the
+    // channel goes away. A transport drop during the grace is reported via
+    // `still_running`, as in `timeout_outcome`.
+    let end = wait_for_end(rx, on_line);
     host.unregister(&channel);
-    StepResult { outcome: MuxyOutcome::Cancelled, session, still_running: false }
+    let still_running = matches!(end, WaitEnd::Disconnected);
+    StepResult { outcome: MuxyOutcome::Cancelled, session, still_running }
 }
 
 /// Reconnect once and re-attach the same session.
@@ -410,7 +448,7 @@ fn resume_after_reconnect(
     host: &mut HostConnection,
     session: SessionId,
     params: &StepParams,
-    tx: &mpsc::Sender<PumpMsg>,
+    tx: &mpsc::SyncSender<PumpMsg>,
 ) -> Result<(), MuxyError> {
     let destination = host.destination().to_string();
     host.reconnect()?;
@@ -426,16 +464,25 @@ fn resume_after_reconnect(
     Ok(())
 }
 
+/// What `wait_for_end` observed during the grace period.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitEnd {
+    /// The pump delivered the session's end reason.
+    Ended(muxy_protocol::ExitReason),
+    /// The transport dropped before the end arrived; the session may still be
+    /// running on the target.
+    Disconnected,
+    /// The grace expired with no end and no drop.
+    Expired,
+}
+
 /// Wait up to [`END_GRACE`] for the session's end reason, forwarding lines.
-fn wait_for_end(
-    rx: &mpsc::Receiver<PumpMsg>,
-    on_line: &dyn Fn(String),
-) -> Result<Option<muxy_protocol::ExitReason>, MuxyError> {
+fn wait_for_end(rx: &mpsc::Receiver<PumpMsg>, on_line: &dyn Fn(String)) -> WaitEnd {
     let end = Instant::now() + END_GRACE;
     loop {
         let left = end.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Ok(None);
+            return WaitEnd::Expired;
         }
         match rx.recv_timeout(left.min(Duration::from_millis(200))) {
             Ok(PumpMsg::Lines(lines)) => {
@@ -445,11 +492,15 @@ fn wait_for_end(
             }
             Ok(PumpMsg::Ended(reason)) => {
                 drain_lines(rx, on_line);
-                return Ok(Some(reason));
+                return WaitEnd::Ended(reason);
             }
-            Ok(PumpMsg::BudgetExceeded | PumpMsg::TuiRedraw | PumpMsg::Disconnected) |
+            Ok(PumpMsg::Disconnected) => {
+                drain_lines(rx, on_line);
+                return WaitEnd::Disconnected;
+            }
+            Ok(PumpMsg::BudgetExceeded | PumpMsg::TuiRedraw) |
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return WaitEnd::Disconnected,
         }
     }
 }

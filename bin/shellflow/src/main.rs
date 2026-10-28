@@ -2,11 +2,14 @@
 //!
 //! The binary owns the I/O boundary: it parses the CLI, runs preflight,
 //! dispatches to subcommands (`run`/`keys`/`secret`), and drives the
-//! execution engine. The `run` path streams everything through the `ui`
-//! module (masked, audited); the report subcommands print terminal reports
-//! directly, which each module declares below with a scoped `expect` — a new
-//! `println!` outside those modules fails the lint instead of silently
-//! bypassing the masker.
+//! execution engine. Every human-readable line the tool prints goes through
+//! the `ui` module: the `run` path streams through [`ui::Ui`] (masked,
+//! audited), and the report subcommands use the `ui::report!` macro (masked).
+//! Byte-exact outputs (`secret encrypt`/`decrypt` stdout, `emit` helper dump)
+//! bypass the sink by design so bytes survive unchanged. A bare `println!`
+//! anywhere but `ui` fails the lint instead of silently bypassing the
+//! masker; `eprintln!` is allowed only under a scoped `#[expect]` (fatal
+//! banners, error reporters, verify problems, test diagnostics).
 
 // The workspace denies `panic`/`unwrap`/`expect` in production code; the unit
 // test modules use them pervasively and opt out explicitly rather than
@@ -15,63 +18,47 @@
 #![cfg_attr(test, allow(clippy::panic, clippy::unwrap_used, clippy::expect_used))]
 #![cfg_attr(test, allow(clippy::pedantic, clippy::nursery))]
 // `main` itself prints the fatal-error and interrupt banners; the executor
-// and the library crates never do.
-#![expect(
-    clippy::print_stderr,
-    reason = "fatal errors before/independent of the Ui handle must reach a possibly-broken stderr"
-)]
+// and the library crates never do. The exemption is scoped to the two
+// functions that must reach a possibly-broken stderr, not the whole crate,
+// so a new `eprintln!` elsewhere still fails the lint.
 
-// The report subcommands render terminal reports directly (they are not the
-// streamed run output); each printing module declares that here, so a new
-// `println!` anywhere else fails the lint instead of bypassing the masker.
-#[expect(clippy::print_stdout, reason = "report subcommand terminal output")]
+// The report modules print through `ui::report!`, so none of them needs a
+// `print_stdout` exemption: the lint stays live in every one of them.
 mod audit;
 mod cli;
-#[expect(clippy::print_stdout, reason = "cred-env progress and verdict lines")]
 mod cred_env;
 mod diffutil;
-#[expect(clippy::print_stdout, reason = "emit writes generated files and reports the path")]
 mod emit;
 mod executor;
 mod exit;
 mod fsx;
-#[expect(clippy::print_stdout, reason = "host command report output")]
 mod host;
-#[expect(clippy::print_stdout, reason = "keys generate prints the public key")]
 mod keys;
 mod lint;
 mod manifest;
 mod preflight;
 mod rbatch;
-#[expect(
-    clippy::print_stdout,
-    clippy::print_stderr,
-    reason = "secret subcommand output (decrypt prints plaintext by design)"
-)]
+// `secret decrypt`/`encrypt` write exact bytes by design: `write_output`
+// bypasses the redacting report sink (plaintext/ciphertext must be byte-exact
+// and must not gain a trailing newline), so only the report lines go through
+// `ui::report!`. Only stderr keeps a scoped exemption (the temp-file warning).
+#[expect(clippy::print_stderr, reason = "secret subcommand warnings reach a broken terminal")]
 mod secret;
 mod secrets;
-#[expect(clippy::print_stdout, reason = "service subcommand progress lines")]
 mod service;
-#[expect(clippy::print_stdout, reason = "service check report output")]
 mod service_check;
-#[expect(clippy::print_stdout, reason = "service diff report output")]
 mod service_diff;
-#[expect(clippy::print_stdout, reason = "service manifest report output")]
 mod service_manifest;
-#[expect(clippy::print_stdout, reason = "service status report output")]
 mod service_status;
-
-#[expect(clippy::print_stdout, reason = "systemd subcommand progress and errors")]
+mod systemctl;
 mod systemd;
 #[cfg(feature = "dbus")]
-#[expect(clippy::print_stdout, reason = "systemd D-Bus path progress lines")]
 mod systemd_dbus;
 mod template;
 // `ui` is the output sink itself: it writes through the locked stdout/stderr
 // handles (not `println!`), so no print lint fires here by construction.
 mod ui;
 mod unit;
-#[expect(clippy::print_stdout, reason = "unit subcommand report output")]
 mod unit_cmd;
 mod unit_verify;
 
@@ -148,7 +135,7 @@ async fn main() -> ExitCode {
                 exit::Code::Plan.code()
             }
         },
-        Some(Command::Systemd(cmd)) => match systemd::run(&cmd.command).await {
+        Some(Command::Systemd(cmd)) => match systemd::run(cmd.command.clone()).await {
             Ok(()) => 0,
             Err(err) => {
                 ui::error_text(&err.to_string());
@@ -210,6 +197,7 @@ async fn main() -> ExitCode {
 /// A silently truncated audit log is worse than no audit log: the operator
 /// believes the run was recorded in full. The same holds for the terminal —
 /// a run piped into `head` must not look complete.
+#[expect(clippy::print_stderr, reason = "truncation warnings must reach a possibly-broken stderr")]
 fn report_truncation() {
     let audit = ui::audit_write_failures();
     if audit > 0 {
@@ -272,6 +260,7 @@ fn run_preflight_flags(flags: &cli::RunFlags) -> Result<(), String> {
 }
 
 /// Execute a plan and map the outcome to an exit code.
+#[expect(clippy::print_stderr, reason = "interrupt banners must reach a possibly-broken stderr")]
 async fn run_plan(
     run: &RunArgs,
     globals: &GlobalFlags,

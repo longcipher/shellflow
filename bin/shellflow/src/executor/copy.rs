@@ -763,11 +763,14 @@ async fn run_scp_transfer(
     } else {
         format!("{}:{dst}", host.spec.dest())
     };
-    let mut scp = Command::new("scp");
-    scp.args(["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]);
-    if let Some(port) = host.spec.port {
-        scp.args(["-P", &port.to_string()]);
-    }
+    // The connection policy comes from the shared builder: scp is the third
+    // transport (after ssh and rsync), not a place to spell `BatchMode` again.
+    // `batch()` is what this path has always used — its own channel, a bounded
+    // connect — so behaviour is unchanged, only the source of the numbers is.
+    let mut scp = Command::from(super::transport::scp_command(
+        super::transport::SshPolicy::batch(),
+        &host.spec,
+    ));
     if is_dir_src {
         scp.arg("-r");
     }

@@ -113,9 +113,9 @@ pub(crate) fn manifest(args: &ServiceManifestArgs) -> Result<(), ServiceError> {
             crate::fsx::write_public_file(path, text.as_bytes()).map_err(|err| {
                 Other(eyre::eyre!("service manifest: cannot write {}: {err}", path.display()))
             })?;
-            println!("service manifest: {count} file(s) written to {}", path.display());
+            crate::ui::report!("service manifest: {count} file(s) written to {}", path.display());
         }
-        None => print!("{text}"),
+        None => crate::ui::report_part!("{text}"),
     }
     Ok(())
 }
@@ -149,18 +149,18 @@ pub(crate) fn verify(args: &ServiceVerifyArgs) -> Result<(), ServiceError> {
 
     let mut drift = 0usize;
     for path in expected_paths.difference(&current_paths) {
-        println!("[FAIL] missing on {}: {path}", args.host);
+        crate::ui::report!("[FAIL] missing on {}: {path}", args.host);
         drift += 1;
     }
     for path in current_paths.difference(&expected_paths) {
-        println!("[FAIL] not in the manifest: {path}");
+        crate::ui::report!("[FAIL] not in the manifest: {path}");
         drift += 1;
     }
     for (path, hash) in &current {
         if let Some(want) = expected.entries.get(path) &&
             want != hash
         {
-            println!("[FAIL] changed: {path}");
+            crate::ui::report!("[FAIL] changed: {path}");
             drift += 1;
         }
     }
@@ -168,7 +168,7 @@ pub(crate) fn verify(args: &ServiceVerifyArgs) -> Result<(), ServiceError> {
     if drift > 0 {
         return Err(Other(eyre::eyre!("service verify: {drift} file(s) drifted from the manifest")));
     }
-    println!("service verify: {} file(s) match the manifest", current.len());
+    crate::ui::report!("service verify: {} file(s) match the manifest", current.len());
     Ok(())
 }
 
