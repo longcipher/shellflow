@@ -29,11 +29,11 @@ muxy-protocol = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-bet
 # `zig` and a network fetch. The transport tests therefore drive the real
 # protocol with an in-crate fake peer (see `crates/shellflow-muxy/src/harness.rs`).
 # local crates
-shellflow-core = { path = "crates/shellflow-core", version = "0.5.2" }
-shellflow-dsl = { path = "crates/shellflow-dsl", version = "0.5.2" }
-shellflow-muxy = { path = "crates/shellflow-muxy", version = "0.5.2" }
-shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.5.2" }
-shellflow-text = { path = "crates/shellflow-text", version = "0.5.2" }
+shellflow-core = { path = "crates/shellflow-core", version = "0.5.3" }
+shellflow-dsl = { path = "crates/shellflow-dsl", version = "0.5.3" }
+shellflow-muxy = { path = "crates/shellflow-muxy", version = "0.5.3" }
+shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.5.3" }
+shellflow-text = { path = "crates/shellflow-text", version = "0.5.3" }
 
 # external crates
 age = "0.12.1"
