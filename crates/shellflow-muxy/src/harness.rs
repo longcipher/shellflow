@@ -22,9 +22,10 @@ use std::{
 
 use muxy_client::{Client, bridge::BridgeExit};
 use muxy_protocol::{
-    BuildInfo, COMPATIBILITY, CURRENT, CatalogPage, ChannelId, ErrorCode, ErrorReply, ExecResult,
-    Feature, FileEntry, FilesAction, FilesReply, Message, ProjectDescriptor, ProjectId, ReplyBody,
-    RequestBody, RequestId, ServerInfo, ServerPath, SessionId, SessionInfo,
+    AttachSnapshot, BuildInfo, COMPATIBILITY, CURRENT, CatalogPage, ChannelId, Cursor, CursorShape,
+    ErrorCode, ErrorReply, ExecResult, Feature, FileEntry, FilesAction, FilesReply, Message, Modes,
+    ProjectDescriptor, ProjectId, ReplyBody, RequestBody, RequestId, ServerInfo, ServerPath,
+    SessionId, SessionInfo, Size,
     wire::{Decoder, Encoder},
 };
 
@@ -61,6 +62,8 @@ struct State {
     exec_stderr: String,
     /// Whether `ping` succeeds.
     ping_ok: bool,
+    /// Whether `Attach` answers with a snapshot instead of refusing.
+    attach_ok: bool,
     /// The session id the peer hands out on `CreateSession`.
     next_session: u64,
 }
@@ -119,6 +122,12 @@ impl Bridge {
     /// Set whether `ping` succeeds.
     pub(crate) fn set_ping(&self, ok: bool) {
         self.state.lock().unwrap_or_else(PoisonError::into_inner).ping_ok = ok;
+    }
+
+    /// Let `Attach` answer with an initial terminal snapshot. Tests that
+    /// expect a refused attach keep the default (`false`).
+    pub(crate) fn set_attach_ok(&self, ok: bool) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).attach_ok = ok;
     }
 
     /// Push an unsolicited message to the client (a screen frame, an end).
@@ -187,6 +196,7 @@ fn serve(
                         protocol: vec![CURRENT],
                     },
                     instance: 1,
+                    unreadable: Vec::new(),
                 },
                 features: features.clone(),
             }),
@@ -245,6 +255,14 @@ fn answer(state: &Arc<Mutex<State>>, id: RequestId, body: RequestBody) -> Option
                 directory: ServerPath(b"/work".to_vec()),
             })
         }
+        RequestBody::Attach { .. } | RequestBody::AttachWithoutResize(_) => {
+            let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.record.calls.push("attach".to_string());
+            if !state.attach_ok {
+                return error(id, "the fake peer refuses the attach");
+            }
+            ReplyBody::Attached { snapshot: Box::new(snapshot()), process: None }
+        }
         RequestBody::EndSession(session) => {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
             state.record.calls.push(format!("end-session {}", session.get()));
@@ -270,6 +288,27 @@ fn error(id: RequestId, message: &str) -> Option<Message> {
         id,
         body: ReplyBody::Error(ErrorReply { code: ErrorCode::BadRequest, message: message.into() }),
     })
+}
+
+/// The initial terminal state the real client turns into a `RunGrid` on
+/// `ClientEvent::Attached`. `history_total` is non-zero so a test can prove
+/// the snapshot, not a default grid, reached the step.
+fn snapshot() -> AttachSnapshot {
+    AttachSnapshot {
+        graphics: muxy_protocol::Graphics::default(),
+        prompts: Vec::new(),
+        channel: ChannelId(4),
+        size: Size { cols: 80, rows: 24 },
+        rows: Vec::new(),
+        cursor: Cursor { shape: CursorShape::default(), row: 0, col: 0, visible: false },
+        modes: Modes::default(),
+        title: "step".to_string(),
+        directory: ServerPath(b"/work".to_vec()),
+        history: Vec::new(),
+        history_cursor: None,
+        history_total: 7,
+        links: None,
+    }
 }
 
 /// The catalog: one Home project at `/work`.

@@ -13,7 +13,7 @@ use std::{
     io::Read,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -62,6 +62,12 @@ pub const DEFAULT_ROWS: u16 = 50;
 /// a step that stops draining (a slow operator terminal) must push back on
 /// the pump instead of growing memory without limit.
 pub(crate) const PUMP_QUEUE: usize = 256;
+
+/// Attaches whose initial grid the pump has not delivered yet, keyed by the
+/// tag the step passed to `Client::attach`. `attach` now returns only a
+/// `ChannelId`; the snapshot arrives as `ClientEvent::Attached` on the event
+/// stream the pump owns, so the pump routes it back to the waiting step.
+type PendingAttaches = Arc<Mutex<HashMap<u64, mpsc::SyncSender<muxy_client::RunGrid>>>>;
 
 /// A message from the pump to the step that owns a channel.
 pub(crate) enum PumpMsg {
@@ -122,6 +128,10 @@ pub struct HostConnection {
     /// tombstone a step that unregisters mid-frame would be resurrected when
     /// the pump re-inserts the state it still holds.
     retired: Arc<Mutex<HashSet<ChannelId>>>,
+    /// Tags for attaches whose snapshot the pump has not delivered yet.
+    pending: PendingAttaches,
+    /// Correlation tags for `Client::attach`, unique for this connection.
+    next_tag: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     /// Set when this connection's client has been adopted by another
     /// connection (`reconnect`): the `Drop` must not disconnect the *new*
@@ -205,11 +215,14 @@ impl HostConnection {
         let channels: Arc<Mutex<HashMap<ChannelId, ChannelState>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let retired: Arc<Mutex<HashSet<ChannelId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let pending: PendingAttaches = Arc::new(Mutex::new(HashMap::new()));
+        let next_tag = Arc::new(AtomicU64::new(1));
         let shutdown = Arc::new(AtomicBool::new(false));
         spawn_pump(
             client.clone(),
             Arc::clone(&channels),
             Arc::clone(&retired),
+            Arc::clone(&pending),
             Arc::clone(&shutdown),
             destination.to_string(),
         )?;
@@ -223,6 +236,8 @@ impl HostConnection {
             ssh_spec: ssh_spec.to_vec(),
             channels,
             retired,
+            pending,
+            next_tag,
             shutdown,
             abandoned: false,
         })
@@ -293,6 +308,25 @@ impl HostConnection {
         self.client.is_connected()
     }
 
+    /// A correlation tag for one `Client::attach` call.
+    #[must_use]
+    pub(crate) fn next_attach_tag(&self) -> u64 {
+        self.next_tag.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Hand the pump the sink for one attach's initial grid. Call before
+    /// `Client::attach`: its `ClientEvent::Attached` can arrive before the
+    /// request returns, and the pump is the only consumer of that event.
+    pub(crate) fn prepare_attach(&self, tag: u64, sink: mpsc::SyncSender<muxy_client::RunGrid>) {
+        lock(&self.pending).insert(tag, sink);
+    }
+
+    /// Drop a pending attach whose request failed. A late snapshot then has
+    /// no waiting step, so the pump detaches it instead of leaking a terminal.
+    pub(crate) fn cancel_attach(&self, tag: u64) {
+        lock(&self.pending).remove(&tag);
+    }
+
     /// Register a channel with its attach snapshot; the pump streams its
     /// lines to `tx` until the step unregisters it.
     pub(crate) fn register(
@@ -339,6 +373,8 @@ impl HostConnection {
         self.client = fresh.client.clone();
         self.channels = Arc::clone(&fresh.channels);
         self.retired = Arc::clone(&fresh.retired);
+        self.pending = Arc::clone(&fresh.pending);
+        self.next_tag = Arc::clone(&fresh.next_tag);
         self.shutdown = Arc::clone(&fresh.shutdown);
         // Adopt the new client without running its `Drop` (which would
         // disconnect the *new* connection) and without leaking the rest of
@@ -370,6 +406,7 @@ fn spawn_pump(
     client: Client,
     channels: Arc<Mutex<HashMap<ChannelId, ChannelState>>>,
     retired: Arc<Mutex<HashSet<ChannelId>>>,
+    pending: PendingAttaches,
     shutdown: Arc<AtomicBool>,
     destination: String,
 ) -> Result<(), MuxyError> {
@@ -394,6 +431,9 @@ fn spawn_pump(
                     }
                 };
                 match event {
+                    ClientEvent::Attached { tag, attachment, .. } => {
+                        handle_attached(&client, &pending, tag, attachment);
+                    }
                     ClientEvent::Frame { channel, frame } => {
                         handle_frame(&client, &channels, &retired, &shutdown, channel, &frame);
                     }
@@ -410,6 +450,25 @@ fn spawn_pump(
         })
         .map_err(|_| MuxyError::PumpSpawn { destination })?;
     Ok(())
+}
+
+/// Route an attach snapshot to the step that asked for it.
+///
+/// `Client::attach` resolves with only a `ChannelId`; the initial `RunGrid`
+/// arrives here. A late snapshot for an attach that already failed has no
+/// waiting step, so detach it instead of leaving a terminal nobody owns.
+fn handle_attached(
+    client: &Client,
+    pending: &PendingAttaches,
+    tag: u64,
+    attachment: Box<muxy_client::Attachment>,
+) {
+    let Some(sink) = lock(pending).remove(&tag) else {
+        let _ = client.detach(attachment.terminal.channel());
+        return;
+    };
+    let attachment = *attachment;
+    let _ = sink.send(attachment.terminal.grid);
 }
 
 /// Apply one frame: update the grid, ack immediately, assemble lines.
@@ -756,6 +815,102 @@ mod tests {
             history_total: 0,
             history_fresh: true,
         }
+    }
+
+    /// An attach snapshot as the new muxy client delivers it on the event
+    /// stream instead of returning it from `Client::attach`.
+    fn attachment(rows: u16) -> muxy_client::Attachment {
+        muxy_client::Attachment {
+            terminal: muxy_client::AttachedTerminal::new(muxy_protocol::ChannelId(4), grid(rows)),
+            server_input: true,
+            title: "step".to_string(),
+            directory: muxy_protocol::ServerPath(b"/work".to_vec()),
+            process: None,
+        }
+    }
+
+    #[test]
+    fn the_pump_routes_an_attach_snapshot_to_its_tag() {
+        use std::sync::mpsc;
+        let (client, _bridge) = crate::harness::connect(Duration::from_secs(5));
+        let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
+        let (tx, rx) = mpsc::sync_channel(1);
+        let tag = host.next_attach_tag();
+        host.prepare_attach(tag, tx);
+        handle_attached(host.client(), &host.pending, tag, Box::new(attachment(3)));
+        let delivered = rx.try_recv().expect("the initial grid reaches the step");
+        assert_eq!(delivered.size.rows, 3);
+        assert!(lock(&host.pending).is_empty(), "one snapshot consumes its tag");
+    }
+
+    #[test]
+    fn a_snapshot_for_an_unknown_tag_never_reaches_another_attach() {
+        use std::sync::mpsc;
+        let (client, _bridge) = crate::harness::connect(Duration::from_secs(5));
+        let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
+        let (tx, rx) = mpsc::sync_channel(1);
+        host.prepare_attach(1, tx);
+        handle_attached(host.client(), &host.pending, 2, Box::new(attachment(3)));
+        assert!(rx.try_recv().is_err(), "the wrong tag must not receive the grid");
+        assert!(lock(&host.pending).contains_key(&1), "the real attach stays pending");
+    }
+
+    #[test]
+    fn attach_tags_are_unique_for_one_connection() {
+        let (client, _bridge) = crate::harness::connect(Duration::from_secs(5));
+        let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
+        let first = host.next_attach_tag();
+        let second = host.next_attach_tag();
+        assert_ne!(first, 0, "a tag must never be a default value");
+        assert_ne!(first, second, "two attaches on one connection must not share a tag");
+    }
+
+    #[test]
+    fn cancelling_an_attach_drops_its_pending_snapshot() {
+        use std::sync::mpsc;
+        let (client, _bridge) = crate::harness::connect(Duration::from_secs(5));
+        let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let tag = host.next_attach_tag();
+        host.prepare_attach(tag, tx);
+        assert!(lock(&host.pending).contains_key(&tag), "the attach is pending");
+        host.cancel_attach(tag);
+        assert!(
+            !lock(&host.pending).contains_key(&tag),
+            "a failed attach must not keep a sink the pump would detach instead"
+        );
+    }
+
+    #[test]
+    fn a_failed_reconnect_stops_the_old_pump() {
+        let (client, _bridge) = crate::harness::connect(Duration::from_secs(5));
+        let mut host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
+        assert!(!host.shutdown.load(Ordering::SeqCst));
+        host.reconnect().expect_err("no ssh bridge is reachable for the fake destination");
+        assert!(
+            host.shutdown.load(Ordering::SeqCst),
+            "a failed reconnect must still stop the old pump"
+        );
+    }
+
+    #[test]
+    fn the_pump_forwards_a_real_attach_snapshot_to_its_tag() {
+        use std::sync::mpsc;
+        let (client, bridge) = crate::harness::connect(Duration::from_secs(5));
+        bridge.set_attach_ok(true);
+        let host = HostConnection::from_client("fake-host", &[], client).expect("from_client");
+        let (tx, rx) = mpsc::sync_channel(1);
+        let tag = host.next_attach_tag();
+        host.prepare_attach(tag, tx);
+        let session = muxy_protocol::SessionId::new(9).expect("session");
+        let size = muxy_protocol::Size { cols: 80, rows: 24 };
+        let channel = host.client().attach(tag, session, size).expect("attach");
+        let grid = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the pump forwards the server's snapshot to the step");
+        assert_eq!(channel, muxy_protocol::ChannelId(4));
+        assert_eq!(grid.history_total, 7, "the step gets the snapshot, not a blank grid");
+        assert!(bridge.calls().iter().any(|call| call == "attach"), "{:?}", bridge.calls());
     }
 
     #[test]

@@ -22,8 +22,8 @@ readme = "README.md"
 # the version req only documents the protocol line this build speaks. The
 # dependency is optional (`muxy` feature); the ssh transport covers every step
 # without it. Re-evaluate the pin on each muxy stable release.
-muxy-client = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "d1bffca5f218526a9f1f6bc94a2583676f3808b5" }
-muxy-protocol = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "d1bffca5f218526a9f1f6bc94a2583676f3808b5" }
+muxy-client = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "f522821e2e2a09208c38794e21537c00faf4aeba" }
+muxy-protocol = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "f522821e2e2a09208c38794e21537c00faf4aeba" }
 # Note: the same rev's `muxy-server` is *not* usable as a dev-dependency — it
 # pulls `muxy-terminal`, whose `libghostty-vt-sys` builds ghostty's VT with
 # `zig` and a network fetch. The transport tests therefore drive the real

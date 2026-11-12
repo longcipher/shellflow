@@ -151,11 +151,16 @@ pub fn classify_client_error(destination: &str, err: &muxy_client::ClientError) 
                     MuxyError::UnexpectedOutput { destination, detail }
                 }
                 RemoteReason::BridgeFailed => MuxyError::BridgeFailed { destination, detail },
+                // Pairing and pinned-identity failures are trust decisions
+                // the operator must make, like the ssh key failures above;
+                // none of them is recoverable by simply retrying.
                 RemoteReason::NotRunning |
                 RemoteReason::HostKeyUnknown |
                 RemoteReason::HostKeyChanged |
                 RemoteReason::AuthenticationFailed |
-                RemoteReason::SshMissing => MuxyError::Ssh { destination, detail },
+                RemoteReason::SshMissing |
+                RemoteReason::Unpaired |
+                RemoteReason::IdentityChanged => MuxyError::Ssh { destination, detail },
             }
         }
         ClientError::VersionUnsupported => MuxyError::Incompatible {
@@ -192,5 +197,23 @@ mod tests {
     fn auth_and_missing_muxy_are_not_recoverable() {
         assert!(!MuxyError::NotInstalled { destination: "api".into() }.recoverable());
         assert!(!MuxyError::Ssh { destination: "api".into(), detail: "x".into() }.recoverable());
+    }
+
+    #[test]
+    fn pairing_and_identity_failures_are_non_recoverable_ssh_errors() {
+        use muxy_client::{ClientError, RemoteReason};
+        for reason in [RemoteReason::Unpaired, RemoteReason::IdentityChanged] {
+            let err = ClientError::Remote {
+                reason,
+                destination: "api".into(),
+                detail: "pair again".into(),
+            };
+            let classified = classify_client_error("api", &err);
+            assert!(
+                matches!(classified, MuxyError::Ssh { .. }),
+                "a trust decision must reach the operator as an ssh-class failure: {classified:?}"
+            );
+            assert!(!classified.recoverable(), "retrying cannot repair a pairing decision");
+        }
     }
 }

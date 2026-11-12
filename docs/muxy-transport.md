@@ -674,8 +674,8 @@ build.
 ```toml
 # Cargo.toml (workspace)
 [workspace.dependencies]
-muxy-client = { git = "https://github.com/muxy-app/muxy", rev = "d1bffca5…" }
-muxy-protocol = { git = "https://github.com/muxy-app/muxy", rev = "d1bffca5…" }
+muxy-client = { git = "https://github.com/muxy-app/muxy", rev = "f522821e…" }
+muxy-protocol = { git = "https://github.com/muxy-app/muxy", rev = "f522821e…" }
 
 # bin/shellflow/Cargo.toml
 [features]

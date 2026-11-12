@@ -19,6 +19,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is a required input to the fingerprint; when it cannot be read, the
   fingerprint cache is disabled and the store is re-sealed (fail closed).
 
+### Changed
+
+- **Muxy is pinned to `f522821e2e2a09208c38794e21537c00faf4aeba`.** Upstream
+  `Client::attach` now returns only a `ChannelId` and delivers the initial
+  terminal grid as `ClientEvent::Attached`; the event pump routes that snapshot
+  back to the attaching step by tag, so frames are never applied to a missing
+  grid. The two new pairing/identity failure reasons are classified as
+  non-recoverable.
+
 ## [0.5.3] — 2026-10-28
 
 ### Fixed

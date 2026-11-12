@@ -33,6 +33,11 @@ const END_GRACE: Duration = Duration::from_secs(5);
 /// Cap of one payload file: the server rejects larger files.
 const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 
+/// How long the attaching step waits for the initial grid the pump forwards
+/// from `ClientEvent::Attached`. The event is emitted by the same reply that
+/// resolves `Client::attach`, so this is a fail-safe, not a normal wait.
+const ATTACH_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Parameters of one step's session.
 #[derive(Clone)]
 pub struct StepParams {
@@ -196,6 +201,7 @@ pub fn run_step(
         &home_dir,
         size,
         env_map,
+        None,
     ) {
         Ok(info) => info,
         Err(err) => {
@@ -235,12 +241,20 @@ fn run_attached(
     let marker = begin_marker(&params.run_id, &params.step_id);
     let (tx, rx) = mpsc::sync_channel::<PumpMsg>(super::conn::PUMP_QUEUE);
 
-    let attachment = match client.attach(session, size) {
-        Ok(attachment) => attachment,
+    // `Client::attach` now returns only the channel. The initial terminal
+    // grid arrives as `ClientEvent::Attached` on the event stream the pump
+    // owns, so register the tag before the request and wait for the pump to
+    // route the grid back here; registering without it would drop frames.
+    let tag = host.next_attach_tag();
+    let (grid_tx, grid_rx) = mpsc::sync_channel::<muxy_client::RunGrid>(1);
+    host.prepare_attach(tag, grid_tx);
+    let channel = match client.attach(tag, session, size) {
+        Ok(channel) => channel,
         Err(err) => {
             // The session exists but was never attached to: end it so no
             // half-created terminal is left behind, then report with no
             // session left — auto mode may fall back to ssh.
+            host.cancel_attach(tag);
             let _ = client.end_session(session);
             return Err(MuxyFailure {
                 error: crate::error::classify_client_error(&destination, &err),
@@ -249,9 +263,23 @@ fn run_attached(
             });
         }
     };
-    let channel = attachment.channel;
-    let history = attachment.grid.history_total;
-    let grid = attachment.grid;
+    let grid = match grid_rx.recv_timeout(ATTACH_SNAPSHOT_TIMEOUT) {
+        Ok(grid) => grid,
+        Err(err) => {
+            // No snapshot means no grid to apply frames to. End the session
+            // before it can run unobserved instead of reporting success.
+            host.cancel_attach(tag);
+            let _ = client.end_session(session);
+            return Err(MuxyFailure {
+                error: MuxyError::Request {
+                    detail: format!("no attach snapshot from the server ({err:?})"),
+                },
+                session: None,
+                still_running: false,
+            });
+        }
+    };
+    let history = grid.history_total;
     host.register(session, channel, grid, history, &marker, tx.clone());
 
     let bootstrap = bootstrap_line(&params.run_id, &params.step_id);
@@ -453,12 +481,23 @@ fn resume_after_reconnect(
     let destination = host.destination().to_string();
     host.reconnect()?;
     let client = host.client().clone();
-    let attachment = client
-        .attach_without_resize(session)
-        .map_err(|err| crate::error::classify_client_error(&destination, &err))?;
-    let channel = attachment.channel;
-    let history_total = attachment.grid.history_total;
-    let grid = attachment.grid;
+    // The fresh connection has a fresh pump, so the re-attach needs a tag on
+    // that pump's routing table and the snapshot it forwards back.
+    let tag = host.next_attach_tag();
+    let (grid_tx, grid_rx) = mpsc::sync_channel::<muxy_client::RunGrid>(1);
+    host.prepare_attach(tag, grid_tx);
+    let channel = match client.attach_without_resize(tag, session) {
+        Ok(channel) => channel,
+        Err(err) => {
+            host.cancel_attach(tag);
+            return Err(crate::error::classify_client_error(&destination, &err));
+        }
+    };
+    let grid = grid_rx.recv_timeout(ATTACH_SNAPSHOT_TIMEOUT).map_err(|err| {
+        host.cancel_attach(tag);
+        MuxyError::Request { detail: format!("no attach snapshot after reconnect ({err:?})") }
+    })?;
+    let history_total = grid.history_total;
     let marker = begin_marker(&params.run_id, &params.step_id);
     host.register(session, channel, grid, history_total, &marker, tx.clone());
     Ok(())
@@ -763,6 +802,16 @@ mod tests {
             bridge.deleted()
         );
         assert!(!failure.still_running, "no session is left running when none could start");
+    }
+
+    #[test]
+    fn resume_after_reconnect_reports_a_bridge_that_cannot_start() {
+        let (client, _bridge) = crate::harness::connect(std::time::Duration::from_secs(5));
+        let mut host = host(client);
+        let (tx, _rx) = mpsc::sync_channel(crate::conn::PUMP_QUEUE);
+        let session = muxy_protocol::SessionId::new(9).expect("session");
+        resume_after_reconnect(&mut host, session, &params(), &tx)
+            .expect_err("a reconnect without a reachable ssh bridge must fail");
     }
 
     #[test]
