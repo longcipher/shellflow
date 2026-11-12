@@ -35,6 +35,9 @@ just mutation
 
 `just lint` is the CI gate: `typos`, `rumdl`, `cargo sort --check`, `cargo +nightly fmt --check`, `cargo +nightly clippy -D warnings`, `cargo shear`. `just fuzz-check` type-checks the fuzz targets; `just fuzz SECS=60` runs them.
 
+- Always type-check fuzz targets with plain `cargo check --manifest-path <crate>/fuzz/Cargo.toml --bins`; `cargo fuzz check` defaults to the triple the tool was built for, not the host.
+- Never run mutation testing in CI: no `mutation` job and no `schedule` trigger in `.github/workflows/ci.yml`.
+
 ## Rust workspace rules
 
 - Edition 2024, resolver 3. Members are `crates/*`, `bin/*` and `examples/*`; the fuzz crates under `crates/*/fuzz` are detached workspaces and are excluded from the root workspace on purpose.

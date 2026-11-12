@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] — 2026-11-12
+
+### Fixed
+
+- **The credential-store fingerprint ignored the systemd host key.**
+  `cred-env credstore-install` read `/etc/systemd/credentials.secret`, a path
+  that does not exist on systemd hosts (the host key lives at
+  `/var/lib/systemd/credential.secret`), so the host key was never part of the
+  fingerprint. After a host key rotation or a reinstall, a store holding
+  ciphertext sealed with the old key could be reported as current and left
+  unsealed — the failure only surfaced at the next boot, when systemd could no
+  longer decrypt the credentials. The host key is now read after elevation and
+  is a required input to the fingerprint; when it cannot be read, the
+  fingerprint cache is disabled and the store is re-sealed (fail closed).
+
 ## [0.5.3] — 2026-10-28
 
 ### Fixed

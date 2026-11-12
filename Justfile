@@ -35,15 +35,27 @@ test:
 # integration suite (`main.rs`, `executor/process.rs`) and the demo targets;
 # see the file for why.
 #
-# Run mutation tests with cargo-mutants
+# Run mutation tests with cargo-mutants (local only, never in CI)
 mutation:
   cargo mutants --workspace
 
+# Mutation-test only the lines changed in the working tree. The full gate above
+# scans ~2900 mutants (a long-running local gate); this is the gate for one
+# change.
+mutation-diff:
+  @set -eu; d=$(mktemp); trap 'rm -f "$d"' EXIT; git diff > "$d"; cargo mutants --in-diff "$d"
+
 # Type-check every fuzz target (no execution)
+#
+# Plain `cargo check` on each detached fuzz workspace. `cargo fuzz check` is
+# unfit for this gate: its default `--target` is the triple the cargo-fuzz
+# binary was built for, which on Linux CI is x86_64-unknown-linux-musl. That
+# target has no std installed and its static libc conflicts with ASan, so the
+# gate failed before it ever checked our code.
 fuzz-check:
-  cd crates/shellflow-core && cargo +nightly fuzz check
-  cd crates/shellflow-dsl && cargo +nightly fuzz check
-  cd crates/shellflow-secrets && cargo +nightly fuzz check
+  cargo +nightly check --manifest-path crates/shellflow-core/fuzz/Cargo.toml --bins
+  cargo +nightly check --manifest-path crates/shellflow-dsl/fuzz/Cargo.toml --bins
+  cargo +nightly check --manifest-path crates/shellflow-secrets/fuzz/Cargo.toml --bins
 
 # Run every fuzz target for SECS seconds (hostile-input parsers)
 fuzz SECS="20":
