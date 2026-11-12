@@ -252,9 +252,10 @@ pub(crate) fn credstore_install(service: &str, store_dir: Option<&Path>) -> Resu
 /// a fingerprint that describes a store that no longer exists.
 const FINGERPRINT_FILE: &str = ".seal-fingerprint";
 
-/// systemd's host key: the credential store is sealed with it, so a store
-/// sealed with a *different* host key is unreadable whatever the values are.
-const HOST_KEY_PATH: &str = "/etc/systemd/credentials.secret";
+/// systemd's host key for `systemd-creds --with-key=host`. It is root-only and
+/// lives in `/var/lib`, not `/etc/systemd`: a store sealed with a *different*
+/// host key is unreadable whatever the values are.
+const HOST_KEY_PATH: &str = "/var/lib/systemd/credential.secret";
 
 /// A fingerprint of the credentials about to be sealed.
 ///
@@ -264,7 +265,11 @@ const HOST_KEY_PATH: &str = "/etc/systemd/credentials.secret";
 /// * the values themselves (a rotated value must be re-sealed),
 /// * the host key (a store sealed with another host key cannot be read),
 /// * the names of the files in the store (a store that lost a file must be rebuilt, not trusted).
-fn seal_fingerprint(keys: &[String]) -> Result<String> {
+///
+/// The host key is passed in by the caller, which reads it after elevation:
+/// the fingerprint must never depend on a path the process cannot actually
+/// read, and tests can prove a rotated key invalidates it.
+fn seal_fingerprint(keys: &[String], host_key: &[u8]) -> Result<String> {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -275,10 +280,8 @@ fn seal_fingerprint(keys: &[String]) -> Result<String> {
         hasher.update(value.as_bytes());
         hasher.update(b"\n");
     }
-    if let Ok(host_key) = fs::read(HOST_KEY_PATH) {
-        hasher.update(b"host-key:");
-        hasher.update(Sha256::digest(&host_key));
-    }
+    hasher.update(b"host-key:");
+    hasher.update(Sha256::digest(host_key));
     // The credentials the store is *supposed* to hold, sorted so the order
     // does not matter. The store's actual contents are compared separately:
     // a store that lost a file must be rebuilt, not trusted.
@@ -366,9 +369,26 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
     // Sealing is the expensive part of an install: one host-key crypto
     // operation per credential. When the store already holds exactly these
     // credentials, re-sealing it would burn that work to produce the same
-    // result, so the install is skipped.
-    let fingerprint = seal_fingerprint(keys)?;
-    if store_is_current(&store, keys, &fingerprint) {
+    // result, so the install is skipped. The host key is root-only and is
+    // read after elevation; if it cannot be read, no fingerprint is trustworthy
+    // (a wrong path once left stores bound to a rotated key, which only failed
+    // at the next boot), so re-seal instead of trusting the cache.
+    let fingerprint = match fs::read(HOST_KEY_PATH) {
+        Ok(host_key) => Some(seal_fingerprint(keys, &host_key)?),
+        Err(err) => {
+            crate::ui::warn(
+                &format!(
+                    "cred-env: cannot read host key `{HOST_KEY_PATH}` ({err}); re-sealing \
+                     without the fingerprint cache"
+                ),
+                &None,
+            );
+            None
+        }
+    };
+    if let Some(fingerprint) = &fingerprint &&
+        store_is_current(&store, keys, fingerprint)
+    {
         return Ok(());
     }
 
@@ -392,7 +412,9 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
     // rather than a data-loss risk.
     if exchange_dirs(&staging, &store) {
         discard_tree(&staging);
-        record_fingerprint(&store, &fingerprint);
+        if let Some(fingerprint) = &fingerprint {
+            record_fingerprint(&store, fingerprint);
+        }
         return Ok(());
     }
 
@@ -418,7 +440,9 @@ fn seal_into_store(service: &str, store_dir: Option<&Path>, keys: &[String]) -> 
         );
     }
     discard_tree(&retired);
-    record_fingerprint(&store, &fingerprint);
+    if let Some(fingerprint) = &fingerprint {
+        record_fingerprint(&store, fingerprint);
+    }
     Ok(())
 }
 
@@ -572,7 +596,21 @@ fn sudo(args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_service_name, is_valid_var_name};
+    use super::{HOST_KEY_PATH, is_valid_service_name, is_valid_var_name, seal_fingerprint};
+
+    #[test]
+    fn host_key_path_is_the_systemd_default() {
+        assert_eq!(HOST_KEY_PATH, "/var/lib/systemd/credential.secret");
+    }
+
+    #[test]
+    fn fingerprint_changes_when_the_host_key_rotates() {
+        let keys = vec!["SHELLFLOW_FP_KEY_A".to_owned(), "SHELLFLOW_FP_KEY_B".to_owned()];
+        let before = seal_fingerprint(&keys, b"host-key-a").unwrap();
+        let after = seal_fingerprint(&keys, b"host-key-b").unwrap();
+        assert_ne!(before, after, "a rotated host key must force a re-seal");
+        assert_eq!(before, seal_fingerprint(&keys, b"host-key-a").unwrap());
+    }
 
     #[test]
     fn var_name_validation_matches_the_env_parser() {

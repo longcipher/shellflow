@@ -7,7 +7,7 @@ members = ["bin/*", "crates/*", "examples/*"]
 exclude = [".github/", "crates/*/fuzz"]
 resolver = "3"
 [workspace.package]
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/longcipher/shellflow"
@@ -29,11 +29,11 @@ muxy-protocol = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-bet
 # `zig` and a network fetch. The transport tests therefore drive the real
 # protocol with an in-crate fake peer (see `crates/shellflow-muxy/src/harness.rs`).
 # local crates
-shellflow-core = { path = "crates/shellflow-core", version = "0.5.3" }
-shellflow-dsl = { path = "crates/shellflow-dsl", version = "0.5.3" }
-shellflow-muxy = { path = "crates/shellflow-muxy", version = "0.5.3" }
-shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.5.3" }
-shellflow-text = { path = "crates/shellflow-text", version = "0.5.3" }
+shellflow-core = { path = "crates/shellflow-core", version = "0.5.4" }
+shellflow-dsl = { path = "crates/shellflow-dsl", version = "0.5.4" }
+shellflow-muxy = { path = "crates/shellflow-muxy", version = "0.5.4" }
+shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.5.4" }
+shellflow-text = { path = "crates/shellflow-text", version = "0.5.4" }
 
 # external crates
 age = "0.12.1"
@@ -52,8 +52,8 @@ sha2 = "0.11.1"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = "1.54.0"
-toml_edit = "0.25.17"
-zbus = { version = "6.1.0", default-features = false, features = ["tokio", "proxy"] }
+toml_edit = "0.25.19"
+zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy"] }
 zeroize = "1.9.1"
 
 [workspace.lints.clippy]
