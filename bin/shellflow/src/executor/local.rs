@@ -109,6 +109,41 @@ fn append_capture(script: &str, vars: &[ExportVar]) -> String {
     out
 }
 
+/// Resolve the plan-level `@env` entries for a runner step.
+///
+/// Runner steps (`@toolchain`, `@build`, `@image`, and the `@service` family)
+/// execute generated commands, so they never see the exported run-state
+/// wholesale; they receive exactly the entries the plan declares. A bare
+/// `@env KEY` reads the controller environment at run time and is skipped
+/// when unset, so a declared-but-unset switch stays a no-op. When a literal
+/// and a passthrough name the same key, the literal wins: the passthrough
+/// only fills what is not already present.
+pub(super) fn build_runner_env(entries: &[EnvEntry]) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    for entry in entries {
+        match entry {
+            EnvEntry::Literal { key, value } => {
+                env.retain(|(k, _)| k != key);
+                env.push((key.clone(), value.clone()));
+            }
+            EnvEntry::Passthrough { key } => {
+                if !env.iter().any(|(k, _)| k == key) &&
+                    let Ok(value) = std::env::var(key)
+                {
+                    env.push((key.clone(), value));
+                }
+            }
+            // `EnvEntry` is `#[non_exhaustive]`: a variant this build does not
+            // know cannot be turned into an environment pair without guessing,
+            // and guessing an environment value is exactly what this tool must
+            // not do. The planner and this build ship together, so the arm is
+            // unreachable in practice; the entry is simply not injected.
+            _ => {}
+        }
+    }
+    env
+}
+
 /// What a captured value contributes to the mask registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Masking {
@@ -472,7 +507,85 @@ async fn run_bash_n(script: &str, log_file: &LogFile) -> Result<(), LocalFailure
 
 #[cfg(test)]
 mod tests {
-    use super::{ExportVar, Masking, create_capture_file, masking_for};
+    use super::{EnvEntry, ExportVar, Masking, build_runner_env, create_capture_file, masking_for};
+
+    /// Serializes tests that mutate process-global env vars. Rust 2024 makes
+    /// `set_var` `unsafe`, so every mutation is guarded by this lock and
+    /// scoped to the closure.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `body` with `$key` set to `value`, or removed when `value` is
+    /// `None`.
+    fn with_env<T>(key: &str, value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: serialized by `ENV_LOCK`; no other test reads this var
+        // concurrently and the values are non-secret test fixtures.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        let out = body();
+        // SAFETY: serialized by `ENV_LOCK`, as above.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        out
+    }
+
+    #[test]
+    fn runner_env_passthrough_reads_the_controller_environment() {
+        let entries = [EnvEntry::Passthrough { key: "SFW_RUNNER_PROBE".to_string() }];
+        with_env("SFW_RUNNER_PROBE", Some("seen"), || {
+            assert_eq!(
+                build_runner_env(&entries),
+                vec![("SFW_RUNNER_PROBE".to_string(), "seen".to_string())]
+            );
+        });
+    }
+
+    #[test]
+    fn runner_env_unset_passthrough_injects_nothing() {
+        let entries = [EnvEntry::Passthrough { key: "SFW_RUNNER_PROBE".to_string() }];
+        with_env("SFW_RUNNER_PROBE", None, || {
+            assert!(build_runner_env(&entries).is_empty());
+        });
+    }
+
+    #[test]
+    fn runner_env_literal_wins_over_passthrough_of_the_same_key() {
+        let entries = [
+            EnvEntry::Passthrough { key: "SFW_RUNNER_PROBE".to_string() },
+            EnvEntry::Literal {
+                key: "SFW_RUNNER_PROBE".to_string(),
+                value: "declared".to_string(),
+            },
+        ];
+        with_env("SFW_RUNNER_PROBE", Some("controller"), || {
+            assert_eq!(
+                build_runner_env(&entries),
+                vec![("SFW_RUNNER_PROBE".to_string(), "declared".to_string())]
+            );
+        });
+    }
+
+    #[test]
+    fn runner_env_passthrough_alongside_an_unrelated_literal() {
+        let entries = [
+            EnvEntry::Literal { key: "SFW_RUNNER_A".to_string(), value: "1".to_string() },
+            EnvEntry::Passthrough { key: "SFW_RUNNER_B".to_string() },
+        ];
+        with_env("SFW_RUNNER_B", Some("from-controller"), || {
+            assert_eq!(
+                build_runner_env(&entries),
+                vec![
+                    ("SFW_RUNNER_A".to_string(), "1".to_string()),
+                    ("SFW_RUNNER_B".to_string(), "from-controller".to_string()),
+                ]
+            );
+        });
+    }
 
     #[test]
     fn a_captured_value_is_masked_unless_declared_public() {
