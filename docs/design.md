@@ -111,7 +111,7 @@ All other lines (including plain comments) belong to the current block.
 |---|---|---|
 | `@server` | `# @server <name> <ssh-spec>` | Declare a server alias. `<ssh-spec>` = `[user@]host[:port]` |
 | `@group` | `# @group <name> <member>[,<member>…]` | Declare a group of server aliases |
-| `@env` | `# @env <KEY>` / `# @env <KEY>=<value>` | Inject an env var into subsequent blocks. No `=value` → copy from shellflow's own environment. Values never appear in argv and are masked in previews/traces (§7.2, §9) |
+| `@env` | `# @env <KEY>` / `# @env <KEY>=<value>` | Inject an env var into subsequent blocks — remote blocks and every runner step (`@service` family, `@install`, `@backup`, `@credstore`, `@unit_inventory`, `@release`, `@build`, `@toolchain`, `@image`). No `=value` → copy from shellflow's own environment, skipped while unset. Values never appear in argv and are masked in previews/traces (§7.2, §9) |
 | `@local` | `# @local` | Following lines run on the local machine (default at start) |
 | `@remote` | `# @remote <target>` | Following lines stream to `<target>` (alias, group, or raw ssh-spec; `@`-prefix optional) |
 | `@copy` | `# @copy <src> -> <dst> @<target> [--delete] [--exclude <glob>]` | Sync a local file/dir to `<dst>` on all hosts in `<target>`. `--delete` mirrors removal of remote extras; in `--local` mode it swaps a staged copy into place so a failed copy cannot empty the destination. `--exclude` (repeatable) is honored by the rsync path and warned as ignored on the scp fallback and in `--local` mode. `src`/`dst` support `$VAR`/`${VAR}` interpolation from `@export`ed state (§4.4) |

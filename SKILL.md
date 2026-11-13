@@ -65,7 +65,7 @@ lines belong to the current block.
 |---|---|---|
 | `@server` | `# @server <name> <ssh-spec>` | Alias a host; `<ssh-spec>` = `[user@]host[:port]` or a `~/.ssh/config` host alias |
 | `@group` | `# @group <name> <member>[,<member>…]` | Alias a group of servers |
-| `@env` | `# @env <KEY>` / `# @env <KEY>=<value>` | Inject env into later blocks; literal values are masked in output |
+| `@env` | `# @env <KEY>` / `# @env <KEY>=<value>` | Inject env into later blocks (remote blocks and every runner step); a bare `@env KEY` reads shellflow's own environment, skipped while unset; literal values are masked in output |
 | `@secrets` | `# @secrets <file.env.age> [--identity <PATH>]` | Decrypt an age-encrypted env file at run time; inject every key into the block environment, export the space-separated key list as `LT_SECRET_KEYS`, and mask all values. Identity precedence: the directive's `--identity`, then run-wide `-i`, then `$SHELLFLOW_AGE_IDENTITY`, then `~/.config/age/keys.txt`. Resolution is a hard error without a usable identity |
 | `@local` | `# @local` | Following lines run locally (default) |
 | `@remote` | `# @remote <target>` | Following lines stream to the target (alias, group, raw spec) |

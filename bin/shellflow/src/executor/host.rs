@@ -60,6 +60,9 @@ pub(super) struct TargetCommand<'a> {
     pub ui: &'a ArcUi,
     /// The remote command to run.
     pub command: String,
+    /// The resolved plan-level `@env` entries (`build_runner_env`), applied
+    /// before the secrets overlay so a sealed secret wins a same-key clash.
+    pub env: Vec<(String, String)>,
     /// The hosts to run it on.
     pub hosts: Vec<ResolvedHost>,
     /// The per-step settings.
@@ -99,6 +102,7 @@ pub(super) async fn run_target_command(
     let TargetCommand {
         ui,
         command,
+        env,
         hosts,
         config,
         semaphore,
@@ -120,6 +124,7 @@ pub(super) async fn run_target_command(
     for host in hosts {
         let ui = Arc::clone(ui);
         let command = command.clone();
+        let env = env.clone();
         let semaphore = semaphore.clone();
         let log_file = log_file.clone();
         let cancel = cancel.clone();
@@ -134,13 +139,14 @@ pub(super) async fn run_target_command(
             if cancel.is_cancelled() {
                 return (host.alias.clone(), HostOutcome::Cancelled);
             }
-            // The command runs through the target's login shell with the
-            // step's environment — including the `@secrets` values — in
-            // front of it, exactly like a remote block. A credential that
-            // never reaches the command cannot be sealed into the store.
             let remote_env =
                 crate::executor::remote::resolve_remote_env(&host, &shell_cache, &cancel).await;
-            let mut payload_env = Vec::new();
+            // The command runs through the target's login shell with the
+            // step's environment — the declared `@env` entries, then the
+            // `@secrets` values (which win a same-key clash) — exactly like
+            // a remote block. A credential that never reaches the command
+            // cannot be sealed into the store.
+            let mut payload_env = env;
             secrets.overlay(&mut payload_env, &host.alias);
             #[cfg(feature = "muxy")]
             {

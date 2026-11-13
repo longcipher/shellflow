@@ -14,7 +14,7 @@ use tokio::{
 use super::{
     ArcUi, Cancel, CopyStepArgs, HostOutcome, LogFile, Native, RunError, RunOutcome, ShellCache,
     StepConfig, fanout_slot, helper,
-    local::{GuardOutcome, build_env, run_local_block},
+    local::{GuardOutcome, build_env, build_runner_env, run_local_block},
     process::isolate,
     stream,
 };
@@ -469,6 +469,10 @@ fn resolve_or_report(
 /// [`super::host::run_target_command`]; this wrapper only threads the shared
 /// per-run state, so a new verb contributes its `command`, `label`, and
 /// [`super::transport::StepClass`] and nothing else.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the resolved @env entries extend the existing seven; folding them into a params struct would spread every call site"
+)]
 async fn run_target_step(
     setup: &RunSetup,
     step_no: usize,
@@ -477,11 +481,13 @@ async fn run_target_step(
     command: String,
     label: String,
     class: super::transport::StepClass,
+    env: Vec<(String, String)>,
 ) -> eyre::Result<Vec<(String, HostOutcome)>> {
     let native = setup.native.at_step(step_no);
     super::host::run_target_command(super::host::TargetCommand {
         ui: &setup.ui,
         command,
+        env,
         hosts,
         config,
         semaphore: &setup.semaphore,
@@ -667,6 +673,7 @@ async fn run_single_step(
                     command,
                     format!("service {}", service.unit),
                     super::transport::StepClass::Service,
+                    build_runner_env(plan.env()),
                 )
                 .await,
             )
@@ -712,6 +719,7 @@ async fn run_single_step(
                     command,
                     format!("install {dst}"),
                     super::transport::StepClass::ShortHelper,
+                    build_runner_env(plan.env()),
                 )
                 .await,
             )
@@ -753,6 +761,7 @@ async fn run_single_step(
                     command,
                     "backup".to_string(),
                     super::transport::StepClass::LongHelper,
+                    build_runner_env(plan.env()),
                 )
                 .await,
             )
@@ -772,6 +781,7 @@ async fn run_single_step(
                     command,
                     format!("credstore {}", credstore.service),
                     super::transport::StepClass::ShortHelper,
+                    build_runner_env(plan.env()),
                 )
                 .await,
             )
@@ -790,6 +800,7 @@ async fn run_single_step(
                     super::host::unit_inventory_command(),
                     "unit inventory".to_string(),
                     super::transport::StepClass::ShortHelper,
+                    build_runner_env(plan.env()),
                 )
                 .await,
             )
@@ -815,6 +826,7 @@ async fn run_single_step(
                     command,
                     format!("release {}", release.repo),
                     super::transport::StepClass::LongHelper,
+                    build_runner_env(plan.env()),
                 )
                 .await,
             )
@@ -833,6 +845,7 @@ async fn run_single_step(
                     super::build::build_command(build),
                     format!("build {}", build.repo),
                     super::transport::StepClass::LongHelper,
+                    build_runner_env(plan.env()),
                 )
                 .await,
             )
@@ -851,6 +864,7 @@ async fn run_single_step(
                     super::toolchain::toolchain_command(&toolchain.tools),
                     "toolchain update".to_string(),
                     super::transport::StepClass::LongHelper,
+                    build_runner_env(plan.env()),
                 )
                 .await,
             )
@@ -869,6 +883,7 @@ async fn run_single_step(
                     super::image::image_command(&image.images, image.prune),
                     "image update".to_string(),
                     super::transport::StepClass::LongHelper,
+                    build_runner_env(plan.env()),
                 )
                 .await,
             )
