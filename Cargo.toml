@@ -7,7 +7,7 @@ members = ["bin/*", "crates/*", "examples/*"]
 exclude = [".github/", "crates/*/fuzz"]
 resolver = "3"
 [workspace.package]
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/longcipher/shellflow"
@@ -22,18 +22,18 @@ readme = "README.md"
 # the version req only documents the protocol line this build speaks. The
 # dependency is optional (`muxy` feature); the ssh transport covers every step
 # without it. Re-evaluate the pin on each muxy stable release.
-muxy-client = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "f522821e2e2a09208c38794e21537c00faf4aeba" }
-muxy-protocol = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "f522821e2e2a09208c38794e21537c00faf4aeba" }
+muxy-client = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "97b321b1af1c71393a343d70ddb75c4c30bd9df0" }
+muxy-protocol = { git = "https://github.com/muxy-app/muxy", version = "2.0.0-beta-0", rev = "97b321b1af1c71393a343d70ddb75c4c30bd9df0" }
 # Note: the same rev's `muxy-server` is *not* usable as a dev-dependency — it
 # pulls `muxy-terminal`, whose `libghostty-vt-sys` builds ghostty's VT with
 # `zig` and a network fetch. The transport tests therefore drive the real
 # protocol with an in-crate fake peer (see `crates/shellflow-muxy/src/harness.rs`).
 # local crates
-shellflow-core = { path = "crates/shellflow-core", version = "0.5.4" }
-shellflow-dsl = { path = "crates/shellflow-dsl", version = "0.5.4" }
-shellflow-muxy = { path = "crates/shellflow-muxy", version = "0.5.4" }
-shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.5.4" }
-shellflow-text = { path = "crates/shellflow-text", version = "0.5.4" }
+shellflow-core = { path = "crates/shellflow-core", version = "0.5.5" }
+shellflow-dsl = { path = "crates/shellflow-dsl", version = "0.5.5" }
+shellflow-muxy = { path = "crates/shellflow-muxy", version = "0.5.5" }
+shellflow-secrets = { path = "crates/shellflow-secrets", version = "0.5.5" }
+shellflow-text = { path = "crates/shellflow-text", version = "0.5.5" }
 
 # external crates
 age = "0.12.1"
@@ -53,7 +53,7 @@ tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = "1.54.0"
 toml_edit = "0.25.19"
-zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy"] }
+zbus = { version = "6.3.0", default-features = false, features = ["tokio", "proxy"] }
 zeroize = "1.9.1"
 
 [workspace.lints.clippy]
