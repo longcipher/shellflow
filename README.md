@@ -533,9 +533,9 @@ fan-out, guards, timeouts, env passthrough, and secret masking. See
 ## Development
 
 ```bash
-just setup        # install dev tools (cargo-mutants, shear, sort, typos, rumdl)
+just setup        # install dev tools (cargo-mutants, sort, typos, rumdl)
 just format
-just lint         # typos, rumdl, cargo sort, fmt, clippy -D warnings, shear
+just lint         # typos, rumdl, cargo sort, fmt, clippy -D warnings
 just test         # cargo test --all-features (unit + proptest + integration)
 just mutation     # cargo-mutants — kill surviving mutants
 just check-cn     # no CJK in code/comments

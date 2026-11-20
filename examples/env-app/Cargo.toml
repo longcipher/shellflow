@@ -10,6 +10,7 @@ categories.workspace = true
 readme.workspace = true
 description = "Example application configured with plain environment variables (no encryption) — the simple baseline that shellflow's encrypted workflow replaces."
 publish = false
+rust-version.workspace = true
 
 [[bin]]
 name = "env-app"
