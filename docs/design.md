@@ -1338,7 +1338,7 @@ These tests require local `bash`, `ssh`-less (mock shims), and no network.
 
 ```bash
 just format
-just lint        # typos, rumdl, cargo sort, fmt, clippy -D warnings, cargo shear
+just lint        # typos, rumdl, cargo sort, fmt, clippy -D warnings
 just test        # cargo test --all-features (incl. proptest)
 just mutation    # cargo-mutants; fix survivors
 just check-cn    # no CJK in code/comments (docs/comments are English-only)

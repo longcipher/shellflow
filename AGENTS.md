@@ -38,7 +38,7 @@ temp file and run `cargo mutants --in-diff <diff-file>` for that file only, with
 60 mutants / 300 s. Never add a whole-repo mutation recipe: `just check-mutation-scope` fails
 `just lint` when an unbounded mutation command appears in a build or CI file.
 
-`just lint` is the CI gate: `typos`, `rumdl`, `cargo sort --check`, `cargo +nightly fmt --check`, `cargo +nightly clippy -D warnings`, `cargo shear`. `just fuzz-check` type-checks the fuzz targets; `just fuzz SECS=60` runs them.
+`just lint` is the CI gate: `typos`, `rumdl`, `cargo sort --check`, `cargo +nightly fmt --check`, `cargo +nightly clippy -D warnings` (which also runs Cargo's native `unused_dependencies` lint). `just fuzz-check` type-checks the fuzz targets; `just fuzz SECS=60` runs them.
 
 - Always type-check fuzz targets with plain `cargo check --manifest-path <crate>/fuzz/Cargo.toml --bins`; `cargo fuzz check` defaults to the triple the tool was built for, not the host.
 - Never run mutation testing in CI: no `mutation` job and no `schedule` trigger in `.github/workflows/ci.yml`.
@@ -54,6 +54,12 @@ temp file and run `cargo mutants --in-diff <diff-file>` for that file only, with
 - There is no `rust-toolchain.toml`: CI installs nightly, so use `cargo +nightly fmt` and `cargo +nightly clippy` exactly as the Justfile does.
 - `.cargo/mutants.toml` excludes only `bin/shellflow/src/main.rs`, `bin/shellflow/src/executor/process.rs`, and `examples/*/src/**`: every other `bin` module carries unit tests that kill mutants, so they stay in mutation scope. The orchestration paths that need a live process tree are covered by `bin/shellflow/tests/integration.rs` instead.
 - Never hand-type dependency versions. Shared crates go into root `[workspace.dependencies]` and members reference them with `workspace = true`.
+
+## Rust 1.100 baseline
+
+- Workspace MSRV is Rust 1.100. Prefer newly stabilized features and APIs over older workarounds; do not add feature gates for anything already stable in 1.100.
+- `[workspace.lints.cargo]` enables Cargo's native `unused_dependencies` lint, the only unused-dependency check; do not reintroduce a third-party checker. Its level is `warn`, and `.cargo/config.toml` sets `build.warnings = "deny"` so a finding fails the gate.
+- `.cargo/config.toml` sets resolver `incompatible-rust-versions = "fallback"` (MSRV-aligned resolution) and `registry.global-min-publish-age = "5 days"` (Rust 1.100 dependency cooldown); keep both.
 
 ## Dependency choices
 

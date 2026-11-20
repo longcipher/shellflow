@@ -13,6 +13,7 @@ readme.workspace = true
 # depends on git-only beta crates absent from crates.io. The binary is a
 # build-from-source product; the library crates below are the published artifacts.
 publish = false
+rust-version.workspace = true
 
 [features]
 # Event-driven systemd unit state (D-Bus). Off by default so the standard

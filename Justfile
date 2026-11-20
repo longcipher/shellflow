@@ -25,7 +25,6 @@ lint:
   cargo sort -w -g -c
   cargo +nightly fmt --all -- --check
   RUSTC_WRAPPER= cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
-  RUSTC_WRAPPER= cargo shear
   just check-mutation-scope
 
 # Run the workspace test suite
@@ -252,7 +251,6 @@ clean:
 # Install all required development tools
 setup:
   cargo install cargo-mutants
-  cargo install cargo-shear
   cargo install cargo-sort
   cargo install typos-cli
   cargo install rumdl
@@ -281,10 +279,6 @@ clippy-all:
 # Run tests with nextest
 test-nextest:
   cargo nextest run --all-features
-
-# Check for unused dependencies
-unused-deps:
-  cargo shear --check
 
 # Update all dependencies
 update-deps:
