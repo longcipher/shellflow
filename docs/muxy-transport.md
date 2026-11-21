@@ -379,6 +379,7 @@ server's file API**, never typed:
   shellflow blocks are a few KiB). Both paths are **relative to the Home project
   root** (`$HOME`) — `.shellflow/steps/<run-id>/<step-id>.sh`; the server rejects
   absolute paths and `..`.
+
 - The typed line is short and contains no user text:
 
   ```
@@ -397,6 +398,7 @@ server's file API**, never typed:
 
   There is no `export KEY='…'` header: the environment is applied by the server
   (5.2), so the payload contains no secret material.
+
 - `FilesAction::Delete` after the step; a stale sweep at run start removes
   `<run-id>` directories older than 24 h (a crashed run leaves one behind).
 
