@@ -329,7 +329,7 @@ mod tests {
 
         let resolved =
             resolve_secrets(&entries, &[], Some(&identity), 6).map_err(|err| format!("{err:#}"))?;
-        assert!(resolved.masks().contains(&"supersecret_value".to_string()));
+        assert!(resolved.masks().iter().any(|mask| mask.as_str() == "supersecret_value"));
         assert_eq!(value_of(resolved.shared_env(), "SECRET"), "supersecret_value");
         Ok(())
     }

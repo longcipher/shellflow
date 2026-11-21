@@ -372,8 +372,8 @@ mod ssh_tests {
     fn verbose_policy_adds_ssh_v() {
         let quiet = args(&ssh_command(SshPolicy::step(false, false), &spec()));
         let verbose = args(&ssh_command(SshPolicy::step(false, true), &spec()));
-        assert!(!quiet.contains(&"-v".to_string()));
-        assert!(verbose.contains(&"-v".to_string()));
+        assert!(!quiet.iter().any(|flag| flag.as_str() == "-v"));
+        assert!(verbose.iter().any(|flag| flag.as_str() == "-v"));
     }
 
     #[test]

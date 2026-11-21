@@ -413,7 +413,6 @@ impl<'a> AnswerReader<'a> {
     /// Whether every expected answer has arrived.
     // `BTreeMap::len` is not a const fn on stable, so clippy's suggestion
     // does not compile; the method is still the clearest form.
-    #[expect(clippy::missing_const_for_fn, reason = "BTreeMap::len is not const on stable")]
     fn is_complete(&self) -> bool {
         self.sections.len() >= self.batch.section_count()
     }

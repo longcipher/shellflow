@@ -2034,7 +2034,7 @@ impl State {
                         ),
                     });
                 }
-                if !tools.contains(&part.to_string()) {
+                if !tools.iter().any(|tool| tool.as_str() == part) {
                     tools.push(part.to_string());
                 }
             }

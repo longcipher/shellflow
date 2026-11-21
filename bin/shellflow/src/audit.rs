@@ -644,14 +644,12 @@ mod tests {
     }
 
     #[test]
-    fn a_real_value_next_to_a_secret_key_is_still_found() {
-        // The tightened key matching must not lose the real thing.
+    fn a_live_looking_value_next_to_a_secret_key_is_still_found() {
+        // The tightened key matching must not lose a non-placeholder value.
         assert_eq!(hits("FERRISKEY_DB_PASSWORD=s3cret-fixture-value"), 1);
         assert_eq!(hits("requirepass=s3cret-fixture-value"), 1);
         assert_eq!(
-            hits(
-                "ExecStart=/home/akagi201/ferriskey/bin/ferriskey-api --database-password s3cret-fixture-value"
-            ),
+            hits("ExecStart=/opt/example/ferriskey-api --database-password s3cret-fixture-value"),
             1
         );
         assert_eq!(hits("dufs.service: DUFS_AUTH_PASSWORD=s3cret-fixture-value"), 1);
