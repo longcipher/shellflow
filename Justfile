@@ -264,6 +264,11 @@ setup:
 docs:
   cargo doc --no-deps --open
 
+# Scan the working tree and full git history for leaked secrets
+secrets:
+  gitleaks git . --config .gitleaks.toml --redact --no-banner --log-opts="--all"
+  gitleaks dir . --config .gitleaks.toml --redact --no-banner
+
 # Run security audit
 audit:
   cargo audit

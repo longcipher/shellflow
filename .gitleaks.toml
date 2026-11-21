@@ -1,0 +1,26 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Illustrative documentation values and synthetic test fixtures; none are real credentials."
+regexTarget = "match"
+regexes = [
+  '''sk-prod-abcdef1234567890''',
+  '''ss-prod-xyz7890123456789''',
+  '''db-pass-s3cur3-2024!''',
+  '''shellflow-topsecret''',
+  '''s3cret-fixture-value''',
+  '''postgres://u:hunter2secret@h/db''',
+  '''postgres://u:p@h/db''',
+]
+
+[[allowlists]]
+description = "Local build artifacts, VCS metadata and tool caches; never committed."
+paths = [
+  '''(^|/)\.git/''',
+  '''(^|/)target/''',
+  '''(^|/)mutants\.out(\.old)?/''',
+  '''(^|/)\.codegraph/''',
+  '''(^|/)\.rumdl_cache/''',
+  '''(^|/)\.freebuff/''',
+]
