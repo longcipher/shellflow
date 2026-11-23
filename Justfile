@@ -27,6 +27,10 @@ lint:
   RUSTC_WRAPPER= cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
   just check-mutation-scope
 
+# Run the prek commit hooks on every tracked file (requires prek)
+hooks:
+  prek run --all-files
+
 # Run the workspace test suite
 test:
   cargo test --all-features
